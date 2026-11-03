@@ -1,0 +1,208 @@
+{
+  "version": 1,
+  "patches": [
+    {
+      "title_id": "0x01007EF00011E000",
+      "main_build_id": "cd57b23fa4bbad65803d9788c01821ee00000000000000000000000000000000",
+      "module": "frame-rate",
+      "original_callee": "0x151d3d0",
+      "calls": [
+        {
+          "offset": "0x1281044",
+          "expected_instruction": "0x940a70e3"
+        },
+        {
+          "offset": "0xcf9ad4",
+          "expected_instruction": "0x94208e3f"
+        }
+      ],
+      "layout": {
+        "framework_pointer": "0x1e44c30",
+        "framework_period": "0xf0",
+        "override_flag": "0x29",
+        "ratio": "0x30",
+        "interval": "0x34",
+        "base_interval": "0x150",
+        "frame_step": "0x1dad0e0"
+      },
+      "words": [
+        {
+          "offset": "0xed5ba0",
+          "expected_instruction": "0x32170108",
+          "replacement_instruction": "0xd503201f",
+          "nvn_driver_only": true
+        },
+        {
+          "offset": "0x112670c",
+          "expected_instruction": "0x1e204160",
+          "replacement_instruction": "0x1e204140"
+        },
+        {
+          "offset": "0x1126710",
+          "expected_instruction": "0x71000b7f",
+          "replacement_instruction": "0x7100077f"
+        },
+        {
+          "offset": "0x112665c",
+          "expected_instruction": "0x52800078",
+          "replacement_instruction": "0x52800058"
+        },
+        {
+          "offset": "0x1126748",
+          "expected_instruction": "0x71000d1f",
+          "replacement_instruction": "0x7100091f"
+        },
+        {
+          "offset": "0x1126794",
+          "expected_instruction": "0x71000d3f",
+          "replacement_instruction": "0x7100093f"
+        },
+        {
+          "offset": "0xef6368",
+          "expected_instruction": "0x885ffd2e",
+          "replacement_instruction": "0xb8aa812e"
+        },
+        {
+          "offset": "0xef636c",
+          "expected_instruction": "0x3400006e",
+          "replacement_instruction": "0x35ffff8e"
+        },
+        {
+          "offset": "0xef6370",
+          "expected_instruction": "0xd5033f5f",
+          "replacement_instruction": "0x14000004"
+        },
+        {
+          "offset": "0xef6374",
+          "expected_instruction": "0x17fffffd",
+          "replacement_instruction": "0xd503201f"
+        },
+        {
+          "offset": "0xef6378",
+          "expected_instruction": "0x880e7d2a",
+          "replacement_instruction": "0xd503201f"
+        },
+        {
+          "offset": "0xef637c",
+          "expected_instruction": "0x35ffff6e",
+          "replacement_instruction": "0xd503201f"
+        },
+        {
+          "offset": "0xef63fc",
+          "expected_instruction": "0x885ffd2e",
+          "replacement_instruction": "0xb8aa812e"
+        },
+        {
+          "offset": "0xef6400",
+          "expected_instruction": "0x3400006e",
+          "replacement_instruction": "0x35ffff8e"
+        },
+        {
+          "offset": "0xef6404",
+          "expected_instruction": "0xd5033f5f",
+          "replacement_instruction": "0x17ffffe0"
+        },
+        {
+          "offset": "0xef6408",
+          "expected_instruction": "0x17fffffd",
+          "replacement_instruction": "0xd503201f"
+        },
+        {
+          "offset": "0xef640c",
+          "expected_instruction": "0x880e7d2a",
+          "replacement_instruction": "0xd503201f"
+        },
+        {
+          "offset": "0xef6410",
+          "expected_instruction": "0x35ffff6e",
+          "replacement_instruction": "0xd503201f"
+        },
+        {
+          "offset": "0x1126924",
+          "expected_instruction": "0x36000080",
+          "replacement_instruction": "0x14000004"
+        },
+        {
+          "offset": "0x112697c",
+          "expected_instruction": "0x36000080",
+          "replacement_instruction": "0x14000004"
+        },
+        {
+          "offset": "0x1280ec8",
+          "expected_instruction": "0x97cc0894",
+          "replacement_instruction": "0x97cc6e30"
+        },
+        {
+          "offset": "0x1280ecc",
+          "expected_instruction": "0x1e230000",
+          "replacement_instruction": "0xd503201f"
+        },
+        {
+          "offset": "0x1280ee4",
+          "expected_instruction": "0x1e210800",
+          "replacement_instruction": "0xd503201f"
+        },
+        {
+          "offset": "0x125f114",
+          "expected_instruction": "0x97cc9001",
+          "replacement_instruction": "0x97ccf59d"
+        },
+        {
+          "offset": "0x125f118",
+          "expected_instruction": "0x1e230000",
+          "replacement_instruction": "0xd503201f"
+        },
+        {
+          "offset": "0x125f128",
+          "expected_instruction": "0x1e210800",
+          "replacement_instruction": "0xd503201f"
+        }
+      ],
+      "resolution": {
+        "tv_size": [
+          [
+            "0xc61ee8",
+            "0xc61ef4"
+          ],
+          [
+            "0xc61f1c",
+            "0xc61f28"
+          ],
+          [
+            "0x12618b8",
+            "0x12618c4"
+          ]
+        ],
+        "screen_widths": [
+          "0x12660bc",
+          "0x12660c8"
+        ],
+        "display_size": [
+          "0x12660d0",
+          "0x12660d4"
+        ],
+        "window_crop": [
+          "0x1266104",
+          "0x12660f0"
+        ],
+        "floor": [
+          "0x12667a4",
+          "0x12667a8"
+        ],
+        "render_target_pool": "0x1261704",
+        "graphics_heap": "0xc61b14",
+        "process_heap": "0x71c",
+        "root_heap": "0xc617c0",
+        "load_scale": "0x1267098",
+        "swapchain_textures": 3,
+        "pool_size": [
+          1600,
+          900
+        ],
+        "minimum_render_width": 1024
+      },
+      "nvn_driver": true,
+      "pipelines": "pipelines.tsv"
+    }
+  ]
+}

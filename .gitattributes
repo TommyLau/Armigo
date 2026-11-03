@@ -1,0 +1,8 @@
+* text=auto eol=lf
+
+# Only independently authored, approved project artwork may use these rules.
+assets/original/**/*.png filter=lfs diff=lfs merge=lfs -text
+assets/original/**/*.jpg filter=lfs diff=lfs merge=lfs -text
+assets/original/**/*.jpeg filter=lfs diff=lfs merge=lfs -text
+assets/original/**/*.webp filter=lfs diff=lfs merge=lfs -text
+assets/original/**/*.psd filter=lfs diff=lfs merge=lfs -text

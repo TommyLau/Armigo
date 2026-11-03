@@ -1,0 +1,23 @@
+Armigo Proprietary License - Availability Notice
+
+Copyright (c) 2026 Tommy Lau.
+
+No proprietary license is granted by this notice alone.
+
+The LicenseRef-Armigo-Proprietary alternative applies only under a separate
+written agreement executed by the licensee and a copyright holder authorized
+to license the relevant Armigo material. That agreement must identify the
+licensed material and the rights granted. Its scope, conditions, duration,
+fees, support, termination, liability, and other terms are determined by the
+executed agreement.
+
+Absent such an agreement, this alternative grants no right to use, modify,
+convey, or integrate the material outside the rights available under the
+GNU General Public License, version 3 only, supplied in LICENSE.
+
+The alternative does not grant rights in games, ROMs, firmware, extracted
+assets, encryption keys, third-party dependencies, trademarks, or platform
+software. Copyright ownership is not transferred by implication.
+
+This notice does not restrict rights granted under GPL-3.0-only.
+See COMMERCIAL-LICENSE.md for the dual-licensing policy.

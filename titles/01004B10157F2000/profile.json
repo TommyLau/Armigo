@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "patches": [
+    {
+      "title_id": "0x01004B10157F2000",
+      "main_build_id": "d4b150b29a931cd381e2a30318fc299f2b0ee36d000000000000000000000000",
+      "nvn_driver": true,
+      "startup_user": true,
+      "pipelines": "pipelines.tsv"
+    }
+  ]
+}

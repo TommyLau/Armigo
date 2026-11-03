@@ -1,0 +1,61 @@
+// ============================================================================
+// Armigo Audio - Horizon Audio Renderer
+// Copyright (c) 2026 Tommy Lau.
+// SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Armigo-Proprietary
+//
+// This file is licensed under GPL-3.0-only or, by separate written
+// agreement, an Armigo proprietary license.
+// See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
+// ============================================================================
+
+#pragma once
+
+#include <span>
+
+#include "renderer/behavior/behavior_info.h"
+#include "renderer/memory/memory_pool_info.h"
+#include "renderer/upsampler/upsampler_manager.h"
+#include "renderer/common/types.h"
+
+namespace armigo::audio::renderer {
+// Execution mode of the audio renderer.
+// Only Auto is currently supported.
+enum class ExecutionMode : u8 {
+    Auto,
+    Manual,
+};
+
+// Parameters from the game, passed to the audio renderer for initialisation.
+struct AudioRendererParameterInternal {
+    /* 0x00 */ u32 sample_rate;
+    /* 0x04 */ u32 sample_count;
+    /* 0x08 */ u32 mixes;
+    /* 0x0C */ u32 sub_mixes;
+    /* 0x10 */ u32 voices;
+    /* 0x14 */ u32 sinks;
+    /* 0x18 */ u32 effects;
+    /* 0x1C */ u32 perf_frames;
+    /* 0x20 */ u8 voice_drop_enabled;
+    /* 0x21 */ u8 unk_21;
+    /* 0x22 */ u8 rendering_device;
+    /* 0x23 */ ExecutionMode execution_mode;
+    /* 0x24 */ u32 splitter_infos;
+    /* 0x28 */ s32 splitter_destinations;
+    /* 0x2C */ u32 external_context_size;
+    /* 0x30 */ u32 revision;
+};
+static_assert(sizeof(AudioRendererParameterInternal) == 0x34,
+              "AudioRendererParameterInternal has the wrong size!");
+
+// Context for rendering, contains a bunch of useful fields for the command generator.
+struct AudioRendererSystemContext {
+    s32 session_id;
+    s8 channels;
+    s16 mix_buffer_count;
+    BehaviorInfo* behavior;
+    std::span<s32> depop_buffer;
+    UpsamplerManager* upsampler_manager;
+    MemoryPoolInfo* memory_pool_info;
+};
+
+} // namespace armigo::audio::renderer

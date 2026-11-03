@@ -1,0 +1,20 @@
+// ============================================================================
+// Armigo Shader - Native Shader Translation
+// Copyright (c) 2026 Tommy Lau.
+// SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Armigo-Proprietary
+//
+// This file is licensed under GPL-3.0-only or, by separate written
+// agreement, an Armigo proprietary license.
+// See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
+// ============================================================================
+
+#pragma once
+#include "../facts.h"
+#include "../resources.h"
+
+namespace armigo::shader::pipeline::passes {
+// Both passes require valid SSA and publish changes only after validation succeeds.
+// Cleanup preserves all effects and never evaluates floating arithmetic on the host.
+[[nodiscard]] Status cleanup(Program&);
+[[nodiscard]] Status legalize_nontexture(Program&, FactReader&, const MetalProfile&);
+} // namespace armigo::shader::pipeline::passes

@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+ ============================================================================
+ Armigo Tools - Development and Verification Tools
+ Copyright (c) 2026 Tommy Lau.
+ SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Armigo-Proprietary
+
+ This file is licensed under GPL-3.0-only or, by separate written
+ agreement, an Armigo proprietary license.
+ See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
+ ============================================================================
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>${MACOSX_BUNDLE_EXECUTABLE_NAME}</string>
+    <key>CFBundleIdentifier</key>
+    <string>${MACOSX_BUNDLE_GUI_IDENTIFIER}</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Armigo</string>
+    <key>CFBundleDisplayName</key>
+    <string>Armigo</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${MACOSX_BUNDLE_SHORT_VERSION_STRING}</string>
+    <key>CFBundleVersion</key>
+    <string>${MACOSX_BUNDLE_BUNDLE_VERSION}</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>26.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category-games</string>
+    <key>LSSupportsGameMode</key>
+    <true/>
+    <key>GCSupportsGameMode</key>
+    <true/>
+    <key>GCSupportsControllerUserInteraction</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+</dict>
+</plist>
