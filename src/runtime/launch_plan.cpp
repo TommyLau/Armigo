@@ -355,6 +355,8 @@ LaunchResult<PreparedLaunch> load_prepared_launch(
             execution::PreparedImageError::none, false, {}, {}, {}, {}, {}, {}, {}};
         bool title_nvn_enabled = false;
         bool title_matched = false;
+        const compat::PatchDescription* rate_patch = nullptr;
+        std::string requested_title_rate;
         if (!patches.empty()) {
             const auto main = std::find_if(input.modules.begin(), input.modules.end(),
                 [](const auto& module) { return module.name == "main"; });
@@ -367,7 +369,15 @@ LaunchResult<PreparedLaunch> load_prepared_launch(
                     title_nvn_enabled = patch->nvn_driver;
                     if (auto error = compat::validate_patch(*patch, source); !error.empty())
                         return fail(LaunchError::artifact_mismatch, "compatibility-preflight", std::move(error));
-                    auto words = patch->words;
+                    const char* requested_rate = std::getenv("ARMIGO_COMPAT_FRAME_RATE");
+                    if (patch->frame_rate) {
+                        rate_patch = patch;
+                        requested_title_rate = requested_rate ? requested_rate : "";
+                    }
+                    auto selected = compat::select_patch_words(*patch, requested_rate ? requested_rate : "");
+                    if (const auto* failure = std::get_if<std::string>(&selected))
+                        return fail(LaunchError::invalid_input, "compatibility-frame-rate", *failure);
+                    auto words = std::get<std::vector<compat::WordPatch>>(std::move(selected));
                     if (patch->resolution) {
                         namespace title = titles::title_01007ef00011e000;
                         const auto settings = title::resolution_settings(*patch->resolution);
@@ -450,6 +460,11 @@ LaunchResult<PreparedLaunch> load_prepared_launch(
             }
         }
         // Words meant for the NVN driver apply only when it replaces the game's own.
+        if (rate_patch) {
+            auto effective = compat::select_patch_words(*rate_patch, requested_title_rate, loading.nvn_module.has_value());
+            if (const auto* failure = std::get_if<std::string>(&effective))
+                return fail(LaunchError::invalid_input, "compatibility-frame-rate", *failure);
+        }
         if (!loading.nvn_module)
             std::erase_if(loading.words, [](const compat::WordPatch& word) { return word.nvn_driver_only; });
         if (loading.words.empty()) loading.word_module.reset();

@@ -133,11 +133,34 @@ if(BUILD_TESTING)
     target_include_directories(armigo_metal_nvn_replay_tests PRIVATE
         "${PROJECT_SOURCE_DIR}/src/nvn" "${PROJECT_SOURCE_DIR}/src/platform/metal")
     target_link_libraries(armigo_metal_nvn_replay_tests PRIVATE armigo_nvn_metal)
+    # Keep the unbatched path covered alongside default and explicit-on variants.
     add_test(NAME nvn.metal_replay COMMAND armigo_metal_nvn_replay_tests)
+    set_tests_properties(nvn.metal_replay PROPERTIES
+        ENVIRONMENT "ARMIGO_NVN_BATCH_FINALIZED_QUERIES=0")
     # The same cases with the worker making its Metal calls itself.
     add_test(NAME nvn.metal_replay_worker_encoding COMMAND armigo_metal_nvn_replay_tests)
     set_tests_properties(nvn.metal_replay_worker_encoding PROPERTIES
-        ENVIRONMENT "ARMIGO_NVN_ENCODE_THREAD=0")
+        ENVIRONMENT "ARMIGO_NVN_ENCODE_THREAD=0;ARMIGO_NVN_BATCH_FINALIZED_QUERIES=0")
+    add_test(NAME nvn.metal_replay_conditional_contract COMMAND armigo_metal_nvn_replay_tests)
+    set_tests_properties(nvn.metal_replay_conditional_contract PROPERTIES
+        ENVIRONMENT "ARMIGO_NVN_CONDITIONAL_CONTRACT_TESTS=1")
+    # The same suites under Metal API validation: every encoder barrier must
+    # use stages its encoder admits (a render encoder waits only on vertex work).
+    add_test(NAME nvn.metal_replay_validation COMMAND armigo_metal_nvn_replay_tests)
+    set_tests_properties(nvn.metal_replay_validation PROPERTIES ENVIRONMENT "MTL_DEBUG_LAYER=1")
+    add_test(NAME nvn.metal_replay_conditional_contract_validation COMMAND armigo_metal_nvn_replay_tests)
+    set_tests_properties(nvn.metal_replay_conditional_contract_validation PROPERTIES
+        ENVIRONMENT "ARMIGO_NVN_CONDITIONAL_CONTRACT_TESTS=1;MTL_DEBUG_LAYER=1")
+    add_test(NAME nvn.metal_replay_worker_encoding_validation COMMAND armigo_metal_nvn_replay_tests)
+    set_tests_properties(nvn.metal_replay_worker_encoding_validation PROPERTIES
+        ENVIRONMENT "ARMIGO_NVN_ENCODE_THREAD=0;MTL_DEBUG_LAYER=1")
+    # Exercise finalized-query reuse, write guards and restored draw state in CI.
+    add_test(NAME nvn.metal_replay_finalized_queries COMMAND armigo_metal_nvn_replay_tests)
+    set_tests_properties(nvn.metal_replay_finalized_queries PROPERTIES
+        ENVIRONMENT "ARMIGO_NVN_BATCH_FINALIZED_QUERIES=1;ARMIGO_NVN_CONDITIONAL_CONTRACT_TESTS=1;MTL_DEBUG_LAYER=1")
+    add_test(NAME nvn.metal_replay_finalized_queries_worker COMMAND armigo_metal_nvn_replay_tests)
+    set_tests_properties(nvn.metal_replay_finalized_queries_worker PROPERTIES
+        ENVIRONMENT "ARMIGO_NVN_BATCH_FINALIZED_QUERIES=1;ARMIGO_NVN_CONDITIONAL_CONTRACT_TESTS=1;ARMIGO_NVN_ENCODE_THREAD=0;MTL_DEBUG_LAYER=1")
     # Conditional-render predicates as the compute kernel before each block's pass.
     add_test(NAME nvn.metal_replay_predicate_kernel COMMAND armigo_metal_nvn_replay_tests)
     set_tests_properties(nvn.metal_replay_predicate_kernel PROPERTIES

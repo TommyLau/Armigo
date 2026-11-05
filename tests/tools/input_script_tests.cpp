@@ -22,6 +22,7 @@ void check(bool condition, const char* detail) {
 class FakePresenter final : public armigo::platform::Presenter {
 public:
     bool fail = false, drained = false;
+    std::uint64_t presented_count() const noexcept override { return 42; }
     armigo::platform::PresentationMode mode() const noexcept override {
         return armigo::platform::PresentationMode::headless;
     }
@@ -72,6 +73,7 @@ int main() {
     check(publications == 4, "end of script holds last state without repeated events");
     presenter->drain({});
     check(inner->drained, "drain reaches underlying presenter");
+    check(presenter->presented_count() == 42, "drawable presentation count passes through");
     for (const auto* invalid : {"-1 down a", "2 down a\n1 up a", "0 down unknown",
              "0 stick left nan 0", "0 stick right 0 1.01", "0 hold a 0", "0 hold a -2",
              "18446744073709551615 hold a 1", "0 down a extra", "0 stick middle 0 0",
@@ -129,16 +131,67 @@ int main() {
     if (auto* failure = std::get_if<runtime::LaunchFailure>(&report.result.outcome))
         check(failure->operation == "input script", "missing script has explicit diagnostic");
     char option[] = "--input-script", file[] = "synthetic.txt";
-    char* argv[] = {option, file};
-    check(!tools::parse_runner_arguments(platform::PresentationMode::windowed, argv).ok,
-          "windowed runner rejects scripted input");
     char exefs[] = "--exefs", romfs[] = "--romfs", shaders[] = "--shaders", current[] = ".";
     char* valid[] = {exefs, current, romfs, current, shaders, current, option, file};
     const auto parsed_arguments = tools::parse_runner_arguments(platform::PresentationMode::headless, valid);
     check(parsed_arguments.ok && parsed_arguments.arguments.input_script_file == "synthetic.txt",
           "headless CLI preserves the input script path");
+    const auto windowed = tools::parse_runner_arguments(platform::PresentationMode::windowed, valid);
+    check(windowed.ok && windowed.arguments.input_script_file == "synthetic.txt",
+          "explicit windowed CLI preserves the input script path");
+    const auto defaults = tools::parse_runner_arguments(platform::PresentationMode::windowed, {});
+    check(!defaults.arguments.input_script_file,
+          "the empty argument span used by packed launches never selects an input script");
     char* missing[] = {option};
     check(!tools::parse_runner_arguments(platform::PresentationMode::headless, missing).ok,
           "script option requires a value");
+    check(!tools::parse_runner_arguments(platform::PresentationMode::windowed, missing).ok,
+          "windowed script option requires a value");
+    const auto windowed_failure = tools::run_windowed_shell(arguments, {}, {});
+    const auto* failure = std::get_if<runtime::LaunchFailure>(&windowed_failure.result.outcome);
+    check(failure && failure->operation == "input script",
+          "windowed missing script fails before window creation");
+
+    tools::ScriptInputOverlay overlay;
+    platform::HostInputSnapshot physical;
+    physical.controller.connected = physical.controller.supported = true;
+    physical.controller.buttons = platform::button_mask(platform::HostButton::South);
+    physical.controller.left_stick = {0.25f, 0};
+    physical.controller.right_stick = {0, 1};
+    physical.controller.left_trigger = 0.75f;
+    physical.controller.has_motion = physical.controller.has_rotation_rate = true;
+    physical.controller.acceleration = {1, 2, 3};
+    physical.keyboard.connected = physical.keyboard.supported = true;
+    physical.keyboard.buttons = platform::button_mask(platform::HostButton::North);
+    platform::HostInputSnapshot scripted;
+    scripted.controller.connected = scripted.controller.supported = true;
+    scripted.controller.buttons = platform::button_mask(platform::HostButton::East);
+    scripted.controller.left_stick = {-1, 0};
+    scripted.controller.right_stick = {0.5f, 0};
+    scripted.controller.right_trigger = 1;
+    overlay.publish(scripted);
+    auto combined = overlay.merge(physical);
+    auto input = runtime::full_key_input(combined);
+    check((input.buttons & 7) == 7 && input.left_x == -32767 && input.right_y == 32767,
+          "script, keyboard and physical controller merge with stronger sticks");
+    check((input.buttons & (256 | 512)) == (256 | 512) && input.has_motion && input.has_gyroscope &&
+          input.acceleration == physical.controller.acceleration,
+          "script preserves physical triggers and motion");
+    runtime::FocusFilter focus;
+    check(focus.apply(input, false).buttons == 0, "normal focus loss releases merged input");
+    check(focus.apply(input, true).buttons == 0, "held merged controls stay released on refocus");
+    overlay.publish({});
+    input = runtime::full_key_input(overlay.merge(physical));
+    check((input.buttons & 7) == 6 && input.left_x == 8192,
+          "script release leaves physical controls intact");
+    (void)focus.apply(runtime::full_key_input(overlay.merge({})), true);
+    overlay.publish(scripted);
+    input = runtime::full_key_input(overlay.merge({}));
+    check((focus.apply(input, true).buttons & 1) != 0,
+          "new scripted press after release survives focus filtering");
+    physical.controller.supported = false;
+    combined = overlay.merge(physical);
+    check(combined.controller.buttons == scripted.controller.buttons && !combined.controller.has_motion,
+          "unsupported physical devices cannot contribute stale controls");
     return failures ? 1 : 0;
 }

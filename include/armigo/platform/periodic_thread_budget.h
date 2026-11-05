@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <armigo/platform/periodic_thread_limits.h>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -24,12 +25,13 @@ public:
     using Duration = std::chrono::nanoseconds;
     enum class Result { unchanged, applied, rejected };
 
+    // Last successful request; the native scheduler may adjust its computation.
     Duration period() const noexcept { return applied_period_; }
     Duration computation() const noexcept { return applied_computation_; }
 
     // A zero period requests ordinary scheduling. Failed changes preserve the
-    // last accepted declaration and retry after one sampling window, without
-    // treating an unaccepted budget as active.
+    // last successful request and retry after a fresh sampling window, without
+    // treating a rejected budget as active.
     template <class Apply>
     Result tick(Duration period, Duration cpu, Apply&& apply) {
         if (period < Duration::zero()) period = Duration::zero();
@@ -40,11 +42,23 @@ public:
             count_ = 0;
             last_cpu_ = Duration::zero();
             retry_ = 0;
-            return declare(apply);
+            return declare(apply, cpu);
         }
         if (retry_) {
+            if (period != Duration::zero()) {
+                const auto previous = last_cpu_;
+                last_cpu_ = cpu;
+                if (cpu < previous) {
+                    count_ = 0;
+                    retry_ = samples_.size();
+                    return Result::unchanged;
+                }
+                samples_[count_++] = cpu - previous;
+            }
             if (--retry_) return Result::unchanged;
-            return declare(apply);
+            if (period != Duration::zero()) requested_computation_ = estimate(period);
+            count_ = 0;
+            return declare(apply, cpu);
         }
         if (period == Duration::zero() || applied_period_ != period)
             return Result::unchanged;
@@ -55,26 +69,31 @@ public:
         samples_[count_++] = cpu - previous;
         if (count_ != samples_.size()) return Result::unchanged;
         count_ = 0;
-        auto sorted = samples_;
-        std::sort(sorted.begin(), sorted.end());
-        const auto computation = bounded(period, sorted[107] * 5 / 4);
+        const auto computation = estimate(period);
         if (computation <= applied_computation_ * 115 / 100 &&
             computation >= applied_computation_ * 85 / 100)
             return Result::unchanged;
         requested_computation_ = computation;
-        return declare(apply);
+        return declare(apply, cpu);
     }
 
 private:
     static Duration bounded(Duration period, Duration computation) noexcept {
-        return std::min(std::max(computation, Duration(1'000'000)), period * 9 / 10);
+        return bounded_periodic_computation(period, computation);
     }
 
-    template <class Apply> Result declare(Apply& apply) {
+    Duration estimate(Duration period) const {
+        auto sorted = samples_;
+        std::sort(sorted.begin(), sorted.end());
+        // Bound before scaling so a very long observed CPU interval cannot wrap.
+        return bounded(period, std::min(sorted[107], maximum_periodic_computation) * 5 / 4);
+    }
+
+    template <class Apply> Result declare(Apply& apply, Duration cpu) {
         if (!apply(requested_period_, requested_computation_)) {
             retry_ = samples_.size();
             count_ = 0;
-            last_cpu_ = Duration::zero();
+            last_cpu_ = cpu;
             return Result::rejected;
         }
         applied_period_ = requested_period_;

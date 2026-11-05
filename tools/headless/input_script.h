@@ -14,6 +14,7 @@
 #include <armigo/platform/presenter.h>
 #include <functional>
 #include <istream>
+#include <mutex>
 #include <string>
 #include <variant>
 #include <vector>
@@ -28,6 +29,18 @@ struct InputScript {
     enum class Clock { presents, milliseconds };
     Clock clock = Clock::presents;
     std::vector<ScriptInputState> states;
+};
+// Retains the scripted controller across host polls. Buttons combine, triggers
+// take the greater value, and each stick takes the greater deflection. Physical
+// controller motion and keyboard state survive; the normal poller applies focus.
+class ScriptInputOverlay {
+public:
+    void publish(const platform::HostInputSnapshot& input);
+    platform::HostInputSnapshot merge(platform::HostInputSnapshot host) const;
+
+private:
+    mutable std::mutex mutex_;
+    platform::HostInputDeviceState controller_;
 };
 // Parse the complete script before launch; errors include the source line.
 std::variant<InputScript, std::string> parse_input_script(std::istream& source);

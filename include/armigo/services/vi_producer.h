@@ -52,6 +52,9 @@ public:
     // Host pacing period for scheduling graphics workers. This query does not
     // wait, advance presentation, or alter guest-visible refresh events.
     virtual std::chrono::nanoseconds scheduling_period(int) const { return {}; }
+    // The guest's requested refresh multiple, even when host waits are disabled.
+    // Zero means no cadence is known. This query never advances the refresh clock.
+    virtual std::chrono::nanoseconds guest_present_period(int) const { return {}; }
 };
 
 std::shared_ptr<NativeWindowProducer> find_native_window(void* native_window);

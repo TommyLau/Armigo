@@ -10,8 +10,14 @@
 
 // Host-owned PCM16 output: a bounded single-producer / single-consumer ring of
 // 48000 Hz stereo frames drained by the platform output AudioUnit, or by
-// nothing at all in the explicit muted mode. The producer (the audio renderer
-// thread) converts its mono, stereo or 5.1 PCM16 into stereo while copying
+// nothing at all in the explicit muted mode. Silent output uses that same
+// AudioUnit and ring; after the callback has copied, scaled and counted a
+// block it zero-fills those samples, so the device clock and every counter
+// match audible output while the buffer that leaves the callback is zero.
+// The system volume and the default device are left alone, and a later
+// set_volume still stores the guest gain without raising those samples.
+// The producer (the audio renderer thread) converts its mono, stereo or 5.1
+// PCM16 into stereo while copying
 // into the ring; the realtime render callback drains the ring into the device
 // buffer - a plain memcpy at unity gain, otherwise an exact saturating multiply
 // by the current per-sink gain - and zero-fills whatever is missing. Because
@@ -66,7 +72,8 @@
 //                      had to be zero-filled.
 // The gain never touches this accounting: frames the consumer takes out of the
 // ring are consumed regardless of gain (a zero gain renders silence but is not
-// an underrun), and only genuinely missing frames are underruns. Stop/restart
+// an underrun), and only genuinely missing frames are underruns. Silent output
+// zero-fills after that accounting, so it counts the same way. Stop/restart
 // retains the selected gain; it starts at 1.0. Writes while stopped are
 // rejected (return 0) and touch no counter.
 //
@@ -129,6 +136,7 @@ static_assert(sizeof(float) == sizeof(std::uint32_t),
 struct PcmSink {
     // Immutable after open.
     bool audible = false;            // AudioUnit backed, or the explicit muted sink (no device, no ring use).
+    bool silent = false;             // Device path that zero-fills the callback buffer after consumption.
     std::int16_t* ring = nullptr;    // pcm_ring_frames interleaved stereo frames; owned by the sink.
     AudioUnit unit = nullptr;        // Null for muted sinks.
     // Producer-owned, read by the callback.
@@ -145,6 +153,8 @@ struct PcmSink {
     // consumed/underrun by the callback only; all are atomic because
     // pcm_sink_get_counters reads them from the producer side.
     std::atomic<std::uint64_t> submitted{0}, consumed{0}, dropped{0}, underrun{0};
+    // Silent output only: maximum absolute sample written into a device buffer.
+    std::atomic<int> output_peak{0};
     // Producer-owned explicit error state: last failing AudioToolbox status, 0 when healthy.
     OSStatus last_error = 0;
     PcmSink* next_unit = nullptr;  // Audible sinks with a live unit, under units_lock.
@@ -224,12 +234,31 @@ inline std::int16_t gain16(std::int16_t value, float gain) {
     return static_cast<std::int16_t>(scaled);
 }
 
+// Records the loudest absolute sample in a finished device buffer. Silent
+// output calls this after zero-filling, so a non-zero peak means the mute
+// missed a sample. Lock-free; the realtime callback may call it.
+void observe_output_peak(PcmSink* sink, const std::int16_t* samples, std::uint32_t count) {
+    int peak = 0;
+    for (std::uint32_t index = 0; index < count; ++index) {
+        const int sample = samples[index];
+        const int magnitude = sample < 0 ? -sample : sample;
+        if (magnitude > peak) peak = magnitude;
+    }
+    if (peak == 0) return;
+    int current = sink->output_peak.load(std::memory_order_relaxed);
+    while (peak > current &&
+           !sink->output_peak.compare_exchange_weak(current, peak, std::memory_order_relaxed))
+        ;
+}
+
 // Realtime consumer on the AudioUnit render thread: no allocation, locks,
 // logging or calls outside this file. Fills exactly one interleaved stereo
 // int16 buffer. Takes one lock-free gain snapshot per invocation and scales the
 // consumed frames with it after the copy out of the ring, so every frame in one
 // buffer is scaled by a single gain value and already queued frames reflect a
 // new gain. Unity gain keeps the plain memcpy path and its bit-exact output.
+// Silent output then zero-fills the consumed samples; the counters already
+// include them, and the silence flag stays the one the audible path would set.
 OSStatus render_callback(void* context, AudioUnitRenderActionFlags* flags, const AudioTimeStamp*,
                          UInt32, UInt32 frame_count, AudioBufferList* buffers) {
     auto* sink = static_cast<PcmSink*>(context);
@@ -265,6 +294,10 @@ OSStatus render_callback(void* context, AudioUnitRenderActionFlags* flags, const
             }
             sink->head.store(head + got, std::memory_order_release);
             sink->consumed.fetch_add(got, std::memory_order_relaxed);
+            if (sink->silent) {
+                // Consumption and gain are done. The device hears silence.
+                std::memset(destination, 0, std::size_t{got} * pcm_frame_bytes);
+            }
         }
         if (want > got) sink->underrun.fetch_add(want - got, std::memory_order_relaxed);
     }
@@ -275,6 +308,10 @@ OSStatus render_callback(void* context, AudioUnitRenderActionFlags* flags, const
     if (buffers->mBuffers[0].mDataByteSize > filled)
         std::memset(reinterpret_cast<std::uint8_t*>(destination) + filled, 0,
                     buffers->mBuffers[0].mDataByteSize - filled);
+    if (sink->silent) {
+        const auto samples = buffers->mBuffers[0].mDataByteSize / static_cast<UInt32>(sizeof(std::int16_t));
+        observe_output_peak(sink, destination, samples);
+    }
     if (got == 0 && flags) *flags |= kAudioUnitRenderAction_OutputIsSilence;
     return noErr;
 }
@@ -419,16 +456,18 @@ int open_unit(PcmSink* sink) {
 
 }  // namespace
 
-PcmSink* pcm_sink_open(bool audible) {
+PcmSink* pcm_sink_open(PcmOutputKind kind) {
+    const bool device = kind != PcmOutputKind::muted;
 #if TARGET_OS_IPHONE
-    if (audible && !prepare_audio_session()) return nullptr;
+    if (device && !prepare_audio_session()) return nullptr;
 #endif
     auto* sink = new (std::nothrow) PcmSink;
     if (!sink) {
         PCM_LOG("cannot allocate the sink");
         return nullptr;
     }
-    sink->audible = audible;
+    sink->audible = device;
+    sink->silent = kind == PcmOutputKind::silent;
     store_gain(sink, 1.0f);  // The documented initial gain is unity.
     if (sink->audible) {
         sink->ring = static_cast<std::int16_t*>(std::calloc(pcm_ring_frames, pcm_frame_bytes));
@@ -449,6 +488,12 @@ PcmSink* pcm_sink_open(bool audible) {
         sink->next_unit = units;
         units = sink;
         pthread_mutex_unlock(&units_lock);
+        if (sink->silent) {
+            static std::once_flag logged;
+            std::call_once(logged, [] {
+                armigo::diag::info("[audio output] silent output is active\n");
+            });
+        }
     }
     return sink;
 }
@@ -553,6 +598,11 @@ void pcm_sink_get_counters(const PcmSink* sink, PcmSinkCounters* out) {
     out->consumed_frames = sink->consumed.load(std::memory_order_relaxed);
     out->dropped_frames = sink->dropped.load(std::memory_order_relaxed);
     out->underrun_frames = sink->underrun.load(std::memory_order_relaxed);
+}
+
+int pcm_sink_output_peak(const PcmSink* sink) {
+    if (!sink) return 0;
+    return sink->output_peak.load(std::memory_order_relaxed);
 }
 
 void pcm_sink_resume_devices() {
@@ -675,11 +725,12 @@ private:
         reported_ = now;
         PcmSinkCounters counters;
         pcm_sink_get_counters(sink_, &counters);
-        armigo::diag::opt_in("[audio output] submitted=%llu consumed=%llu dropped=%llu underrun=%llu%s\n",
+        armigo::diag::opt_in("[audio output] submitted=%llu consumed=%llu dropped=%llu underrun=%llu peak=%d%s\n",
                      static_cast<unsigned long long>(counters.submitted_frames),
                      static_cast<unsigned long long>(counters.consumed_frames),
                      static_cast<unsigned long long>(counters.dropped_frames),
-                     static_cast<unsigned long long>(counters.underrun_frames), final ? " (closed)" : "");
+                     static_cast<unsigned long long>(counters.underrun_frames),
+                     pcm_sink_output_peak(sink_), final ? " (closed)" : "");
     }
     void finish_dump() {
         const auto put32 = [&](std::uint32_t value) { std::fwrite(&value, 4, 1, dump_); };
@@ -701,8 +752,8 @@ private:
 
 }  // namespace
 
-std::shared_ptr<audio::PcmOutput> make_pcm_sink_output(bool audible) {
-    PcmSink* sink = pcm_sink_open(audible);
+std::shared_ptr<audio::PcmOutput> make_pcm_sink_output(PcmOutputKind kind) {
+    PcmSink* sink = pcm_sink_open(kind);
     if (!sink) return nullptr;
     try {
         return std::make_shared<SinkOutput>(sink);

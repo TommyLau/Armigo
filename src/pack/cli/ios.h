@@ -46,6 +46,11 @@ struct ShaderStagePaths {
     const std::filesystem::path& macos_app, const std::filesystem::path& destination_game,
     const std::string& expected_title_id);
 
+// Directories under game/addons. A missing add-ons directory is zero add-ons.
+// A dangling link, a non-directory, or an unreadable directory is an error.
+[[nodiscard]] std::variant<std::string, std::vector<std::filesystem::path>> reused_addon_directories(
+    const std::filesystem::path& game);
+
 [[nodiscard]] std::string validate_reused_selection(
     const PackedIdentity& identity, const std::vector<std::filesystem::path>& reused_addons,
     const std::string& title_id, const std::string& build_id, std::uint32_t title_version,
@@ -55,7 +60,10 @@ struct ShaderStagePaths {
     const std::filesystem::path& requested, const std::filesystem::path& packer_executable,
     const std::filesystem::path& host_shader_translator);
 
-[[nodiscard]] std::string run_pack_tool(const std::vector<std::string>& arguments);
+// Embedded capture and verification both use the title default, independent of
+// the packer's inherited launch-mode override. The parent environment is unchanged.
+[[nodiscard]] std::string run_pack_tool(const std::vector<std::string>& arguments,
+                                      bool default_title_rate = false);
 [[nodiscard]] std::string create_ios_ipa(const std::filesystem::path& app_path);
 
 } // namespace armigo::pack

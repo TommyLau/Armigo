@@ -74,10 +74,16 @@ void apply_performance_overlay(const PlayerChoices& choices) {
 
 void apply_player_choices(const PlayerChoices& choices, std::uint32_t width, RunnerArguments& arguments) {
     arguments.operation_mode = choices.handheld ? services::OperationMode::Handheld : services::OperationMode::Console;
+    // A title mode selects game timing separately from the guest display cadence.
+    const auto refresh_rate = choices.display_refresh_rate ? choices.display_refresh_rate : choices.frame_rate;
+    if (refresh_rate && !std::getenv("ARMIGO_VI_REFRESH_HZ"))
+        setenv("ARMIGO_VI_REFRESH_HZ", std::to_string(refresh_rate).c_str(), 1);
     if (width && !std::getenv("ARMIGO_COMPAT_RESOLUTION_WIDTH"))
         setenv("ARMIGO_COMPAT_RESOLUTION_WIDTH", std::to_string(width).c_str(), 1);
     if (choices.frame_rate && !std::getenv("ARMIGO_COMPAT_RESOLUTION_RATE"))
         setenv("ARMIGO_COMPAT_RESOLUTION_RATE", std::to_string(choices.frame_rate).c_str(), 1);
+    if (choices.title_frame_rate && !std::getenv("ARMIGO_COMPAT_FRAME_RATE"))
+        setenv("ARMIGO_COMPAT_FRAME_RATE", std::to_string(choices.frame_rate).c_str(), 1);
     arguments.content_width = width;
     arguments.display_sync = choices.vsync;
 }

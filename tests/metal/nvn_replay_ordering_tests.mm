@@ -194,17 +194,17 @@ template <class Predicate> bool eventually(Predicate predicate) {
   return true;
 }
 
-// A blocked GPU must still allow three encodes, but never a fourth. Reports
-// keep timestamp storage live in every slot and the fourth submission reuses
+// A blocked GPU must still allow six encodes, but never a seventh. Reports
+// keep timestamp storage live in every slot and the seventh submission reuses
 // the oldest slot only after completion. Read guest results after the last fence.
-void test_three_inflight_submissions(id<MTLDevice> device,
+void test_six_inflight_submissions(id<MTLDevice> device,
                                      id<MTL4CommandQueue> queue) {
   SharedResources resources(device, 64 * 1024);
   auto backend = replay::create_replay_backend(device, queue, resources);
   id<MTLSharedEvent> gate = [device newSharedEvent];
   [queue waitForEvent:gate value:1];
   Recorder recorder;
-  std::array<NVNcommandHandle, 4> handles{};
+  std::array<NVNcommandHandle, 7> handles{};
   std::uint64_t last = 0;
   for (unsigned i = 0; i != handles.size(); ++i) {
     load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
@@ -217,14 +217,14 @@ void test_three_inflight_submissions(id<MTLDevice> device,
     last = backend->submit({&handles[i], 1});
     CHECK(last != 0);
   }
-  CHECK(eventually([&] { return backend->statistics().submissions == 3; }));
+  CHECK(eventually([&] { return backend->statistics().submissions == 6; }));
   CHECK(backend->completed_fence() == 0);
   CHECK(!backend->wait_fence(last, 1'000'000));
-  CHECK(backend->statistics().upload_arena_allocations == 3);
+  CHECK(backend->statistics().upload_arena_allocations == 6);
   gate.signaledValue = 1;
   CHECK(backend->wait_fence(last, 10'000'000'000ull));
   CHECK(!backend->last_error());
-  CHECK(backend->statistics().upload_arena_allocations == 3);
+  CHECK(backend->statistics().upload_arena_allocations == 6);
   CHECK(backend->statistics().upload_arena_reuses == 1);
   std::uint64_t previous_timestamp = 0;
   for (unsigned i = 0; i != handles.size(); ++i) {
@@ -563,7 +563,7 @@ int main() {
     if (queue) {
       select_api_version({55, 15});
       register_command_entries();
-      test_three_inflight_submissions(device, queue);
+      test_six_inflight_submissions(device, queue);
       test_feedback_during_encoder_split(device, queue);
       test_report_value_precedes_gpu_copy(device, queue);
       test_event_orders_gpu_work_in_one_stream(device, queue);

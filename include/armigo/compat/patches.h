@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -29,6 +30,9 @@ struct TitleIdentity {
 struct CallPatch {
     std::uint64_t offset = 0;
     std::uint32_t expected_instruction = 0;
+    // Plain English from the profile: what this call changes and why.
+    // Required there, 1 to 200 characters. Empty for a call built in code.
+    std::string note;
 };
 // One instruction of the main module replaced at load time. The expected word
 // must be present, unchanged by preparation, or the title is not patched.
@@ -39,6 +43,19 @@ struct WordPatch {
     std::uint32_t expected_instruction = 0;
     std::uint32_t replacement_instruction = 0;
     bool nvn_driver_only = false;
+    // Plain English from the profile: what this word changes and why.
+    // Required there, 1 to 200 characters. Empty for a word built in code.
+    std::string note;
+    // Zero applies at every rate; otherwise this word belongs to that title mode.
+    // Distinct modes may replace one offset, but must share its original preimage.
+    std::uint32_t frame_rate = 0;
+};
+struct FrameRateSettings {
+    std::uint32_t default_rate = 30;
+    // The guest display cadence can differ from the game's requested frame rate.
+    std::uint32_t display_refresh_rate = 60;
+    // Explicitly admitted modes, including the default.
+    std::vector<std::uint32_t> supported_rates;
 };
 // Instruction sites of the internal-resolution patch
 // (titles/01007EF00011E000/resolution.h). Each
@@ -56,6 +73,23 @@ struct ResolutionSites {
     std::uint64_t load_scale = 0;                  // dynamic-resolution load scale (f32 high half)
     std::uint32_t swapchain_textures = 0, pool_width = 0, pool_height = 0, minimum_render_width = 0;
     std::uint32_t maximum_width = 0, target_rate = 60;   // defaults; the environment overrides
+};
+// Where the packer finds this title's shader stages. Absent profile settings
+// keep the historical choice: BNSH containers and a minus-one-to-one vertex
+// depth. A gfd-cache description reads .gsc members of CPK archives plus the
+// packages embedded in the main module.
+enum class ShaderContainerSet { Bnsh, GfdCache };
+enum class ShaderVertexDepth { NegativeOneToOne, ZeroToOne };
+struct ShaderCacheFallback {
+    std::string cache;
+    std::vector<std::string> alternatives;
+};
+struct ShaderInputSettings {
+    ShaderContainerSet containers = ShaderContainerSet::Bnsh;
+    ShaderVertexDepth vertex_depth = ShaderVertexDepth::NegativeOneToOne;
+    std::vector<std::string> caches;
+    std::vector<ShaderCacheFallback> fallbacks;
+    std::vector<std::uint64_t> ignored_needle_offsets;
 };
 struct PatchDescription {
     TitleIdentity identity;
@@ -79,7 +113,12 @@ struct PatchDescription {
     // the requested interval would cap it a whole refresh below the target.
     bool present_link = false;
     std::vector<WordPatch> words;
+    std::optional<FrameRateSettings> frame_rate;
     std::optional<ResolutionSites> resolution;
+    ShaderInputSettings shader_inputs;
+    // Optional plain English on the description itself, 1 to 200 characters
+    // when the profile includes it.
+    std::string note;
 };
 struct InstalledPatch {
     PatchDescription description;
@@ -95,6 +134,11 @@ using PatchDescriptions = std::vector<PatchDescription>;
 using PatchReadResult = std::variant<PatchDescriptions, std::string>;
 // An explicit file is fail-closed; absent configuration is handled by the runner.
 PatchReadResult read_patch_descriptions(const std::filesystem::path& path);
+// Empty or "0" selects the title's default. A title without a rate policy
+// retains all of its ordinary words and ignores this title-only setting.
+// A nondefault mode needs an effective rate-conditioned word after driver filtering.
+std::variant<std::vector<WordPatch>, std::string> select_patch_words(
+    const PatchDescription& patch, std::string_view requested_rate = {}, bool nvn_driver_enabled = true);
 const PatchDescription* match_patch(std::span<const PatchDescription> patches,
                                     const TitleIdentity& identity) noexcept;
 // Validates executable placement, BL destination, preimages, data placement and

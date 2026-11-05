@@ -25,6 +25,7 @@ using TextureExporter =
 // Install before initializing windows; existing registrations retain their
 // reader.
 void set_texture_exporter(TextureExporter exporter);
+[[nodiscard]] bool window_texture_overlaps(std::uint64_t address, std::uint64_t size);
 void register_present_entries();
 
 } // namespace armigo::nvn

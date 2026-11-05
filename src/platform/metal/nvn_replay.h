@@ -143,6 +143,8 @@ public:
     virtual void complete_gpu_writes(std::uint64_t generation) { (void)generation; }
     // Moves whenever a registration changes what a cached binding would resolve.
     [[nodiscard]] virtual std::uint64_t registration_generation() const { return 0; }
+    // An unclassified provider must retain the ordered report path.
+    [[nodiscard]] virtual bool overlaps_texture_backing(std::uint64_t, std::uint64_t) const { return true; }
     // Whether the texture shares the guest's bytes directly (linear storage) or
     // a private tiled copy backs it: a GPU write to it writes guest memory.
     [[nodiscard]] virtual bool texture_is_in_place(const nvn::TextureState&) { return false; }
@@ -176,6 +178,7 @@ struct ReplayError {
 };
 
 struct ReplayStatistics {
+    std::uint64_t report_fast = 0, report_ordered = 0;
     std::uint64_t submissions = 0;
     std::uint64_t render_passes = 0;
     std::uint64_t draws = 0;
@@ -304,6 +307,10 @@ struct ReplaySchedulingPolicy {
     void* context = nullptr;
     bool (*apply)(void*, ReplayThread, std::uint64_t period_ns,
                   std::uint64_t computation_ns) = nullptr;
+    // Optional observation on the encode thread, after selecting a submission's
+    // waiting budget. It does not replace the policy or alter command ordering.
+    void (*observe_encode_spin)(void*, std::uint64_t fence, std::uint64_t period_ns,
+                                std::uint64_t spin_ns) = nullptr;
 };
 
 // The queue must belong to device and both objects must outlive the backend.

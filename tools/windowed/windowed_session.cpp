@@ -11,6 +11,7 @@
 #include "runner_shell.h"
 
 #include "frame_rate_controller.h"
+#include "input_script.h"
 #include "runner_shell_internal.h"
 
 #include <armigo/platform/apple_input.h>
@@ -18,6 +19,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <optional>
 #include <thread>
 #include <utility>
@@ -31,6 +33,20 @@ ShellReport run_windowed_shell(const RunnerArguments& arguments,
     using runtime::LaunchError;
     using runtime::LaunchFailure;
     using runtime::LaunchStage;
+
+    InputScript input_script;
+    std::shared_ptr<ScriptInputOverlay> scripted_input;
+    if (arguments.input_script_file) {
+        std::ifstream source(*arguments.input_script_file);
+        auto parsed = source ? parse_input_script(source)
+                             : std::variant<InputScript, std::string>("Could not open input script.");
+        if (const auto* error = std::get_if<std::string>(&parsed)) {
+            return shell_detail::failed_report(shell_detail::failure(
+                LaunchStage::inputs, LaunchError::invalid_input, "input script", *error));
+        }
+        input_script = std::move(std::get<InputScript>(parsed));
+        scripted_input = std::make_shared<ScriptInputOverlay>();
+    }
 
     // The caller is the application main thread; host creation, pumping and
     // destruction never leave it.
@@ -99,7 +115,10 @@ ShellReport run_windowed_shell(const RunnerArguments& arguments,
     runtime::RuntimeDependencies dependencies;
     dependencies.clock = presentation_clock->clock();
     dependencies.presentation_clock = std::move(presentation_clock);
-    dependencies.presenter = presenter;
+    dependencies.presenter = scripted_input
+        ? scripted_presenter(presenter, std::move(input_script),
+            [scripted_input](const platform::HostInputSnapshot& input) { scripted_input->publish(input); })
+        : presenter;
     auto runtime_result = environment.create_runtime(description, std::move(dependencies));
     if (auto* failed = std::get_if<LaunchFailure>(&runtime_result)) {
         return shell_detail::failed_report(std::move(*failed));
@@ -108,7 +127,10 @@ ShellReport run_windowed_shell(const RunnerArguments& arguments,
         std::move(std::get<std::unique_ptr<runtime::ProcessRuntime>>(runtime_result)));
 
     // Keyboard, controllers and the mouse drive player one while the window runs.
-    runtime::HostControllerPoller controller(platform::poll_apple_input);
+    runtime::HostControllerPoller controller([scripted_input] {
+        auto input = platform::poll_apple_input();
+        return scripted_input ? scripted_input->merge(std::move(input)) : input;
+    });
 
     // Window close asks the runtime to stop; it never destroys guest or
     // graphics resources directly.

@@ -68,6 +68,7 @@ public:
   // so a cached binding that resolved a handle or address can tell that it must
   // be resolved again.
   [[nodiscard]] std::uint64_t registration_generation() const;
+  [[nodiscard]] bool overlaps_texture_backing(std::uint64_t address, std::uint64_t size) const;
 
   [[nodiscard]] BufferSpan buffer_at(std::uint64_t gpu_address,
                                      std::uint64_t size);
@@ -101,6 +102,8 @@ public:
   // the lookup found no texture.
   struct DescriptorStamp {
     std::uint64_t epoch = 0, rare = 0, serial = 0, serial_stamp = 0;
+    // Guest storage read by this descriptor, including separately backed views.
+    std::uint64_t backing_begin = 0, backing_size = 0;
     std::uint32_t slot = 0;
     bool valid = false;
   };

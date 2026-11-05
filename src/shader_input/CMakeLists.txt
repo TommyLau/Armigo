@@ -26,6 +26,7 @@ set(ARMIGO_SHADER_INPUT_TEST_DIR
 add_library(armigo_shader_input
     archive.cpp
     container.cpp
+    gfd_cache.cpp
     shader_input.cpp
 )
 add_library(armigo::shader_input ALIAS armigo_shader_input)
@@ -52,6 +53,7 @@ if(BUILD_TESTING)
     add_executable(armigo_shader_input_tests
         "${ARMIGO_SHADER_INPUT_TEST_DIR}/archive_tests.cpp"
         "${ARMIGO_SHADER_INPUT_TEST_DIR}/container_tests.cpp"
+        "${ARMIGO_SHADER_INPUT_TEST_DIR}/gfd_cache_tests.cpp"
         "${ARMIGO_SHADER_INPUT_TEST_DIR}/shader_input_tests.cpp"
         "${ARMIGO_SHADER_INPUT_TEST_DIR}/test_main.cpp"
     )
@@ -65,7 +67,7 @@ if(BUILD_TESTING)
             -Wall -Wextra -Wpedantic)
     endif()
 
-    foreach(group IN ITEMS control code structure metadata yaz0 sarc bnsh bahs)
+    foreach(group IN ITEMS control code structure metadata yaz0 sarc bnsh bahs gfd)
         add_test(NAME shader_input.${group}
                  COMMAND armigo_shader_input_tests ${group})
     endforeach()

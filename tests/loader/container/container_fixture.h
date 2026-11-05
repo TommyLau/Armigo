@@ -1012,6 +1012,12 @@ struct BuiltUpdateNca {
     // section), for corruption tests that expect an IVFC failure.
     std::uint64_t patch_table_offset = 0; // inside the patched level tables
     std::uint64_t patch_data_offset = 0;  // inside the patched image data
+    // Stored BKTR section size, the level-5 (RomFS) virtual offset, and the
+    // relocation tree's virtual image size. A non-zero virtual base places
+    // the RomFS offset past the stored section and inside the patched image.
+    std::uint64_t stored_section_size = 0;
+    std::uint64_t romfs_offset = 0;
+    std::uint64_t patch_virtual_size = 0;
 };
 
 // Builds an update program NCA with titlekey encryption (rights id) and a
@@ -1022,10 +1028,29 @@ struct BuiltUpdateNca {
 //   [0x840,0xA48) base   (level-5 padding and image block 0 head; equal)
 //   [0xA48,0xE00) patch  (image bytes holding hello.txt; differ)
 // The patch data holds two subsections with different counters.
+// `virtual_base` is added to every IVFC level offset and every relocation
+// virtual start, and to the relocation tree's total. Physical patch and
+// base offsets stay put, so the same bytes are read through a virtual
+// image that begins above the stored section. The first bucket window
+// offset stays 0; it is a bucket payload offset, not a virtual start.
+// A defect changes one declared extent so extraction must reject it.
+enum class UpdateFixtureDefect {
+    none,
+    // Level 1's byte count is 2^63 at a 16-byte block: the digest count wraps.
+    digest_overflow,
+    // Level 1 needs more digests than its parent level declares.
+    short_parent,
+    // The base relocation's physical start wraps when the RomFS read begins.
+    relocation_wrap,
+};
+
 inline BuiltUpdateNca build_update_program_nca(const TestKeys& keys, const TestRsaKey& sign_key,
                                                std::span<const std::byte> npdm,
                                                std::uint64_t title_id,
-                                               std::uint64_t subsection_total_adjustment = 0) {
+                                               std::uint64_t subsection_total_adjustment = 0,
+                                               std::uint64_t data_offset_override = 0,
+                                               std::uint64_t virtual_base = 0,
+                                               UpdateFixtureDefect defect = UpdateFixtureDefect::none) {
     constexpr std::uint64_t kHashBlockSize = 0x200;
     constexpr std::uint32_t kHashBlockLog2 = 9;
     BuiltUpdateNca built;
@@ -1062,6 +1087,15 @@ inline BuiltUpdateNca build_update_program_nca(const TestKeys& keys, const TestR
     // The virtual image the BKTR section describes.
     const std::vector<std::byte>& virtual_image = patched_tree.section;
     const std::uint64_t virtual_size = virtual_image.size();
+    if (virtual_base > ~std::uint64_t{0} - virtual_size) {
+        return built;
+    }
+    const std::uint64_t image_size = virtual_size + virtual_base;
+    // The overflow fixture's level is larger than any stored section, so the
+    // relocation tree's declared image must cover it or parsing rejects the
+    // descriptor before the digest arithmetic runs.
+    const std::uint64_t tree_total =
+        defect == UpdateFixtureDefect::digest_overflow ? ~std::uint64_t{0} : image_size;
     // The base ranges must be byte-identical in both images; the builder
     // fails loudly here rather than emitting a fixture that cannot verify.
     const std::uint64_t kBaseRangeBegin = 0x840;
@@ -1112,7 +1146,7 @@ inline BuiltUpdateNca build_update_program_nca(const TestKeys& keys, const TestR
     };
     std::vector<std::byte> reloc_bucket(0x10 + 3 * 0x14, std::byte{0});
     put_u32(reloc_bucket, 0x04, 3);
-    put_u64(reloc_bucket, 0x08, virtual_size);
+    put_u64(reloc_bucket, 0x08, tree_total);
     auto put_reloc = [&](std::size_t index, std::uint64_t virt, std::uint64_t phys,
                          std::uint32_t is_patch) {
         const std::size_t at = 0x10 + index * 0x14;
@@ -1120,11 +1154,26 @@ inline BuiltUpdateNca build_update_program_nca(const TestKeys& keys, const TestR
         put_u64(reloc_bucket, at + 0x08, phys);
         put_u32(reloc_bucket, at + 0x10, is_patch);
     };
-    put_reloc(0, kPatch1Begin, 0, 1);
-    put_reloc(1, kPatch1End, kPatch1End, 0); // base range at its own offset
-    put_reloc(2, kPatch2Begin, patch2_phys, 1);
+    std::uint64_t base_virt = kPatch1End + virtual_base;
+    std::uint64_t base_phys = kPatch1End;
+    if (defect == UpdateFixtureDefect::relocation_wrap) {
+        // The RomFS read must begin two bytes into this entry. Delta 2 plus
+        // a physical start of UINT64_MAX-1 wraps to 1. The two bytes before
+        // the RomFS are level padding, so the previous level never reads them.
+        const std::uint64_t romfs_at = patched_tree.level_offsets[5] + virtual_base;
+        const std::uint64_t level4_end =
+            patched_tree.level_offsets[4] + patched_tree.level_sizes[4] + virtual_base;
+        if (romfs_at < 2 || level4_end > romfs_at - 2 || romfs_at - 2 < kPatch1Begin + virtual_base) {
+            return built;
+        }
+        base_virt = romfs_at - 2;
+        base_phys = ~std::uint64_t{0} - 1;
+    }
+    put_reloc(0, kPatch1Begin + virtual_base, 0, 1);
+    put_reloc(1, base_virt, base_phys, 0);
+    put_reloc(2, kPatch2Begin + virtual_base, patch2_phys, 1);
     const std::vector<std::byte> relocation_tree =
-        make_tree_block(1, virtual_size, {{0, reloc_bucket}});
+        make_tree_block(1, tree_total, {{0, reloc_bucket}});
 
     constexpr std::uint32_t kSubsectionCtr1 = 0x11111111;
     constexpr std::uint32_t kSubsectionCtr2 = 0x22222222;
@@ -1150,6 +1199,17 @@ inline BuiltUpdateNca build_update_program_nca(const TestKeys& keys, const TestR
     const std::vector<std::byte> subsection_tree =
         make_tree_block(1, relocation_offset + subsection_total_adjustment,
                         {{0, subsection_bucket}});
+    built.stored_section_size = section_size;
+    built.patch_virtual_size = tree_total;
+    {
+        const std::uint64_t romfs_raw = data_offset_override != 0
+                                            ? data_offset_override
+                                            : patched_tree.level_offsets[5];
+        if (virtual_base > ~std::uint64_t{0} - romfs_raw) {
+            return built;
+        }
+        built.romfs_offset = romfs_raw + virtual_base;
+    }
     built.bktr_section_offset = 0; // set below, after the ExeFS layout
 
     // The ExeFS: a PFS0 with a patched module and the same NPDM.
@@ -1238,9 +1298,20 @@ inline BuiltUpdateNca build_update_program_nca(const TestKeys& keys, const TestR
         put_u32(image, superblock + 0x0C, 7);
         for (std::size_t level = 0; level < 6; ++level) {
             const std::size_t descriptor = superblock + 0x10 + level * 0x18;
-            put_u64(image, descriptor, patched_tree.level_offsets[level]);
-            put_u64(image, descriptor + 0x08, patched_tree.level_sizes[level]);
-            put_u32(image, descriptor + 0x10, kHashBlockLog2);
+            const std::uint64_t level_raw =
+                level == 5 && data_offset_override != 0 ? data_offset_override
+                                                        : patched_tree.level_offsets[level];
+            std::uint64_t level_size = patched_tree.level_sizes[level];
+            std::uint32_t level_log2 = kHashBlockLog2;
+            if (level == 1 && defect == UpdateFixtureDefect::digest_overflow) {
+                level_size = std::uint64_t{1} << 63;
+                level_log2 = 4;
+            } else if (level == 1 && defect == UpdateFixtureDefect::short_parent) {
+                level_size = patched_tree.level_sizes[1] + kHashBlockSize;
+            }
+            put_u64(image, descriptor, level_raw + virtual_base);
+            put_u64(image, descriptor + 0x08, level_size);
+            put_u32(image, descriptor + 0x10, level_log2);
         }
         std::memcpy(image.data() + superblock + 0xC0, patched_tree.master_hash.data(), 0x20);
         // Relocation header: patch data then the relocation tree.

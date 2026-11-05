@@ -9,12 +9,14 @@
 // ============================================================================
 
 #include <armigo/common/diagnostics.h>
+#include <algorithm>
 #include <atomic>
 
 #include <armigo/compat/patches.h>
 #include <armigo/graphics/presentation_hints.h>
 #include <armigo/aarch64/instruction.h>
 #import <Foundation/Foundation.h>
+#include <algorithm>
 #include <charconv>
 #include <cstring>
 #include <fstream>
@@ -41,6 +43,26 @@ std::string string(id value) {
     require([value isKindOfClass:[NSString class]], "Compatibility value must be a string.");
     return [value UTF8String];
 }
+std::string cache_member_name(id value) {
+    auto name = string(value);
+    require(!name.empty() && name.size() <= 256,
+            "Compatibility shader cache name is empty or too long.");
+    require(name.front() != '/' && name.find('\\') == std::string::npos &&
+                name.find("//") == std::string::npos && name.find("..") == std::string::npos,
+            "Compatibility shader cache name is not an archive member name.");
+    return name;
+}
+// A profile note is plain English of 1 to 200 characters. NSString's length
+// counts UTF-16 code units, which is the character count for this text.
+std::string note_text(id value) {
+    require([value isKindOfClass:[NSString class]], "Compatibility note must be a string.");
+    NSString* text = value;
+    require([text length] >= 1 && [text length] <= 200,
+            "Compatibility note must be 1 to 200 characters.");
+    const char* utf8 = [text UTF8String];
+    require(utf8 != nullptr, "Compatibility note must be a string.");
+    return utf8;
+}
 std::uint64_t hex(id value, std::size_t digits = 0) {
     auto text = string(value);
     require(text.starts_with("0x"), "Compatibility integers require hexadecimal strings with 0x prefix.");
@@ -52,6 +74,26 @@ std::uint64_t hex(id value, std::size_t digits = 0) {
     require(parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size(),
             "Compatibility hexadecimal integer is invalid.");
     return number;
+}
+bool exclusive_word_modes(const WordPatch& left, const WordPatch& right) {
+    return left.frame_rate && right.frame_rate && left.frame_rate != right.frame_rate &&
+           left.expected_instruction == right.expected_instruction;
+}
+bool valid_frame_rates(const FrameRateSettings& settings) {
+    if (settings.default_rate != 30 && settings.default_rate != 60) return false;
+    if (settings.supported_rates.empty() || settings.supported_rates.size() > 3) return false;
+    std::set<std::uint32_t> rates;
+    for (auto rate : settings.supported_rates)
+        if ((rate != 30 && rate != 60 && rate != 120) || !rates.insert(rate).second) return false;
+    return rates.contains(settings.default_rate);
+}
+std::uint32_t frame_rate_value(id value, bool private_rate = false) {
+    require([value isKindOfClass:[NSNumber class]] &&
+            CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID() &&
+            ([value isEqual:@30] || [value isEqual:@60] || (private_rate && [value isEqual:@120])),
+            private_rate ? "Compatibility word frame rate must be 30, 60 or 120."
+                         : "Compatibility default and display frame rates must be 30 or 60.");
+    return [value unsignedIntValue];
 }
 }
 PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
@@ -79,8 +121,8 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                 require([entry isKindOfClass:[NSDictionary class]], "Compatibility record must be an object.");
                 const bool has_patch = entry[@"module"] != nil;
                 auto record = has_patch
-                    ? object(entry, {"title_id", "main_build_id", "module", "original_callee", "calls", "layout"}, {"nvn_driver", "startup_user", "pipelines", "words", "present_link", "resolution"})
-                    : object(entry, {"title_id", "main_build_id"}, {"nvn_driver", "startup_user", "pipelines", "words", "present_link", "resolution"});
+                    ? object(entry, {"title_id", "main_build_id", "module", "original_callee", "calls", "layout"}, {"nvn_driver", "startup_user", "pipelines", "words", "present_link", "resolution", "shader_inputs", "note", "frame_rate", "frame_rates"})
+                    : object(entry, {"title_id", "main_build_id"}, {"nvn_driver", "startup_user", "pipelines", "words", "present_link", "resolution", "shader_inputs", "note", "frame_rate", "frame_rates"});
                 PatchDescription patch;
                 patch.identity.title_id = hex(record[@"title_id"], 16);
                 auto build = string(record[@"main_build_id"]);
@@ -116,27 +158,119 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                             "Compatibility pipeline list is missing from the profile's folder.");
                     patch.pso_manifest = file.string();
                 }
+                if (id inputs = record[@"shader_inputs"]) {
+                    auto selected = object(inputs, {"containers", "vertex_depth"},
+                                           {"caches", "fallbacks", "ignored_needle_offsets"});
+                    const auto containers = string(selected[@"containers"]);
+                    if (containers == "bnsh") patch.shader_inputs.containers = ShaderContainerSet::Bnsh;
+                    else if (containers == "gfd-cache") patch.shader_inputs.containers = ShaderContainerSet::GfdCache;
+                    else require(false, "Compatibility shader containers are bnsh or gfd-cache.");
+                    const auto depth = string(selected[@"vertex_depth"]);
+                    if (depth == "minus-one-to-one") patch.shader_inputs.vertex_depth = ShaderVertexDepth::NegativeOneToOne;
+                    else if (depth == "zero-to-one") patch.shader_inputs.vertex_depth = ShaderVertexDepth::ZeroToOne;
+                    else require(false, "Compatibility vertex depth is minus-one-to-one or zero-to-one.");
+                    if (id caches = selected[@"caches"]) {
+                        require([caches isKindOfClass:[NSArray class]] && [caches count] <= 64,
+                                "Compatibility shader caches must be a bounded array.");
+                        std::set<std::string> cache_names;
+                        for (id item in caches) {
+                            auto name = cache_member_name(item);
+                            require(cache_names.insert(name).second, "Duplicate compatibility shader cache name.");
+                            patch.shader_inputs.caches.push_back(std::move(name));
+                        }
+                    }
+                    if (id fallbacks = selected[@"fallbacks"]) {
+                        require([fallbacks isKindOfClass:[NSArray class]] && [fallbacks count] <= 16,
+                                "Compatibility shader cache fallbacks must be a bounded array.");
+                        std::set<std::string> fallback_names;
+                        for (id item in fallbacks) {
+                            auto fallback = object(item, {"cache", "alternatives"});
+                            ShaderCacheFallback entry_fallback;
+                            entry_fallback.cache = cache_member_name(fallback[@"cache"]);
+                            require(std::find(patch.shader_inputs.caches.begin(), patch.shader_inputs.caches.end(),
+                                              entry_fallback.cache) != patch.shader_inputs.caches.end(),
+                                    "Compatibility shader cache fallback does not name a required cache.");
+                            require(fallback_names.insert(entry_fallback.cache).second,
+                                    "Duplicate compatibility shader cache fallback.");
+                            id alternatives = fallback[@"alternatives"];
+                            require([alternatives isKindOfClass:[NSArray class]] && [alternatives count] > 0 &&
+                                        [alternatives count] <= 8,
+                                    "Compatibility shader cache alternatives must be a nonempty bounded array.");
+                            std::set<std::string> alternative_names;
+                            for (id alternative in alternatives) {
+                                auto name = cache_member_name(alternative);
+                                require(name != entry_fallback.cache,
+                                        "Compatibility shader cache alternative repeats the required cache.");
+                                require(alternative_names.insert(name).second,
+                                        "Duplicate compatibility shader cache alternative.");
+                                entry_fallback.alternatives.push_back(std::move(name));
+                            }
+                            patch.shader_inputs.fallbacks.push_back(std::move(entry_fallback));
+                        }
+                    }
+                    if (id offsets = selected[@"ignored_needle_offsets"]) {
+                        require([offsets isKindOfClass:[NSArray class]] && [offsets count] <= 64,
+                                "Compatibility ignored shader offsets must be a bounded array.");
+                        std::set<std::uint64_t> seen_offsets;
+                        for (id item in offsets) {
+                            const auto offset = hex(item);
+                            require(seen_offsets.insert(offset).second, "Duplicate compatibility ignored shader offset.");
+                            patch.shader_inputs.ignored_needle_offsets.push_back(offset);
+                        }
+                    }
+                    if (patch.shader_inputs.containers == ShaderContainerSet::Bnsh) {
+                        require(patch.shader_inputs.caches.empty() && patch.shader_inputs.fallbacks.empty() &&
+                                    patch.shader_inputs.ignored_needle_offsets.empty(),
+                                "bnsh shader input does not name caches or ignored offsets.");
+                    }
+                }
                 if (id link = record[@"present_link"]) {
                     require(CFGetTypeID((__bridge CFTypeRef)link) == CFBooleanGetTypeID(),
                             "Compatibility present_link must be a JSON boolean.");
                     patch.present_link = [link boolValue];
                 }
+                if (id note = record[@"note"]) patch.note = note_text(note);
+                if (id rate = record[@"frame_rate"]) {
+                    auto settings = object(rate, {"default", "display_refresh_rate"});
+                    patch.frame_rate = FrameRateSettings{frame_rate_value(settings[@"default"]),
+                        frame_rate_value(settings[@"display_refresh_rate"]), {}};
+                    id supported = record[@"frame_rates"];
+                    require([supported isKindOfClass:[NSArray class]] && [supported count] > 0 && [supported count] <= 3,
+                            "A title frame-rate policy requires an explicit frame_rates array.");
+                    for (id value in supported) patch.frame_rate->supported_rates.push_back(frame_rate_value(value, true));
+                    require(valid_frame_rates(*patch.frame_rate),
+                            "Supported frame rates must be unique and include the title default.");
+                }
+                require(!record[@"frame_rates"] || patch.frame_rate.has_value(),
+                        "Supported frame rates require a title frame-rate policy.");
                 if (id words = record[@"words"]) {
                     require([words isKindOfClass:[NSArray class]] && [words count] > 0 && [words count] <= 64,
                             "Compatibility words must be a nonempty bounded array.");
-                    std::set<std::uint64_t> word_offsets;
                     for (id item in words) {
-                        auto word = object(item, {"offset", "expected_instruction", "replacement_instruction"},
-                                           {"nvn_driver_only"});
+                        auto word = object(item, {"offset", "expected_instruction", "replacement_instruction", "note"},
+                                           {"nvn_driver_only", "frame_rate"});
                         WordPatch patch_word{hex(word[@"offset"]),
                             static_cast<std::uint32_t>(hex(word[@"expected_instruction"], 8)),
                             static_cast<std::uint32_t>(hex(word[@"replacement_instruction"], 8))};
+                        patch_word.note = note_text(word[@"note"]);
+                        if (id rate = word[@"frame_rate"]) {
+                            require(patch.frame_rate.has_value(),
+                                    "A rate-specific word requires a title frame-rate policy.");
+                            patch_word.frame_rate = frame_rate_value(rate, true);
+                            require(std::find(patch.frame_rate->supported_rates.begin(), patch.frame_rate->supported_rates.end(),
+                                              patch_word.frame_rate) != patch.frame_rate->supported_rates.end(),
+                                    "A word's frame rate is not declared in frame_rates.");
+                        }
                         if (id only = word[@"nvn_driver_only"]) {
                             require(CFGetTypeID((__bridge CFTypeRef)only) == CFBooleanGetTypeID(),
                                     "Compatibility nvn_driver_only must be a JSON boolean.");
                             patch_word.nvn_driver_only = [only boolValue];
                         }
-                        require(word_offsets.insert(patch_word.offset).second, "Duplicate compatibility word offset.");
+                        for (const auto& previous : patch.words) {
+                            if (previous.offset != patch_word.offset) continue;
+                            require(exclusive_word_modes(previous, patch_word),
+                                    "Overlapping compatibility word modes or inconsistent preimages.");
+                        }
                         patch.words.push_back(patch_word);
                     }
                 }
@@ -198,8 +332,9 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                             "Compatibility calls must be a nonempty bounded array.");
                     std::set<std::uint64_t> offsets;
                     for (id item in calls) {
-                        auto call = object(item, {"offset", "expected_instruction"});
+                        auto call = object(item, {"offset", "expected_instruction", "note"});
                         CallPatch site{hex(call[@"offset"]), static_cast<std::uint32_t>(hex(call[@"expected_instruction"], 8))};
+                        site.note = note_text(call[@"note"]);
                         require(offsets.insert(site.offset).second, "Duplicate compatibility call offset.");
                         patch.calls.push_back(site);
                     }
@@ -218,6 +353,33 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
             return result;
         } catch (const std::exception& error) { return std::string(error.what()); }
     }
+}
+std::variant<std::vector<WordPatch>, std::string> select_patch_words(
+    const PatchDescription& patch, std::string_view requested_rate, bool nvn_driver_enabled) {
+    if (!patch.frame_rate) return patch.words;
+    auto rate = patch.frame_rate->default_rate;
+    if (!requested_rate.empty() && requested_rate != "0") {
+        if (requested_rate == "30") rate = 30;
+        else if (requested_rate == "60") rate = 60;
+        else if (requested_rate == "120") rate = 120;
+        else return "The title frame rate must be Auto (0), 30, 60 or private 120.";
+    }
+    if (!valid_frame_rates(*patch.frame_rate)) return "The title's supported frame rates are invalid.";
+    if (std::find(patch.frame_rate->supported_rates.begin(), patch.frame_rate->supported_rates.end(), rate) ==
+        patch.frame_rate->supported_rates.end())
+        return "The requested frame rate is not supported by this title profile.";
+    std::vector<WordPatch> result;
+    std::set<std::uint64_t> selected_offsets;
+    for (const auto& word : patch.words)
+        if ((nvn_driver_enabled || !word.nvn_driver_only) && (word.frame_rate == 0 || word.frame_rate == rate)) {
+            if (!selected_offsets.insert(word.offset).second)
+                return "The selected title mode has overlapping instruction words.";
+            result.push_back(word);
+        }
+    if (rate != patch.frame_rate->default_rate && std::none_of(result.begin(), result.end(),
+            [rate](const auto& word) { return word.frame_rate == rate; }))
+        return "The requested frame rate has no effective instruction words for the selected graphics driver.";
+    return result;
 }
 execution::GateStatus handle_patch(const InstalledPatch& patch, execution::GateCall& call,
                                     const horizon::GuestBuffers& memory) noexcept {
@@ -238,6 +400,8 @@ const PatchDescription* match_patch(std::span<const PatchDescription> patches,
     return nullptr;
 }
 std::string validate_patch(const PatchDescription& patch, const loader::NsoModuleImage& image) {
+    if (patch.frame_rate && !valid_frame_rates(*patch.frame_rate))
+        return "The title's supported frame rates are invalid.";
     const auto& text = image.segment(loader::NsoSegmentKind::text);
     const auto executable = [&](std::uint64_t offset) {
         return offset % 4 == 0 && offset >= text.image_offset &&
@@ -245,6 +409,15 @@ std::string validate_patch(const PatchDescription& patch, const loader::NsoModul
             offset <= image.bytes.size() && image.bytes.size() - offset >= 4;
     };
     for (const auto& word : patch.words) {
+        for (const auto& previous : patch.words) {
+            if (&previous == &word) break;
+            if (previous.offset == word.offset && !exclusive_word_modes(previous, word))
+                return "Overlapping compatibility word modes or inconsistent preimages.";
+        }
+        if (word.frame_rate != 0 &&
+            (!patch.frame_rate || std::find(patch.frame_rate->supported_rates.begin(),
+                patch.frame_rate->supported_rates.end(), word.frame_rate) == patch.frame_rate->supported_rates.end()))
+            return "Compatibility instruction word has an invalid frame-rate condition.";
         if (!executable(word.offset)) return "Compatibility instruction word is outside executable text.";
         std::uint32_t actual = 0;
         std::memcpy(&actual, image.bytes.data() + word.offset, 4);

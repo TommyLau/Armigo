@@ -123,6 +123,12 @@ std::string info_plist(const BundleSpec& spec) {
     const auto display = xml_escape(spec.display_name);
     const auto name = xml_escape(spec.bundle_name);
     const auto identifier = xml_escape(spec.bundle_identifier);
+    const auto frame_rate = spec.default_frame_rate && spec.display_refresh_rate
+        ? "<key>ArmigoTitleFrameRate</key><dict><key>Default</key><integer>" +
+            std::to_string(spec.default_frame_rate) +
+            "</integer><key>DisplayRefresh</key><integer>" +
+            std::to_string(spec.display_refresh_rate) + "</integer></dict>\n"
+        : std::string{};
     if (spec.platform == "ios") {
         return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
                "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
@@ -168,7 +174,7 @@ std::string info_plist(const BundleSpec& spec) {
                "    <key>CFBundleIdentifier</key>\n"
                "    <string>") +
            identifier +
-           "</string>\n" + bundle_localizations(spec) +
+           "</string>\n" + bundle_localizations(spec) + frame_rate +
            "    <key>CFBundleInfoDictionaryVersion</key>\n"
            "    <string>6.0</string>\n"
            "    <key>CFBundleName</key>\n"

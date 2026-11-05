@@ -18,7 +18,7 @@ the game builds listed in that folder's `profile.json`:
 | Title ID | Title | State |
 | --- | --- | --- |
 | `01007EF00011E000` | The Legend of Zelda: Breath of the Wild | Playable on macOS and iPadOS |
-| `01004B10157F2000` | Persona 5 Royal | In progress; packing is not supported yet |
+| `01004B10157F2000` | Persona 5 Royal | In progress: packs for macOS and iOS; holds 30 fps on Apple Silicon Macs, with an optional 60 fps mode; iOS performance not yet measured |
 
 Other titles are not supported. Tears of the Kingdom and Unicorn Overlord are
 planned, not supported.
@@ -69,7 +69,7 @@ the Settings app):
 | --- | --- |
 | Console Mode | Docked (default), Handheld |
 | Resolution | Auto (default: native on macOS, 1080p on iOS), 720p, 900p, 1080p, 1440p, 4K (macOS), Native |
-| Frame Rate | Auto, 30, 60 (default) |
+| Frame Rate | Auto (default: the title's own rate, 60 for Breath of the Wild and 30 for Persona 5 Royal), 30, 60 |
 | V-Sync | On (default), Off (macOS) |
 | Performance Overlay | Off (default), On |
 

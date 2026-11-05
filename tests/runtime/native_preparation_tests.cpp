@@ -740,6 +740,74 @@ void test_embedded_native_launch() {
         std::filesystem::path path;
         ~Cleanup() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
     } cleanup{directory};
+    // Rate-specific words select at ordinary launch. Embedded capture always
+    // records the profile's default, and a different fixed-code mode is refused.
+    auto rate_patch = patch;
+    rate_patch.frame_rate = compat::FrameRateSettings{30, 60, {30, 60, 120}};
+    rate_patch.words.front().frame_rate = 60;
+    auto private_word = rate_patch.words.front();
+    private_word.frame_rate = 120;
+    private_word.replacement_instruction = 0xd2800060u;  // MOV X0, #3.
+    rate_patch.words.push_back(private_word);
+    const auto word_at = [](const PreparedLaunch& selected) {
+        std::uint32_t word = 0;
+        const auto bytes = selected.modules->mapping(1).readable_bytes(0x300, 4);
+        CHECK(bytes.has_value());
+        if (bytes) std::memcpy(&word, bytes->data(), 4);
+        return word;
+    };
+    for (const char* rate : {"0", "30", "60", "120"}) {
+        setenv("ARMIGO_COMPAT_FRAME_RATE", rate, 1);
+        auto selected = load_native_launch(input, profile, std::make_shared<platform::ThreadSlotKey>(),
+            std::span(&rate_patch, 1));
+        CHECK(std::holds_alternative<PreparedLaunch>(selected));
+        if (const auto* prepared = std::get_if<PreparedLaunch>(&selected))
+            CHECK(word_at(*prepared) == (std::string_view(rate) == "120" ? 0xd2800060u :
+                std::string_view(rate) == "60" ? 0xd2800040u : 0xd2800020u));
+        CHECK(input.modules[0].bytes == source);
+    }
+    auto high_only = rate_patch;
+    high_only.words.erase(high_only.words.begin());
+    high_only.frame_rate->supported_rates = {30, 120};
+    setenv("ARMIGO_COMPAT_FRAME_RATE", "60", 1);
+    CHECK(std::holds_alternative<LaunchFailure>(load_native_launch(input, profile,
+        std::make_shared<platform::ThreadSlotKey>(), std::span(&high_only, 1))));
+    high_only.words.front().nvn_driver_only = true;
+    setenv("ARMIGO_COMPAT_FRAME_RATE", "120", 1);
+    setenv("ARMIGO_NVN", "stream", 1);
+    CHECK(std::holds_alternative<LaunchFailure>(load_native_launch(input, profile,
+        std::make_shared<platform::ThreadSlotKey>(), std::span(&high_only, 1))));
+    setenv("ARMIGO_COMPAT_FRAME_RATE", "30", 1);
+    CHECK(std::holds_alternative<PreparedLaunch>(load_native_launch(input, profile,
+        std::make_shared<platform::ThreadSlotKey>(), std::span(&high_only, 1))));
+    unsetenv("ARMIGO_NVN");
+    setenv("ARMIGO_COMPAT_FRAME_RATE", "invalid", 1);
+    CHECK(std::holds_alternative<LaunchFailure>(load_native_launch(input, profile,
+        std::make_shared<platform::ThreadSlotKey>(), std::span(&rate_patch, 1))));
+    setenv("ARMIGO_COMPAT_FRAME_RATE", "60", 1);
+    EmbeddedNativeArtifacts rate_capture;
+    auto selected = load_native_launch(input, profile, std::make_shared<platform::ThreadSlotKey>(),
+        std::span(&rate_patch, 1), {true, &rate_capture});
+    CHECK(std::holds_alternative<PreparedLaunch>(selected));
+    if (const auto* prepared = std::get_if<PreparedLaunch>(&selected)) CHECK(word_at(*prepared) == 0xd2800020u);
+    const auto rate_directory = cleanup.path / "rate";
+    CHECK(std::holds_alternative<std::monostate>(write_embedded_modules(rate_directory, rate_capture)));
+    auto rate_files = open_embedded_modules(rate_directory);
+    CHECK(std::holds_alternative<EmbeddedNativeFiles>(rate_files));
+    if (const auto* files = std::get_if<EmbeddedNativeFiles>(&rate_files)) {
+        for (const char* rate : {"60", "120"}) {
+            setenv("ARMIGO_COMPAT_FRAME_RATE", rate, 1);
+            auto mismatch = load_native_launch(input, profile, std::make_shared<platform::ThreadSlotKey>(),
+                std::span(&rate_patch, 1), {true, nullptr, &files->artifacts(), files->backings()});
+            CHECK(std::holds_alternative<LaunchFailure>(mismatch));
+        }
+        unsetenv("ARMIGO_COMPAT_FRAME_RATE");
+        auto restored = load_native_launch(input, profile, std::make_shared<platform::ThreadSlotKey>(),
+            std::span(&rate_patch, 1), {true, nullptr, &files->artifacts(), files->backings()});
+        CHECK(std::holds_alternative<PreparedLaunch>(restored));
+        if (const auto* prepared = std::get_if<PreparedLaunch>(&restored)) CHECK(word_at(*prepared) == 0xd2800020u);
+    }
+    unsetenv("ARMIGO_COMPAT_FRAME_RATE");
     CHECK(std::holds_alternative<std::monostate>(write_embedded_modules(cleanup.path, artifacts)));
     {
         auto files = open_embedded_modules(cleanup.path);

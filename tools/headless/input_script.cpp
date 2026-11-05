@@ -64,6 +64,7 @@ public:
         : presenter_(std::move(presenter)), script_(std::move(script)),
           publish_input_(std::move(publish_input)), now_(std::move(now)) { publish(); }
     platform::PresentationMode mode() const noexcept override { return presenter_->mode(); }
+    std::uint64_t presented_count() const noexcept override { return presenter_->presented_count(); }
     platform::PresentResult present(const platform::PresentationFrame& frame,
         std::optional<std::chrono::steady_clock::time_point> deadline,
         std::stop_token stop) override {
@@ -101,6 +102,30 @@ private:
     std::uint64_t completed_ = 0;
 };
 } // namespace
+
+void ScriptInputOverlay::publish(const platform::HostInputSnapshot& input) {
+    const std::lock_guard lock(mutex_);
+    controller_ = input.controller;
+}
+
+platform::HostInputSnapshot ScriptInputOverlay::merge(platform::HostInputSnapshot host) const {
+    const std::lock_guard lock(mutex_);
+    if (!controller_.connected || !controller_.supported) return host;
+    auto& pad = host.controller;
+    if (!pad.connected || !pad.supported) pad = {};
+    pad.connected = pad.supported = true;
+    pad.buttons |= controller_.buttons;
+    pad.left_trigger = std::max(pad.left_trigger, controller_.left_trigger);
+    pad.right_trigger = std::max(pad.right_trigger, controller_.right_trigger);
+    const auto stronger = [](auto& host_stick, const auto& script_stick) {
+        if (script_stick[0] * script_stick[0] + script_stick[1] * script_stick[1] >
+            host_stick[0] * host_stick[0] + host_stick[1] * host_stick[1])
+            host_stick = script_stick;
+    };
+    stronger(pad.left_stick, controller_.left_stick);
+    stronger(pad.right_stick, controller_.right_stick);
+    return host;
+}
 
 std::variant<InputScript, std::string> parse_input_script(std::istream& source) {
     std::vector<Event> events;

@@ -14,10 +14,10 @@
 # tools. A fallback that launches a bare `armigo` when the bundle executable
 # is missing would launch this packer.
 
-find_library(ARMIGO_PACK_FOUNDATION_FRAMEWORK Foundation REQUIRED)
-find_library(ARMIGO_PACK_IMAGEIO_FRAMEWORK ImageIO REQUIRED)
-find_library(ARMIGO_PACK_COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
-find_library(ARMIGO_PACK_UNIFORMTYPEIDENTIFIERS_FRAMEWORK UniformTypeIdentifiers REQUIRED)
+armigo_find_framework(ARMIGO_PACK_FOUNDATION_FRAMEWORK Foundation)
+armigo_find_framework(ARMIGO_PACK_IMAGEIO_FRAMEWORK ImageIO)
+armigo_find_framework(ARMIGO_PACK_COREGRAPHICS_FRAMEWORK CoreGraphics)
+armigo_find_framework(ARMIGO_PACK_UNIFORMTYPEIDENTIFIERS_FRAMEWORK UniformTypeIdentifiers)
 
 add_library(armigo_pack STATIC
     naming.cpp

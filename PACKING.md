@@ -12,8 +12,7 @@
 
 `armigo` turns one game you own into one player app: a macOS `.app`, or an iOS
 and iPadOS `.ipa`. Build Armigo first (see [README.md](README.md)). Packing
-currently supports The Legend of Zelda: Breath of the Wild
-(`01007EF00011E000`) only.
+supports the titles listed in the README's status table.
 
 ```text
 armigo <game.xci|nsp or folder> [--update FILE]... [--dlc FILE]...
@@ -30,7 +29,7 @@ All inputs are your own dumps.
 | game | The base game: an `.xci` or `.nsp` file, or a folder of `.xci`, `.nsp` or `.nca` files |
 | `--update FILE` | An update `.nsp`; repeat for several, the newest applies |
 | `--dlc FILE` | An add-on content `.nsp`; repeat for each |
-| `--keys FILE` | Your console's `prod.keys` |
+| `--keys FILE` | Your console's `prod.keys`; it must contain every key your game's content uses (the packer names any missing key) |
 | `--firmware PATH` | Your console's firmware: a folder of its `.nca` files, or a `.zip` of them. Armigo's baseline is 20.5.0; other versions pack with a warning |
 | `--title-keys FILE` | Optional `title.keys`. Without it, title keys come from the tickets inside the NSPs |
 | `--output DIR` | Where the app is written (default: the current directory); never inside a git checkout |

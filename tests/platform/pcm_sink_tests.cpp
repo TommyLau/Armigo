@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <string>
 #include <vector>
@@ -304,6 +305,118 @@ void muted_and_failures() {
     }
 }
 
+void audio_setting() {
+    using armigo::platform::PcmOutputKind;
+    using armigo::platform::pcm_output_kind_from_setting;
+    CHECK(pcm_output_kind_from_setting(nullptr, false) == PcmOutputKind::muted);
+    CHECK(pcm_output_kind_from_setting(nullptr, true) == PcmOutputKind::audible);
+    CHECK(pcm_output_kind_from_setting("", false) == PcmOutputKind::muted);
+    CHECK(pcm_output_kind_from_setting("", true) == PcmOutputKind::audible);
+    CHECK(pcm_output_kind_from_setting("0", true) == PcmOutputKind::muted);
+    CHECK(pcm_output_kind_from_setting("0", false) == PcmOutputKind::muted);
+    CHECK(pcm_output_kind_from_setting("1", false) == PcmOutputKind::audible);
+    CHECK(pcm_output_kind_from_setting("1", true) == PcmOutputKind::audible);
+    CHECK(pcm_output_kind_from_setting("silent", false) == PcmOutputKind::silent);
+    CHECK(pcm_output_kind_from_setting("silent", true) == PcmOutputKind::silent);
+    // Any other value stays on the historical audible path, including a
+    // different spelling of the silent setting.
+    CHECK(pcm_output_kind_from_setting("Silent", false) == PcmOutputKind::audible);
+    CHECK(pcm_output_kind_from_setting("2", true) == PcmOutputKind::audible);
+}
+
+void silent_render() {
+    using armigo::platform::PcmOutputKind;
+    mock = {};
+    PcmSink* sink = armigo::platform::pcm_sink_open(PcmOutputKind::silent);
+    CHECK(sink != nullptr);
+    CHECK(mock.calls == "NSSI");
+    const std::int16_t loud[8] = {32767, -32768, 1000, -1000, 5, 6, 7, 8};
+    // Stopped writes are refused. An active silent sink queues, it does not
+    // consume on the spot the way the muted sink does.
+    CHECK(armigo::platform::pcm_sink_write(sink, loud, 4, 2) == 0);
+    CHECK(armigo::platform::pcm_sink_set_active(sink, true) == 0);
+    CHECK(mock.calls == "NSSIA");
+    CHECK(armigo::platform::pcm_sink_write(sink, loud, 4, 2) == 4);
+    auto value = counters(sink);
+    CHECK(value.submitted_frames == 4 && value.consumed_frames == 0);
+    // The guest volume is stored and does not raise the device buffer.
+    CHECK(armigo::platform::pcm_sink_set_volume(sink, 128.0f) == 0);
+    AudioUnitRenderActionFlags flags = 0;
+    auto out = pull(6, &flags);
+    for (std::int16_t sample : out) CHECK(sample == 0);
+    CHECK((flags & kAudioUnitRenderAction_OutputIsSilence) == 0);
+    value = counters(sink);
+    CHECK(value.submitted_frames == 4 && value.consumed_frames == 4);
+    CHECK(value.underrun_frames == 2 && value.dropped_frames == 0);
+    CHECK(armigo::platform::pcm_sink_output_peak(sink) == 0);
+    out = pull(2, &flags);
+    CHECK((flags & kAudioUnitRenderAction_OutputIsSilence) != 0);
+    CHECK(out[0] == 0 && out[3] == 0);
+    CHECK(counters(sink).underrun_frames == 4);
+    CHECK(armigo::platform::pcm_sink_output_peak(sink) == 0);
+    armigo::platform::pcm_sink_close(sink);
+    CHECK(mock.calls == "NSSIAOUD");
+
+    // Same writes and the same pull: silent at full guest volume matches an
+    // audible sink whose gain is zero, sample for sample and counter for counter.
+    mock = {};
+    PcmSink* audible = armigo::platform::pcm_sink_open(PcmOutputKind::audible);
+    CHECK(armigo::platform::pcm_sink_set_active(audible, true) == 0);
+    CHECK(armigo::platform::pcm_sink_write(audible, loud, 4, 2) == 4);
+    CHECK(armigo::platform::pcm_sink_set_volume(audible, 0.0f) == 0);
+    flags = 0;
+    auto zero = pull(6, &flags);
+    for (std::int16_t sample : zero) CHECK(sample == 0);
+    CHECK((flags & kAudioUnitRenderAction_OutputIsSilence) == 0);
+    const auto audible_counters = counters(audible);
+    CHECK(audible_counters.submitted_frames == 4 && audible_counters.consumed_frames == 4);
+    CHECK(audible_counters.underrun_frames == 2 && audible_counters.dropped_frames == 0);
+    CHECK(armigo::platform::pcm_sink_output_peak(audible) == 0);
+    armigo::platform::pcm_sink_close(audible);
+
+    // The audible path still renders the queued samples once the gain is unity.
+    mock = {};
+    audible = armigo::platform::pcm_sink_open(true);
+    CHECK(armigo::platform::pcm_sink_set_active(audible, true) == 0);
+    CHECK(armigo::platform::pcm_sink_write(audible, loud, 1, 2) == 1);
+    out = pull(1);
+    CHECK(out[0] == 32767 && out[1] == -32768);
+    armigo::platform::pcm_sink_close(audible);
+}
+
+void silent_dump_keeps_source() {
+    const auto path = std::filesystem::temp_directory_path() / "armigo-pcm-silent-dump.wav";
+    std::filesystem::remove(path);
+    CHECK(setenv("ARMIGO_AUDIO_DUMP", path.c_str(), 1) == 0);
+    mock = {};
+    auto output = armigo::platform::make_pcm_sink_output(armigo::platform::PcmOutputKind::silent);
+    unsetenv("ARMIGO_AUDIO_DUMP");
+    CHECK(output != nullptr);
+    if (!output) return;
+    const std::int16_t stereo[4] = {1000, -2000, 3000, -4000};
+    CHECK(output->set_active(true));
+    CHECK(output->write(stereo, 2, 2) == 2);
+    CHECK(output->set_volume(64.0f));
+    auto rendered = pull(2);
+    CHECK(rendered[0] == 0 && rendered[1] == 0 && rendered[2] == 0 && rendered[3] == 0);
+    CHECK(output->counters().submitted_frames == 2);
+    output.reset();
+    std::FILE* file = std::fopen(path.c_str(), "rb");
+    CHECK(file != nullptr);
+    if (file) {
+        CHECK(std::fseek(file, 0, SEEK_END) == 0);
+        CHECK(std::ftell(file) == 44 + 8);
+        CHECK(std::fseek(file, 44, SEEK_SET) == 0);
+        std::int16_t samples[4] = {};
+        CHECK(std::fread(samples, sizeof(std::int16_t), 4, file) == 4);
+        CHECK(samples[0] == 1000 && samples[1] == -2000);
+        CHECK(samples[2] == 3000 && samples[3] == -4000);
+        std::fclose(file);
+    }
+    std::filesystem::remove(path);
+    CHECK(mock.calls == "NSSIAOUD");
+}
+
 }  // namespace
 
 int main() {
@@ -311,6 +424,9 @@ int main() {
     ring_and_channel_mapping();
     gain();
     muted_and_failures();
+    audio_setting();
+    silent_render();
+    silent_dump_keeps_source();
     std::printf("pcm sink failures: %u\n", failures);
     return failures ? 1 : 0;
 }

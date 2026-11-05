@@ -13,6 +13,13 @@ cmake_minimum_required(VERSION 3.25)
 if(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "26.0" CACHE STRING "Minimum Apple OS version")
 endif()
+# Framework lookups resolve inside the compiler's own SDK, so their directory
+# is the SDK's system framework directory (no -F, system headers). With no
+# SDK named they can resolve in another SDK, whose headers then build as user
+# headers and fail on its own unguarded newer API.
+if(NOT CMAKE_OSX_SYSROOT AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(CMAKE_OSX_SYSROOT "macosx" CACHE STRING "Apple SDK" FORCE)
+endif()
 if(NOT DEFINED CMAKE_OSX_ARCHITECTURES)
     set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "Target architecture")
 endif()
@@ -56,6 +63,23 @@ if(ARMIGO_IOS AND BUILD_TESTING)
     message(FATAL_ERROR "Device builds require BUILD_TESTING=OFF; run synthetic tests on macOS.")
 endif()
 option(ARMIGO_ENABLE_GPU_TESTS "Run tests that require an available Metal 4 GPU" OFF)
+
+# Apple frameworks are linked by name, after checking that the SDK has them.
+# A framework linked by its full path makes CMake pass that directory with -F,
+# and headers found there build as user headers: an SDK's own unguarded newer
+# API then fails -Werror=unguarded-availability-new (AppKit in the macOS 27
+# SDKs), and a stale cache can point at another SDK entirely. By name, the
+# compiler's SDK supplies them as system headers.
+function(armigo_find_framework variable name)
+    find_library(${variable} ${name} REQUIRED)
+    set(${variable} "-framework ${name}" PARENT_SCOPE)
+endfunction()
+# Frameworks the subdirectories look up too: found here first, so their own
+# lookups keep these names (a set variable makes find_library do nothing).
+armigo_find_framework(ARMIGO_FOUNDATION_FRAMEWORK Foundation)
+armigo_find_framework(ARMIGO_METAL_FRAMEWORK Metal)
+armigo_find_framework(ARMIGO_SECURITY_FRAMEWORK Security)
+armigo_find_framework(ARMIGO_COREFOUNDATION_FRAMEWORK CoreFoundation)
 
 add_subdirectory(src/common)
 link_libraries(armigo_diagnostics)
@@ -114,8 +138,8 @@ else()
 
 endif()
 
-find_library(ARMIGO_FOUNDATION_FRAMEWORK Foundation REQUIRED)
-find_library(ARMIGO_METAL_FRAMEWORK Metal REQUIRED)
+armigo_find_framework(ARMIGO_FOUNDATION_FRAMEWORK Foundation)
+armigo_find_framework(ARMIGO_METAL_FRAMEWORK Metal)
 
 add_library(armigo_metal_probe STATIC src/platform/metal/headless_probe.mm)
 target_include_directories(armigo_metal_probe PUBLIC include)
@@ -200,11 +224,11 @@ target_link_libraries(armigo_metal_renderer PUBLIC armigo_graphics
     armigo_metal_buffer_cache armigo_metal_texture_cache armigo_metal_clear_encoder
     PRIVATE "${ARMIGO_FOUNDATION_FRAMEWORK}" "${ARMIGO_METAL_FRAMEWORK}")
 
-find_library(ARMIGO_QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
+armigo_find_framework(ARMIGO_QUARTZCORE_FRAMEWORK QuartzCore)
 if(ARMIGO_IOS)
-    find_library(ARMIGO_UI_FRAMEWORK UIKit REQUIRED)
+    armigo_find_framework(ARMIGO_UI_FRAMEWORK UIKit)
 else()
-    find_library(ARMIGO_APPKIT_FRAMEWORK AppKit REQUIRED)
+    armigo_find_framework(ARMIGO_APPKIT_FRAMEWORK AppKit)
     set(ARMIGO_UI_FRAMEWORK "${ARMIGO_APPKIT_FRAMEWORK}")
 endif()
 
@@ -219,7 +243,7 @@ target_link_libraries(armigo_platform_presenter
 add_library(armigo_platform_application STATIC src/platform/${ARMIGO_PLATFORM_DIRECTORY}/application.mm
     src/platform/macos/display_refresh.mm)
 if(NOT ARMIGO_IOS)
-    find_library(ARMIGO_GAME_CONTROLLER_FRAMEWORK GameController REQUIRED)
+    armigo_find_framework(ARMIGO_GAME_CONTROLLER_FRAMEWORK GameController)
     target_sources(armigo_platform_application PRIVATE src/platform/macos/key_guide.mm)
     target_link_libraries(armigo_platform_application PRIVATE "${ARMIGO_GAME_CONTROLLER_FRAMEWORK}")
 endif()
@@ -286,13 +310,13 @@ target_include_directories(armigo_services_apm PUBLIC include)
 target_link_libraries(armigo_services_apm PUBLIC armigo_horizon Threads::Threads)
 
 # Host PCM output: the default output device through a CoreAudio AudioUnit.
-find_library(ARMIGO_AUDIOTOOLBOX_FRAMEWORK AudioToolbox REQUIRED)
+armigo_find_framework(ARMIGO_AUDIOTOOLBOX_FRAMEWORK AudioToolbox)
 add_library(armigo_platform_pcm_sink STATIC src/platform/macos/pcm_sink.mm)
 target_include_directories(armigo_platform_pcm_sink PUBLIC include)
 target_link_libraries(armigo_platform_pcm_sink PUBLIC armigo_audio_renderer
     PRIVATE "${ARMIGO_AUDIOTOOLBOX_FRAMEWORK}")
 if(ARMIGO_IOS)
-    find_library(ARMIGO_AVFAUDIO_FRAMEWORK AVFAudio REQUIRED)
+    armigo_find_framework(ARMIGO_AVFAUDIO_FRAMEWORK AVFAudio)
     target_link_libraries(armigo_platform_pcm_sink PRIVATE "${ARMIGO_AVFAUDIO_FRAMEWORK}")
 endif()
 
@@ -914,6 +938,14 @@ if(BUILD_TESTING)
     add_test(NAME shader_input.extract
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/tools/shader_extract_tests.py"
             "$<TARGET_FILE:armigo-shader-extract>")
+    if(NOT ARMIGO_IOS)
+        add_executable(armigo_player_choices_probe tests/tools/player_choices_probe.cpp)
+        target_link_libraries(armigo_player_choices_probe PRIVATE armigo_runner_shell)
+        add_test(NAME runtime.player_choices
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/tools/player_choices_tests.py"
+                "$<TARGET_FILE:armigo_player_choices_probe>")
+        set_tests_properties(runtime.player_choices PROPERTIES LABELS "runtime;tools" TIMEOUT 30)
+    endif()
     add_test(NAME shader.translate
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/tools/shader_translate_tests.py"
             "$<TARGET_FILE:armigo-shader-translate>")
@@ -1354,13 +1386,13 @@ add_library(armigo_host_input STATIC
 add_library(armigo_platform_display STATIC
     src/platform/display_capabilities.cpp src/platform/${ARMIGO_PLATFORM_DIRECTORY}/display_capabilities.mm)
 target_include_directories(armigo_platform_display PUBLIC include)
-find_library(ARMIGO_COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
+armigo_find_framework(ARMIGO_COREGRAPHICS_FRAMEWORK CoreGraphics)
 target_link_libraries(armigo_platform_display PRIVATE
     "${ARMIGO_UI_FRAMEWORK}" "${ARMIGO_COREGRAPHICS_FRAMEWORK}"
     "${ARMIGO_FOUNDATION_FRAMEWORK}")
 target_include_directories(armigo_host_input PUBLIC include)
-find_library(ARMIGO_GAME_CONTROLLER_FRAMEWORK GameController REQUIRED)
-find_library(ARMIGO_CORE_HAPTICS_FRAMEWORK CoreHaptics REQUIRED)
+armigo_find_framework(ARMIGO_GAME_CONTROLLER_FRAMEWORK GameController)
+armigo_find_framework(ARMIGO_CORE_HAPTICS_FRAMEWORK CoreHaptics)
 target_link_libraries(armigo_host_input PRIVATE
     "${ARMIGO_GAME_CONTROLLER_FRAMEWORK}" "${ARMIGO_CORE_HAPTICS_FRAMEWORK}" "${ARMIGO_FOUNDATION_FRAMEWORK}")
 

@@ -38,6 +38,10 @@ struct BundleSpec {
     // The title in each language that has one: (Horizon language code, title).
     std::vector<std::pair<std::string, std::string>> localized_titles;
     std::uint32_t supported_language_flag = 0;
+    // Zero keeps the player's ordinary display-rate setting. These describe
+    // a macOS title mode whose simulation rate is separate from display cadence.
+    std::uint32_t default_frame_rate = 0;
+    std::uint32_t display_refresh_rate = 0;
 };
 
 [[nodiscard]] std::string info_plist(const BundleSpec& spec);

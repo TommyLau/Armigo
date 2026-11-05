@@ -45,7 +45,11 @@ public:
     // source is destroyed.
     std::shared_ptr<horizon::Event> acquire(std::uint64_t display_id, bool& created);
 
-    std::chrono::nanoseconds interval() const noexcept { return interval_; }
+    // Live host policy: the presentation clock can change its refresh period
+    // after this source is created, for example when the display rate changes.
+    std::chrono::nanoseconds interval() const noexcept {
+        return presentation_clock_ ? presentation_clock_->configuration().refresh_period : interval_;
+    }
     // Once the refresh grid follows the window's display, the grid point
     // nearest `slot`, so a present paced on its own cadence lands on the
     // display's vblanks too; empty otherwise (and always headless).

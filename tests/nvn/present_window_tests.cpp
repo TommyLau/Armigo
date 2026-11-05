@@ -18,9 +18,13 @@
 #include <vector>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <future>
 #include <mutex>
 #include <stdexcept>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 
 using namespace armigo::nvn;
 using namespace std::chrono_literals;
@@ -54,7 +58,11 @@ public:
   std::atomic<std::uint64_t> submitted{0}, completed{0};
   std::atomic<unsigned> waits{0};
   std::atomic<std::uint64_t> scheduling_period{0};
-  void set_scheduling_period(std::uint64_t period_ns) override { scheduling_period = period_ns; }
+  std::atomic<bool> preserve_encode_spin{false};
+  void set_scheduling_period(std::uint64_t period_ns, bool preserve_spin = false) override {
+    scheduling_period = period_ns;
+    preserve_encode_spin = preserve_spin;
+  }
   std::mutex mutex;
   std::condition_variable changed;
   std::uint64_t submit(std::span<const NVNcommandHandle>) override {
@@ -94,9 +102,47 @@ bool wait_for_condition(Predicate predicate,
   }
   return true;
 }
+
+void test_live_refresh_period_queries() {
+  using namespace armigo;
+  auto guest_result = runtime::create_guest_clock();
+  CHECK(std::holds_alternative<std::shared_ptr<runtime::GuestClock>>(guest_result));
+  if (!std::holds_alternative<std::shared_ptr<runtime::GuestClock>>(guest_result)) return;
+  auto guest = std::get<std::shared_ptr<runtime::GuestClock>>(guest_result);
+  runtime::PresentationClockConfiguration configuration;
+  configuration.refresh_period = 16'666'666ns;
+  auto clock_result = runtime::create_presentation_clock(guest, configuration);
+  CHECK(std::holds_alternative<std::shared_ptr<runtime::PresentationClock>>(clock_result));
+  if (!std::holds_alternative<std::shared_ptr<runtime::PresentationClock>>(clock_result)) return;
+  auto clock = std::get<std::shared_ptr<runtime::PresentationClock>>(clock_result);
+  auto source = std::make_shared<services::vi::VsyncSource>(clock);
+  horizon::HandleTable handles(16);
+  services::vi::DisplaySession display(handles);
+  display.set_vsync_source(source);
+  int token;
+  CHECK(display.bind_native_window(&token));
+  auto producer = services::vi::find_native_window(&token);
+  CHECK(producer);
+  if (!producer) return;
+  CHECK(producer->scheduling_period(2) == 33'333'332ns);
+  CHECK(producer->guest_present_period(2) == 33'333'332ns);
+  CHECK(clock->set_refresh_period(33'333'333ns));
+  CHECK(source->interval() == 33'333'333ns);
+  CHECK(producer->scheduling_period(1) == 33'333'333ns);
+  CHECK(producer->scheduling_period(2) == 66'666'666ns);
+  setenv("ARMIGO_VI_PACE", "0", 1);
+  CHECK(producer->scheduling_period(2) == 0ns);
+  CHECK(producer->guest_present_period(1) == 33'333'333ns);
+  CHECK(producer->guest_present_period(2) == 66'666'666ns);
+  CHECK(clock->set_refresh_period(16'666'666ns));
+  CHECK(producer->guest_present_period(2) == 33'333'332ns);
+  unsetenv("ARMIGO_VI_PACE");
+  services::vi::unbind_native_window(&token);
+}
 } // namespace
 
 int main() {
+  test_live_refresh_period_queries();
   select_api_version({55, 15});
   register_present_entries();
   Replay replay;
@@ -115,6 +161,14 @@ int main() {
   std::array<std::int32_t, 4> observed_crop{};
   display.set_presenter(
       [&](const armigo::services::GraphicsPresentation &frame) {
+#if defined(__APPLE__)
+        if (consumed.load() == 0) {
+          qos_class_t qos = QOS_CLASS_UNSPECIFIED;
+          int priority = 0;
+          CHECK(pthread_get_qos_class_np(pthread_self(), &qos, &priority) == 0);
+          CHECK(qos == QOS_CLASS_USER_INTERACTIVE);
+        }
+#endif
         // The frame arrives as a native texture with a lazy readback: an
         // ordinary present hands over the GPU frame without reading it back.
         if (replay.completed < replay.submitted ||
@@ -166,6 +220,8 @@ int main() {
     texture.serial = i + 11;
     texture.description.width = 4;
     texture.description.height = 4;
+    texture.memory = reinterpret_cast<std::uint8_t*>(0x10000 + i * 0x1000);
+    texture.size = 64;
     pointers[i] = &textures[i];
   }
   alignas(8) NVNwindowBuilder builder{};
@@ -178,6 +234,9 @@ int main() {
   call<Entry::nvnWindowBuilderSetTextures>(&builder, 3, pointers);
   call<Entry::nvnWindowBuilderSetPresentInterval>(&builder, 0);
   CHECK(call<Entry::nvnWindowInitialize>(&window, &builder));
+  CHECK(window_texture_overlaps(0x10000, 1));
+  CHECK(window_texture_overlaps(0xffff, 2));
+  CHECK(!window_texture_overlaps(0x10040, 1));
   CHECK(call<Entry::nvnWindowGetNativeWindow>(&window) == &native_token);
   CHECK(call<Entry::nvnWindowGetPresentInterval>(&window) == 0);
   armigo::graphics::set_maximum_presentation_rate(0);
@@ -187,15 +246,30 @@ int main() {
           NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS);
     if (&slot == &slots[0]) {
       CHECK(replay.scheduling_period.load() == 0);
+      CHECK(!replay.preserve_encode_spin.load());
+      // Bypassing host waits must retain the guest's two-refresh deadline.
+      // An explicit maximum-rate hint still takes precedence over that fallback.
+      call<Entry::nvnWindowSetPresentInterval>(&window, 2);
+      setenv("ARMIGO_VI_PACE", "0", 1);
+    } else if (&slot == &slots[1]) {
+      CHECK(replay.scheduling_period.load() == 4'000'000);
+      CHECK(replay.preserve_encode_spin.load());
       armigo::graphics::set_maximum_presentation_rate(1000);
     }
   }
+  unsetenv("ARMIGO_VI_PACE");
+  call<Entry::nvnWindowSetPresentInterval>(&window, 0);
   CHECK(replay.scheduling_period.load() == 1'000'000);
+  CHECK(!replay.preserve_encode_spin.load());
   CHECK(slots[0] != slots[1] && slots[1] != slots[2] && slots[2] != slots[0]);
   CHECK(call<Entry::nvnSyncWait>(&sync, std::uint64_t{0}) ==
         NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED);
   auto producer = armigo::services::vi::find_native_window(&native_token);
   CHECK(producer && !producer->free_event()->is_signaled());
+  CHECK(producer->guest_present_period(0) == 0ns);
+  CHECK(producer->guest_present_period(-1) == 0ns);
+  CHECK(producer->guest_present_period(6) == 0ns);
+  CHECK(producer->guest_present_period(2) == 4ms);
   // A copied object locates host state by serial; guest object address is not
   // identity.
   auto copied = window;
@@ -267,6 +341,7 @@ int main() {
   // Finalize safely cancels producer-owned dequeues, but not consumer-owned
   // work.
   call<Entry::nvnWindowFinalize>(&window);
+  CHECK(!window_texture_overlaps(0x10000, 1));
   CHECK(replay.scheduling_period.load() == 0);
   CHECK(armigo::graphics::presentation_scheduling_period(0ns) == 0ns);
   CHECK(call<Entry::nvnWindowAcquireTexture>(&copied, &sync, &again) ==

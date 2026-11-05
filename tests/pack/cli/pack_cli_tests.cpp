@@ -257,6 +257,16 @@ void test_bundle_and_icon() {
     CHECK(plist.find("<string>26.0</string>") != std::string::npos);
     CHECK(plist.find("NSApplication") != std::string::npos);
     CHECK(plist.find("<string>Armigo</string>") != std::string::npos);
+    CHECK(plist.find("ArmigoTitleFrameRate") == std::string::npos);
+    spec.default_frame_rate = 30;
+    spec.display_refresh_rate = 60;
+    const auto title_rate_plist = pack::info_plist(spec);
+    CHECK(title_rate_plist.find("<key>ArmigoTitleFrameRate</key><dict><key>Default</key><integer>30</integer>") != std::string::npos);
+    CHECK(title_rate_plist.find("<key>DisplayRefresh</key><integer>60</integer>") != std::string::npos);
+    spec.platform = "ios";
+    CHECK(pack::info_plist(spec).find("ArmigoTitleFrameRate") == std::string::npos);
+    spec.platform = "macos";
+    spec.default_frame_rate = spec.display_refresh_rate = 0;
     const std::string json = pack::pack_json(spec);
     CHECK(json.find("\"title_id\"") != std::string::npos);
     CHECK(json.find("\"build_id\"") != std::string::npos);
@@ -434,6 +444,57 @@ void test_ios_paths_and_selection() {
     CHECK(!pack::validate_reused_selection(identity, actual, identity.title_id, identity.build_id, 7, {}).empty());
 }
 
+void test_reused_addon_directories() {
+    const fs::path directory = fs::temp_directory_path() / "armigo_pack_cli_addons";
+    fs::remove_all(directory);
+    const fs::path game = directory / "game";
+    fs::create_directories(game);
+
+    const auto missing = pack::reused_addon_directories(game);
+    CHECK(std::holds_alternative<std::vector<fs::path>>(missing));
+    if (const auto* paths = std::get_if<std::vector<fs::path>>(&missing)) CHECK(paths->empty());
+
+    {
+        std::ofstream file(game / "addons");
+        file << "not-a-directory";
+    }
+    CHECK(std::holds_alternative<std::string>(pack::reused_addon_directories(game)));
+    fs::remove(game / "addons");
+
+    const fs::path addons = game / "addons";
+    fs::create_directories(addons / "0100000000000003");
+    {
+        std::ofstream note(addons / "note.txt");
+        note << "ignored";
+    }
+    const auto present = pack::reused_addon_directories(game);
+    CHECK(std::holds_alternative<std::vector<fs::path>>(present));
+    if (const auto* paths = std::get_if<std::vector<fs::path>>(&present)) {
+        CHECK(paths->size() == 1);
+        CHECK(paths->front().filename() == "0100000000000003");
+    }
+
+    fs::remove_all(addons / "0100000000000003");
+    fs::remove(addons / "note.txt");
+    fs::permissions(addons, fs::perms::none);
+    CHECK(std::holds_alternative<std::string>(pack::reused_addon_directories(game)));
+    fs::permissions(addons, fs::perms::owner_all);
+    fs::remove_all(addons);
+    fs::create_symlink(directory / "missing-addon-target", addons);
+    CHECK(std::holds_alternative<std::string>(pack::reused_addon_directories(game)));
+    fs::remove(addons);
+    const fs::path linked_tree = directory / "linked-addons";
+    fs::create_directories(linked_tree / "0100000000000004");
+    fs::create_directory_symlink(linked_tree, addons);
+    const auto linked = pack::reused_addon_directories(game);
+    CHECK(std::holds_alternative<std::vector<fs::path>>(linked));
+    if (const auto* paths = std::get_if<std::vector<fs::path>>(&linked)) {
+        CHECK(paths->size() == 1);
+        CHECK(paths->front().filename() == "0100000000000004");
+    }
+    fs::remove_all(directory);
+}
+
 void test_ios_reuse() {
     const fs::path directory = fs::temp_directory_path() / "armigo_pack_cli_reuse";
     fs::remove_all(directory);
@@ -508,6 +569,24 @@ void test_firmware_input() {
     fs::remove_all(directory);
 }
 
+void test_embedded_preparer_environment() {
+    const char* inherited = std::getenv("ARMIGO_COMPAT_FRAME_RATE");
+    const bool had_inherited = inherited != nullptr;
+    const std::string saved = inherited ? inherited : "";
+    for (const char* rate : {"60", "120"}) {
+        setenv("ARMIGO_COMPAT_FRAME_RATE", rate, 1);
+        for (const char* phase : {"capture", "verify"}) {
+            CHECK(pack::run_pack_tool({"/usr/bin/python3", "-c",
+                "import os,sys;assert os.environ['ARMIGO_COMPAT_FRAME_RATE']=='0',sys.argv[1]", phase}, true).empty());
+            CHECK(std::string_view(std::getenv("ARMIGO_COMPAT_FRAME_RATE")) == rate);
+        }
+        CHECK(pack::run_pack_tool({"/usr/bin/python3", "-c",
+            "import os,sys;assert os.environ['ARMIGO_COMPAT_FRAME_RATE']==sys.argv[1]", rate}).empty());
+    }
+    if (had_inherited) setenv("ARMIGO_COMPAT_FRAME_RATE", saved.c_str(), 1);
+    else unsetenv("ARMIGO_COMPAT_FRAME_RATE");
+}
+
 void test_git_work_tree() {
     const fs::path directory = fs::temp_directory_path() / "armigo_pack_cli_git";
     fs::remove_all(directory);
@@ -531,8 +610,10 @@ int main() {
     test_build_id();
     test_bundle_and_icon();
     test_ios_paths_and_selection();
+    test_reused_addon_directories();
     test_ios_reuse();
     test_firmware_input();
+    test_embedded_preparer_environment();
     test_git_work_tree();
     if (failures != 0) {
         std::printf("%d checks failed\n", failures);

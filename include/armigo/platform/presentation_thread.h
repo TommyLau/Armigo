@@ -10,8 +10,10 @@
 
 #pragma once
 
+#include <armigo/platform/periodic_thread_limits.h>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <thread>
 
 #if defined(__APPLE__)
@@ -19,6 +21,7 @@
 #include <mach/mach_time.h>
 #include <mach/thread_policy.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #endif
 
 // Scheduling for the thread that paces presentation to the display period.
@@ -28,27 +31,35 @@
 
 namespace armigo::platform {
 
+inline bool declare_interactive_thread() noexcept {
+#if defined(__APPLE__)
+    return pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) == 0;
+#else
+    return false;
+#endif
+}
+
 // Declares the calling thread periodic: it needs up to `computation` of CPU
-// in every `period`. Returns whether the host accepted the declaration; the
-// thread keeps its previous policy otherwise.
+// in every `period`. Returns whether the host accepted the request; the kernel
+// may adjust the computation. The thread keeps its previous policy on failure.
 inline bool declare_periodic_thread(std::chrono::nanoseconds period,
                                     std::chrono::nanoseconds computation) noexcept {
 #if defined(__APPLE__)
     if (period <= std::chrono::nanoseconds::zero()) return false;
     mach_timebase_info_data_t timebase{};
-    if (mach_timebase_info(&timebase) != KERN_SUCCESS || !timebase.numer) return false;
-    const auto ticks = [&](std::chrono::nanoseconds value) {
-        return static_cast<std::uint32_t>(static_cast<std::uint64_t>(value.count()) *
-                                          timebase.denom / timebase.numer);
+    if (mach_timebase_info(&timebase) != KERN_SUCCESS || !timebase.numer || !timebase.denom) return false;
+    const auto ticks = [&](std::chrono::nanoseconds value, std::uint32_t& out) {
+        const auto converted = static_cast<__uint128_t>(value.count()) *
+                               timebase.denom / timebase.numer;
+        if (!converted || converted > std::numeric_limits<std::uint32_t>::max()) return false;
+        out = static_cast<std::uint32_t>(converted);
+        return true;
     };
-    const auto minimum = std::chrono::nanoseconds(1'000'000);
-    const auto maximum = period * 9 / 10;
-    if (computation < minimum) computation = minimum;
-    if (computation > maximum) computation = maximum;
+    computation = bounded_periodic_computation(period, computation);
+    if (computation < minimum_periodic_computation) return false;
     thread_time_constraint_policy_data_t policy{};
-    policy.period = ticks(period);
-    policy.computation = ticks(computation);
-    policy.constraint = ticks(period);
+    if (!ticks(period, policy.period) || !ticks(computation, policy.computation)) return false;
+    policy.constraint = policy.period;
     policy.preemptible = 1;
     return thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
                              reinterpret_cast<thread_policy_t>(&policy),

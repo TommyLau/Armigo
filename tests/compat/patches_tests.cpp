@@ -25,7 +25,7 @@ const char* json = R"({"version":1,"patches":[{
 "title_id":"0x0000000000000123",
 "main_build_id":"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
 "module":"frame-rate","original_callee":"0x80",
-"calls":[{"offset":"0x20","expected_instruction":"0x94000018"}],
+"calls":[{"offset":"0x20","expected_instruction":"0x94000018","note":"Synthetic interval-update hook."}],
 "layout":{"framework_pointer":"0x200","framework_period":"0x10",
 "override_flag":"0x0","ratio":"0x4","interval":"0x8","base_interval":"0xc"}}]})";
 armigo::compat::PatchReadResult parse(const std::string& contents) {
@@ -48,6 +48,9 @@ int main() {
     if (!std::holds_alternative<compat::PatchDescriptions>(read)) return 1;
     const auto patches = std::get<compat::PatchDescriptions>(read);
     const auto& patch = patches.front();
+    CHECK(patch.shader_inputs.containers == compat::ShaderContainerSet::Bnsh);
+    CHECK(patch.shader_inputs.vertex_depth == compat::ShaderVertexDepth::NegativeOneToOne);
+    CHECK(patch.shader_inputs.caches.empty());
     CHECK(compat::match_patch(patches, patch.identity) == &patch);
     auto other = patch.identity;
     ++other.title_id;
@@ -55,6 +58,8 @@ int main() {
     other = patch.identity; other.main_build_id.back() ^= std::byte{1};
     CHECK(compat::match_patch(patches, other) == nullptr);
     CHECK(compat::match_patch({}, patch.identity) == nullptr);
+    CHECK(patch.note.empty());
+    CHECK(patch.calls[0].note == "Synthetic interval-update hook.");
     loader::NsoModuleImage image;
     image.bytes.resize(0x400);
     image.segments[0].image_offset = 0;
@@ -106,17 +111,41 @@ int main() {
         CHECK(std::holds_alternative<std::string>(parse(replace(json, R"("base_interval":"0xc"})",
                                                                 R"("base_interval":"0xc","frame_step":"0x0"})"))));
     }
+    // A call note is required, a string of 1 to 200 characters. The description
+    // note is the same string when present and may be omitted.
+    CHECK(std::holds_alternative<std::string>(parse(replace(json, R"(,"note":"Synthetic interval-update hook.")", ""))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(json, "Synthetic interval-update hook.", ""))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(json, R"("note":"Synthetic interval-update hook.")", R"("note":7)"))));
+    {
+        const std::string longest(200, 'n');
+        const std::string over(201, 'n');
+        const auto accepted = parse(replace(json, "Synthetic interval-update hook.", longest.c_str()));
+        CHECK(std::holds_alternative<compat::PatchDescriptions>(accepted));
+        if (const auto* parsed = std::get_if<compat::PatchDescriptions>(&accepted))
+            CHECK(parsed->front().calls[0].note.size() == 200);
+        CHECK(std::holds_alternative<std::string>(parse(replace(json, "Synthetic interval-update hook.", over.c_str()))));
+        const auto described = parse(replace(json, R"("module":"frame-rate")",
+                                             R"("module":"frame-rate","note":"Synthetic description.")"));
+        CHECK(std::holds_alternative<compat::PatchDescriptions>(described));
+        if (const auto* parsed = std::get_if<compat::PatchDescriptions>(&described))
+            CHECK(parsed->front().note == "Synthetic description.");
+        CHECK(std::holds_alternative<std::string>(parse(replace(json, R"("module":"frame-rate")",
+                                                                R"("module":"frame-rate","note":"")"))));
+        CHECK(std::holds_alternative<std::string>(parse(replace(json, R"("module":"frame-rate")",
+                                                                (R"("module":"frame-rate","note":")" + over + "\"").c_str()))));
+    }
     // Instruction words: parsed with or without a module, validated against
     // executable text and their preimage, never overlapping a call hook.
     const auto words_json = replace(json, R"("override_flag":"0x0","ratio":"0x4","interval":"0x8","base_interval":"0xc"}})",
-        R"("override_flag":"0x0","ratio":"0x4","interval":"0x8","base_interval":"0xc"},"words":[{"offset":"0x40","expected_instruction":"0x32170108","replacement_instruction":"0xd503201f"}]})");
+        R"("override_flag":"0x0","ratio":"0x4","interval":"0x8","base_interval":"0xc"},"words":[{"offset":"0x40","note":"Synthetic word.","expected_instruction":"0x32170108","replacement_instruction":"0xd503201f"}]})");
     auto with_words = parse(words_json);
     CHECK(std::holds_alternative<compat::PatchDescriptions>(with_words));
     if (std::holds_alternative<compat::PatchDescriptions>(with_words)) {
         const auto worded = std::get<compat::PatchDescriptions>(with_words).front();
         CHECK(worded.words.size() == 1 && worded.words[0].offset == 0x40 &&
               worded.words[0].expected_instruction == 0x32170108u &&
-              worded.words[0].replacement_instruction == 0xd503201fu);
+              worded.words[0].replacement_instruction == 0xd503201fu &&
+              worded.words[0].note == "Synthetic word.");
         const std::uint32_t orr = 0x32170108u;
         std::memcpy(image.bytes.data() + 0x40, &orr, 4);
         CHECK(compat::validate_patch(worded, image).empty());
@@ -131,12 +160,95 @@ int main() {
         CHECK(compat::validate_patch(words_only, image).empty());
     }
     CHECK(std::holds_alternative<std::string>(parse(replace(words_json, "replacement_instruction", "replacement"))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(words_json, R"(,"note":"Synthetic word.")", ""))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(words_json, R"("note":"Synthetic word.")", R"("note":"")"))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(words_json, "Synthetic word.", std::string(201, 'w').c_str()))));
     auto driver_only = parse(replace(words_json, R"("replacement_instruction":"0xd503201f")",
                                      R"("replacement_instruction":"0xd503201f","nvn_driver_only":true)"));
     CHECK(std::holds_alternative<compat::PatchDescriptions>(driver_only) &&
           std::get<compat::PatchDescriptions>(driver_only).front().words[0].nvn_driver_only);
     CHECK(std::holds_alternative<std::string>(parse(replace(words_json, R"("replacement_instruction":"0xd503201f")",
                                                             R"("replacement_instruction":"0xd503201f","nvn_driver_only":1)"))));
+    const auto rate_json = replace(words_json, R"("words":[)",
+        R"("frame_rate":{"default":30,"display_refresh_rate":60},"frame_rates":[30,60],"words":[)");
+    const auto conditional_json = replace(rate_json, R"("note":"Synthetic word.")",
+        R"("note":"Synthetic word.","frame_rate":60)");
+    const auto conditional = parse(conditional_json);
+    CHECK(std::holds_alternative<compat::PatchDescriptions>(conditional));
+    if (const auto* descriptions = std::get_if<compat::PatchDescriptions>(&conditional)) {
+        auto chosen = descriptions->front();
+        CHECK(chosen.frame_rate->default_rate == 30 && chosen.frame_rate->display_refresh_rate == 60);
+        CHECK(std::get<std::vector<compat::WordPatch>>(compat::select_patch_words(chosen)).empty());
+        CHECK(std::get<std::vector<compat::WordPatch>>(compat::select_patch_words(chosen, "0")).empty());
+        CHECK(std::get<std::vector<compat::WordPatch>>(compat::select_patch_words(chosen, "30")).empty());
+        CHECK(std::get<std::vector<compat::WordPatch>>(compat::select_patch_words(chosen, "60")).size() == 1);
+        for (const auto* invalid_rate : {"auto", "30.0", "-1", " 60", "60x"})
+            CHECK(std::holds_alternative<std::string>(compat::select_patch_words(chosen, invalid_rate)));
+        CHECK(std::holds_alternative<std::string>(compat::select_patch_words(chosen, "120")));
+        auto common = chosen.words.front(); common.offset += 4; common.frame_rate = 0;
+        chosen.words.push_back(common);
+        CHECK(std::get<std::vector<compat::WordPatch>>(compat::select_patch_words(chosen, "30")).size() == 1);
+        CHECK(std::get<std::vector<compat::WordPatch>>(compat::select_patch_words(chosen, "60")).size() == 2);
+        chosen.frame_rate->default_rate = 60;
+        CHECK(std::get<std::vector<compat::WordPatch>>(compat::select_patch_words(chosen, "0")).size() == 2);
+        // Inactive words still require the original executable preimage.
+        chosen.frame_rate->default_rate = 30;
+        chosen.words.resize(1);
+        auto wrong_image = image;
+        wrong_image.bytes[chosen.words.front().offset] ^= std::byte{1};
+        CHECK(compat::validate_patch(chosen, wrong_image).find("preimage mismatch") != std::string::npos);
+    }
+    CHECK(std::holds_alternative<std::string>(parse(replace(words_json, R"("note":"Synthetic word.")",
+        R"("note":"Synthetic word.","frame_rate":60)"))));
+    for (const auto* invalid_rate : {"0", "120", "true", "30.5", "\"30\""}) {
+        CHECK(std::holds_alternative<std::string>(parse(replace(conditional_json, R"("default":30)",
+            (std::string("\"default\":") + invalid_rate).c_str()))));
+    }
+    for (const auto* invalid_rate : {"0", "90", "true", "30.5", "\"30\""}) {
+        CHECK(std::holds_alternative<std::string>(parse(replace(conditional_json, R"("frame_rate":60)",
+            (std::string("\"frame_rate\":") + invalid_rate).c_str()))));
+    }
+    // Private modes can share an instruction site only when their conditions
+    // are mutually exclusive and they identify the same original instruction.
+    const std::string private_word = R"({"offset":"0x40","note":"Synthetic private mode.",)"
+        R"("expected_instruction":"0x32170108","replacement_instruction":"0xd503203f","frame_rate":120},)";
+    const auto variants_json = replace(replace(conditional_json, R"("frame_rates":[30,60])",
+        R"("frame_rates":[30,60,120])"), R"("words":[)", (R"("words":[)" + private_word).c_str());
+    const auto variants = parse(variants_json);
+    CHECK(std::holds_alternative<compat::PatchDescriptions>(variants));
+    if (const auto* descriptions = std::get_if<compat::PatchDescriptions>(&variants)) {
+        auto modes = descriptions->front();
+        CHECK(compat::validate_patch(modes, image).empty());
+        CHECK(std::get<std::vector<compat::WordPatch>>(compat::select_patch_words(modes, "30")).empty());
+        const auto sixty = std::get<std::vector<compat::WordPatch>>(compat::select_patch_words(modes, "60"));
+        const auto high = std::get<std::vector<compat::WordPatch>>(compat::select_patch_words(modes, "120"));
+        CHECK(sixty.size() == 1 && sixty.front().replacement_instruction == 0xd503201fu);
+        CHECK(high.size() == 1 && high.front().replacement_instruction == 0xd503203fu);
+        auto high_only = modes;
+        high_only.words.resize(1);
+        high_only.frame_rate->supported_rates = {30, 120};
+        CHECK(std::holds_alternative<std::string>(compat::select_patch_words(high_only, "60")));
+        high_only.frame_rate->supported_rates = {30, 60, 120};
+        CHECK(std::holds_alternative<std::string>(compat::select_patch_words(high_only, "60")));
+        high_only.words.front().nvn_driver_only = true;
+        CHECK(std::holds_alternative<std::string>(compat::select_patch_words(high_only, "120", false)));
+        CHECK(std::get<std::vector<compat::WordPatch>>(compat::select_patch_words(high_only, "30", false)).empty());
+        modes.words.front().frame_rate = 60;
+        CHECK(!compat::validate_patch(modes, image).empty());
+        CHECK(std::holds_alternative<std::string>(compat::select_patch_words(modes, "60")));
+    }
+    CHECK(std::holds_alternative<std::string>(parse(replace(variants_json, R"("frame_rate":120)", R"("frame_rate":60)"))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(variants_json, R"(,"frame_rate":120)", ""))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(variants_json,
+        R"("expected_instruction":"0x32170108")", R"("expected_instruction":"0xd503201f")"))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(rate_json, "display_refresh_rate", "refresh"))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(rate_json, R"(,"frame_rates":[30,60])", ""))));
+    for (const char* supported : {"[]", "[60]", "[30,30]", "[30,90]", "[30,true]"})
+        CHECK(std::holds_alternative<std::string>(parse(replace(rate_json, "[30,60]", supported))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(variants_json, "[30,60,120]", "[30,60]"))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(rate_json,
+        R"("display_refresh_rate":60)", R"("display_refresh_rate":120)"))));
+    CHECK(std::get<std::vector<compat::WordPatch>>(compat::select_patch_words(patch, "unrelated")).empty());
     // Resolution sites: the swapchain size takes one pair or a list of pairs,
     // one per copy of its initializer.
     const std::string resolution = R"(,"resolution":{"tv_size":TV,"screen_widths":["0x60","0x64"],)"
@@ -159,6 +271,42 @@ int main() {
           std::get<compat::PatchDescriptions>(copies).front().resolution->tv_size == two);
     CHECK(std::holds_alternative<std::string>(with_resolution("[]")));
     CHECK(std::holds_alternative<std::string>(with_resolution(R"([["0x50"]])")));
+    const char* shader_json = R"({"version":1,"patches":[{
+"title_id":"0x0000000000000123",
+"main_build_id":"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+"shader_inputs":{"containers":"gfd-cache","vertex_depth":"zero-to-one",
+"caches":["BASE/ONE.GSC","BASE/TWO.GSC"],
+"fallbacks":[{"cache":"BASE/TWO.GSC","alternatives":["BASE/ALT.GSC"]}],
+"ignored_needle_offsets":["0x10"]}}]})";
+    auto shader_read = parse(shader_json);
+    CHECK(std::holds_alternative<compat::PatchDescriptions>(shader_read));
+    if (const auto* parsed = std::get_if<compat::PatchDescriptions>(&shader_read)) {
+        const auto& selected = parsed->front().shader_inputs;
+        CHECK(selected.containers == compat::ShaderContainerSet::GfdCache);
+        CHECK(selected.vertex_depth == compat::ShaderVertexDepth::ZeroToOne);
+        CHECK(selected.caches.size() == 2 && selected.caches[1] == "BASE/TWO.GSC");
+        CHECK(selected.fallbacks.size() == 1 && selected.fallbacks[0].cache == "BASE/TWO.GSC" &&
+              selected.fallbacks[0].alternatives.size() == 1 &&
+              selected.fallbacks[0].alternatives[0] == "BASE/ALT.GSC");
+        CHECK(selected.ignored_needle_offsets.size() == 1 && selected.ignored_needle_offsets[0] == 0x10);
+    }
+    const auto shader_of = [](const char* body) {
+        return parse(std::string(R"({"version":1,"patches":[{
+"title_id":"0x0000000000000123",
+"main_build_id":"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+"shader_inputs":)") + body + "}]}");
+    };
+    CHECK(std::holds_alternative<compat::PatchDescriptions>(shader_of(
+        R"({"containers":"bnsh","vertex_depth":"minus-one-to-one"})")));
+    CHECK(std::holds_alternative<std::string>(shader_of(R"({"containers":"bnsh"})")));
+    CHECK(std::holds_alternative<std::string>(shader_of(
+        R"({"containers":"other","vertex_depth":"zero-to-one"})")));
+    CHECK(std::holds_alternative<std::string>(shader_of(
+        R"({"containers":"bnsh","vertex_depth":"minus-one-to-one","caches":["BASE/ONE.GSC"]})")));
+    CHECK(std::holds_alternative<std::string>(shader_of(
+        R"({"containers":"gfd-cache","vertex_depth":"zero-to-one","caches":["BASE/ONE.GSC"],"fallbacks":[{"cache":"BASE/MISSING.GSC","alternatives":["BASE/ALT.GSC"]}]})")));
+    CHECK(std::holds_alternative<std::string>(shader_of(
+        R"({"containers":"gfd-cache","vertex_depth":"zero-to-one","extra":true})")));
     std::puts(failures ? "Compatibility patch tests failed." : "Compatibility patch tests passed.");
     return failures ? 1 : 0;
 }

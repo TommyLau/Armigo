@@ -530,6 +530,8 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
         std::string title_pso_manifest;
         bool title_startup_user = false;
         bool title_matched = false;
+        const compat::PatchDescription* rate_patch = nullptr;
+        std::string requested_title_rate;
         if (const auto main = position_of("main"); main && !patches.empty()) {
             const auto& source = images[*main];
             if (const auto* patch = compat::match_patch(patches, {profile.title_id, source.build_id})) {
@@ -539,7 +541,19 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
                 title_startup_user = patch->startup_user;
                 if (auto error = compat::validate_patch(*patch, source); !error.empty())
                     return fail(LaunchError::artifact_mismatch, "compatibility-preflight", std::move(error));
-                auto words = patch->words;
+                // Embedded capture records the profile's default independently of
+                // a developer's launch environment. Restoring another mode must
+                // still satisfy the captured preparation fingerprint.
+                const char* requested_rate = native_options.embedded_preparation && !native_options.artifacts
+                    ? nullptr : std::getenv("ARMIGO_COMPAT_FRAME_RATE");
+                if (patch->frame_rate) {
+                    rate_patch = patch;
+                    requested_title_rate = requested_rate ? requested_rate : "";
+                }
+                auto selected = compat::select_patch_words(*patch, requested_rate ? requested_rate : "");
+                if (const auto* failure = std::get_if<std::string>(&selected))
+                    return fail(LaunchError::invalid_input, "compatibility-frame-rate", *failure);
+                auto words = std::get<std::vector<compat::WordPatch>>(std::move(selected));
                 std::vector<compat::WordPatch> launch_words;
                 if (patch->resolution) {
                     namespace title = titles::title_01007ef00011e000;
@@ -643,6 +657,11 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
             }
         }
         // Words meant for the NVN driver apply only when it replaces the game's own.
+        if (rate_patch) {
+            auto effective = compat::select_patch_words(*rate_patch, requested_title_rate, loading.nvn_module.has_value());
+            if (const auto* failure = std::get_if<std::string>(&effective))
+                return fail(LaunchError::invalid_input, "compatibility-frame-rate", *failure);
+        }
         if (!loading.nvn_module)
             std::erase_if(loading.words, [](const compat::WordPatch& word) { return word.nvn_driver_only; });
         if (loading.words.empty()) loading.word_module.reset();

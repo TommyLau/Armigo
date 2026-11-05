@@ -275,6 +275,13 @@ public:
         return interval > 0 ? source_->interval() * interval : std::chrono::nanoseconds::zero();
     }
 
+    std::chrono::nanoseconds guest_present_period(int requested) const override {
+        // Native windows accept zero (immediate) or one through five refreshes.
+        // Use the explicit cadence, not wall time that can include GPU stalls.
+        return requested > 0 && requested <= 5
+            ? source_->interval() * requested : std::chrono::nanoseconds::zero();
+    }
+
     GraphicsPresentationResult present(
         std::int32_t requested_slot, std::uint64_t fence,
         std::function<bool(std::uint64_t)> wait_fence,
@@ -420,6 +427,9 @@ public:
         const std::lock_guard thread_lock(thread_mutex_);
         if (present_thread_.joinable()) return;
         present_thread_ = std::jthread([this](std::stop_token stop) {
+            if (!platform::declare_interactive_thread())
+                armigo::diag::write(armigo::diag::Level::error,
+                    "Armigo vi: presentation QoS declaration failed; retaining inherited policy\n");
             for (;;) {
                 PendingPresent item;
                 {

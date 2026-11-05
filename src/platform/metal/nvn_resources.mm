@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -445,7 +446,43 @@ struct Resources::Impl {
     std::uint64_t begin = 0, end = 0, serial = 0;
   };
   std::vector<TextureRange> texture_ranges;
+  // Keep a conservative union for the backend lifetime: recorded descriptors
+  // and window exports can outlive a texture registration. Report probes must
+  // not scan every texture and descriptor after each registration generation.
+  std::map<std::uint64_t, std::uint64_t> report_texture_ranges;
+  bool report_texture_range_unknown = false;
+  void note_report_texture_range_locked(const nvn::TextureState& state) {
+    auto begin = reinterpret_cast<std::uint64_t>(state.memory);
+    if (!begin || !state.size) return;
+    if (state.size > UINT64_MAX - begin) {
+      report_texture_range_unknown = true;
+      return;
+    }
+    auto end = begin + state.size;
+    auto next = report_texture_ranges.lower_bound(begin);
+    if (next != report_texture_ranges.end() && next->first == begin && next->second >= end) return;
+    if (next != report_texture_ranges.begin()) {
+      auto previous = std::prev(next);
+      if (previous->second >= begin) {
+        if (previous->second >= end) return;
+        begin = previous->first;
+        next = report_texture_ranges.erase(previous);
+      }
+    }
+    while (next != report_texture_ranges.end() && next->first <= end) {
+      end = std::max(end, next->second);
+      next = report_texture_ranges.erase(next);
+    }
+    try {
+      report_texture_ranges.emplace(begin, end);
+    } catch (...) {
+      // A failed merge must never turn an excluded range into a fast-path hit.
+      report_texture_range_unknown = true;
+      throw;
+    }
+  }
   void note_texture_range_locked(const nvn::TextureState &state) {
+    note_report_texture_range_locked(state);
     const auto begin = reinterpret_cast<std::uint64_t>(state.memory);
     if (begin && state.size)
       texture_ranges.push_back({begin, begin + state.size, state.serial});
@@ -826,6 +863,8 @@ struct Resources::Impl {
     stamp.rare = slot.rare;
     stamp.serial = slot.descriptor.texture.serial;
     stamp.serial_stamp = slot.serial_stamp;
+    stamp.backing_begin = reinterpret_cast<std::uint64_t>(slot.descriptor.texture.memory);
+    stamp.backing_size = slot.descriptor.texture.size;
     stamp.valid = stamp.slot != 0 && slot.sampled;
   }
   std::unordered_map<std::int32_t, Sampler> samplers;
@@ -2462,6 +2501,15 @@ std::uint64_t Resources::registration_generation() const {
           ((std::uint64_t{1} << descriptor_bits) - 1));
 }
 
+bool Resources::overlaps_texture_backing(std::uint64_t address, std::uint64_t size) const {
+  if (!size || size > UINT64_MAX - address) return true;
+  const auto end = address + size;
+  std::lock_guard lock(impl_->mutex);
+  if (!impl_->find_pool(address, end) || impl_->report_texture_range_unknown) return true;
+  const auto after = impl_->report_texture_ranges.lower_bound(end);
+  return after != impl_->report_texture_ranges.begin() && std::prev(after)->second > address;
+}
+
 Resources::BufferSpan Resources::buffer_at(std::uint64_t gpu_address,
                                            std::uint64_t size) {
   if (!size || gpu_address > UINT64_MAX - size) return {nil, 0};
@@ -3318,6 +3366,7 @@ void Resources::register_texture_descriptor(std::int32_t id,
   slot = {};
   slot.registered = true;
   slot.descriptor = descriptor;
+  impl_->note_report_texture_range_locked(texture);
   impl_->texture_versions.bump(id);
 }
 

@@ -85,6 +85,8 @@ void test_resolution_and_choices() {
 
     unsetenv("ARMIGO_COMPAT_RESOLUTION_WIDTH");
     unsetenv("ARMIGO_COMPAT_RESOLUTION_RATE");
+    unsetenv("ARMIGO_COMPAT_FRAME_RATE");
+    unsetenv("ARMIGO_VI_REFRESH_HZ");
     armigo::tools::PlayerChoices choices;
     CHECK(!choices.handheld && choices.resolution == "auto" && choices.frame_rate == 60 && choices.vsync &&
           !choices.performance_overlay);
@@ -94,6 +96,7 @@ void test_resolution_and_choices() {
     choices.performance_overlay = true;
     armigo::tools::RunnerArguments arguments;
     armigo::tools::apply_player_choices(choices, 1920, arguments);
+    CHECK(!arguments.input_script_file);
     CHECK(arguments.operation_mode == armigo::services::OperationMode::Handheld);
     CHECK(arguments.content_width == 1920 && !arguments.display_sync);
     unsetenv("MTL_HUD_ENABLED");
@@ -104,6 +107,23 @@ void test_resolution_and_choices() {
     unsetenv("MTL_HUD_ENABLED");
     CHECK(std::string_view(std::getenv("ARMIGO_COMPAT_RESOLUTION_WIDTH")) == "1920");
     CHECK(std::string_view(std::getenv("ARMIGO_COMPAT_RESOLUTION_RATE")) == "30");
+    CHECK(std::string_view(std::getenv("ARMIGO_VI_REFRESH_HZ")) == "30");
+    CHECK(!std::getenv("ARMIGO_COMPAT_FRAME_RATE"));
+    choices.title_frame_rate = true;
+    choices.display_refresh_rate = 60;
+    choices.frame_rate = 0;
+    unsetenv("ARMIGO_VI_REFRESH_HZ");
+    armigo::tools::apply_player_choices(choices, 1920, arguments);
+    CHECK(std::string_view(std::getenv("ARMIGO_COMPAT_FRAME_RATE")) == "0");
+    CHECK(std::string_view(std::getenv("ARMIGO_VI_REFRESH_HZ")) == "60");
+    choices.frame_rate = 60;
+    armigo::tools::apply_player_choices(choices, 1920, arguments);
+    CHECK(std::string_view(std::getenv("ARMIGO_COMPAT_FRAME_RATE")) == "0");
+    unsetenv("ARMIGO_COMPAT_FRAME_RATE");
+    armigo::tools::apply_player_choices(choices, 1920, arguments);
+    CHECK(std::string_view(std::getenv("ARMIGO_COMPAT_FRAME_RATE")) == "60");
+    unsetenv("ARMIGO_COMPAT_FRAME_RATE");
+    unsetenv("ARMIGO_VI_REFRESH_HZ");
     // A width the environment already chose wins.
     armigo::tools::apply_player_choices(choices, 2560, arguments);
     CHECK(std::string_view(std::getenv("ARMIGO_COMPAT_RESOLUTION_WIDTH")) == "1920");

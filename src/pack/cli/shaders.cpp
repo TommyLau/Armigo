@@ -16,6 +16,7 @@
 #include <armigo/shader/package.h>
 #include <armigo/shader_input/archive.h>
 #include <armigo/shader_input/container.h>
+#include <armigo/shader_input/gfd_cache.h>
 #include <armigo/shader_input/shader_input.h>
 #include <armigo/shader_translation/stage_translation.h>
 #include "sha256.h"
@@ -71,6 +72,16 @@ bool starts_with(Bytes input, std::string_view magic) {
            std::memcmp(input.data(), magic.data(), magic.size()) == 0;
 }
 
+bool ends_with_ignore_case(std::string_view text, std::string_view suffix) {
+    if (text.size() < suffix.size()) return false;
+    for (std::size_t index = 0; index < suffix.size(); ++index) {
+        const auto left = static_cast<unsigned char>(text[text.size() - suffix.size() + index]);
+        const auto right = static_cast<unsigned char>(suffix[index]);
+        if (std::tolower(left) != std::tolower(right)) return false;
+    }
+    return true;
+}
+
 si::ByteSpan view_of(Bytes input) {
     return {reinterpret_cast<const std::uint8_t*>(input.data()), input.size()};
 }
@@ -121,6 +132,7 @@ struct Enumerator {
     std::size_t unique = 0;
     std::size_t unsupported = 0;
     std::size_t structural_errors = 0;
+    bool strict_stages = false;
     std::atomic<std::size_t> scanned_bytes{0};
     std::vector<std::string> errors;
     std::string hard;
@@ -154,16 +166,17 @@ struct Enumerator {
         return unique;
     }
 
-    void record(const si::ContainerStage& stage) {
-        const auto kind = stage.shader.stage;
-        const auto control = bytes_of(stage.shader.control);
-        const auto code = bytes_of(stage.shader.code);
+    void record(si::Stage kind, Bytes control, Bytes code) {
         const auto key = kind == si::Stage::Vertex || kind == si::Stage::Fragment || kind == si::Stage::Compute
             ? hex_digest(control) + "-" + hex_digest(code)
             : std::string{};
         const std::lock_guard lock(mutex);
         if (kind != si::Stage::Vertex && kind != si::Stage::Fragment && kind != si::Stage::Compute) {
-            ++unsupported;
+            if (strict_stages) {
+                if (hard.empty()) hard = "A shader stage is not vertex, fragment, or compute.";
+            } else {
+                ++unsupported;
+            }
             return;
         }
         if (!seen.insert(key).second) {
@@ -174,6 +187,10 @@ struct Enumerator {
         write_bytes(directory / "control.bin", control);
         write_bytes(directory / "code.bin", code);
         ++unique;
+    }
+
+    void record(const si::ContainerStage& stage) {
+        record(stage.shader.stage, bytes_of(stage.shader.control), bytes_of(stage.shader.code));
     }
 };
 
@@ -446,18 +463,138 @@ void enumerate_tree(const fs::path& root, Enumerator& enumerator) {
     for (unsigned index = 0; index < created; ++index) pthread_join(threads[index], nullptr);
 }
 
+void collect_cpk_archives(const fs::path& root, std::vector<fs::path>& archives, Enumerator& enumerator) {
+    std::error_code error;
+    if (!fs::is_directory(root, error)) {
+        enumerator.fail("Missing extracted directory " + root.string());
+        return;
+    }
+    for (const auto& entry : fs::recursive_directory_iterator(root, error)) {
+        if (error) {
+            enumerator.fail("Cannot list " + root.string());
+            return;
+        }
+        std::error_code link;
+        if (entry.is_symlink(link) || !entry.is_regular_file(link)) continue;
+        if (ends_with_ignore_case(entry.path().filename().string(), ".cpk")) {
+            archives.push_back(entry.path());
+        }
+    }
+    if (error) enumerator.fail("Cannot list " + root.string());
+}
+
+void enumerate_gfd(const fs::path& exefs, const fs::path& romfs, const std::vector<fs::path>& addons,
+                   const ShaderPackInput& input, Enumerator& enumerator) {
+    std::vector<fs::path> archives;
+    collect_cpk_archives(romfs, archives, enumerator);
+    for (const auto& addon : addons) {
+        if (enumerator.stopped()) return;
+        collect_cpk_archives(addon, archives, enumerator);
+    }
+    if (enumerator.stopped()) return;
+    std::sort(archives.begin(), archives.end());
+    struct CacheMember {
+        fs::path archive;
+        si::CpkMember member;
+    };
+    std::vector<CacheMember> members;
+    std::set<std::string> names;
+    for (const auto& archive : archives) {
+        auto listing = si::list_cpk(archive);
+        if (const auto* failure = std::get_if<si::GfdCacheError>(&listing)) {
+            enumerator.fail(failure->message);
+            return;
+        }
+        for (auto& member : std::get<si::CpkListing>(listing).members) {
+            if (!ends_with_ignore_case(member.name, ".gsc")) continue;
+            if (!names.insert(member.name).second) {
+                enumerator.fail("Shader cache " + member.name + " is listed more than once.");
+                return;
+            }
+            members.push_back(CacheMember{archive, std::move(member)});
+        }
+    }
+    std::vector<std::string> present;
+    present.reserve(members.size());
+    for (const auto& item : members) present.push_back(item.member.name);
+    const auto missing = si::missing_shader_caches(present, input.caches, input.fallbacks);
+    if (!missing.empty()) {
+        enumerator.fail("Required shader cache is missing: " + missing.front());
+        return;
+    }
+    for (const auto& item : members) {
+        if (enumerator.stopped()) return;
+        armigo::diag::write(armigo::diag::Level::info, "Shader cache %s\n", item.member.name.c_str());
+        std::fflush(stderr);
+        auto bytes = si::read_cpk_member(item.archive, item.member);
+        if (const auto* failure = std::get_if<si::GfdCacheError>(&bytes)) {
+            enumerator.fail(failure->message);
+            return;
+        }
+        const auto& decoded = std::get<std::vector<std::byte>>(bytes);
+        auto stages = si::parse_gsc(decoded, item.member.name);
+        if (const auto* failure = std::get_if<si::GfdCacheError>(&stages)) {
+            enumerator.fail(failure->message);
+            return;
+        }
+        for (const auto& stage : std::get<std::vector<si::OwnedShaderStage>>(stages)) {
+            enumerator.record(stage.stage, stage.control, stage.code);
+        }
+    }
+    if (enumerator.stopped()) return;
+    std::error_code error;
+    const fs::path main_file = fs::is_regular_file(exefs / "main", error) ? exefs / "main" : exefs / "main.nso";
+    if (!fs::is_regular_file(main_file, error)) {
+        enumerator.fail("The main module is missing from the extracted ExeFS.");
+        return;
+    }
+    const auto size = fs::file_size(main_file, error);
+    if (error || size > kMemoryLimit) {
+        enumerator.fail(main_file.string() + " exceeds the in-memory limit.");
+        return;
+    }
+    const auto data = read_file(main_file, size);
+    if (!starts_with(data, "NSO0")) {
+        enumerator.fail(main_file.string() + " is not an NSO module.");
+        return;
+    }
+    const auto module = armigo::loader::read_nso_module(data);
+    if (!module.ok()) {
+        enumerator.fail(main_file.string() + ": " + armigo::loader::to_string(module.error.code));
+        return;
+    }
+    const auto packages = si::scan_hhneedle(module.image->bytes, main_file.filename().string(),
+                                            input.ignored_needle_offsets);
+    if (!packages.rejected.empty()) {
+        enumerator.fail(packages.rejected.front());
+        return;
+    }
+    if (!packages.uncovered_controls.empty()) {
+        enumerator.fail("Shader control at main image offset " +
+                        std::to_string(packages.uncovered_controls.front()) +
+                        " is not part of a packaged stage.");
+        return;
+    }
+    armigo::diag::write(armigo::diag::Level::info, "Shader packages in main: %zu stages\n", packages.stages.size());
+    std::fflush(stderr);
+    for (const auto& stage : packages.stages) {
+        enumerator.record(stage.stage, stage.control, stage.code);
+    }
+}
+
 std::uint32_t word_at(std::span<const std::byte> bytes, std::size_t offset) {
     std::uint32_t value = 0;
     std::memcpy(&value, bytes.data() + offset, sizeof value);
     return value;
 }
 
-tr::StageOptions stage_options(si::Stage stage, std::span<const std::byte> control) {
+tr::StageOptions stage_options(si::Stage stage, std::span<const std::byte> control,
+                               gm::VertexDepthConvention vertex_depth) {
     tr::StageOptions options;
     options.texture_handle_cbuf = 2;
     options.texture_descriptors_derived = true;
     if (stage == si::Stage::Vertex) {
-        options.emission.vertex_depth = gm::VertexDepthConvention::NegativeOneToOne;
+        options.emission.vertex_depth = vertex_depth;
     } else if (stage == si::Stage::Compute) {
         constexpr std::size_t kLocal = 0x748;
         constexpr std::size_t kShared = 0x754;
@@ -475,8 +612,8 @@ tr::StageOptions stage_options(si::Stage stage, std::span<const std::byte> contr
 }
 
 tr::TranslatedStage translate_with_retry(std::span<const std::byte> control, std::span<const std::byte> code,
-                                        si::Stage stage) {
-    auto options = stage_options(stage, control);
+                                        si::Stage stage, gm::VertexDepthConvention vertex_depth) {
+    auto options = stage_options(stage, control, vertex_depth);
     try {
         return tr::translate_stage(control, code, options);
     } catch (const std::exception& first) {
@@ -492,7 +629,7 @@ tr::TranslatedStage translate_with_retry(std::span<const std::byte> control, std
     }
 }
 
-bool translate_directory(const fs::path& directory, std::string& error) {
+bool translate_directory(const fs::path& directory, gm::VertexDepthConvention vertex_depth, std::string& error) {
     try {
         const auto control_size = fs::file_size(directory / "control.bin");
         const auto code_size = fs::file_size(directory / "code.bin");
@@ -505,7 +642,7 @@ bool translate_directory(const fs::path& directory, std::string& error) {
             return false;
         }
         const auto stage = std::get<si::ParsedShader>(parsed).stage;
-        const auto translated = translate_with_retry(control, code, stage);
+        const auto translated = translate_with_retry(control, code, stage, vertex_depth);
         const auto source = std::as_bytes(std::span<const char>(translated.source.data(), translated.source.size()));
         const auto reflection = std::as_bytes(
             std::span<const char>(translated.reflection.data(), translated.reflection.size()));
@@ -530,6 +667,7 @@ struct TranslateQueue {
     std::atomic<std::size_t> failed{0};
     std::mutex mutex;
     std::vector<std::string> errors;
+    gm::VertexDepthConvention vertex_depth = gm::VertexDepthConvention::NegativeOneToOne;
 };
 
 void* translate_worker(void* raw) {
@@ -540,7 +678,7 @@ void* translate_worker(void* raw) {
             return nullptr;
         }
         std::string error;
-        if (!translate_directory(queue.stages[index], error)) {
+        if (!translate_directory(queue.stages[index], queue.vertex_depth, error)) {
             queue.failed.fetch_add(1);
             const std::lock_guard lock(queue.mutex);
             if (queue.errors.size() < kMaxErrors) {
@@ -567,7 +705,8 @@ unsigned worker_count(unsigned maximum) {
 
 std::variant<std::string, ShaderReport> build_shader_package_impl(
     const fs::path& exefs, const fs::path& romfs, const std::vector<fs::path>& addons, const fs::path& staging,
-    const fs::path& package, const fs::path& compile_cache, const fs::path& translate_tool) {
+    const fs::path& package, const fs::path& compile_cache, const fs::path& translate_tool,
+    const ShaderPackInput& input) {
     std::error_code error;
     if (!fs::is_regular_file(translate_tool, error)) {
         return "The shader translator is missing next to the packer.";
@@ -581,15 +720,20 @@ std::variant<std::string, ShaderReport> build_shader_package_impl(
     fs::remove_all(package, error);
     Enumerator enumerator;
     enumerator.stages = staging / "stages";
-    enumerate_tree(exefs, enumerator);
-    if (!enumerator.stopped()) {
-        enumerate_tree(romfs, enumerator);
-    }
-    for (const auto& addon : addons) {
-        if (enumerator.stopped()) {
-            break;
+    if (input.containers == ShaderPackInput::Containers::GfdCache) {
+        enumerator.strict_stages = true;
+        enumerate_gfd(exefs, romfs, addons, input, enumerator);
+    } else {
+        enumerate_tree(exefs, enumerator);
+        if (!enumerator.stopped()) {
+            enumerate_tree(romfs, enumerator);
         }
-        enumerate_tree(addon, enumerator);
+        for (const auto& addon : addons) {
+            if (enumerator.stopped()) {
+                break;
+            }
+            enumerate_tree(addon, enumerator);
+        }
     }
     if (enumerator.stopped()) {
         return enumerator.hard_error();
@@ -604,6 +748,9 @@ std::variant<std::string, ShaderReport> build_shader_package_impl(
         return std::string("No shader stages were found in the extracted game.");
     }
     TranslateQueue queue;
+    queue.vertex_depth = input.vertex_depth == ShaderPackInput::VertexDepth::ZeroToOne
+        ? gm::VertexDepthConvention::ZeroToOne
+        : gm::VertexDepthConvention::NegativeOneToOne;
     for (const auto& entry : fs::directory_iterator(enumerator.stages)) {
         if (entry.is_directory()) {
             queue.stages.push_back(entry.path());
@@ -638,6 +785,9 @@ std::variant<std::string, ShaderReport> build_shader_package_impl(
     if (translated == 0) {
         return std::string("No shader stages were translated.");
     }
+    if (input.containers == ShaderPackInput::Containers::GfdCache && queue.failed.load() != 0) {
+        return queue.errors.empty() ? std::string("A shader stage did not translate.") : queue.errors.front();
+    }
     armigo::shader::package::BuildOptions options;
     for (const auto& entry : fs::directory_iterator(enumerator.stages)) {
         if (entry.is_directory() && fs::is_regular_file(entry.path() / "reflection.json")) {
@@ -666,9 +816,11 @@ std::variant<std::string, ShaderReport> build_shader_package_impl(
 
 std::variant<std::string, ShaderReport> build_shader_package(
     const fs::path& exefs, const fs::path& romfs, const std::vector<fs::path>& addons, const fs::path& staging,
-    const fs::path& package, const fs::path& compile_cache, const fs::path& translate_tool) {
+    const fs::path& package, const fs::path& compile_cache, const fs::path& translate_tool,
+    const ShaderPackInput& input) {
     try {
-        return build_shader_package_impl(exefs, romfs, addons, staging, package, compile_cache, translate_tool);
+        return build_shader_package_impl(exefs, romfs, addons, staging, package, compile_cache, translate_tool,
+                                         input);
     } catch (const std::bad_alloc&) {
         return std::string("Host memory for shader packing could not be allocated.");
     } catch (const std::exception& failure) {

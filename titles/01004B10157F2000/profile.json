@@ -6,7 +6,158 @@
       "main_build_id": "d4b150b29a931cd381e2a30318fc299f2b0ee36d000000000000000000000000",
       "nvn_driver": true,
       "startup_user": true,
-      "pipelines": "pipelines.tsv"
+      "pipelines": "pipelines.tsv",
+      "frame_rate": {
+        "default": 30,
+        "display_refresh_rate": 60
+      },
+      "words": [
+        {
+          "offset": "0xfd1d10",
+          "expected_instruction": "0x1a880120",
+          "replacement_instruction": "0x52800780",
+          "note": "Select nominal 60 Hz through the existing initialization setter when the player chooses the 60 fps mode.",
+          "frame_rate": 60
+        },
+        {
+          "offset": "0x8991c4",
+          "expected_instruction": "0x79dbf500",
+          "replacement_instruction": "0x52800780",
+          "note": "Keep the selected nominal 60 Hz rate when the game reads its saved frame-rate setting.",
+          "frame_rate": 60
+        },
+        {
+          "offset": "0xce5788",
+          "expected_instruction": "0x2a0303f4",
+          "replacement_instruction": "0x4b0343f4",
+          "note": "Stores the observed scene delay as negative fractional 30 Hz units; zero still selects the original immediate path.",
+          "frame_rate": 60
+        },
+        {
+          "offset": "0xce56c0",
+          "expected_instruction": "0x7100013f",
+          "replacement_instruction": "0x36f80109",
+          "note": "A nonnegative fractional scene counter has expired; testing its sign also recognizes exact zero without a separate compare.",
+          "frame_rate": 60
+        },
+        {
+          "offset": "0xce56c4",
+          "expected_instruction": "0x540000ed",
+          "replacement_instruction": "0x52a93e08",
+          "note": "Loads the exact scale 30 times 2^16 for the scene countdown, making fractional updates independent of rendering frequency.",
+          "frame_rate": 60
+        },
+        {
+          "offset": "0xce56c8",
+          "expected_instruction": "0x51000528",
+          "replacement_instruction": "0x1e270101",
+          "note": "Transfers the exact fixed-point time scale to a caller-saved floating-point register.",
+          "frame_rate": 60
+        },
+        {
+          "offset": "0xce56cc",
+          "expected_instruction": "0xb9000e68",
+          "replacement_instruction": "0x1e210800",
+          "note": "Uses the game's simulation delta, already capped at 50 ms per callback; hitches keep that cap rather than catching up full wall time.",
+          "frame_rate": 60
+        },
+        {
+          "offset": "0xce56d0",
+          "expected_instruction": "0xf9400bf3",
+          "replacement_instruction": "0x1e280008",
+          "note": "Rounds fractional units up. Non-steady or non-standard cadence may shift expiry by at most one callback; steady 30 Hz keeps the original count.",
+          "frame_rate": 60
+        },
+        {
+          "offset": "0xce56d4",
+          "expected_instruction": "0xaa1f03e0",
+          "replacement_instruction": "0x0b080128",
+          "note": "Advances the negative scene counter toward zero by elapsed simulation time instead of one whole frame per callback.",
+          "frame_rate": 60
+        },
+        {
+          "offset": "0xce56d8",
+          "expected_instruction": "0xa8c27bfd",
+          "replacement_instruction": "0xb9000e68",
+          "note": "Stores the fractional scene counter in its existing word; the allocation and other state fields are unchanged.",
+          "frame_rate": 60
+        },
+        {
+          "offset": "0xce56dc",
+          "expected_instruction": "0xd65f03c0",
+          "replacement_instruction": "0x17fffff4",
+          "note": "Returns through the existing shared epilogue. Expiry is checked on the next callback, retaining frequency-dependent callback latency.",
+          "frame_rate": 60
+        },
+        {
+          "offset": "0xccb53c",
+          "expected_instruction": "0x940aa0fd",
+          "replacement_instruction": "0x528003c0",
+          "note": "Use original 30 Hz duration units for the standard fade coefficient; preserve the existing zero-duration path.",
+          "frame_rate": 60
+        },
+        {
+          "offset": "0xccb8d8",
+          "expected_instruction": "0x940aa016",
+          "replacement_instruction": "0x528003c0",
+          "note": "Use original 30 Hz duration units when the standard opposite-direction fade is initialized; animation durations retain their existing seconds conversion.",
+          "frame_rate": 60
+        },
+        {
+          "offset": "0xccb6c8",
+          "expected_instruction": "0x1e201900",
+          "replacement_instruction": "0x1e204100",
+          "note": "Advance fades with capped elapsed time. Hitch progress differs from frame counting; very large unsigned durations can stall float progress.",
+          "frame_rate": 60
+        },
+        {
+          "offset": "0xccba10",
+          "expected_instruction": "0x1e201900",
+          "replacement_instruction": "0x1e204100",
+          "note": "Advance the opposite-direction standard fade by capped elapsed time; preserve alpha clamping and completion handling.",
+          "frame_rate": 60
+        },
+        {
+          "offset": "0x7ac9bc",
+          "expected_instruction": "0xb8607900",
+          "replacement_instruction": "0x52800780",
+          "frame_rate": 60,
+          "note": "Keep the selected 60 Hz mode when an individual frame-rate option is applied."
+        },
+        {
+          "offset": "0x7aca2c",
+          "expected_instruction": "0xb8697900",
+          "replacement_instruction": "0x52800780",
+          "frame_rate": 60,
+          "note": "Keep the selected 60 Hz mode when a graphics preset applies its frame-rate table entry."
+        }
+      ],
+      "frame_rates": [
+        30,
+        60
+      ],
+      "shader_inputs": {
+        "containers": "gfd-cache",
+        "vertex_depth": "zero-to-one",
+        "caches": [
+          "BASE/GFDNXHHPRESET_INIT.GSC",
+          "BASE/GFDNXHHPRESET1.GSC",
+          "BASE/GFDNXHHPRESET2.GSC",
+          "BASE/GFDNXHHPRESET3.GSC",
+          "BASE/GFDNXHHPRESET4.GSC",
+          "BASE/GFDNXHHPRESET5.GSC",
+          "BASE/GFDNXHHPRESET6.GSC",
+          "BASE/GFDNXHHPRESET7.GSC",
+          "BASE/GFDNXHHPRESET8.GSC"
+        ],
+        "fallbacks": [
+          {
+            "cache": "BASE/GFDNXHHPRESET1.GSC",
+            "alternatives": ["BASE/GFDNXHHPRESET.GSC", "BASE/GFDNXHH.GSC"]
+          }
+        ],
+        "ignored_needle_offsets": ["0x16a9b44"]
+      }
     }
   ]
 }

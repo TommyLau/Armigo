@@ -24,6 +24,7 @@
 
 #include "../../nvn/commands.h"
 #include "../../nvn/programs.h"
+#include "../../nvn/present.h"
 #include <armigo/nvn/driver.h>
 #include <armigo/nvn/timeline.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -145,6 +146,8 @@ void periodic_graphics_tick(std::uint64_t period_ns, ReplayThread thread,
         warned = true;
     } else if (result == platform::PeriodicThreadBudget::Result::applied) {
         warned = false;
+        timeline_event("thread_requested_period", static_cast<std::uint64_t>(thread), budget.period().count());
+        timeline_event("thread_requested_budget", static_cast<std::uint64_t>(thread), budget.computation().count());
     }
 }
 
@@ -153,7 +156,9 @@ constexpr std::size_t buffer_slots = 16;
 constexpr std::size_t texture_slots = 128;
 constexpr std::size_t sampler_slots = 128;
 constexpr std::size_t image_slots = 32;
-constexpr std::size_t submission_slots = 3;
+// Several queue submissions can belong to one frame. Keep room for the next
+// frame to encode while earlier submissions still own their GPU storage.
+constexpr std::size_t submission_slots = 6;
 // Pipelines a capturing session writes to one archive file before it starts
 // another (see ReplayImpl::capture).
 constexpr std::uint64_t archive_chunk_pipelines = 4096;
@@ -568,6 +573,7 @@ struct ReplayState {
     // the latest stamp or binding record (0 before any).
     std::uint64_t sampler_registrations = 0;
     std::array<NVNbufferRange, buffer_slots> vertex_buffers{};
+    BoundBuffer index_buffer{};
     std::array<VertexAttributeStateBits, buffer_slots> attributes{};
     std::array<VertexStreamStateBits, buffer_slots> streams{};
     std::array<BlendStateBits, 8> blend{};
@@ -675,12 +681,12 @@ vertex void armigo_nvn_render_predicate_vertex(device const PredicateJob& job [[
 enum class PassBreak : std::uint8_t {
     render_targets, transfer, clear, dispatch, barrier, wait_sync, fence_sync, counter, depth_needed,
     storage_after_depth_barrier, color_alias, depth_sampled, sample_locations, downsample, discard, skip,
-    cpu_drain, finish, predicate, count
+    cpu_drain, finish, predicate, buffer_writes, count
 };
 constexpr const char* pass_break_names[] = {
     "render_targets", "transfer", "clear", "dispatch", "barrier", "wait_sync", "fence_sync", "counter",
     "depth_needed", "storage_after_depth_barrier", "color_alias", "depth_sampled", "sample_locations",
-    "downsample", "discard", "skip", "cpu_drain", "finish", "predicate"};
+    "downsample", "discard", "skip", "cpu_drain", "finish", "predicate", "buffer_writes"};
 static_assert(std::size(pass_break_names) == std::size_t(PassBreak::count));
 
 bool pass_reasons_enabled() {
@@ -689,6 +695,39 @@ bool pass_reasons_enabled() {
         return value && *value == '1';
     }();
     return enabled;
+}
+
+// Bound verbose command-order diagnostics by replay time and submission count.
+// Submission fences are not presents: consumers must align them with the timeline.
+std::uint64_t trace_pass_submission() {
+    struct Configuration {
+        bool enabled = false;
+        std::uint64_t start = 0, delay = 0, remaining = 0, sequence = 0;
+        Configuration() {
+            const char* flag = std::getenv("ARMIGO_NVN_PASS_TRACE");
+            enabled = flag && *flag == '1';
+            if (!enabled) return;
+            const auto number = [](const char* name, std::uint64_t fallback) {
+                const char* value = std::getenv(name);
+                std::uint64_t result = fallback;
+                if (value) {
+                    const auto parsed = std::from_chars(value, value + std::strlen(value), result);
+                    if (parsed.ec != std::errc{} || *parsed.ptr) result = fallback;
+                }
+                return result;
+            };
+            start = timeline_now_ns();
+            delay = std::min(number("ARMIGO_NVN_PASS_TRACE_DELAY_SECONDS", 0), std::uint64_t{86400}) * 1'000'000'000;
+            remaining = number("ARMIGO_NVN_PASS_TRACE_SUBMISSIONS", 600);
+        }
+    };
+    static Configuration config;
+    if (!config.enabled) return 0;
+    static std::mutex mutex;
+    const std::lock_guard lock(mutex);
+    if (!config.remaining || timeline_now_ns() - config.start < config.delay) return 0;
+    --config.remaining;
+    return ++config.sequence;
 }
 
 struct PassBreakCounts {
@@ -823,6 +862,8 @@ struct CompletionEffect {
     enum class Kind { accumulate, reset, report, signal } kind = Kind::accumulate;
     std::size_t visibility_begin = 0, visibility_end = 0;
     BufferSpan destination{};
+    // The retained shared buffer keeps this CPU mapping stable through retirement.
+    std::byte* destination_cpu = nullptr;
     id<MTL4CounterHeap> timestamp = nil;
     std::uint64_t cpu_before = 0, gpu_before = 0;
     std::size_t timestamp_index = 0;
@@ -910,6 +951,7 @@ class EncodeThread;
 
 struct PendingSubmission : std::enable_shared_from_this<PendingSubmission> {
     std::uint64_t scheduling_period_ns = 0;
+    bool preserve_encode_spin = false;
     // Set when the encode thread replays this submission's Metal encoding;
     // commands is then nil on the worker.
     EncodeThread* encode_thread = nullptr;
@@ -945,6 +987,7 @@ struct PendingSubmission : std::enable_shared_from_this<PendingSubmission> {
         std::uint64_t metal_binds = 0, pipeline_hashes = 0, pipeline_hits = 0;
         std::uint64_t binds_vertex = 0, binds_buffer = 0, binds_texture = 0, binds_sampler = 0;
         std::uint64_t window_uploads = 0, window_reuses = 0;
+        std::uint64_t report_fast = 0, report_ordered = 0;
         std::uint64_t arg_table_rebuilds = 0, uniform_updates = 0;
         std::uint64_t fill_calls = 0, fill_bytes = 0, version_creations = 0;
         // Stage argument encodes and reuses, and what invalidated the stages:
@@ -1099,6 +1142,7 @@ private:
     static constexpr std::uint64_t spin_unpaced_ns = 500'000;
     static constexpr std::uint64_t spin_paced_min_period_ns = 8'000'000;
     std::uint64_t spin_ns_ = spin_unpaced_ns;
+    bool spin_reported_ = false;
     // The last pipeline record named a pipeline that failed to compile.
     bool skip_draws_ = false;
     bool skip_dispatches_ = false;
@@ -1289,6 +1333,7 @@ struct Encoder {
     struct DeferredClear {
         graphics::ClearPlan plan;
         id<MTLTexture> texture;
+        std::uint64_t backing_begin = 0, backing_size = 0;
     };
     std::vector<DeferredClear> deferred_clears;
     bool flush_clears(std::size_t count = std::numeric_limits<std::size_t>::max());
@@ -1537,6 +1582,9 @@ struct Encoder {
     Encoder(ReplayImpl& owner, PendingSubmission& submission, const ReplayState& initial)
         : backend(owner), pending(submission), queue(submission.encode_thread), state(initial) {
         dirty.arguments.fill(true);
+        trace_submission_id = trace_pass_submission();
+        if (trace_submission_id) timeline_event("pass_trace_submission", pending.fence, trace_submission_id);
+        trace_pass_event("submission", "begin");
     }
 
     // Metal calls on the submission's command buffer and its open encoder:
@@ -1592,6 +1640,15 @@ struct Encoder {
     bool visit_command(const CommandRecordView& record);
     bool fail(ReplayErrorCode code, std::string detail);
     Op current_op_ = Op::end;
+    std::uint64_t trace_submission_id = 0;
+    std::uint64_t trace_encoder_sequence = 0, trace_active_encoder = 0;
+    std::uint64_t trace_conditional = 0;
+    std::size_t finalized_visibility = 0;
+    std::size_t pass_buffer_writes_begin = 0;
+    bool pass_storage_writes = false;
+    void trace_pass_event(const char* event, const char* reason,
+                          std::uint64_t a = 0, std::uint64_t b = 0,
+                          std::uint64_t c = 0, std::uint64_t d = 0) const;
     bool close_render(PassBreak why, bool keep_clears = false);
     bool close_transfer();
     bool barrier(PassBreak why);
@@ -1654,10 +1711,11 @@ struct Encoder {
     std::uint64_t uniform_address(const BoundBuffer& binding, std::uint64_t gpu,
                                   std::uint64_t extent);
     void overlay_uniform(std::uint64_t address, std::byte* bytes, std::size_t size) const;
-    bool enqueue_counter(const ReportCounter& command, const BufferSpan& destination);
+    bool enqueue_counter(const ReportCounter& command, const BufferSpan& destination, std::byte* destination_cpu);
     bool order_completion_read(const BufferSpan& span, std::uint64_t size);
     bool order_completion_read(id<MTLBuffer> __unsafe_unretained buffer, std::uint64_t offset,
-                               const std::byte* cpu, std::uint64_t size);
+                               const std::byte* cpu, std::uint64_t size,
+                               const char* wait_tag = nullptr, bool* ordered = nullptr);
     // Resolved sampled textures are owned by this walk. Rebinding an unchanged
     // ID avoids the resource-table lock; a registration of that ID or a change
     // to its texture's entry (its stamp) or tracked writes force resolution
@@ -1670,6 +1728,14 @@ struct Encoder {
         id<MTLTexture> texture = nil;
     };
     std::array<ResolvedTexture, 256> resolved_textures;
+    struct ReportPage {
+        std::uint64_t page = UINT64_MAX, generation = 0;
+        bool aliases = true;
+    };
+    std::array<ReportPage, 64> report_pages{};
+    bool report_destination_isolated(std::uint64_t address, std::uint64_t size);
+    bool order_texture_backing(std::uint64_t begin, std::uint64_t size, bool& ordered);
+    id<MTLTexture> texture_for_use(const TextureState& state, const TextureViewState* view);
     id<MTLTexture> sampled_texture(std::int32_t texture_id);
     BufferSpan buffer_at(std::uint64_t address, std::uint64_t size);
     BufferAddress buffer_address(std::uint64_t address, std::uint64_t size);
@@ -1689,7 +1755,6 @@ struct Encoder {
     // 3 + n the NVN uniform buffer slot n.
     BoundBuffer hardware_buffer(std::size_t stage, std::uint32_t slot) const;
     std::array<std::byte, 0xa00> driver_constants(std::size_t stage, std::uint32_t slot) const;
-    bool graphics_writes_buffers() const;
     bool draw(const Draw& draw);
     // Records visited so far, and whether the look-ahead already ran for this
     // submission.
@@ -1728,6 +1793,14 @@ struct Encoder {
 id<MTL4RenderCommandEncoder> Encoder::begin_render(MTL4RenderPassDescriptor* pass,
                                                    id<MTL4ArgumentTable> vertex,
                                                    id<MTL4ArgumentTable> fragment) {
+    pass_buffer_writes_begin = other_buffer_writes.size();
+    pass_storage_writes = false;
+    if (trace_submission_id) {
+        trace_active_encoder = ++trace_encoder_sequence;
+        trace_pass_event("begin", current_op_ == Op::downsample ? "resolve" : "draw",
+                         pass.colorAttachments[0].texture.width, pass.colorAttachments[0].texture.height,
+                         pass.depthAttachment.texture != nil, pass.stencilAttachment.texture != nil);
+    }
     if (queue) {
         // The worker keeps changing its descriptor after the pass begins.
         queue->put(EncodeOp::render_begin, 0,
@@ -2781,12 +2854,20 @@ public:
                          static_cast<unsigned long long>(count), where);
     }
 
-    void set_scheduling_period(std::uint64_t period_ns) override {
-        scheduling_period_ns_.store(period_ns, std::memory_order_relaxed);
+    void set_scheduling_period(std::uint64_t period_ns, bool preserve_encode_spin) override {
+        const std::lock_guard lock(mutex_);
+        scheduling_period_ns_ = period_ns;
+        preserve_encode_spin_ = preserve_encode_spin;
     }
 
     void update_encode_budget(std::uint64_t period_ns) {
         periodic_graphics_tick(period_ns, ReplayThread::encode, scheduling_);
+    }
+
+    void observe_encode_spin(const PendingSubmission& pending, std::uint64_t spin_ns) {
+        if (scheduling_.observe_encode_spin)
+            scheduling_.observe_encode_spin(scheduling_.context, pending.fence,
+                                            pending.scheduling_period_ns, spin_ns);
     }
 
     // The guest thread that acquires window textures paces the frame: it gets
@@ -2803,10 +2884,11 @@ public:
         if (enabled && period_ns) periodic_graphics_tick(period_ns, ReplayThread::guest_present, scheduling_);
     }
 
-    void finish_frame(std::uint64_t period_ns) override {
+    void finish_frame(std::uint64_t period_ns, bool preserve_encode_spin) override {
         std::lock_guard lock(mutex_);
-        scheduling_period_ns_.store(period_ns, std::memory_order_relaxed);
-        queued_.push_back({0, {}, period_ns, true});
+        scheduling_period_ns_ = period_ns;
+        preserve_encode_spin_ = preserve_encode_spin;
+        queued_.push_back({0, {}, period_ns, preserve_encode_spin, true});
         queued_ready_.notify_one();
     }
 
@@ -2825,7 +2907,7 @@ public:
         std::lock_guard lock(mutex_);
         const auto fence = next_fence_++;
         fence_commands(*captured, fence);
-        queued_.push_back({fence, std::move(captured), scheduling_period_ns_.load(std::memory_order_relaxed)});
+        queued_.push_back({fence, std::move(captured), scheduling_period_ns_, preserve_encode_spin_});
         queued_ready_.notify_one();
         submit_cpu_ns_ += thread_cpu_ns() - cpu_start;
         timeline_event("submit", fence, timeline_now_ns() - timeline_begin);
@@ -2856,7 +2938,8 @@ public:
             // submission, even though the worker thread itself is long-lived.
             const auto cpu_start = thread_cpu_ns();
             @autoreleasepool {
-                encode(item.fence, std::move(item.captured), item.scheduling_period_ns);
+                encode(item.fence, std::move(item.captured), item.scheduling_period_ns,
+                       item.preserve_encode_spin);
             }
             // Draining the submission's autoreleased objects is part of the
             // replay's per-frame cost and happens outside encode().
@@ -2921,7 +3004,7 @@ public:
         const auto& phases = entry.pending->phases;
         const auto& pending = *entry.pending;
         armigo::diag::frame(
-                     "nvn_work frame=%llu draws=%llu passes=%llu overlay_calls=%llu "
+                     "nvn_work frame=%llu draws=%llu passes=%llu report_fast=%llu report_ordered=%llu overlay_calls=%llu "
                      "buffer_barriers=%llu overlay_bytes=%llu metal_binds=%llu binds_vertex=%llu binds_buffer=%llu binds_texture=%llu binds_sampler=%llu window_uploads=%llu window_reuses=%llu pipeline_hashes=%llu "
                      "pipeline_hits=%llu uniform_updates=%llu fills=%llu fill_bytes=%llu "
                      "versions=%llu walk_us=%llu prep_us=%llu fin_us=%llu commit_us=%llu pool_us=%llu "
@@ -2929,6 +3012,8 @@ public:
                      static_cast<unsigned long long>(fence),
                      static_cast<unsigned long long>(c.draws),
                      static_cast<unsigned long long>(c.passes),
+                     static_cast<unsigned long long>(c.report_fast),
+                     static_cast<unsigned long long>(c.report_ordered),
                      static_cast<unsigned long long>(c.overlay_calls),
                      static_cast<unsigned long long>(c.buffer_barriers),
                      static_cast<unsigned long long>(c.overlay_bytes),
@@ -3016,7 +3101,7 @@ public:
     }
 
     void encode(std::uint64_t fence, std::shared_ptr<const CommandSubmission> captured,
-                std::uint64_t scheduling_period_ns) {
+                std::uint64_t scheduling_period_ns, bool preserve_encode_spin) {
         const auto phase_start = timeline_now_ns();
         // The worker owns encoding. Only a full ring waits, and no encoder or
         // publication lock is held while GPU completion makes a slot available.
@@ -3038,6 +3123,7 @@ public:
         auto pending = std::make_shared<PendingSubmission>();
         pending->fence = fence;
         pending->scheduling_period_ns = scheduling_period_ns;
+        pending->preserve_encode_spin = preserve_encode_spin;
         pending->encode_begin_ns = phase_start;
         pending->captured = std::move(captured);
         auto& slot = submission_storage_[(fence - 1) % submission_slots];
@@ -3127,8 +3213,7 @@ public:
         pending->other_buffer_writes = std::move(encoder.other_buffer_writes);
         for (const auto& effect : pending->effects) {
             if (effect.kind == CompletionEffect::Kind::report) {
-                const auto begin = reinterpret_cast<std::uintptr_t>(effect.destination.buffer.contents) +
-                    effect.destination.offset;
+                const auto begin = reinterpret_cast<std::uintptr_t>(effect.destination_cpu);
                 pending->completion_writes.emplace_back(begin, begin + sizeof(NVNcounterData));
             } else if (effect.kind == CompletionEffect::Kind::signal) {
                 const auto begin = reinterpret_cast<std::uintptr_t>(effect.event);
@@ -3687,8 +3772,7 @@ public:
             NVNcounterData value{};
             value.timestamp = (ns / 625) * 384 + (ns % 625) * 384 / 625;
             value.counter = effect.samples ? samples_counter_ : 0;
-            std::memcpy(static_cast<std::byte*>(effect.destination.buffer.contents) +
-                            effect.destination.offset, &value, sizeof value);
+            std::memcpy(effect.destination_cpu, &value, sizeof value);
         }
         pending.effects.clear();
     }
@@ -3809,9 +3893,12 @@ private:
         std::uint64_t fence = 0;
         std::shared_ptr<const CommandSubmission> captured;
         std::uint64_t scheduling_period_ns = 0;
+        bool preserve_encode_spin = false;
         bool frame_boundary = false;
     };
-    std::atomic<std::uint64_t> scheduling_period_ns_{0};
+    // The queue mutex keeps both hint fields coherent when a submission captures them.
+    std::uint64_t scheduling_period_ns_ = 0;
+    bool preserve_encode_spin_ = false;
     std::deque<QueuedSubmission> queued_;
     std::condition_variable queued_ready_;
     bool stopping_ = false;
@@ -3920,7 +4007,14 @@ bool EncodeThread::exec(const EncodeRing::Header& header, const void* payload) {
                 record_value<std::shared_ptr<PendingSubmission>*>(payload));
             owned_ = std::move(*owner);
             owner_ = owned_.get();
-            spin_ns_ = owner_->scheduling_period_ns >= spin_paced_min_period_ns ? 0 : spin_unpaced_ns;
+            const auto spin = !owner_->preserve_encode_spin &&
+                owner_->scheduling_period_ns >= spin_paced_min_period_ns ? 0 : spin_unpaced_ns;
+            if (!spin_reported_ || spin != spin_ns_) {
+                timeline_event("encode_spin_budget", owner_->fence, spin);
+                spin_reported_ = true;
+            }
+            spin_ns_ = spin;
+            backend_.observe_encode_spin(*owner_, spin_ns_);
         }
         commands_ = [backend_.device() newCommandBuffer];
         if (!commands_) {
@@ -4739,6 +4833,13 @@ bool Encoder::encode_planned_clear(const graphics::ClearPlan& plan, ClearBinding
     id<MTLDevice> device = backend.device();
     // A block captures a reference as a reference: the plan goes by value.
     const graphics::ClearPlan planned = plan;
+    // Separate clear passes bypass close_render. Capture the command identity
+    // by value because the encode worker can execute this call after traversal.
+    const std::uint64_t trace_clear = trace_submission_id ? ++trace_encoder_sequence : 0;
+    const std::uint64_t trace_submission = trace_submission_id;
+    const std::uint64_t trace_fence = pending.fence;
+    const std::size_t trace_index = records_seen;
+    const unsigned trace_op = unsigned(current_op_);
     return encode_call(^(EncodeCallContext& context) {
         auto into = bindings;
         into.into = context.commands;
@@ -4758,6 +4859,16 @@ bool Encoder::encode_planned_clear(const graphics::ClearPlan& plan, ClearBinding
             return;
         }
         const auto& encoded = std::get<EncodedClear>(result);
+        if (trace_clear) {
+            const char* reason = planned.fold_into_load || planned.fold_layers_into_load
+                ? "clear_load" : "clear_draw";
+            for (const char* event : {"begin", "end"})
+                armigo::diag::opt_in(
+                    "nvn_encoder_trace trace=%llu fence=%llu index=%zu op=%u encoder=%llu event=%s reason=%s\n",
+                    static_cast<unsigned long long>(trace_submission),
+                    static_cast<unsigned long long>(trace_fence), trace_index, trace_op,
+                    static_cast<unsigned long long>(trace_clear), event, reason);
+        }
         if (encoded.retained) [context.retained addObjectsFromArray:encoded.retained];
     }, ReplayErrorCode::unsupported);
 }
@@ -4812,8 +4923,29 @@ bool Encoder::apply_clears(MTL4RenderPassDescriptor* pass) {
     return true;
 }
 
+void Encoder::trace_pass_event(const char* event, const char* reason,
+                               std::uint64_t a, std::uint64_t b,
+                               std::uint64_t c, std::uint64_t d) const {
+    if (!trace_submission_id) return;
+    // Report values: address, effect index, first slot, end slot. Predicate
+    // reads: operand index, first slot, end slot, address. Slots are half-open;
+    // finalized names the end of the prefix already closed into earlier passes.
+    armigo::diag::opt_in(
+        "nvn_encoder_trace trace=%llu fence=%llu index=%zu op=%u encoder=%llu event=%s reason=%s conditional=%llu "
+        "open=%u predicate=%u visibility=%zu finalized=%zu reset=%zu a=%llu b=%llu c=%llu d=%llu\n",
+        static_cast<unsigned long long>(trace_submission_id),
+        static_cast<unsigned long long>(pending.fence), records_seen, unsigned(current_op_),
+        static_cast<unsigned long long>(trace_active_encoder), event, reason,
+        static_cast<unsigned long long>(trace_conditional), unsigned(render != nil), unsigned(predicate_open()),
+        visibility_cursor, finalized_visibility, reset_slot,
+        static_cast<unsigned long long>(a), static_cast<unsigned long long>(b),
+        static_cast<unsigned long long>(c), static_cast<unsigned long long>(d));
+}
+
 bool Encoder::close_render(PassBreak why, bool keep_clears) {
     if (render) {
+        trace_pass_event("end", pass_break_names[std::size_t(why)]);
+        finalized_visibility = visibility_cursor;
         note_pass_break(why);
         // Why a pass ended is what decides whether two passes with the same
         // attachments could have been one encoder.
@@ -4892,12 +5024,18 @@ void Encoder::note_shader_writes(std::size_t stage) {
 }
 
 bool Encoder::order_buffer_writes() {
-    if (buffer_write_order.consume() && render) {
+    const auto writer = buffer_write_order.consume();
+    if (writer == DrawWriteOrder::Writer::none || !render) return true;
+    // A render encoder's barrier can wait only for vertex-stage work: a
+    // fragment of an earlier draw may still run after later draws' work in
+    // the same pass. Fragment-stage (or other) buffer writes end the pass, and
+    // the next encoder's queue barrier orders all of its stages after them.
+    if (writer == DrawWriteOrder::Writer::vertex) {
         ++pending.counters.buffer_barriers;
-        encoder_barrier(render, MTLStageVertex | MTLStageFragment,
-                        MTLStageVertex | MTLStageFragment);
+        encoder_barrier(render, MTLStageVertex, MTLStageVertex | MTLStageFragment);
+        return true;
     }
-    return true;
+    return close_render(PassBreak::buffer_writes);
 }
 
 bool Encoder::restart_segment() {
@@ -4954,7 +5092,7 @@ bool Encoder::synchronize_gpu_commit() {
         backend.accumulate_samples(pending.visibility, counter_begin, visibility_cursor);
         counter_begin = visibility_cursor;
     }
-    buffer_write_order.pending = false;
+    buffer_write_order.clear();
     return restart_segment();
 }
 
@@ -4999,18 +5137,83 @@ bool Encoder::sync_draw_resources() {
     return dirty.sync_resources(registration, writes);
 }
 
+bool Encoder::report_destination_isolated(std::uint64_t address, std::uint64_t size) {
+    if (!size || size > UINT64_MAX - address) return false;
+    const auto end = address + size;
+    const auto overlaps = [&](std::uint64_t begin, std::uint64_t length) {
+        return begin && length && (length > UINT64_MAX - begin || (address < begin + length && begin < end));
+    };
+    for (const auto& buffer : state.vertex_buffers)
+        if (overlaps(buffer.address, buffer.size)) return false;
+    if (overlaps(state.index_buffer.address, state.index_buffer.size)) return false;
+    for (const auto& stage : state.uniform)
+        for (const auto& buffer : stage)
+            if (overlaps(buffer.address, buffer.size)) return false;
+    for (const auto& stage : state.storage)
+        for (const auto& buffer : stage)
+            if (overlaps(buffer.address, buffer.size)) return false;
+    for (const auto* target : state.targets.color)
+        if (target && overlaps(reinterpret_cast<std::uint64_t>(target->memory), target->size)) return false;
+    if (state.targets.depth && overlaps(reinterpret_cast<std::uint64_t>(state.targets.depth->memory),
+                                       state.targets.depth->size)) return false;
+    for (const auto& clear : deferred_clears)
+        if (overlaps(clear.backing_begin, clear.backing_size)) return false;
+    for (auto word = address & ~std::uint64_t{3}; word < end;) {
+        if (uniform_words.contains(word)) return false;
+        if (word > UINT64_MAX - 4) break;
+        word += 4;
+    }
+    // A negative result for the whole page is reusable until registrations
+    // change. Unknown or boundary-spanning storage keeps the ordered path.
+    const auto page = address >> 12;
+    if (((end - 1) >> 12) != page) return false;
+    const auto generation = backend.resources().registration_generation();
+    auto& cached = report_pages[page & (report_pages.size() - 1)];
+    if (cached.page != page || cached.generation != generation) {
+        cached = {page, generation, backend.resources().overlaps_texture_backing(page << 12, 4096)};
+    }
+    return !cached.aliases && !nvn::window_texture_overlaps(address, size);
+}
+
+bool Encoder::order_texture_backing(std::uint64_t begin, std::uint64_t size, bool& ordered) {
+    if (!begin || !size) return true;
+    if (size > UINT64_MAX - begin)
+        return fail(ReplayErrorCode::missing_resource, "texture backing range overflows");
+    return order_completion_read(nil, 0, reinterpret_cast<const std::byte*>(begin),
+                                 size, "texture_report_wait", &ordered);
+}
+
+id<MTLTexture> Encoder::texture_for_use(const TextureState& state, const TextureViewState* view) {
+    bool ordered = false;
+    if (!order_texture_backing(reinterpret_cast<std::uint64_t>(state.memory), state.size, ordered))
+        return nil;
+    return backend.resources().texture(state, view);
+}
+
 id<MTLTexture> Encoder::sampled_texture(std::int32_t texture_id) {
     auto& resources = backend.resources();
-    const auto writes = memory::WriteTracker::now();
+    auto writes = memory::WriteTracker::now();
     auto& cached = resolved_textures[static_cast<std::uint32_t>(texture_id) &
                                      (resolved_textures.size() - 1)];
     if (cached.texture_id == texture_id && cached.writes == writes && cached.texture &&
         (cached.stamp.valid ? resources.texture_stamp_current(texture_id, cached.stamp)
-                            : cached.registration == resources.registration_generation()))
-        return cached.texture;
+                            : cached.registration == resources.registration_generation())) {
+        bool ordered = false;
+        if (!order_texture_backing(cached.stamp.backing_begin, cached.stamp.backing_size, ordered)) return nil;
+        if (!ordered) return cached.texture;
+        // Publication can change separately backed texels without changing the
+        // native descriptor. Resolve again so its upload sees the new bytes.
+        writes = memory::WriteTracker::now();
+    }
     const auto registration = resources.registration_generation();
     ReplayResources::DescriptorStamp stamp;
     id<MTLTexture> texture = resources.texture_for_id_stamped(texture_id, stamp);
+    bool ordered = false;
+    if (texture && !order_texture_backing(stamp.backing_begin, stamp.backing_size, ordered)) return nil;
+    if (ordered) {
+        writes = memory::WriteTracker::now();
+        texture = resources.texture_for_id_stamped(texture_id, stamp);
+    }
     // Stamps precede resolution: a concurrent change must invalidate this
     // result on its next use, even if the lookup itself observed the change.
     if (texture) cached = {texture_id, registration, writes, stamp, texture};
@@ -5036,8 +5239,16 @@ bool Encoder::order_completion_read(const BufferSpan& span, std::uint64_t size) 
 }
 
 bool Encoder::order_completion_read(id<MTLBuffer> __unsafe_unretained buffer, std::uint64_t offset,
-                                    const std::byte* cpu, std::uint64_t size) {
+                                    const std::byte* cpu, std::uint64_t size,
+                                    const char* wait_tag, bool* ordered) {
     const auto begin = reinterpret_cast<std::uintptr_t>(cpu);
+    const auto drain = [&] {
+        if (ordered) *ordered = true;
+        const auto start = wait_tag ? timeline_now_ns() : 0;
+        const bool result = synchronize_gpu();
+        if (wait_tag) timeline_event(wait_tag, pending.fence, timeline_now_ns() - start);
+        return result;
+    };
     // Every binding reads through here: a read outside the spans the
     // completion effects write returns without scanning them.
     if (pending.effects.size() < effect_span.counted) effect_span = {};
@@ -5045,7 +5256,7 @@ bool Encoder::order_completion_read(id<MTLBuffer> __unsafe_unretained buffer, st
         const auto& effect = pending.effects[effect_span.counted];
         std::uintptr_t low = 0, high = 0;
         if (effect.kind == CompletionEffect::Kind::report) {
-            low = reinterpret_cast<std::uintptr_t>(effect.destination.buffer.contents) + effect.destination.offset;
+            low = reinterpret_cast<std::uintptr_t>(effect.destination_cpu);
             high = low + sizeof(NVNcounterData);
         } else if (effect.kind == CompletionEffect::Kind::signal) {
             low = reinterpret_cast<std::uintptr_t>(effect.event);
@@ -5062,31 +5273,41 @@ bool Encoder::order_completion_read(id<MTLBuffer> __unsafe_unretained buffer, st
         if (cpu && (begin + size <= previous->completion_low || previous->completion_high <= begin)) continue;
         for (const auto& [write_begin, write_end] : previous->completion_writes)
             if (begin < write_end && write_begin < begin + size) {
+                if (ordered) *ordered = true;
+                const auto start = wait_tag ? timeline_now_ns() : 0;
                 backend.wait_fence(previous->fence, UINT64_MAX);
+                if (wait_tag) timeline_event(wait_tag, pending.fence, timeline_now_ns() - start);
                 retired_fence = backend.completed_fence();
                 break;
             }
     }
     if (outside_pending) return true;
     for (const auto& effect : pending.effects) {
-        if (effect.kind == CompletionEffect::Kind::report &&
-            effect.destination.buffer == buffer &&
-            offset < effect.destination.offset + sizeof(NVNcounterData) &&
-            effect.destination.offset < offset + size) return synchronize_gpu();
+        if (effect.kind == CompletionEffect::Kind::report) {
+            const auto address = reinterpret_cast<std::uintptr_t>(effect.destination_cpu);
+            const bool overlap = cpu
+                ? begin < address + sizeof(NVNcounterData) && address < begin + size
+                : effect.destination.buffer == buffer &&
+                    offset < effect.destination.offset + sizeof(NVNcounterData) &&
+                    effect.destination.offset < offset + size;
+            if (overlap) return drain();
+        }
         if (effect.kind == CompletionEffect::Kind::signal && cpu) {
             const auto address = reinterpret_cast<std::uintptr_t>(effect.event);
             if (begin < address + sizeof(std::uint32_t) && address < begin + size)
-                return synchronize_gpu();
+                return drain();
         }
     }
     return true;
 }
 
-bool Encoder::enqueue_counter(const ReportCounter& command, const BufferSpan& destination) {
+bool Encoder::enqueue_counter(const ReportCounter& command, const BufferSpan& destination,
+                              std::byte* destination_cpu) {
     if (!flush_uniforms()) return false;
     CompletionEffect effect{};
     effect.kind = CompletionEffect::Kind::report;
     effect.destination = destination;
+    effect.destination_cpu = destination_cpu;
     effect.samples = command.type == NVN_COUNTER_TYPE_SAMPLES_PASSED;
     if (state.samples_active) {
         effect.visibility_begin = counter_begin;
@@ -5117,6 +5338,10 @@ bool Encoder::enqueue_counter(const ReportCounter& command, const BufferSpan& de
         gpu_counters.push_back({pending.effects.size(), std::uint32_t(reset_slot),
                                 std::uint32_t(effect.visibility_end)});
     pending.effects.push_back(effect);
+    trace_pass_event("report", effect.samples ? "samples" : "timestamp", command.address,
+                     pending.effects.size() - 1, effect.visibility_begin, effect.visibility_end);
+    // A report can change texels behind an otherwise unchanged binding.
+    invalidate_args_all();
     pending.buffer_writes.emplace_back(command.address, sizeof(NVNcounterData));
     other_buffer_writes.emplace_back(command.address, sizeof(NVNcounterData));
     note_writes();
@@ -5197,33 +5422,78 @@ bool Encoder::gpu_predicate(const RenderEnableConditional& command, bool& handle
                 pending.effects[*writer].destination.offset != span.offset) return true;
             job.begin[index] = found->begin;
             job.end[index] = found->end;
+            trace_pass_event("predicate_read", "visibility", index, found->begin, found->end, address);
         } else {
             if (!order_completion_read(span.buffer, span.offset, cpu, sizeof(std::uint64_t))) return false;
             make_resident(pending, span.buffer);
             job.memory[index] = span.buffer.gpuAddress + span.offset;
+            trace_pass_event("predicate_read", "memory", index, 0, 0, address);
         }
     }
-    // The predicate reads visibility slots that a render pass writes when it
-    // ends: the block's draws go to a new pass.
-    if (!close_render(PassBreak::predicate)) return false;
+    // A report's slots can belong to an earlier closed pass even when later
+    // draws are still open. Only the closed prefix is ready for an in-pass
+    // vertex predicate; fragment-to-vertex dependencies keep the boundary.
+    // Reuse is enabled by default for all titles. Set
+    // ARMIGO_NVN_BATCH_FINALIZED_QUERIES=0 to restore the unbatched path.
+    static const bool batch_finalized = [] {
+        const char* value = std::getenv("ARMIGO_NVN_BATCH_FINALIZED_QUERIES");
+        return !(value && *value == '0');
+    }();
+    id<MTLRenderPipelineState> reuse_pipeline = nil;
+    if (batch_finalized && render) {
+        const char* rejection = nullptr;
+        // Preserve all guest-buffer write boundaries, including writes from
+        // shaders that have since been rebound and buffer-backed attachments.
+        if (pass_storage_writes || other_buffer_writes.size() != pass_buffer_writes_begin)
+            rejection = "writes";
+        if (color_aliases.any || std::any_of(block_aliases.begin(), block_aliases.end(),
+                [](const BlockAlias& alias) { return alias.alias != nil; }))
+            rejection = "alias";
+        for (unsigned index = 0; index != attachment_root_count; ++index)
+            if (attachment_roots[index].buffer) rejection = "attachment_buffer";
+        for (std::size_t index = 0; !rejection && index != 2; ++index) {
+            if (job.memory[index]) {
+                if (!report_destination_isolated(command.address + index * sizeof(NVNcounterData),
+                                                  sizeof(std::uint64_t)))
+                    rejection = "memory";
+            } else if (job.begin[index] != job.end[index] && job.end[index] > finalized_visibility) {
+                rejection = "visibility";
+            }
+        }
+        if (!rejection) {
+            reuse_pipeline = predicate_draw_pipeline(render_descriptor);
+            if (!reuse_pipeline) rejection = "pipeline";
+        }
+        if (rejection) trace_pass_event("predicate_batch", rejection);
+    }
+    if (!reuse_pipeline && !close_render(PassBreak::predicate)) return false;
     const auto slice = upload(64 + std::size_t(predicate_capacity) * predicate_record);
     if (!slice) return false;
     job.arguments = slice.gpu + 64;
     std::memcpy(slice.cpu, &job, sizeof job);
-    // The predicate runs when the block's pass opens (open_render), or
-    // earlier as the kernel when transfer work comes first (open_transfer_with).
+    // A retained pass runs the predicate below. Otherwise it waits for the
+    // block's new pass, or for a kernel before intervening transfer work.
     predicate.job = slice.gpu;
     predicate.arguments = slice.cpu + 64;
     predicate.arguments_gpu = slice.gpu + 64;
     predicate.used = 0;
     predicate.mode = command.mode;
     predicate.address = command.address;
+    if (reuse_pipeline) {
+        // The helper must not reset the preceding guest draw's visibility
+        // slot. The next guest draw selects its own slot and pipeline again.
+        set_visibility(MTLVisibilityResultModeDisabled, 0);
+        encode_predicate_draw(reuse_pipeline);
+        encoded_pipeline = nullptr;
+        trace_pass_event("predicate_batch", "reuse");
+    }
     handled = true;
     return true;
 }
 
 // The predicate as a compute kernel, in its own compute encoder.
 bool Encoder::dispatch_predicate(std::uint64_t job) {
+    trace_pass_event("predicate_execute", "compute", job);
     id<MTLComputePipelineState> pipeline = backend.predicate_pipeline();
     if (!pipeline) return fail(ReplayErrorCode::unsupported, "the conditional-render kernel is unavailable");
     if (!open_transfer()) return false;
@@ -5268,6 +5538,7 @@ id<MTLRenderPipelineState> Encoder::predicate_draw_pipeline(MTL4RenderPassDescri
 // commands in the pass (where a draw reads its indirect arguments) until it
 // completes. The game's vertex argument table is bound again after it.
 void Encoder::encode_predicate_draw(id<MTLRenderPipelineState> pipeline) {
+    trace_pass_event("predicate_execute", "vertex", predicate.job);
     const auto job = std::exchange(predicate.job, 0);
     id<MTL4ArgumentTable> table = backend.predicate_table();
     if (queue) {
@@ -5332,7 +5603,7 @@ bool Encoder::block_alias(const nvn::TextureState& state, const nvn::TextureView
     const long count = view->sets_layers ? (view->layer_count ? view->layer_count : long(layers) - first) : long(layers);
     if (first < 0 || NSUInteger(first) >= layers) return refuse("the view layer is outside the storage");
     if (count != 1) return refuse("layered rendering through a block view is unsupported");
-    id<MTLTexture> storage = backend.resources().texture(state, nullptr);
+    id<MTLTexture> storage = texture_for_use(state, nullptr);
     if (!storage) return fail(ReplayErrorCode::missing_resource, "render target texture is unavailable");
     if (storage.pixelFormat != MTLPixelFormatBC4_RUnorm && storage.pixelFormat != MTLPixelFormatBC4_RSnorm)
         return refuse("the storage does not hold BC4 blocks");
@@ -5522,7 +5793,7 @@ bool Encoder::open_render(std::int32_t primitive) {
             auto& block = block_aliases[index];
             if (!block_alias(*texture_state, view, block)) return false;
             id<MTLTexture> texture = block.alias ? block.alias
-                : backend.resources().texture(*texture_state, view);
+                : texture_for_use(*texture_state, view);
             if (!texture)
                 return fail(ReplayErrorCode::missing_resource,
                             "render target texture is unavailable");
@@ -5551,7 +5822,7 @@ bool Encoder::open_render(std::int32_t primitive) {
         }
         if (state.targets.depth) {
             const auto* view = state.targets.has_depth_view ? &state.targets.depth_view : nullptr;
-            id<MTLTexture> texture = backend.resources().texture(*state.targets.depth, view);
+            id<MTLTexture> texture = texture_for_use(*state.targets.depth, view);
             if (!texture)
                 return fail(ReplayErrorCode::missing_resource,
                             "depth target texture is unavailable");
@@ -5800,7 +6071,8 @@ bool Encoder::open_render(std::int32_t primitive) {
         // A pending conditional block's predicate runs first in its pass.
         if (predicate_draw) encode_predicate_draw(predicate_draw);
         {
-            // The attachment geometry the GPU actually works on, once per frame.
+            // Guest bindings and final attachment descriptors for each draw
+            // pass. Descriptor rows reflect clear folding and omitted targets.
             static const bool geometry_line = [] {
                 const char* value = std::getenv("ARMIGO_NVN_PASS_GEOMETRY");
                 return value && *value == '1';
@@ -5816,10 +6088,43 @@ bool Encoder::open_render(std::int32_t primitive) {
                     if (const auto* depth = state.targets.depth)
                         in_place += backend.resources().texture_is_in_place(*depth) ? 1 : 0;
                     armigo::diag::opt_in(
-                                 "nvn_pass frame=%llu %ux%u samples=%u targets=%d depth=%d in_place=%d\n",
+                                 "nvn_pass frame=%llu %lux%lu samples=%u targets=%d depth=%d in_place=%d "
+                                 "pass=%llu fragment=%u channels=%u depth_test=%u depth_write=%u "
+                                 "stencil_test=%u rasterizer_discard=%u samples_active=%u\n",
                                  static_cast<unsigned long long>(pending.fence),
-                                 attachment_width, attachment_height, unsigned(attachment_samples),
-                                 targets, state.targets.depth != nullptr, in_place);
+                                 static_cast<unsigned long>(attachment_width),
+                                 static_cast<unsigned long>(attachment_height), unsigned(attachment_samples),
+                                 targets, state.targets.depth != nullptr, in_place,
+                                 static_cast<unsigned long long>(pending.counters.passes),
+                                 unsigned(fragment_shader != nullptr),
+                                 fragment_shader ? state.channel_mask.mask & fragment_shader->interface.color_output_mask : 0,
+                                 unsigned(state.depth_stencil.depth_test), unsigned(state.depth_stencil.depth_write),
+                                 unsigned(state.depth_stencil.stencil_test), unsigned(state.rasterizer_discard),
+                                 unsigned(state.samples_active));
+                    const auto describe_attachment = [&](const char* aspect, unsigned index,
+                                                         MTLRenderPassAttachmentDescriptor* attachment) {
+                        id<MTLTexture> texture = attachment.texture;
+                        if (!texture) return;
+                        armigo::diag::opt_in(
+                            "nvn_attachment frame=%llu pass=%llu aspect=%s index=%u width=%lu height=%lu "
+                            "samples=%lu format=%lu level=%lu slice=%lu depth_plane=%lu load=%lu store=%lu "
+                            "storage=%lu usage=%lu\n",
+                            static_cast<unsigned long long>(pending.fence),
+                            static_cast<unsigned long long>(pending.counters.passes), aspect, index,
+                            static_cast<unsigned long>(std::max<NSUInteger>(1, texture.width >> attachment.level)),
+                            static_cast<unsigned long>(std::max<NSUInteger>(1, texture.height >> attachment.level)),
+                            static_cast<unsigned long>(texture.sampleCount),
+                            static_cast<unsigned long>(texture.pixelFormat),
+                            static_cast<unsigned long>(attachment.level), static_cast<unsigned long>(attachment.slice),
+                            static_cast<unsigned long>(attachment.depthPlane),
+                            static_cast<unsigned long>(attachment.loadAction),
+                            static_cast<unsigned long>(attachment.storeAction),
+                            static_cast<unsigned long>(texture.storageMode), static_cast<unsigned long>(texture.usage));
+                    };
+                    for (unsigned index = 0; index != 8; ++index)
+                        describe_attachment("color", index, pass.colorAttachments[index]);
+                    describe_attachment("depth", 0, pass.depthAttachment);
+                    describe_attachment("stencil", 0, pass.stencilAttachment);
                 }
         }
         for (unsigned i = 0; i < 8; ++i) pass.colorAttachments[i].loadAction = MTLLoadActionLoad;
@@ -6200,7 +6505,7 @@ bool Encoder::flush_uniforms() {
         copy_buffer_range(version.slice.buffer, version.slice.offset + version.dirty_begin - version.begin,
                           destination.buffer, destination.offset, size);
         pending.buffer_writes.emplace_back(version.dirty_begin, size);
-        buffer_write_order.pending = true;
+        buffer_write_order.write();
         ++backend.mutable_statistics().copies;
     }
     if (!versions.empty()) invalidate_args_all();
@@ -6812,13 +7117,11 @@ bool Encoder::bind_draw_support(std::uint32_t base_instance) {
     return true;
 }
 
-bool Encoder::graphics_writes_buffers() const {
-    return bindings[NVN_SHADER_STAGE_VERTEX].writes_buffers ||
-        (state.stage_programs[NVN_SHADER_STAGE_FRAGMENT] &&
-         bindings[NVN_SHADER_STAGE_FRAGMENT].writes_buffers);
-}
-
 void Encoder::note_draw_writes() {
+    const bool vertex_writes = bindings[NVN_SHADER_STAGE_VERTEX].writes_buffers;
+    const bool fragment_writes = state.stage_programs[NVN_SHADER_STAGE_FRAGMENT] && !state.rasterizer_discard &&
+        bindings[NVN_SHADER_STAGE_FRAGMENT].writes_buffers;
+    pass_storage_writes |= vertex_writes || fragment_writes;
     if (pass_depth_only) {
         pass_depth_only = state.targets.depth && state.depth_stencil.depth_test &&
             state.depth_stencil.depth_write && !state.depth_stencil.stencil_test;
@@ -6842,7 +7145,7 @@ void Encoder::note_draw_writes() {
     if (state.stage_programs[NVN_SHADER_STAGE_FRAGMENT])
         note_shader_writes(NVN_SHADER_STAGE_FRAGMENT);
     note_writes();
-    buffer_write_order.draw(graphics_writes_buffers());
+    buffer_write_order.draw(vertex_writes, fragment_writes);
 }
 
 // Pipeline look-ahead. The first pipeline a submission has to compile is a
@@ -7082,6 +7385,7 @@ bool Encoder::draw_indexed(const DrawIndexed& command) {
         return fail(ReplayErrorCode::invalid_command, "indexed draw has an invalid index type");
     if (!order_buffer_writes()) return false;
     const auto bytes = std::uint64_t(command.count) * element_size;
+    state.index_buffer = {command.index_buffer, bytes};
     const auto source = buffer_address(command.index_buffer, bytes);
     if (!source.cpu || source.offset > source.length || bytes > source.length - source.offset)
         return fail(ReplayErrorCode::missing_resource, "index buffer range is unavailable");
@@ -7202,7 +7506,8 @@ bool Encoder::dispatch(const Dispatch& command) {
     if (!program || !program->stages[NVN_SHADER_STAGE_COMPUTE])
         return fail(ReplayErrorCode::missing_program,
                     "compute dispatch has no resolved compute stage");
-    if (!order_buffer_writes()) return false;
+    // Ending the pass orders the dispatch after any earlier draw's writes.
+    buffer_write_order.clear();
     if (!flush_uniforms()) return false;
     close_render(PassBreak::dispatch);
     const auto shader_owner = program->stages[NVN_SHADER_STAGE_COMPUTE];
@@ -7238,7 +7543,7 @@ bool Encoder::dispatch(const Dispatch& command) {
     note_shader_writes(NVN_SHADER_STAGE_COMPUTE);
     note_writes();
     ++backend.mutable_statistics().dispatches;
-    buffer_write_order.pending = true;
+    buffer_write_order.write();
     return true;
 }
 
@@ -7255,7 +7560,8 @@ bool Encoder::dispatch_indirect(const DispatchIndirect& command) {
         ((arguments.buffer.gpuAddress + arguments.offset) & 3))
         return fail(ReplayErrorCode::missing_resource,
                     "indirect dispatch arguments are unavailable or misaligned");
-    if (!order_buffer_writes()) return false;
+    // Ending the pass orders the dispatch after any earlier draw's writes.
+    buffer_write_order.clear();
     if (!flush_uniforms()) return false;
     close_render(PassBreak::dispatch);
     const auto shader_owner = program->stages[NVN_SHADER_STAGE_COMPUTE];
@@ -7288,7 +7594,7 @@ bool Encoder::dispatch_indirect(const DispatchIndirect& command) {
     note_shader_writes(NVN_SHADER_STAGE_COMPUTE);
     note_writes();
     ++backend.mutable_statistics().dispatches;
-    buffer_write_order.pending = true;
+    buffer_write_order.write();
     return true;
 }
 
@@ -7324,7 +7630,7 @@ bool Encoder::copy_buffer(const CopyBuffer& command) {
                           command.size);
     }
     pending.buffer_writes.emplace_back(command.destination, command.size);
-    buffer_write_order.pending = true;
+    buffer_write_order.write();
     note_writes();
     ++backend.mutable_statistics().copies;
     return true;
@@ -7345,7 +7651,7 @@ bool Encoder::copy_buffer_texture(const CopyBufferToTexture& command, bool uploa
     if (command.flags != NVN_COPY_FLAGS_NONE)
         return fail(ReplayErrorCode::unsupported, "buffer/texture copy flags are unsupported");
     const auto* view = command.has_view ? &command.view : nullptr;
-    id<MTLTexture> texture = backend.resources().texture(*command.texture, view);
+    id<MTLTexture> texture = texture_for_use(*command.texture, view);
     if (!texture) return fail(ReplayErrorCode::missing_resource, "copy texture is unavailable");
     const auto& region = command.region;
     if (!valid_region(texture, region))
@@ -7396,7 +7702,7 @@ bool Encoder::copy_buffer_texture(const CopyBufferToTexture& command, bool uploa
     else {
         pending.buffer_writes.emplace_back(command.source, size);
         other_buffer_writes.emplace_back(command.source, size);
-        buffer_write_order.pending = true;
+        buffer_write_order.write();
     }
     note_writes();
     ++backend.mutable_statistics().copies;
@@ -7417,8 +7723,8 @@ bool Encoder::copy_texture_to_texture(const CopyTextureToTexture& command) {
                     "scaled texture copies require the two-dimensional blit path");
     const auto* source_view = command.has_source_view ? &command.source_view : nullptr;
     const auto* destination_view = command.has_destination_view ? &command.destination_view : nullptr;
-    id<MTLTexture> source = backend.resources().texture(*command.source, source_view);
-    id<MTLTexture> destination = backend.resources().texture(*command.destination,
+    id<MTLTexture> source = texture_for_use(*command.source, source_view);
+    id<MTLTexture> destination = texture_for_use(*command.destination,
                                                              destination_view);
     if (!source || !destination)
         return fail(ReplayErrorCode::missing_resource,
@@ -7504,7 +7810,7 @@ bool Encoder::encode_clear_plan(const TextureState& texture_state,
         copy_region.width < 0 || copy_region.height < 0 || copy_region.depth < 0)
         return fail(ReplayErrorCode::invalid_command,
                     "clear texture region contains a negative component");
-    id<MTLTexture> texture = backend.resources().texture(texture_state, view);
+    id<MTLTexture> texture = texture_for_use(texture_state, view);
     if (!texture)
         return fail(ReplayErrorCode::missing_resource,
                     "clear texture resource is unavailable");
@@ -7591,7 +7897,8 @@ bool Encoder::encode_clear_plan(const TextureState& texture_state,
     if (render || !plan.fold_into_load) close_render(PassBreak::clear);
     close_transfer();
     if (plan.fold_into_load) {
-        deferred_clears.push_back({plan, texture});
+        deferred_clears.push_back({plan, texture, reinterpret_cast<std::uint64_t>(texture_state.memory),
+                                   texture_state.size});
         make_resident(pending, texture);
         note_texture_write(texture_state);
         note_writes();
@@ -7622,7 +7929,7 @@ bool Encoder::clear_bound_color(const ClearColor& clear) {
     const auto* texture = state.targets.color[clear.index];
     const auto* view = state.targets.has_color_view[clear.index]
         ? &state.targets.color_views[clear.index] : nullptr;
-    id<MTLTexture> resident = backend.resources().texture(*texture, view);
+    id<MTLTexture> resident = texture_for_use(*texture, view);
     if (!resident)
         return fail(ReplayErrorCode::missing_resource,
                     "color clear render target is unavailable");
@@ -7656,7 +7963,7 @@ bool Encoder::clear_bound_depth(const ClearDepthStencil& clear) {
                     "depth/stencil clear has no bound target");
     }
     const auto* view = state.targets.has_depth_view ? &state.targets.depth_view : nullptr;
-    id<MTLTexture> resident = backend.resources().texture(*state.targets.depth, view);
+    id<MTLTexture> resident = texture_for_use(*state.targets.depth, view);
     if (!resident)
         return fail(ReplayErrorCode::missing_resource,
                     "depth/stencil clear target is unavailable");
@@ -7765,6 +8072,27 @@ bool Encoder::visit(const CommandRecordView& record) {
 bool Encoder::visit_command(const CommandRecordView& record) {
     if (failed) return false;
     current_op_ = record.op;
+    if (trace_submission_id) {
+        switch (record.op) {
+            case Op::draw:
+            case Op::draw_indexed:
+            case Op::draw_indirect:
+            case Op::draw_indexed_indirect:
+            case Op::multi_draw_indirect:
+            case Op::multi_draw_indexed_indirect:
+                trace_pass_event("draw", "command", state.render_enabled, state.samples_active,
+                                 state.depth_stencil.depth_test, state.depth_stencil.stencil_test);
+                break;
+            case Op::barrier:
+                trace_pass_event("barrier", "command", payload<ScalarInt>(record).value,
+                                 pass_depth_only, static_cast<std::uint64_t>(buffer_write_order.pending));
+                break;
+            case Op::set_render_targets:
+                trace_pass_event("targets", "command", same_targets(state.targets, payload<SetRenderTargets>(record)));
+                break;
+            default: break;
+        }
+    }
     switch (record.op) {
         case Op::signal_event: {
             const auto command = payload<SignalEvent>(record);
@@ -7835,16 +8163,23 @@ bool Encoder::visit_command(const CommandRecordView& record) {
         }
         case Op::report_counter: {
             const auto command = payload<ReportCounter>(record);
-            const auto destination = buffer_at(command.address,
-                                                                    sizeof(NVNcounterData));
-            if (!destination.buffer || !destination.buffer.contents)
+            // Only isolated query storage may bypass the old ordered lookup.
+            // Cached or external consumers of aliases retain that dependency.
+            const bool isolated = report_destination_isolated(command.address, sizeof(NVNcounterData));
+            const auto destination = isolated
+                ? backend.resources().buffer_at(command.address, sizeof(NVNcounterData))
+                : buffer_at(command.address, sizeof(NVNcounterData));
+            auto* cpu = static_cast<std::byte*>(destination.buffer.contents);
+            if (!destination.buffer || !cpu)
                 return fail(ReplayErrorCode::missing_resource,
                             "counter report destination is not CPU-visible");
             if (command.type != NVN_COUNTER_TYPE_TIMESTAMP && command.type != NVN_COUNTER_TYPE_TIMESTAMP_TOP &&
                 command.type != NVN_COUNTER_TYPE_SAMPLES_PASSED)
                 return fail(ReplayErrorCode::unsupported,
                             "requested hardware counter is unsupported by Metal replay");
-            return enqueue_counter(command, destination);
+            ++(isolated ? pending.counters.report_fast : pending.counters.report_ordered);
+            ++(isolated ? backend.mutable_statistics().report_fast : backend.mutable_statistics().report_ordered);
+            return enqueue_counter(command, destination, cpu + destination.offset);
         }
         case Op::reset_counter: {
             const auto command = payload<ResetCounter>(record);
@@ -7861,6 +8196,7 @@ bool Encoder::visit_command(const CommandRecordView& record) {
             counter_begin = visibility_cursor;
             counter_reset = true;
             reset_slot = visibility_cursor;
+            trace_pass_event("reset", "samples");
             return true;
         }
         case Op::report_value: {
@@ -7878,7 +8214,7 @@ bool Encoder::visit_command(const CommandRecordView& record) {
                               sizeof command.value);
             other_buffer_writes.emplace_back(command.address, sizeof command.value);
             pending.buffer_writes.emplace_back(command.address, sizeof command.value);
-            buffer_write_order.pending = true;
+            buffer_write_order.write();
             note_writes();
             return true;
         }
@@ -7905,7 +8241,7 @@ bool Encoder::visit_command(const CommandRecordView& record) {
                 copy_buffer_range(source.buffer, source.offset, destination.buffer, destination.offset,
                                   command.size);
                 pending.buffer_writes.emplace_back(command.destination, command.size);
-                buffer_write_order.pending = true;
+                buffer_write_order.write();
                 note_writes();
                 ++backend.mutable_statistics().copies;
             }
@@ -7964,7 +8300,7 @@ bool Encoder::visit_command(const CommandRecordView& record) {
             copy_buffer_range(source.buffer, source.offset, destination.buffer, destination.offset,
                               command.size);
             pending.buffer_writes.emplace_back(command.address, command.size);
-            buffer_write_order.pending = true;
+            buffer_write_order.write();
             note_writes();
             ++backend.mutable_statistics().clears;
             return true;
@@ -8008,7 +8344,7 @@ bool Encoder::visit_command(const CommandRecordView& record) {
             const auto* texture = state.targets.color[command.index];
             const auto* view = state.targets.has_color_view[command.index]
                 ? &state.targets.color_views[command.index] : nullptr;
-            id<MTLTexture> resident = backend.resources().texture(*texture, view);
+            id<MTLTexture> resident = texture_for_use(*texture, view);
             if (!resident)
                 return fail(ReplayErrorCode::missing_resource,
                             "integer color clear target is unavailable");
@@ -8388,9 +8724,9 @@ bool Encoder::visit_command(const CommandRecordView& record) {
             const auto command = payload<Downsample>(record);
             if (!command.source || !command.destination)
                 return fail(ReplayErrorCode::invalid_command, "downsample textures are missing");
-            const auto source = backend.resources().texture(*command.source,
+            const auto source = texture_for_use(*command.source,
                 command.has_source_view ? &command.source_view : nullptr);
-            const auto destination = backend.resources().texture(*command.destination,
+            const auto destination = texture_for_use(*command.destination,
                 command.has_destination_view ? &command.destination_view : nullptr);
             if (!source || !destination)
                 return fail(ReplayErrorCode::missing_resource, "downsample textures are unavailable");
@@ -8494,6 +8830,8 @@ bool Encoder::visit_command(const CommandRecordView& record) {
             return true;
         case Op::render_enable_conditional: {
             const auto command = payload<RenderEnableConditional>(record);
+            if (trace_submission_id) ++trace_conditional;
+            trace_pass_event("conditional", "begin", command.address, command.mode);
             if (command.mode != NVN_CONDITIONAL_RENDER_MODE_RENDER_IF_EQUAL &&
                 command.mode != NVN_CONDITIONAL_RENDER_MODE_RENDER_IF_NOT_EQUAL)
                 return fail(ReplayErrorCode::invalid_command, "conditional render mode is invalid");
@@ -8512,6 +8850,7 @@ bool Encoder::visit_command(const CommandRecordView& record) {
             return read_predicate(command.mode, command.address);
         }
         case Op::render_enable:
+            trace_pass_event("conditional", "end", payload<RenderEnable>(record).enable);
             predicate.arguments = nullptr;
             predicate.job = 0;
             state.predicate_pending = false;
@@ -8595,6 +8934,7 @@ bool Encoder::finish() {
     close_render(PassBreak::finish);
     report_pass_breaks(pending.fence);
     close_transfer();
+    trace_pass_event("submission", "end", pending.counters.passes, pending.counters.draws);
     if (state.samples_active && counter_begin != visibility_cursor) {
         CompletionEffect accumulate{};
         accumulate.visibility_begin = counter_begin;
@@ -8666,6 +9006,9 @@ public:
     void complete_gpu_writes(std::uint64_t generation) override { resources_.complete_gpu_writes(generation); }
     std::uint64_t registration_generation() const override {
         return resources_.registration_generation();
+    }
+    bool overlaps_texture_backing(std::uint64_t address, std::uint64_t size) const override {
+        return resources_.overlaps_texture_backing(address, size);
     }
     bool texture_is_in_place(const nvn::TextureState& state) override {
         return resources_.texture_is_in_place(state);

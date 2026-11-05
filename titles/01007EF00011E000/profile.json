@@ -9,11 +9,13 @@
       "calls": [
         {
           "offset": "0x1281044",
-          "expected_instruction": "0x940a70e3"
+          "expected_instruction": "0x940a70e3",
+          "note": "Hooks the scene calculation's interval update: store the measured frame ratio, clamped from 20 to 300 fps, then run the original update and its side effects."
         },
         {
           "offset": "0xcf9ad4",
-          "expected_instruction": "0x94208e3f"
+          "expected_instruction": "0x94208e3f",
+          "note": "Hooks the second interval-update call the same way: store the measured frame ratio, clamped from 20 to 300 fps, then run the original update and its side effects."
         }
       ],
       "layout": {
@@ -30,132 +32,158 @@
           "offset": "0xed5ba0",
           "expected_instruction": "0x32170108",
           "replacement_instruction": "0xd503201f",
-          "nvn_driver_only": true
+          "nvn_driver_only": true,
+          "note": "Omits the virtual-pool flag in the graphics allocator constructor. Armigo's NVN driver implements ordinary pools, with the GPU address equal to the guest address."
         },
         {
           "offset": "0x112670c",
           "expected_instruction": "0x1e204160",
-          "replacement_instruction": "0x1e204140"
+          "replacement_instruction": "0x1e204140",
+          "note": "Lowers the dynamic present-interval candidate floor from 2.0 to 1.0, so a frame that fits one refresh can present at 60 fps instead of waiting for two."
         },
         {
           "offset": "0x1126710",
           "expected_instruction": "0x71000b7f",
-          "replacement_instruction": "0x7100077f"
+          "replacement_instruction": "0x7100077f",
+          "note": "Lowers the dynamic present-interval floor check from 2 to 1, so the framework can select one refresh instead of holding a 30 fps floor."
         },
         {
           "offset": "0x112665c",
           "expected_instruction": "0x52800078",
-          "replacement_instruction": "0x52800058"
+          "replacement_instruction": "0x52800058",
+          "note": "Lowers the step-down target recorded when the present interval steps up, from 3 to 2, so it matches the new floor of one refresh."
         },
         {
           "offset": "0x1126748",
           "expected_instruction": "0x71000d1f",
-          "replacement_instruction": "0x7100091f"
+          "replacement_instruction": "0x7100091f",
+          "note": "Lowers the step-down target compared when the present interval steps up, from 3 to 2, so recovery matches the new floor of one refresh."
         },
         {
           "offset": "0x1126794",
           "expected_instruction": "0x71000d3f",
-          "replacement_instruction": "0x7100093f"
+          "replacement_instruction": "0x7100093f",
+          "note": "Stops stepping the present interval down once it is below 2 rather than below 3, so the floor stays at one refresh."
         },
         {
           "offset": "0xef6368",
           "expected_instruction": "0x885ffd2e",
-          "replacement_instruction": "0xb8aa812e"
+          "replacement_instruction": "0xb8aa812e",
+          "note": "Replaces the job queue's thread-context lock acquire with one atomic swap. Workers retake the lock without pausing and starve the main thread, causing 80-170 ms hitches."
         },
         {
           "offset": "0xef636c",
           "expected_instruction": "0x3400006e",
-          "replacement_instruction": "0x35ffff8e"
+          "replacement_instruction": "0x35ffff8e",
+          "note": "On a failed swap, returns to the plain-load spin of the thread-context job-queue acquire. The exclusive loop livelocked under host scheduling and caused 80-170 ms hitches."
         },
         {
           "offset": "0xef6370",
           "expected_instruction": "0xd5033f5f",
-          "replacement_instruction": "0x14000004"
+          "replacement_instruction": "0x14000004",
+          "note": "After a successful atomic swap, continues past the thread-context job-queue acquire. The exclusive spin livelocked under host scheduling and caused 80-170 ms hitches."
         },
         {
           "offset": "0xef6374",
           "expected_instruction": "0x17fffffd",
-          "replacement_instruction": "0xd503201f"
+          "replacement_instruction": "0xd503201f",
+          "note": "Removes the back edge of the thread-context job-queue spin. The exclusive acquire livelocked under host scheduling and caused 80-170 ms hitches."
         },
         {
           "offset": "0xef6378",
           "expected_instruction": "0x880e7d2a",
-          "replacement_instruction": "0xd503201f"
+          "replacement_instruction": "0xd503201f",
+          "note": "Removes the thread-context job-queue acquire's exclusive store; the atomic swap already claimed the lock. The spin caused 80-170 ms hitches."
         },
         {
           "offset": "0xef637c",
           "expected_instruction": "0x35ffff6e",
-          "replacement_instruction": "0xd503201f"
+          "replacement_instruction": "0xd503201f",
+          "note": "Removes the thread-context job-queue exclusive-store retry. The acquire is one atomic swap; the old spin caused 80-170 ms hitches under host scheduling."
         },
         {
           "offset": "0xef63fc",
           "expected_instruction": "0x885ffd2e",
-          "replacement_instruction": "0xb8aa812e"
+          "replacement_instruction": "0xb8aa812e",
+          "note": "Replaces the job queue's other lock acquire with one atomic swap. Workers retake the lock without pausing and starve the main thread, causing 80-170 ms hitches."
         },
         {
           "offset": "0xef6400",
           "expected_instruction": "0x3400006e",
-          "replacement_instruction": "0x35ffff8e"
+          "replacement_instruction": "0x35ffff8e",
+          "note": "On a failed swap, returns to the plain-load spin of the job queue's other acquire. The exclusive loop livelocked under host scheduling and caused 80-170 ms hitches."
         },
         {
           "offset": "0xef6404",
           "expected_instruction": "0xd5033f5f",
-          "replacement_instruction": "0x17ffffe0"
+          "replacement_instruction": "0x17ffffe0",
+          "note": "After a successful atomic swap, continues past the job queue's other acquire. The exclusive spin livelocked under host scheduling and caused 80-170 ms hitches."
         },
         {
           "offset": "0xef6408",
           "expected_instruction": "0x17fffffd",
-          "replacement_instruction": "0xd503201f"
+          "replacement_instruction": "0xd503201f",
+          "note": "Removes the back edge of the job queue's other spin. The exclusive acquire livelocked under host scheduling and caused 80-170 ms hitches."
         },
         {
           "offset": "0xef640c",
           "expected_instruction": "0x880e7d2a",
-          "replacement_instruction": "0xd503201f"
+          "replacement_instruction": "0xd503201f",
+          "note": "Removes the job queue's other acquire's exclusive store; the atomic swap already claimed the lock. The spin caused 80-170 ms hitches."
         },
         {
           "offset": "0xef6410",
           "expected_instruction": "0x35ffff6e",
-          "replacement_instruction": "0xd503201f"
+          "replacement_instruction": "0xd503201f",
+          "note": "Removes the other job-queue exclusive-store retry. The acquire is one atomic swap; the old spin caused 80-170 ms hitches under host scheduling."
         },
         {
           "offset": "0x1126924",
           "expected_instruction": "0x36000080",
-          "replacement_instruction": "0x14000004"
+          "replacement_instruction": "0x14000004",
+          "note": "During events, always take the ordinary CPU frame measurement instead of the in-event path. Measuring the GPU span stretched presents by about 33 ms."
         },
         {
           "offset": "0x112697c",
           "expected_instruction": "0x36000080",
-          "replacement_instruction": "0x14000004"
+          "replacement_instruction": "0x14000004",
+          "note": "During events, do not replace the frame span with the max of CPU and GPU time. That GPU span stretched presents by about 33 ms once timestamps were real."
         },
         {
           "offset": "0x1280ec8",
           "expected_instruction": "0x97cc0894",
-          "replacement_instruction": "0x97cc6e30"
+          "replacement_instruction": "0x97cc6e30",
+          "note": "Layout animation steps from the measured frame ratio instead of the integer present interval, so menus and the HUD do not run twice as fast at 120 fps."
         },
         {
           "offset": "0x1280ecc",
           "expected_instruction": "0x1e230000",
-          "replacement_instruction": "0xd503201f"
+          "replacement_instruction": "0xd503201f",
+          "note": "Drops the layout animation's conversion of the integer interval to float. The step is already the measured frame ratio."
         },
         {
           "offset": "0x1280ee4",
           "expected_instruction": "0x1e210800",
-          "replacement_instruction": "0xd503201f"
+          "replacement_instruction": "0xd503201f",
+          "note": "Drops the layout animation's multiply by one half. At 120 fps the integer interval stays 1, so the old step ran every animation twice as fast."
         },
         {
           "offset": "0x125f114",
           "expected_instruction": "0x97cc9001",
-          "replacement_instruction": "0x97ccf59d"
+          "replacement_instruction": "0x97ccf59d",
+          "note": "The fade timer steps from the measured frame ratio instead of the integer present interval, so fades do not run twice as fast at 120 fps."
         },
         {
           "offset": "0x125f118",
           "expected_instruction": "0x1e230000",
-          "replacement_instruction": "0xd503201f"
+          "replacement_instruction": "0xd503201f",
+          "note": "Drops the fade timer's conversion of the integer interval to float. The step is already the measured frame ratio."
         },
         {
           "offset": "0x125f128",
           "expected_instruction": "0x1e210800",
-          "replacement_instruction": "0xd503201f"
+          "replacement_instruction": "0xd503201f",
+          "note": "Drops the fade timer's multiply by one half. At 120 fps the integer interval stays 1, so the old step finished the fade twice as fast."
         }
       ],
       "resolution": {

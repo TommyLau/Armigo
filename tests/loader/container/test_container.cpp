@@ -21,6 +21,8 @@
 #include <optional>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <string_view>
 
 namespace {
 
@@ -970,6 +972,104 @@ void test_update_extraction() {
                   failure->code == loader::ContainerError::program_nca_missing);
         }
     }
+
+    // A BKTR RomFS data offset addresses the patched image, so it may lie
+    // past the stored section. The relocation tree still bounds it.
+    {
+        const BuiltUpdateNca beyond = build_update_program_nca(
+            keys, *sign_key, npdm, title_id, 0, 0x100000000ULL);
+        CHECK(!beyond.image.empty());
+        if (!beyond.image.empty()) {
+            const auto update_file = directory / "update-virtual-offset.nsp";
+            CHECK(write_file(update_file, build_nsp(
+                {{"update.nca", beyond.image}, {"update.tik", beyond.ticket}})));
+            loader::ContainerExtractionOptions options;
+            options.output_directory = directory / "out-virtual-offset";
+            options.anchors = test_anchors(*sign_key);
+            options.keys = std::get<loader::ContainerKeys>(
+                loader::read_container_keys_file(keys_file));
+            options.update_container_file = update_file;
+            const auto result = loader::extract_program_container(base_file, options);
+            const auto* failure = std::get_if<loader::ContainerFailure>(&result);
+            CHECK(failure != nullptr);
+            CHECK(failure != nullptr &&
+                  failure->detail.find("RomFS data offset leaves its section") ==
+                      std::string::npos);
+            CHECK(failure != nullptr &&
+                  failure->detail.find("leaves the patched image") != std::string::npos);
+        }
+    }
+
+    // The same patched bytes extract when every IVFC offset sits past the
+    // stored section and inside the relocation tree's virtual image.
+    {
+        constexpr std::uint64_t kVirtualBase = 0x100000;
+        const BuiltUpdateNca shifted = build_update_program_nca(
+            keys, *sign_key, npdm, title_id, 0, 0, kVirtualBase);
+        CHECK(!shifted.image.empty());
+        CHECK(shifted.stored_section_size > 0);
+        CHECK(shifted.stored_section_size <= shifted.romfs_offset);
+        CHECK(shifted.romfs_offset < shifted.patch_virtual_size);
+        if (!shifted.image.empty() &&
+            shifted.stored_section_size <= shifted.romfs_offset &&
+            shifted.romfs_offset < shifted.patch_virtual_size) {
+            const auto update_file = directory / "update-shifted-virtual.nsp";
+            CHECK(write_file(update_file, build_nsp(
+                {{"update.nca", shifted.image}, {"update.tik", shifted.ticket}})));
+            const auto extraction = run(update_file, nullptr,
+                                        directory / "out-shifted-virtual");
+            CHECK(extraction.has_value());
+            if (extraction) {
+                std::vector<std::byte> hello;
+                std::vector<std::byte> nested;
+                CHECK(read_file_bytes(extraction->romfs_directory / "hello.txt", hello));
+                CHECK(read_file_bytes(extraction->romfs_directory / "data" / "nested.bin",
+                                      nested));
+                CHECK(hello == hello_patched);
+                CHECK(nested.size() == 0x47);
+            }
+        }
+    }
+
+    // Declared hash counts that wrap, a parent table shorter than those
+    // digests, and a relocation whose physical range wraps. Each image is
+    // rejected before any patched file is produced.
+    auto expect_rejection = [&](const char* name, container_test::UpdateFixtureDefect defect,
+                                std::string_view expected) {
+        const BuiltUpdateNca image = build_update_program_nca(
+            keys, *sign_key, npdm, title_id, 0, 0, 0, defect);
+        CHECK(!image.image.empty());
+        if (image.image.empty()) {
+            std::printf("  %s fixture was not built\n", name);
+            return;
+        }
+        const auto update_file = directory / (std::string(name) + ".nsp");
+        CHECK(write_file(update_file, build_nsp(
+            {{"update.nca", image.image}, {"update.tik", image.ticket}})));
+        loader::ContainerExtractionOptions options;
+        options.output_directory = directory / (std::string(name) + "-out");
+        options.anchors = test_anchors(*sign_key);
+        options.keys = std::get<loader::ContainerKeys>(
+            loader::read_container_keys_file(keys_file));
+        options.update_container_file = update_file;
+        const auto result = loader::extract_program_container(base_file, options);
+        const auto* failure = std::get_if<loader::ContainerFailure>(&result);
+        CHECK(failure != nullptr);
+        if (failure == nullptr) {
+            std::printf("  %s extracted\n", name);
+            return;
+        }
+        CHECK(failure->detail.find(expected) != std::string::npos);
+        if (failure->detail.find(expected) == std::string::npos) {
+            std::printf("  %s detail: %s\n", name, failure->detail.c_str());
+        }
+    };
+    expect_rejection("digest-overflow", container_test::UpdateFixtureDefect::digest_overflow,
+                     "The section's hash table or hashed data leaves its section.");
+    expect_rejection("short-parent", container_test::UpdateFixtureDefect::short_parent,
+                     "The section's hash table or hashed data leaves its section.");
+    expect_rejection("relocation-wrap", container_test::UpdateFixtureDefect::relocation_wrap,
+                     "Reading a hashed data block failed.");
     std::filesystem::remove_all(directory);
 }
 

@@ -75,10 +75,15 @@ public:
 
     // Optional host scheduling hint, captured by each submit. It does not pace
     // execution or change guest fences; zero requests ordinary scheduling.
-    virtual void set_scheduling_period(std::uint64_t period_ns) { (void)period_ns; }
+    // A cadence inferred while unpaced retains the encoder's existing spin.
+    virtual void set_scheduling_period(std::uint64_t period_ns, bool preserve_encode_spin = false) {
+        (void)period_ns; (void)preserve_encode_spin;
+    }
     // Marks one presented frame after its submissions. Translation CPU budgets
     // are sampled at frame boundaries; encode-thread budgets are per submission.
-    virtual void finish_frame(std::uint64_t period_ns) { set_scheduling_period(period_ns); }
+    virtual void finish_frame(std::uint64_t period_ns, bool preserve_encode_spin = false) {
+        set_scheduling_period(period_ns, preserve_encode_spin);
+    }
     // Called on the guest thread that acquires window textures, once per
     // acquire: a host scheduling hint for the thread that paces the frame. A
     // zero period (no known presentation rate) leaves its policy as it was.

@@ -368,6 +368,33 @@ enum class TableOutcome {
     failure,
 };
 
+// Bytes occupied by the SHA-256 digest of every block in `data_len`.
+// The entry count is a ceil-divide, then scaled by 0x20. Either step
+// failing means the table cannot be addressed, so the caller rejects
+// the section instead of wrapping the product to an empty read.
+[[nodiscard]] bool hash_digest_bytes(std::uint64_t data_len, std::uint64_t block_size,
+                                     std::uint64_t& digest_bytes) noexcept {
+    if (block_size == 0 || data_len > ~std::uint64_t{0} - (block_size - 1)) {
+        return false;
+    }
+    const std::uint64_t entries = (data_len + block_size - 1) / block_size;
+    if (entries > ~std::uint64_t{0} / 0x20) {
+        return false;
+    }
+    digest_bytes = entries * 0x20;
+    return true;
+}
+
+// IVFC stores a block size as a log2. Values above 22 are not a block
+// this reader will hash, and they are rejected before the shift.
+[[nodiscard]] bool ivfc_block_size(std::uint32_t log2, std::uint64_t& block_size) noexcept {
+    if (log2 > 22) {
+        return false;
+    }
+    block_size = std::uint64_t{1} << log2;
+    return true;
+}
+
 // Verifies `data_len` bytes at `data_offset` (section-relative) against
 // `expected`, the consecutive 0x20-byte digests of its blocks, hashing
 // blocks of `block_size` bytes. The final partial block is zero-padded to
@@ -391,8 +418,9 @@ enum class TableOutcome {
     // tree's virtual size, not the physical section.
     const std::uint64_t image_size =
         view.base_program ? section.patch_virtual_size : section.size;
-    const std::uint64_t entries = (data_len + block_size - 1) / block_size;
-    if (expected.size() < entries * 0x20 || data_offset > image_size ||
+    std::uint64_t digest_bytes = 0;
+    if (!hash_digest_bytes(data_len, block_size, digest_bytes) ||
+        expected.size() < digest_bytes || data_offset > image_size ||
         data_len > image_size - data_offset) {
         failure = {ContainerError::section_invalid,
                    "The section's hash table or hashed data leaves its section."};
@@ -470,12 +498,15 @@ enum class TableOutcome {
                        "hash."};
             return false;
         }
-        const std::uint64_t entries = (superblock.partition_size +
-                                       superblock.partition_block_size - 1) /
-                                      superblock.partition_block_size;
+        std::uint64_t digest_bytes = 0;
+        if (!hash_digest_bytes(superblock.partition_size, superblock.partition_block_size,
+                               digest_bytes)) {
+            failure = {ContainerError::section_invalid,
+                       "The section's hash table or hashed data leaves its section."};
+            return false;
+        }
         std::vector<std::byte> table;
-        if (!read_hash_table(view, superblock.hash_table_offset, entries * 0x20, table,
-                             failure)) {
+        if (!read_hash_table(view, superblock.hash_table_offset, digest_bytes, table, failure)) {
             return false;
         }
         const TableOutcome data = verify_block_digests(
@@ -494,9 +525,14 @@ enum class TableOutcome {
     }
     if (section.partition_type == kPartitionRomFs && section.fs_type == kFsTypeRomFs) {
         const NcaSuperblock::Level& first = superblock.ivfc_levels[0];
+        std::uint64_t master_block = 0;
+        if (!ivfc_block_size(first.block_size_log2, master_block)) {
+            failure = {ContainerError::section_invalid,
+                       "The section's superblock names an unusable hash block size."};
+            return false;
+        }
         const TableOutcome master =
-            verify_block_digests(view, first.offset, first.size,
-                                 std::uint64_t{1} << first.block_size_log2, true,
+            verify_block_digests(view, first.offset, first.size, master_block, true,
                                  superblock.master_hash, bad_entry, failure);
         if (master == TableOutcome::failure) {
             return false;
@@ -510,17 +546,24 @@ enum class TableOutcome {
         for (std::size_t level = 1; level < superblock.ivfc_levels.size(); ++level) {
             const NcaSuperblock::Level& data = superblock.ivfc_levels[level];
             const NcaSuperblock::Level& table_level = superblock.ivfc_levels[level - 1];
-            const std::uint64_t entries = (data.size + (std::uint64_t{1} << data.block_size_log2) -
-                                           1) /
-                                          (std::uint64_t{1} << data.block_size_log2);
+            std::uint64_t block_size = 0;
+            std::uint64_t digest_bytes = 0;
+            // The parent level is the digest table. Its declared size bounds
+            // the read, so a wrapped entry count cannot become an empty table
+            // and a real count cannot read past the parent.
+            if (!ivfc_block_size(data.block_size_log2, block_size) ||
+                !hash_digest_bytes(data.size, block_size, digest_bytes) ||
+                digest_bytes > table_level.size) {
+                failure = {ContainerError::section_invalid,
+                           "The section's hash table or hashed data leaves its section."};
+                return false;
+            }
             std::vector<std::byte> table;
-            if (!read_hash_table(view, table_level.offset, entries * 0x20, table,
-                                 failure)) {
+            if (!read_hash_table(view, table_level.offset, digest_bytes, table, failure)) {
                 return false;
             }
             const TableOutcome outcome =
-                verify_block_digests(view, data.offset, data.size,
-                                     std::uint64_t{1} << data.block_size_log2, true, table,
+                verify_block_digests(view, data.offset, data.size, block_size, true, table,
                                      bad_entry, failure);
             if (outcome == TableOutcome::failure) {
                 return false;
@@ -724,20 +767,28 @@ bool read_section_view(const SectionView& view, std::uint64_t offset_within_sect
             return false;
         }
         const std::uint64_t available = relocation_end - virtual_offset;
+        if (relocation.virt_offset > virtual_offset) {
+            return false;
+        }
+        const std::uint64_t delta = virtual_offset - relocation.virt_offset;
+        // Physical start and the range length are both checked by
+        // subtraction. Adding either one first can wrap a high physical
+        // address to zero, which then passes the later bounds check.
+        if (relocation.phys_offset > ~std::uint64_t{0} - delta ||
+            available > ~std::uint64_t{0} - delta - relocation.phys_offset) {
+            return false;
+        }
+        const std::uint64_t physical = relocation.phys_offset + delta;
         if (relocation.is_patch == 0) {
             const std::uint64_t take = std::min<std::uint64_t>(out.size() - done, available);
-            const std::uint64_t base_offset =
-                virtual_offset - relocation.virt_offset + relocation.phys_offset;
             if (!read_nca_section(*view.base_program, *view.base_section,
-                                  view.base_file ? view.base_file : view.file, base_offset,
+                                  view.base_file ? view.base_file : view.file, physical,
                                   out.subspan(done, std::size_t(take)))) {
                 return false;
             }
             done += std::size_t(take);
             continue;
         }
-        const std::uint64_t physical =
-            virtual_offset - relocation.virt_offset + relocation.phys_offset;
         BktrSubsection subsection;
         std::uint64_t subsection_end = 0;
         if (!find_bktr_subsection(patch, physical, subsection, subsection_end)) {
@@ -1129,10 +1180,10 @@ CandidateOutcome open_nca_candidate(std::FILE* file, std::uint64_t base,
                            "The ExeFS partition extent leaves its section."};
                 return CandidateOutcome::failure;
             }
-            const std::uint64_t table_entries =
-                (parsed_superblock.partition_size + parsed_superblock.partition_block_size - 1) /
-                parsed_superblock.partition_block_size;
-            if (parsed_superblock.hash_table_size < table_entries * 0x20 ||
+            std::uint64_t digest_bytes = 0;
+            if (!hash_digest_bytes(parsed_superblock.partition_size,
+                                   parsed_superblock.partition_block_size, digest_bytes) ||
+                parsed_superblock.hash_table_size < digest_bytes ||
                 parsed_superblock.hash_table_offset > section.size ||
                 parsed_superblock.hash_table_size >
                     section.size - parsed_superblock.hash_table_offset) {
@@ -1181,7 +1232,9 @@ CandidateOutcome open_nca_candidate(std::FILE* file, std::uint64_t base,
             }
             section.romfs_offset = parsed_superblock.ivfc_levels[kIvfcDataLevel].offset;
             parsed_superblock.romfs_size = parsed_superblock.ivfc_levels[kIvfcDataLevel].size;
-            if (section.romfs_offset >= section.size) {
+            // A BKTR data offset addresses the patched image, which can be
+            // larger than the stored section. The relocation tree bounds it.
+            if (section.crypt_type != kCryptBktr && section.romfs_offset >= section.size) {
                 failure = {ContainerError::section_invalid,
                            "The RomFS data offset leaves its section."};
                 return CandidateOutcome::failure;

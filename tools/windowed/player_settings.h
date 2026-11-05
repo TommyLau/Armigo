@@ -47,6 +47,8 @@ struct PlayerChoices {
     bool handheld = false;             // console_mode: "docked" or "handheld"
     std::string resolution = "auto";   // auto, 720p, 900p, 1080p, 1440p, 2160p or native
     int frame_rate = 60;               // 0 (Auto), 30 or 60
+    bool title_frame_rate = false;
+    std::uint32_t display_refresh_rate = 0; // zero follows the frame-rate choice
     bool vsync = true;                 // macOS; iOS always synchronises
     bool performance_overlay = false;  // Apple's Metal performance HUD
 };
@@ -72,7 +74,8 @@ void apply_performance_overlay(const PlayerChoices& choices);
 // Applies the choices to the launch of a packed game: the operation mode, the
 // output width (through the title's resolution setting, for a title that has
 // one) and a drawable no wider than it, V-Sync, and the frame rate the title's
-// resolution controller budgets for. Settings the environment already makes
+// resolution controller budgets for, the title mode, and guest display cadence.
+// Settings the environment already makes
 // win.
 void apply_player_choices(const PlayerChoices& choices, std::uint32_t width, RunnerArguments& arguments);
 

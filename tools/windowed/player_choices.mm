@@ -26,9 +26,16 @@ PlayerChoices read_player_choices() {
             for (NSString* key in @[@"language", @"region", @"fps_overlay", @"frame_rate"])
                 [defaults removeObjectForKey:key];
         }
-        [defaults registerDefaults:@{@"console_mode": @"docked", @"resolution": @"auto", @"frame_rate": @60,
+        NSDictionary* rate_policy = NSBundle.mainBundle.infoDictionary[@"ArmigoTitleFrameRate"];
+        const bool title_rate = [rate_policy isKindOfClass:[NSDictionary class]] &&
+            ([rate_policy[@"Default"] isEqual:@30] || [rate_policy[@"Default"] isEqual:@60]) &&
+            ([rate_policy[@"DisplayRefresh"] isEqual:@30] || [rate_policy[@"DisplayRefresh"] isEqual:@60]);
+        const NSInteger default_rate = title_rate ? [rate_policy[@"Default"] integerValue] : 60;
+        [defaults registerDefaults:@{@"console_mode": @"docked", @"resolution": @"auto", @"frame_rate": @(default_rate),
                                      @"vsync": @YES, @"performance_overlay": @NO}];
         PlayerChoices choices;
+        choices.title_frame_rate = title_rate;
+        if (title_rate) choices.display_refresh_rate = [rate_policy[@"DisplayRefresh"] unsignedIntValue];
         choices.handheld = [[defaults stringForKey:@"console_mode"] isEqualToString:@"handheld"];
         if (NSString* resolution = [defaults stringForKey:@"resolution"]) choices.resolution = resolution.UTF8String;
         const NSInteger rate = [defaults integerForKey:@"frame_rate"];

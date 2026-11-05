@@ -444,10 +444,6 @@ ParsedRunArguments parse_runner_arguments(platform::PresentationMode mode,
             argument_error = !consume_value(arguments, value);
             if (!argument_error) options.capture_directory = value;
         } else if (flag == "--input-script") {
-            if (mode != platform::PresentationMode::headless) {
-                parsed.error = "--input-script is supported only by the headless runner.";
-                return parsed;
-            }
             argument_error = !consume_value(arguments, value);
             if (!argument_error) options.input_script_file = value;
         } else if (flag == "--saves") {
@@ -679,7 +675,7 @@ std::string runner_run_usage() {
            "  --frames N             Stop after N completed presentations (positive).\n"
            "  --time-limit S         Request stop after S seconds (positive).\n"
            "  --report FILE          Write the structured result to FILE.\n"
-           "  --input-script FILE    Controller events; presents or elapsed clock (headless).\n"
+           "  --input-script FILE    Controller events; presents or elapsed clock.\n"
            "  --capture DIR          Runtime capture directory.\n"
            "  --saves DIR            Keep save data in DIR between runs.\n"
            "  --operation-mode MODE  Guest operation mode: console or handheld\n"

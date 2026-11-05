@@ -18,6 +18,7 @@
 #include <armigo/horizon/event.h>
 #include <armigo/graphics/presentation_hints.h>
 #include <atomic>
+#include <array>
 #include <cstdio>
 #include <limits>
 #include <memory>
@@ -34,6 +35,8 @@ struct WindowObject {
 };
 static_assert(sizeof(WindowObject) <= sizeof(NVNwindow));
 struct WindowHost {
+  struct Backing { std::uint64_t address = 0, size = 0; };
+  std::array<Backing, 4> backings{};
   std::mutex mutex;
   bool active = true;
   std::uint32_t width = 0, height = 0;
@@ -114,6 +117,7 @@ NVNboolean initialize(NVNwindow *window, const NVNwindowBuilder *builder) {
       return 0;
     }
     std::array<services::vi::NativeTexture, 4> exports;
+    std::array<WindowHost::Backing, 4> backings{};
     for (int i = 0; i < b.texture_count; ++i) {
       if (!b.textures[i])
         return 0;
@@ -127,11 +131,13 @@ NVNboolean initialize(NVNwindow *window, const NVNwindowBuilder *builder) {
           exported->height != texture.description.height)
         return 0;
       exports[i] = std::move(*exported);
+      backings[i] = {reinterpret_cast<std::uint64_t>(texture.memory), texture.size};
       if (i && (exports[i].width != exports[0].width ||
                 exports[i].height != exports[0].height))
         return 0;
     }
     auto instance = std::make_shared<WindowHost>();
+    instance->backings = backings;
     instance->producer = producer;
     instance->width = exports[0].width;
     instance->height = exports[0].height;
@@ -196,9 +202,13 @@ NVNwindowAcquireTextureResult acquire(NVNwindow *window, NVNsync *sync,
   {
     const std::lock_guard lock(instance->mutex);
     if (!instance->active) return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_NATIVE_ERROR;
-    period = static_cast<std::uint64_t>(graphics::presentation_scheduling_period(
-        instance->producer->scheduling_period(state<WindowState>(window).present_interval)).count());
-    if (backends().replay) backends().replay->set_scheduling_period(period);
+    const auto interval = state<WindowState>(window).present_interval;
+    const auto scheduling = graphics::presentation_scheduling(
+        instance->producer->scheduling_period(interval),
+        instance->producer->guest_present_period(interval));
+    period = static_cast<std::uint64_t>(scheduling.period.count());
+    if (backends().replay)
+      backends().replay->set_scheduling_period(period, scheduling.guest_cadence);
   }
   // A policy change can take a while; present and finalize must not wait on it.
   if (backends().replay) backends().replay->acquire_tick(period);
@@ -325,9 +335,11 @@ void present(NVNqueue *queue, NVNwindow *window, int index) {
     if (instance->active) {
       auto& window_state = state<WindowState>(window);
       ++window_state.presents;
-      const auto period = graphics::presentation_scheduling_period(
-          instance->producer->scheduling_period(window_state.present_interval));
-      replay->finish_frame(static_cast<std::uint64_t>(period.count()));
+      const auto scheduling = graphics::presentation_scheduling(
+          instance->producer->scheduling_period(window_state.present_interval),
+          instance->producer->guest_present_period(window_state.present_interval));
+      replay->finish_frame(static_cast<std::uint64_t>(scheduling.period.count()),
+                           scheduling.guest_cadence);
     }
   } catch (...) {
     queue_error(queue, "Presentation backend raised an exception");
@@ -354,6 +366,20 @@ NVNqueueAcquireTextureResult queue_acquire(NVNqueue *queue, NVNwindow *window,
 void set_texture_exporter(TextureExporter exporter) {
   const std::lock_guard lock(registry_mutex);
   texture_exporter = std::move(exporter);
+}
+bool window_texture_overlaps(std::uint64_t address, std::uint64_t size) {
+  if (!size || size > UINT64_MAX - address) return true;
+  const auto end = address + size;
+  const std::lock_guard lock(registry_mutex);
+  for (const auto& [serial, window] : windows) {
+    static_cast<void>(serial);
+    for (const auto& backing : window->backings)
+      if (backing.address && backing.size &&
+          (backing.size > UINT64_MAX - backing.address ||
+           (address < backing.address + backing.size && backing.address < end)))
+        return true;
+  }
+  return false;
 }
 void register_present_entries() {
   register_queue_entries();

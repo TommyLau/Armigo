@@ -25,12 +25,27 @@ inline void set_maximum_presentation_rate(std::uint32_t rate) noexcept {
     detail::maximum_presentation_rate.store(rate, std::memory_order_relaxed);
 }
 
+struct PresentationScheduling {
+    std::chrono::nanoseconds period{};
+    // A guest cadence supplies a deadline without changing the unpaced
+    // encoder's waiting strategy.
+    bool guest_cadence = false;
+};
+
+inline PresentationScheduling presentation_scheduling(
+    std::chrono::nanoseconds paced_period,
+    std::chrono::nanoseconds guest_period = {}) noexcept {
+    // Known host pacing supplies a deadline independently of a maximum-rate hint.
+    if (paced_period > std::chrono::nanoseconds::zero()) return {paced_period, false};
+    const auto rate = detail::maximum_presentation_rate.load(std::memory_order_relaxed);
+    if (rate) return {std::chrono::nanoseconds(1'000'000'000ull / rate), false};
+    if (guest_period > std::chrono::nanoseconds::zero()) return {guest_period, true};
+    return {};
+}
+
 inline std::chrono::nanoseconds presentation_scheduling_period(
     std::chrono::nanoseconds paced_period) noexcept {
-    // Known host pacing supplies a deadline independently of a maximum-rate hint.
-    if (paced_period > std::chrono::nanoseconds::zero()) return paced_period;
-    const auto rate = detail::maximum_presentation_rate.load(std::memory_order_relaxed);
-    return std::chrono::nanoseconds(rate ? 1'000'000'000ull / rate : 0);
+    return presentation_scheduling(paced_period).period;
 }
 
 } // namespace armigo::graphics

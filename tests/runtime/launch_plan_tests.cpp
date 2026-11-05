@@ -21,9 +21,12 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <numeric>
+#include <optional>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <variant>
@@ -676,6 +679,66 @@ struct CompatibilityMemory {
     }
 };
 
+void rejects_unsupported_and_filtered_prepared_rates() {
+    test::ModuleSpec module;
+    module.name = "main";
+    module.symbols = {{"_start", 0x100, 8, true}};
+    test::put_word(module, 0x100, 0xd2800020u); // MOV X0, #1.
+    test::put_word(module, 0x104, aarch64::encode_ret().word);
+    loader::ExeFsDirectoryInput input;
+    input.modules.push_back({"main", test::build_module(std::move(module))});
+    auto profile = synthetic_profile();
+    profile.title_id = 0x123;
+    const auto artifacts = prepare_modules(input, preparation_options());
+    CHECK(value(artifacts)); if (!value(artifacts)) return;
+    const auto plan = plan_launch(input, profile, *value(artifacts));
+    CHECK(value(plan)); if (!value(plan)) return;
+    const auto image = loader::read_nso_module(input.modules[0].bytes);
+    CHECK(image.ok()); if (!image.ok()) return;
+    compat::PatchDescription patch;
+    patch.identity = {profile.title_id, image.image->build_id};
+    patch.frame_rate = compat::FrameRateSettings{30, 60, {30, 120}};
+    patch.words = {{0x100, 0xd2800020u, 0xd2800060u, false, "Synthetic private mode.", 120}};
+    const auto load = [&] {
+        return load_prepared_launch(input, *value(artifacts), profile, *value(plan),
+            std::make_shared<platform::ThreadSlotKey>(), {}, std::span(&patch, 1));
+    };
+    const auto check_word = [](const LaunchResult<PreparedLaunch>& result, std::uint32_t expected) {
+        CHECK(value(result));
+        if (const auto* loaded = value(result)) {
+            const auto bytes = loaded->modules->mapping(0).readable_bytes(0x100, 4);
+            CHECK(bytes.has_value());
+            std::uint32_t word = 0;
+            if (bytes) std::memcpy(&word, bytes->data(), 4);
+            CHECK(word == expected);
+        }
+    };
+    const auto check_refusal = [](const LaunchResult<PreparedLaunch>& result) {
+        CHECK(failed(result, LaunchError::invalid_input));
+        if (const auto* failure = std::get_if<LaunchFailure>(&result))
+            CHECK(failure->operation == "compatibility-frame-rate");
+    };
+    const auto environment = [](const char* name) -> std::optional<std::string> {
+        if (const char* setting = std::getenv(name)) return std::string(setting);
+        return {};
+    };
+    const auto old_rate = environment("ARMIGO_COMPAT_FRAME_RATE");
+    const auto old_driver = environment("ARMIGO_NVN");
+    setenv("ARMIGO_NVN", "stream", 1);
+    setenv("ARMIGO_COMPAT_FRAME_RATE", "60", 1);
+    check_refusal(load());
+    setenv("ARMIGO_COMPAT_FRAME_RATE", "120", 1);
+    check_word(load(), 0xd2800060u);
+    patch.words.front().nvn_driver_only = true;
+    check_refusal(load());
+    setenv("ARMIGO_COMPAT_FRAME_RATE", "30", 1);
+    check_word(load(), 0xd2800020u);
+    if (old_rate) setenv("ARMIGO_COMPAT_FRAME_RATE", old_rate->c_str(), 1);
+    else unsetenv("ARMIGO_COMPAT_FRAME_RATE");
+    if (old_driver) setenv("ARMIGO_NVN", old_driver->c_str(), 1);
+    else unsetenv("ARMIGO_NVN");
+}
+
 void loads_identity_selected_call_hooks() {
     test::ModuleSpec module;
     module.name = "main";
@@ -778,6 +841,7 @@ void loads_identity_selected_call_hooks() {
 
 int main() {
     loads_identity_selected_call_hooks();
+    rejects_unsupported_and_filtered_prepared_rates();
     derives_dependency_order_and_rejects_unsupported_profiles();
     rejects_invalid_plans_before_publication();
     loads_rootless_companion_without_admitting_entries();

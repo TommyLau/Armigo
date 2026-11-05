@@ -185,7 +185,7 @@ std::string clone_directory(const fs::path& source, const fs::path& destination)
 
 } // namespace
 
-std::string run_pack_tool(const std::vector<std::string>& arguments) {
+std::string run_pack_tool(const std::vector<std::string>& arguments, bool default_title_rate) {
     if (arguments.empty() || arguments.front().empty()) {
         return "Cannot run an empty pack tool command.";
     }
@@ -195,8 +195,18 @@ std::string run_pack_tool(const std::vector<std::string>& arguments) {
         pointers.push_back(const_cast<char*>(argument.c_str()));
     }
     pointers.push_back(nullptr);
+    std::vector<std::string> environment;
+    std::vector<char*> environment_pointers;
+    if (default_title_rate) {
+        for (char** entry = environ; *entry; ++entry)
+            if (!std::string_view(*entry).starts_with("ARMIGO_COMPAT_FRAME_RATE=")) environment.emplace_back(*entry);
+        environment.emplace_back("ARMIGO_COMPAT_FRAME_RATE=0");
+        for (auto& entry : environment) environment_pointers.push_back(entry.data());
+        environment_pointers.push_back(nullptr);
+    }
     pid_t child = 0;
-    const int spawned = posix_spawnp(&child, pointers.front(), nullptr, nullptr, pointers.data(), environ);
+    const int spawned = posix_spawnp(&child, pointers.front(), nullptr, nullptr, pointers.data(),
+                                    default_title_rate ? environment_pointers.data() : environ);
     if (spawned != 0) {
         return "Cannot start " + arguments.front() + ": " + std::strerror(spawned) + ".";
     }
@@ -287,6 +297,42 @@ ShaderStagePaths shader_stage_paths(
                 reused_app / "Contents" / "Resources" / "Armigo" / "shaders"};
     }
     return {staging / "enumeration", staging / "macos-shaders"};
+}
+
+std::variant<std::string, std::vector<fs::path>> reused_addon_directories(const fs::path& game) {
+    std::vector<fs::path> directories;
+    const fs::path addons = game / "addons";
+    std::error_code error;
+    // symlink_status does not follow a link. A missing path is zero add-ons.
+    // exists() would follow a dangling link and report the same absence.
+    const fs::file_status link = fs::symlink_status(addons, error);
+    if (link.type() == fs::file_type::not_found) {
+        return directories;
+    }
+    if (error || link.type() == fs::file_type::none) {
+        return std::string("Cannot enumerate reused add-on content.");
+    }
+    error.clear();
+    if (link.type() == fs::file_type::symlink) {
+        const fs::file_status target = fs::status(addons, error);
+        if (error || target.type() != fs::file_type::directory) {
+            return std::string("Cannot enumerate reused add-on content.");
+        }
+    } else if (link.type() != fs::file_type::directory) {
+        return std::string("Cannot enumerate reused add-on content.");
+    }
+    error.clear();
+    for (fs::directory_iterator cursor(addons, error), end; !error && cursor != end; cursor.increment(error)) {
+        std::error_code entry_error;
+        if (cursor->is_directory(entry_error)) {
+            directories.push_back(cursor->path());
+        } else if (entry_error) {
+            error = entry_error;
+            break;
+        }
+    }
+    if (error) return std::string("Cannot enumerate reused add-on content.");
+    return directories;
 }
 
 std::string validate_reused_selection(

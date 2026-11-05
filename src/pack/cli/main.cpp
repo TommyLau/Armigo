@@ -473,19 +473,12 @@ int pack_game(const pack::Command& command) {
     std::vector<fs::path> addon_directories;
     if (reused_identity) {
         Step step{"Collect reused add-on content"};
-        std::error_code error;
-        const fs::path addons = game / "addons";
-        if (fs::is_directory(addons, error)) {
-            for (fs::directory_iterator cursor(addons, error), end; !error && cursor != end; cursor.increment(error)) {
-                if (cursor->is_directory(error)) {
-                    addon_directories.push_back(cursor->path());
-                }
-            }
-        }
-        if (error) {
-            print_error("Cannot enumerate reused add-on content.");
+        auto collected = pack::reused_addon_directories(game);
+        if (const auto* failure = std::get_if<std::string>(&collected)) {
+            print_error(*failure);
             return 1;
         }
+        addon_directories = std::get<std::vector<fs::path>>(std::move(collected));
     } else {
         Step step{"Extract add-on content"};
         for (const pack::ContentSet& addon : inputs.add_on_content) {
@@ -535,8 +528,23 @@ int pack_game(const pack::Command& command) {
             return 1;
         }
         Step step{"Translate shaders"};
+        pack::ShaderPackInput shader_input;
+        const auto& selected = description->shader_inputs;
+        if (selected.containers == armigo::compat::ShaderContainerSet::GfdCache) {
+            shader_input.containers = pack::ShaderPackInput::Containers::GfdCache;
+        }
+        if (selected.vertex_depth == armigo::compat::ShaderVertexDepth::ZeroToOne) {
+            shader_input.vertex_depth = pack::ShaderPackInput::VertexDepth::ZeroToOne;
+        }
+        shader_input.caches = selected.caches;
+        shader_input.fallbacks.reserve(selected.fallbacks.size());
+        for (const auto& fallback : selected.fallbacks) {
+            shader_input.fallbacks.emplace_back(fallback.cache, fallback.alternatives);
+        }
+        shader_input.ignored_needle_offsets = selected.ignored_needle_offsets;
         auto built = pack::build_shader_package(game / "exefs", game / "romfs", addon_directories,
-                                                 shader_paths.enumeration, macos_shaders, compile_cache, translator);
+                                                 shader_paths.enumeration, macos_shaders, compile_cache, translator,
+                                                 shader_input);
         if (auto* failure = std::get_if<std::string>(&built)) {
             print_error(*failure);
             return 1;
@@ -610,7 +618,7 @@ int pack_game(const pack::Command& command) {
             Step step{"Capture embedded guest code"};
             const std::string failure = pack::run_pack_tool({
                 preparer.string(), "--embedded", "--exefs", (game / "exefs").string(),
-                "--output", embedded.string(), "--patches", (matched.folder / "profile.json").string()});
+                "--output", embedded.string(), "--patches", (matched.folder / "profile.json").string()}, true);
             if (!failure.empty()) {
                 print_error(failure);
                 return 1;
@@ -620,7 +628,7 @@ int pack_game(const pack::Command& command) {
             Step step{"Verify embedded guest code"};
             const std::string failure = pack::run_pack_tool({
                 preparer.string(), "--embedded", "--verify", "--exefs", (game / "exefs").string(),
-                "--output", embedded.string(), "--patches", (matched.folder / "profile.json").string()});
+                "--output", embedded.string(), "--patches", (matched.folder / "profile.json").string()}, true);
             if (!failure.empty()) {
                 print_error(failure);
                 return 1;
@@ -682,6 +690,12 @@ int pack_game(const pack::Command& command) {
         spec.languages = names.languages;
         spec.localized_titles = names.localized_titles;
         spec.supported_language_flag = names.supported_language_flag;
+        // The current title-mode selector is a macOS launch feature. iOS
+        // embeds the profile's default preparation and keeps its existing UI.
+        if (!ios && description->frame_rate) {
+            spec.default_frame_rate = description->frame_rate->default_rate;
+            spec.display_refresh_rate = description->frame_rate->display_refresh_rate;
+        }
         auto assembled = pack::assemble_application(spec);
         if (auto* failure = std::get_if<std::string>(&assembled)) {
             print_error(*failure);

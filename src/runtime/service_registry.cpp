@@ -958,15 +958,16 @@ private:
 
     // Renderer sound plays on the default output device in windowed runs and is
     // muted in headless runs, which never need an audio device. ARMIGO_AUDIO=0
-    // mutes and ARMIGO_AUDIO=1 plays regardless of the presentation mode. A
-    // device that cannot be opened leaves that renderer muted with a diagnostic.
+    // mutes and ARMIGO_AUDIO=1 plays regardless of the presentation mode.
+    // ARMIGO_AUDIO=silent opens that same device and clock and zero-fills the
+    // samples after they are consumed. A device that cannot be opened leaves
+    // that renderer muted with a diagnostic.
     services::audren::OutputFactory audio_output_factory() const {
-        bool audible = presenter_ && presenter_->mode() == platform::PresentationMode::windowed;
-        if (const char* setting = std::getenv("ARMIGO_AUDIO"); setting != nullptr && *setting != '\0')
-            audible = std::string_view(setting) != "0";
-        if (!audible) return {};
-        return [] {
-            auto output = platform::make_pcm_sink_output(true);
+        const bool windowed = presenter_ && presenter_->mode() == platform::PresentationMode::windowed;
+        const auto kind = platform::pcm_output_kind_from_setting(std::getenv("ARMIGO_AUDIO"), windowed);
+        if (kind == platform::PcmOutputKind::muted) return {};
+        return [kind] {
+            auto output = platform::make_pcm_sink_output(kind);
             if (!output)
                 armigo::diag::write(armigo::diag::Level::error,  "[audio output] the default output device is unavailable; "
                                      "guest audio output is muted\n");

@@ -191,10 +191,6 @@ int main(int argc, char* argv[]) {
             const auto choices = armigo::tools::read_player_choices();
             // Before anything here creates a Metal device.
             armigo::tools::apply_performance_overlay(choices);
-            // A fixed frame rate pins the guest's display cadence; Auto runs
-            // at the display's rate.
-            if (choices.frame_rate && !std::getenv("ARMIGO_VI_REFRESH_HZ"))
-                setenv("ARMIGO_VI_REFRESH_HZ", std::to_string(choices.frame_rate).c_str(), 1);
             // Native is the main display's pixels; flags given on the command
             // line keep their own operation mode and window.
             NSScreen* screen = NSScreen.mainScreen;

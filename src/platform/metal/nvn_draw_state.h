@@ -125,10 +125,19 @@ struct DrawInvalidation {
 
 // Buffer hazards are separate from attachment notifications. A read-only draw
 // must clear a consumed obligation instead of retaining a previous writer's bit.
+// Inside a render pass only vertex-stage writes can be ordered before later
+// work, so the order remembers whether the writes came only from that stage.
+// Only writes create an obligation; reads never need ordering here.
 struct DrawWriteOrder {
-    bool pending = false;
-    bool consume() { return std::exchange(pending, false); }
-    void draw(bool writes_buffers) { pending = writes_buffers; }
+    enum class Writer : std::uint8_t { none, vertex, any };
+    Writer pending = Writer::none;
+    Writer consume() { return std::exchange(pending, Writer::none); }
+    void draw(bool vertex_writes, bool fragment_writes) {
+        pending = fragment_writes ? Writer::any : vertex_writes ? Writer::vertex : Writer::none;
+    }
+    // A write by other work (dispatch, transfer, copy): any stage.
+    void write() { pending = Writer::any; }
+    void clear() { pending = Writer::none; }
 };
 
 } // namespace armigo::platform::metal::nvn_driver
