@@ -14,6 +14,7 @@
 #include <armigo/platform/presenter.h>
 #include <armigo/romfs/storage.h>
 #include <armigo/services/addon_content_catalog.h>
+#include <armigo/services/graphics_presentation.h>
 #include <armigo/runtime/guest_clock.h>
 #include <armigo/runtime/guest_memory.h>
 #include <armigo/runtime/launch_profile.h>
@@ -100,8 +101,21 @@ public:
     virtual std::optional<LaunchFailure> failure() const = 0;
     virtual void request_stop() noexcept = 0;
     virtual LaunchStatus drain(std::optional<ClockInstant> deadline) = 0;
+    // Second shutdown phase, after every guest thread has joined. A failure
+    // retains the process owners so a later call can finish draining workers.
+    virtual LaunchStatus finish_guest_shutdown(std::optional<ClockInstant>) {
+        return std::monostate{};
+    }
     virtual ServiceRegistryStatistics statistics() const noexcept = 0;
 };
+
+// Returns the callback unchanged when observation is disabled. An enabled
+// observer borrows guest memory for each bounded copy; it must not retain the
+// handle-table owner through a VI callback owned by that same handle table.
+[[nodiscard]] services::GraphicsPresenter attach_presentation_observer(
+    services::GraphicsPresenter callback,
+    const std::shared_ptr<PresentationClock>& clock,
+    const std::shared_ptr<GuestMemory>& memory);
 
 // Starts opening the shader package in a directory on a background thread.
 // Null when there is no directory or the build has no trusted package chain

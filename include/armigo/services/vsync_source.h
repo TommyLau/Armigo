@@ -58,6 +58,10 @@ public:
         return presentation_clock_ ? presentation_clock_->display_refresh_near(slot) : std::nullopt;
     }
 
+    std::shared_ptr<runtime::PresentationClock> imposed_clock() const noexcept {
+        return presentation_clock_ && presentation_clock_->imposed_pacing() ? presentation_clock_ : nullptr;
+    }
+
     // The sequence advances once for every refresh without consuming or
     // resetting any display event. Waiting returns false if the source fails.
     std::uint64_t sequence() const;

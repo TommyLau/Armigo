@@ -11,11 +11,14 @@
 #include "player_settings.h"
 
 #include <armigo/services/settings.h>
+#include <armigo/common/diagnostics.h>
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <utility>
 
 namespace armigo::tools {
 
@@ -66,6 +69,84 @@ std::uint32_t resolution_width(std::string_view choice, bool ios,
         width = static_cast<std::uint32_t>(std::min<std::uint64_t>(display_width, std::uint64_t(display_height) * 16 / 9));
     else return 0;
     return std::clamp<std::uint32_t>(width, 1280, 3840) & ~15u;
+}
+
+MacFrameRateSelection select_mac_frame_rate(const PlayerChoices& choices,
+    const platform::DisplayCapabilities& display) {
+    MacFrameRateSelection result;
+    result.options.push_back(0);
+    // Use the active mode, not a faster mode the display could switch to.
+    // A mode with no fixed refresh is resolved by the platform to its maximum.
+    const bool high_refresh = display.available() && std::isfinite(display.current.refresh_hz) &&
+        display.current.refresh_hz >= 120.0;
+    for (int rate : {30, 60, 120}) {
+        if (rate == 120 && !high_refresh) continue;
+        if (std::find(choices.supported_frame_rates.begin(), choices.supported_frame_rates.end(), rate) !=
+            choices.supported_frame_rates.end()) result.options.push_back(rate);
+    }
+    result.frame_rate = choices.frame_rate;
+    if (std::find(result.options.begin(), result.options.end(), choices.frame_rate) == result.options.end()) {
+        result.frame_rate = result.options.back();
+        result.fell_back = true;
+    }
+    // Existing 30/60/Auto launches retain exactly the runner's 60 Hz grid.
+    // 120 is selected only after both the title and active display admit it.
+    if (result.frame_rate == 120) result.refresh_hz = 120.0;
+    return result;
+}
+
+WindowedLaunchConfiguration mac_player_launch_configuration(
+    PlayerChoices choices, std::uint32_t width, MacPlayerLaunchObserver observer) {
+    return [choices = std::move(choices), width, observer = std::move(observer)](
+        RunnerArguments& launch, const platform::DisplayCapabilities& display) {
+        const char* override = std::getenv("ARMIGO_COMPAT_FRAME_RATE");
+        auto requested = choices;
+        if (override) {
+            // Leave the environment verbatim for the title selector, including
+            // invalid values it must reject and empty/zero values meaning Auto.
+            const std::string_view value(override);
+            requested.frame_rate = value == "120" ? 120 : value == "60" ? 60 : value == "30" ? 30 : 0;
+        }
+        auto selection = select_mac_frame_rate(requested, display);
+        bool no_rate_fits_clock = false;
+        if (!launch.refresh_hz_explicit && requested.frame_rate == 120 && selection.frame_rate == 120)
+            launch.refresh_hz = 120.0;
+        if (override) {
+            selection.environment_override = override;
+            selection.frame_rate = requested.frame_rate;
+            selection.fell_back = false;
+        } else if ((requested.frame_rate == 120 || selection.frame_rate == 120) && launch.refresh_hz < 120.0) {
+            // UI preferences may not admit 120 words against a slower explicit
+            // clock. Other existing 30/60/Auto behavior is left unchanged.
+            selection.frame_rate = 0;
+            for (int rate : selection.options)
+                if (rate > 0 && rate <= launch.refresh_hz) selection.frame_rate = rate;
+            if (selection.frame_rate == 0) {
+                no_rate_fits_clock = true;
+                selection.frame_rate = static_cast<int>(choices.default_frame_rate);
+            }
+            selection.fell_back = true;
+        }
+        selection.refresh_hz = launch.refresh_hz;
+        auto effective = choices;
+        effective.frame_rate = selection.frame_rate;
+        if (effective.frame_rate == 120 && launch.refresh_hz == 120.0)
+            effective.display_refresh_rate = 120;
+        const auto mode = launch.operation_mode;
+        apply_player_choices(effective, width, launch);
+        launch.operation_mode = mode;
+        if (no_rate_fits_clock)
+            diag::warning("Armigo settings: stored %d fps cannot fit the %.3f Hz presentation/VI clock; "
+                          "every declared rate exceeds it; using the title default of %d fps.\n",
+                          choices.frame_rate, selection.refresh_hz, selection.frame_rate);
+        else if (selection.fell_back)
+            diag::warning("Armigo settings: stored %d fps is unavailable on this title/display/clock; using %d fps "
+                          "with a %.0f Hz presentation/VI clock.\n",
+                          choices.frame_rate, selection.frame_rate, selection.refresh_hz);
+        diag::info("Armigo launch display: %.3f Hz; presentation/VI clock %.3f Hz is fixed for this run "
+                   "(moving between displays does not change it).\n", display.current.refresh_hz, selection.refresh_hz);
+        if (observer) observer(effective, selection);
+    };
 }
 
 void apply_performance_overlay(const PlayerChoices& choices) {

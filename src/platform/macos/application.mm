@@ -140,6 +140,7 @@
 @property (nonatomic, copy) void (^onClose)(void);
 @property (nonatomic, copy) void (^onClosed)(void);
 @property (nonatomic, copy) void (^onGeometry)(void);
+@property (nonatomic, copy) void (^onScreenChanged)(NSWindow*);
 @property (nonatomic, copy) void (^onResignKey)(void);
 @property (nonatomic, copy) void (^onBecomeKey)(void);
 @end
@@ -168,6 +169,10 @@
 - (void)windowDidBecomeKey:(NSNotification*)notification {
     (void)notification;
     if (self.onBecomeKey) self.onBecomeKey();
+}
+
+- (void)windowDidChangeScreen:(NSNotification*)notification {
+    if (self.onScreenChanged) self.onScreenChanged((NSWindow*)notification.object);
 }
 
 - (void)windowDidResize:(NSNotification*)notification {
@@ -305,6 +310,12 @@ public:
 
     std::shared_ptr<Presenter> presenter() const noexcept override { return presenter_; }
 
+    DisplayCapabilities display_capabilities() const noexcept override {
+        NSScreen* screen = window_.screen;
+        if (!screen) return {};
+        return query_display_capabilities([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue]);
+    }
+
     PresenterStatus run(std::stop_token stop) override {
         if (![NSThread isMainThread])
             return failure(PresentationError::host_failure, "the application event loop runs on the main thread");
@@ -411,6 +422,12 @@ ApplicationCreation create_application(const PresenterOptions& options, Applicat
         };
         delegate.onClosed = [state]() {
             state->window_closed.store(true, std::memory_order_relaxed);
+        };
+        delegate.onScreenChanged = [handler](NSWindow* changed_window) {
+            NSScreen* screen = changed_window.screen;
+            if (screen && handler.display_changed)
+                handler.display_changed(query_display_capabilities(
+                    [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue]));
         };
         const std::uint32_t content_width = options.content_width;
         delegate.onGeometry = [view, metal_layer, content_width]() {

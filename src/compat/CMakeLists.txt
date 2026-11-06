@@ -9,7 +9,7 @@
 # ============================================================================
 
 add_library(armigo_compat STATIC
-    "${PROJECT_SOURCE_DIR}/src/titles/01007EF00011E000/frame_rate.cpp"
+    "${PROJECT_SOURCE_DIR}/src/titles/frame_rate.cpp"
     "${PROJECT_SOURCE_DIR}/src/titles/01007EF00011E000/resolution.cpp"
     patches.mm title_settings.mm)
 target_include_directories(armigo_compat PUBLIC "${PROJECT_SOURCE_DIR}/include")
@@ -27,6 +27,9 @@ if(BUILD_TESTING)
     target_include_directories(armigo_title_settings_tests PRIVATE "${PROJECT_SOURCE_DIR}/src/platform/metal")
     target_link_libraries(armigo_title_settings_tests PRIVATE armigo_compat)
     add_test(NAME compat.title_settings COMMAND armigo_title_settings_tests "${PROJECT_SOURCE_DIR}/titles")
+    add_executable(armigo_title_frame_rate_tests "${PROJECT_SOURCE_DIR}/tests/titles/frame_rate_tests.cpp")
+    target_link_libraries(armigo_title_frame_rate_tests PRIVATE armigo_compat)
+    add_test(NAME title.frame_rate COMMAND armigo_title_frame_rate_tests)
     add_executable(armigo_01007EF00011E000_frame_rate_tests
         "${PROJECT_SOURCE_DIR}/tests/titles/01007EF00011E000/frame_rate_tests.cpp")
     target_link_libraries(armigo_01007EF00011E000_frame_rate_tests PRIVATE armigo_compat)

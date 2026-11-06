@@ -64,6 +64,15 @@ public:
     // mutations fail or defer under their evidenced operation contract.
     virtual LaunchResult<GuestMemoryPin> pin(horizon::AddressRange range,
                                              memory::Permission access) = 0;
+    // Bounded diagnostic copy (1..8 bytes), checked under the mapping lock.
+    // It publishes no retained pin: concurrent mapping changes wait for the
+    // copy instead of failing because instrumentation retained their range.
+    // This protects mappings, not a multi-field snapshot of guest writes.
+    virtual bool copy_observation(std::uint64_t address, std::span<std::byte> out) const noexcept {
+        static_cast<void>(address);
+        static_cast<void>(out);
+        return false;
+    }
     // Existing adapters borrow this object; the process owns it through all
     // callbacks. Each invocation pins its complete access. Preserve partial
     // ordered word-copy semantics and native aligned atomics from GuestCopyOut;

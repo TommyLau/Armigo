@@ -11,6 +11,7 @@
 #include "player_settings.h"
 
 #import <Foundation/Foundation.h>
+#include <TargetConditionals.h>
 
 namespace armigo::tools {
 
@@ -35,11 +36,26 @@ PlayerChoices read_player_choices() {
                                      @"vsync": @YES, @"performance_overlay": @NO}];
         PlayerChoices choices;
         choices.title_frame_rate = title_rate;
+        choices.default_frame_rate = static_cast<std::uint32_t>(default_rate);
         if (title_rate) choices.display_refresh_rate = [rate_policy[@"DisplayRefresh"] unsignedIntValue];
         choices.handheld = [[defaults stringForKey:@"console_mode"] isEqualToString:@"handheld"];
         if (NSString* resolution = [defaults stringForKey:@"resolution"]) choices.resolution = resolution.UTF8String;
         const NSInteger rate = [defaults integerForKey:@"frame_rate"];
         choices.frame_rate = rate == 0 || rate == 30 ? static_cast<int>(rate) : 60;
+#if !TARGET_OS_IPHONE
+        if (rate == 120) choices.frame_rate = 120;
+        if (title_rate) {
+            id declared = rate_policy[@"SupportedRates"];
+            if ([declared isKindOfClass:[NSArray class]] && [declared count]) {
+                choices.supported_frame_rates.clear();
+                for (id value in declared) {
+                    if ([value isEqual:@30] || [value isEqual:@60] || [value isEqual:@120])
+                        choices.supported_frame_rates.push_back([value unsignedIntValue]);
+                }
+                if (choices.supported_frame_rates.empty()) choices.supported_frame_rates = {30, 60};
+            }
+        }
+#endif
         choices.vsync = [defaults boolForKey:@"vsync"];
         choices.performance_overlay = [defaults boolForKey:@"performance_overlay"];
         return choices;

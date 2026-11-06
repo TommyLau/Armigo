@@ -726,6 +726,7 @@ public:
                 return failure;
         }
 #ifdef ARMIGO_HAS_RUNTIME_PRESENTATION
+        if (auto failure = presentation_clock_->observation_failure()) return failure;
         if (presentation_) {
             if (auto failure = presentation_->failure())
                 return failure;
@@ -766,6 +767,13 @@ public:
             return converted;
         }
 #endif
+        return success();
+    }
+
+    LaunchStatus finish_guest_shutdown(std::optional<ClockInstant> deadline) override {
+        if (nvn_driver_ && !platform::metal::nvn_driver::stop_submission_workers(deadline))
+            return make_failure(LaunchStage::shutdown, LaunchError::deadline_expired,
+                                "service_registry.nvn_shutdown", "NVN submission workers did not stop before the deadline.");
         return success();
     }
 
@@ -1065,7 +1073,8 @@ private:
                 display->set_buffer_backing_lookup(graphics_access_.lookup);
                 if (nvn_driver_) platform::metal::nvn_driver::bind_native_windows(display);
                 if (observe_display_) observe_display_(display);
-                auto callback = presentation_->callback();
+                auto callback = attach_presentation_observer(
+                    presentation_->callback(), presentation_clock_, memory_);
                 auto counters = counters_;
                 display->set_presenter(
                     [callback = std::move(callback), counters](
@@ -1168,6 +1177,27 @@ private:
 };
 
 } // namespace
+
+services::GraphicsPresenter attach_presentation_observer(
+    services::GraphicsPresenter callback,
+    const std::shared_ptr<PresentationClock>& clock,
+    const std::shared_ptr<GuestMemory>& memory) {
+    if (!clock->observes_presents()) return callback;
+    return [callback = std::move(callback), clock, memory = std::weak_ptr{memory}](
+               const services::GraphicsPresentation& frame) {
+        auto result = callback(frame);
+        if (result.completed) {
+            const auto observed = clock->observe_present(frame.frame_number, frame.swap_interval,
+                [memory](std::uint64_t address, std::span<std::byte> out) {
+                    const auto owner = memory.lock();
+                    return owner && owner->copy_observation(address, out);
+                });
+            if (const auto* error = std::get_if<LaunchFailure>(&observed))
+                return services::GraphicsPresentationResult{false, error->detail};
+        }
+        return result;
+    };
+}
 
 horizon::SessionConnection ServiceRegistry::connector(
     void* context, std::string_view port) {

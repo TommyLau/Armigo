@@ -171,7 +171,7 @@ struct State : std::enable_shared_from_this<State> {
                 static_cast<std::size_t>(range.size));
         return result;
     }
-    // One short, aligned word access. It validates exactly as pin() does and then performs the
+    // One short native access. It validates exactly as pin() does and then performs the
     // access under the same lock instead of creating, registering and later expiring a pin: a
     // concurrent unmap or permission change waits for the access and so cannot interleave with it,
     // which is the protection a pin gives for the duration of this call.
@@ -449,6 +449,12 @@ public:
         try { return state_->pin(range, access); }
         catch (const std::bad_alloc&) { return failure(LaunchError::resource_limit, "pin", "Pin allocation failed."); }
         catch (const std::length_error&) { return failure(LaunchError::resource_limit, "pin", "Pin limit exceeded."); }
+    }
+    bool copy_observation(std::uint64_t address, std::span<std::byte> out) const noexcept override {
+        if (out.empty() || out.size() > 8 || address > UINT64_MAX - out.size()) return false;
+        return state_->with_word(address, out.size(), Permission::read, false, [&] {
+            std::memcpy(out.data(), reinterpret_cast<const void*>(address), out.size());
+        });
     }
     GuestCopyOut copy_out() noexcept override {
         return {write_word, read_word, state_.get(), exchange_word, read_double};

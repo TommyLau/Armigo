@@ -735,7 +735,12 @@ LaunchStatus NativeProcessRuntime::initialize(std::shared_ptr<romfs::Storage> ro
         return captures_frame(output_, frame_number);
     };
     service_dependencies.acquire_graphics_access = [this] { return acquire_graphics_access(); };
-    auto registry = create_service_registry(std::move(service_dependencies));
+    if (dependencies_.create_services && profile_.origin != ProfileOrigin::synthetic_test)
+        return fail(LaunchStage::services, LaunchError::invalid_input, "create-services",
+                    "A service factory override requires a synthetic profile.");
+    auto create_services = std::move(dependencies_.create_services);
+    auto registry = create_services ? create_services(std::move(service_dependencies))
+                                    : create_service_registry(std::move(service_dependencies));
     if (const auto* failed = std::get_if<LaunchFailure>(&registry)) return *failed;
     services_ = std::get<std::shared_ptr<ServiceRegistry>>(std::move(registry));
     auto exception = memory_->allocate(platform::native_page_size(), horizon::MemoryType::normal, rw);
@@ -964,6 +969,13 @@ LaunchStatus NativeProcessRuntime::shutdown(std::optional<ClockInstant> deadline
             }
             if (const auto failed = threads_->failure()) record_failure(*failed);
         }
+        // Native submissions can still arrive while guest threads leave host
+        // calls. Close and join those workers only after all producers joined,
+        // and before mappings or process-exit registries can be destroyed.
+        if (services_) {
+            const auto finished = services_->finish_guest_shutdown(deadline);
+            if (const auto* failed = std::get_if<LaunchFailure>(&finished)) return remember_teardown(*failed);
+        }
     } catch (const std::exception& error) {
         return remember_teardown(fail(LaunchStage::shutdown, LaunchError::host_failure,
                                       "shutdown", error.what()));
@@ -1172,6 +1184,14 @@ LaunchResult<std::unique_ptr<ProcessRuntime>> ProcessRuntime::create(
         }
         if (const auto* failed = std::get_if<LaunchFailure>(&loaded)) return *failed;
         auto launch = std::get<PreparedLaunch>(std::move(loaded));
+        if (dependencies.presentation_clock->observes_presents()) {
+            std::vector<PresentationModule> observed_modules;
+            for (std::size_t i = 0; i < launch.modules->module_count(); ++i)
+                observed_modules.push_back({launch.modules->module_name(i), launch.modules->mapping(i).base_address()});
+            dependencies.presentation_clock->bind_observation_modules(observed_modules);
+        }
+        const auto admitted_frame_rate = launch.title_frame_rate;
+        const auto refresh_period = dependencies.presentation_clock->configuration().refresh_period;
         auto handles = std::make_shared<horizon::HandleTable>(profile.permissions.handle_table_capacity);
         auto backed = create_guest_memory(profile, dependencies.memory_options, launch.modules, handles);
         if (const auto* failed = std::get_if<LaunchFailure>(&backed)) return *failed;
@@ -1216,6 +1236,14 @@ LaunchResult<std::unique_ptr<ProcessRuntime>> ProcessRuntime::create(
                 // The preallocated owner remains reachable for a later retry.
             }
             return std::move(*failed);
+        }
+        // Both runners pass their actual presentation/VI clock here. Allow one
+        // nanosecond for period rounding; this diagnostic changes no clock or code.
+        if (admitted_frame_rate && refresh_period.count() > 1'000'000'000 / admitted_frame_rate + 1) {
+            armigo::diag::write(armigo::diag::Level::warning,
+                "Armigo: admitted title frame rate %u fps exceeds the configured presentation/VI clock (%.6f Hz). "
+                "Check --refresh-hz for this title mode; continuing with the configured clock and patches.\n",
+                admitted_frame_rate, 1e9 / static_cast<double>(refresh_period.count()));
         }
         return std::unique_ptr<ProcessRuntime>(std::move(runtime));
     } catch (const std::bad_alloc&) {

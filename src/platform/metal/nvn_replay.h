@@ -14,6 +14,8 @@
 
 #include "../../nvn/backend.h"
 
+#include <chrono>
+#include <optional>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -286,6 +288,12 @@ class MetalReplayBackend : public nvn::ReplayBackend {
 public:
     ~MetalReplayBackend() override = default;
 
+    // After guest producers have stopped: close submission admission, drain
+    // admitted work and logging tails, and join replay/encode before mappings
+    // or command registries can retire. A timeout retains owners for retry.
+    virtual bool stop_submission_workers(
+        std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt) = 0;
+
     // Starts the pipeline warm-up, manifest recording and archive described by
     // the configuration. Call once, before the first submission.
     virtual void configure_pipeline_warmup(PipelineWarmupConfig config) { (void)config; }
@@ -311,6 +319,10 @@ struct ReplaySchedulingPolicy {
     // waiting budget. It does not replace the policy or alter command ordering.
     void (*observe_encode_spin)(void*, std::uint64_t fence, std::uint64_t period_ns,
                                 std::uint64_t spin_ns) = nullptr;
+    // Optional lifecycle observations, using the same context lifetime above.
+    // They must not call back into replay; joined may be observed on retries.
+    void (*observe_shutdown_workers_joined)(void*) = nullptr;
+    void (*observe_retired_log)(void*, std::uint64_t fence) = nullptr;
 };
 
 // The queue must belong to device and both objects must outlive the backend.

@@ -2482,6 +2482,35 @@ ReplayImpl*& archive_exit_target() {
     return target;
 }
 
+// Fence publication precedes diagnostics. A shared tail ticket lets the
+// callback finish without touching a potentially retired backend, while
+// shutdown separately waits for every logging tail and retained-log owner.
+struct RetirementTails {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::uint64_t active = 0;
+    bool drain(std::optional<std::chrono::steady_clock::time_point> deadline) {
+        std::unique_lock lock(mutex);
+        if (deadline) return changed.wait_until(lock, *deadline, [&] { return active == 0; });
+        changed.wait(lock, [&] { return active == 0; });
+        return true;
+    }
+};
+struct RetirementTailTicket {
+    explicit RetirementTailTicket(std::shared_ptr<RetirementTails> tails) : tails(std::move(tails)) {
+        const std::lock_guard lock(this->tails->mutex);
+        ++this->tails->active;
+    }
+    RetirementTailTicket(const RetirementTailTicket&) = delete;
+    RetirementTailTicket& operator=(const RetirementTailTicket&) = delete;
+    ~RetirementTailTicket() {
+        const std::lock_guard lock(tails->mutex);
+        --tails->active;
+        tails->changed.notify_all();
+    }
+    std::shared_ptr<RetirementTails> tails;
+};
+
 class ReplayImpl final : public MetalReplayBackend {
 public:
     ReplayImpl(id<MTLDevice> device, id<MTL4CommandQueue> queue, std::shared_ptr<ReplayResources> resources,
@@ -2554,21 +2583,48 @@ public:
             const std::lock_guard lock(archive_exit_mutex());
             if (archive_exit_target() == this) archive_exit_target() = nullptr;
         }
-        std::uint64_t fence = 0;
+        (void)stop_submission_workers();
+    }
+
+    bool stop_submission_workers(
+        std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt) override {
+        std::unique_lock serial(shutdown_mutex_, std::defer_lock);
+        if (deadline ? !serial.try_lock_until(*deadline) : (serial.lock(), false)) return false;
+        std::uint64_t fence;
         {
             std::lock_guard lock(mutex_);
+            accepting_submissions_.store(false, std::memory_order_release);
+            stopping_ = true;
             fence = next_fence_ - 1;
         }
-        if (fence) wait_fence(fence, UINT64_MAX);
-        {
-            std::lock_guard lock(mutex_);
-            stopping_ = true;
-        }
         queued_ready_.notify_all();
+        {
+            std::unique_lock lock(mutex_);
+            if (deadline) {
+                if (!worker_exited_.wait_until(lock, *deadline, [&] { return worker_stopped_; })) return false;
+            } else {
+                worker_exited_.wait(lock, [&] { return worker_stopped_; });
+            }
+        }
         if (worker_.joinable()) worker_.join();
-        // Every submission retired, so every record was replayed.
-        encode_thread_.reset();
+        if (scheduling_.observe_shutdown_workers_joined)
+            scheduling_.observe_shutdown_workers_joined(scheduling_.context);
+        const auto remaining = deadline ? std::uint64_t(std::max<std::int64_t>(0,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(*deadline - std::chrono::steady_clock::now()).count()))
+            : UINT64_MAX;
+        if (!wait_fence(fence, remaining)) return false;
+        if (!retirement_tails_->drain(deadline)) return false;
+        // GPU retirement proves every encode record completed. Keep the
+        // backend/resources alive for late VI fence readers and archive flush.
+        std::unique_ptr<EncodeThread> encode;
+        {
+            const std::lock_guard lock(mutex_);
+            if (encode_thread_) stopped_encode_cpu_ns_ = encode_thread_->cpu_ns();
+            encode = std::move(encode_thread_);
+        }
+        encode.reset();
         resources_->set_completion_hook({});
+        return true;
     }
 
     // The manifest lists the stages in the order the title first selects them,
@@ -2886,6 +2942,7 @@ public:
 
     void finish_frame(std::uint64_t period_ns, bool preserve_encode_spin) override {
         std::lock_guard lock(mutex_);
+        if (stopping_) return;
         scheduling_period_ns_ = period_ns;
         preserve_encode_spin_ = preserve_encode_spin;
         queued_.push_back({0, {}, period_ns, preserve_encode_spin, true});
@@ -2895,6 +2952,11 @@ public:
     // Pin the lists and snapshot deferred bindings on the guest thread. The
     // replay worker reads ordinary records in place through fence retirement.
     std::uint64_t submit(std::span<const NVNcommandHandle> handles) override {
+        if (!accepting_submissions_.load(std::memory_order_acquire)) {
+            std::lock_guard lock(mutex_);
+            last_error_ = {ReplayErrorCode::invalid_command, "Replay submission was requested after shutdown."};
+            return 0;
+        }
         const auto timeline_begin = timeline_now_ns();
         const auto cpu_start = thread_cpu_ns();
         CommandWalkStatus status;
@@ -2905,6 +2967,10 @@ public:
             return 0;
         }
         std::lock_guard lock(mutex_);
+        if (stopping_) {
+            last_error_ = {ReplayErrorCode::invalid_command, "Replay submission raced shutdown."};
+            return 0;
+        }
         const auto fence = next_fence_++;
         fence_commands(*captured, fence);
         queued_.push_back({fence, std::move(captured), scheduling_period_ns_, preserve_encode_spin_});
@@ -2926,7 +2992,11 @@ public:
             {
                 std::unique_lock lock(mutex_);
                 queued_ready_.wait(lock, [&] { return stopping_ || !queued_.empty(); });
-                if (queued_.empty()) return;
+                if (queued_.empty()) {
+                    worker_stopped_ = true;
+                    worker_exited_.notify_all();
+                    return;
+                }
                 item = std::move(queued_.front());
                 queued_.pop_front();
             }
@@ -2978,6 +3048,8 @@ public:
     // 2000 submissions the log names the entry points the guest called since the
     // previous report, most called first.
     static void log_call_counts(std::uint64_t fence) {
+        static std::mutex count_mutex;
+        const std::lock_guard lock(count_mutex);
         static std::vector<nvn::CallCount> previous;
         std::vector<nvn::CallCount> current(previous.empty() ? 1024 : previous.size());
         current.resize(std::min(current.size(), nvn::call_counts(current)));
@@ -3084,11 +3156,19 @@ public:
     // waiter may destroy the backend once the lock is free, so nothing after
     // the unlock touches it: the lines come from the submissions alone.
     void publish_retired(std::unique_lock<std::mutex>& lock) {
+        // Register the tail before releasing fence_mutex_ or waking waiters.
+        // Construct the ticket first so it outlives the retired payloads too.
+        RetirementTailTicket ticket(retirement_tails_);
         auto retired = std::move(retired_log_);
         retired_log_.clear();
+        const auto observe = scheduling_.observe_retired_log;
+        auto* context = scheduling_.context;
         completion_.notify_all();
         lock.unlock();
-        for (const auto& entry : retired) log_retired(entry);
+        for (const auto& entry : retired) {
+            if (observe) observe(context, entry.fence);
+            log_retired(entry);
+        }
     }
 
     // A submission that failed to encode completes in order with no GPU work.
@@ -3277,7 +3357,7 @@ public:
         std::scoped_lock lock(mutex_, fence_mutex_);
         auto result = published_statistics_;
         result.submit_cpu_ns = submit_cpu_ns_;
-        result.encode_thread_cpu_ns = encode_thread_ ? encode_thread_->cpu_ns() : 0;
+        result.encode_thread_cpu_ns = encode_thread_ ? encode_thread_->cpu_ns() : stopped_encode_cpu_ns_;
         result.gpu_ns = gpu_ns_;
         result.completion_cpu_ns = completion_cpu_ns_;
         result.counter_timestamp_fallbacks = counter_fallbacks_;
@@ -3902,11 +3982,17 @@ private:
     std::deque<QueuedSubmission> queued_;
     std::condition_variable queued_ready_;
     bool stopping_ = false;
+    bool worker_stopped_ = false;
+    std::condition_variable worker_exited_;
+    std::timed_mutex shutdown_mutex_;
+    std::shared_ptr<RetirementTails> retirement_tails_ = std::make_shared<RetirementTails>();
+    std::atomic<bool> accepting_submissions_{true};
     std::thread worker_;
     SegmentPolicy segment_policy_;
     std::atomic<std::uint64_t> outstanding_segments_{0};
     std::uint64_t next_segment_ = 0;
     std::unique_ptr<EncodeThread> encode_thread_;
+    std::uint64_t stopped_encode_cpu_ns_ = 0;
     std::shared_ptr<PendingSubmission> encoding_submission_;
     DrawTable<DrawPipelineKey, NativePipeline> pipelines_;
     bool created_pipeline_ = false;

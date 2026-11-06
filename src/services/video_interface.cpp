@@ -358,7 +358,21 @@ public:
         // that is late by less than one period presents at once and keeps the
         // cadence; a frame late by a whole period or more restarts the cadence
         // from now instead of presenting a burst to catch up.
-        if (const int link_interval = present_link_interval(item.interval); link_interval > 0) {
+        if (const auto clock = source_->imposed_clock()) {
+            const auto planned = clock->schedule(last_imposed_refresh_, present_link_interval(item.interval));
+            if (const auto* error = std::get_if<runtime::LaunchFailure>(&planned)) {
+                note_failure(error->detail);
+                return;
+            }
+            const auto target = std::get<runtime::PresentationSchedule>(planned);
+            const auto waited = clock->clock()->wait_until(target.deadline, stop);
+            if (const auto* error = std::get_if<runtime::LaunchFailure>(&waited)) {
+                note_failure(error->detail);
+                return;
+            }
+            if (std::get<runtime::ClockWait>(waited) == runtime::ClockWait::cancelled) return;
+            last_imposed_refresh_ = target.refresh_index;
+        } else if (const int link_interval = present_link_interval(item.interval); link_interval > 0) {
             const auto period = source_->interval() *
                 static_cast<std::int64_t>(link_interval);
             const auto now = std::chrono::steady_clock::now();
@@ -527,6 +541,7 @@ private:
     std::shared_ptr<DisplaySession::QueueState> queue_;
     std::shared_ptr<VsyncSource> source_;
     std::optional<std::chrono::steady_clock::time_point> last_slot_;
+    std::optional<std::uint64_t> last_imposed_refresh_;
     // The period the presentation thread last declared to the host scheduler.
     std::chrono::steady_clock::duration declared_period_{};
     bool attached_ = true;

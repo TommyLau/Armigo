@@ -66,6 +66,9 @@ public:
                 if (handler && *handler) (*handler)(vblank, period);
             };
         }
+        callbacks.display_changed = [this](const platform::DisplayCapabilities& display) {
+            if (display_change_handler_) display_change_handler_(display);
+        };
         auto creation = platform::create_application(options, std::move(callbacks));
         if (auto* application =
                 std::get_if<std::unique_ptr<platform::Application>>(&creation)) {
@@ -78,6 +81,10 @@ public:
         return application_ ? application_->presenter() : nullptr;
     }
 
+    platform::DisplayCapabilities display_capabilities() const noexcept override {
+        return application_ ? application_->display_capabilities() : platform::DisplayCapabilities{};
+    }
+
     void set_close_handler(std::function<void()> close) override {
         close_handler_ = std::move(close);
     }
@@ -86,6 +93,10 @@ public:
         auto shared = std::make_shared<const platform::DisplayRefreshCallback>(std::move(handler));
         const std::lock_guard lock(refresh_mutex_);
         refresh_handler_ = std::move(shared);
+    }
+
+    void set_display_change_handler(platform::DisplayChangeCallback handler) override {
+        display_change_handler_ = std::move(handler);
     }
 
     bool set_display_refresh_rate(double rate) noexcept override {
@@ -139,6 +150,7 @@ private:
     // application stops its display link, the refresh handler's only caller.
     std::mutex refresh_mutex_;
     std::shared_ptr<const platform::DisplayRefreshCallback> refresh_handler_;
+    platform::DisplayChangeCallback display_change_handler_;
     std::unique_ptr<platform::Application> application_;
     std::function<void()> close_handler_;
 };

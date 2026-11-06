@@ -19,10 +19,8 @@
 namespace armigo::platform {
 namespace {
 
-// Refresh rate of a CoreGraphics mode. Modes that describe no rate are the
-// fixed-rate built-in panels; they report the panel's nominal rate through
-// CGDisplayModeGetRefreshRate returning zero, so the display's reported frame
-// rate from AppKit is used instead.
+// Refresh rate of a CoreGraphics mode. When the mode describes no rate,
+// use the same display's maximum frame rate reported by AppKit.
 double mode_refresh_hz(CGDisplayModeRef mode, double fallback) {
     const double rate = CGDisplayModeGetRefreshRate(mode);
     if (rate > 0.0) return rate;
@@ -39,16 +37,20 @@ std::uint32_t mode_height(CGDisplayModeRef mode) {
 
 } // namespace
 
-DisplayCapabilities query_display_capabilities() noexcept {
+DisplayCapabilities query_display_capabilities(std::uint32_t display_id) noexcept {
     DisplayCapabilities result;
     @autoreleasepool {
-        const CGDirectDisplayID display = CGMainDisplayID();
+        const CGDirectDisplayID display = display_id;
         CGDisplayModeRef active = CGDisplayCopyDisplayMode(display);
-        // AppKit reports the highest rate the panel runs at, which is the rate a
-        // fixed-rate mode without a described rate uses.
+        // AppKit supplies the highest rate for modes without a described rate.
+        // Match by display ID so another screen's capability cannot leak in.
         double panel_rate = 0.0;
-        if (NSScreen* screen = NSScreen.mainScreen)
-            panel_rate = screen.maximumFramesPerSecond;
+        for (NSScreen* screen in NSScreen.screens) {
+            if ([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue] == display) {
+                panel_rate = screen.maximumFramesPerSecond;
+                break;
+            }
+        }
         if (active) {
             result.current.width = mode_width(active);
             result.current.height = mode_height(active);
@@ -89,6 +91,10 @@ DisplayCapabilities query_display_capabilities() noexcept {
         }
     }
     return result;
+}
+
+DisplayCapabilities query_display_capabilities() noexcept {
+    return query_display_capabilities(CGMainDisplayID());
 }
 
 } // namespace armigo::platform

@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -46,8 +47,10 @@ std::string apply_language_manifest(const LanguageManifest& manifest,
 struct PlayerChoices {
     bool handheld = false;             // console_mode: "docked" or "handheld"
     std::string resolution = "auto";   // auto, 720p, 900p, 1080p, 1440p, 2160p or native
-    int frame_rate = 60;               // 0 (Auto), 30 or 60
+    int frame_rate = 60;               // 0 (Auto), 30, 60 or macOS-only 120
     bool title_frame_rate = false;
+    std::uint32_t default_frame_rate = 60;
+    std::vector<std::uint32_t> supported_frame_rates = {30, 60};
     std::uint32_t display_refresh_rate = 0; // zero follows the frame-rate choice
     bool vsync = true;                 // macOS; iOS always synchronises
     bool performance_overlay = false;  // Apple's Metal performance HUD
@@ -58,6 +61,27 @@ struct PlayerChoices {
 // by default then) are removed, and its frame-rate overlay toggle becomes the
 // performance overlay.
 PlayerChoices read_player_choices();
+
+// macOS launch policy, resolved against the window's active display mode. An
+// unknown display never admits 120. Auto remains zero for the title selector;
+// unsupported stored choices fall back to the highest declared rate <= clock.
+struct MacFrameRateSelection {
+    std::vector<int> options;
+    int frame_rate = 0;
+    double refresh_hz = 60.0;
+    bool fell_back = false;
+    std::optional<std::string> environment_override;
+};
+[[nodiscard]] MacFrameRateSelection select_mac_frame_rate(const PlayerChoices& choices,
+    const platform::DisplayCapabilities& display);
+
+// Production macOS launch callback. An explicit title-rate environment override
+// wins over stored preferences; an explicit --refresh-hz wins over clock policy.
+// The observer handles UI after the settings and their diagnostics are applied.
+using MacPlayerLaunchObserver =
+    std::function<void(const PlayerChoices&, const MacFrameRateSelection&)>;
+[[nodiscard]] WindowedLaunchConfiguration mac_player_launch_configuration(
+    PlayerChoices choices, std::uint32_t width, MacPlayerLaunchObserver observer = {});
 
 // The game's output width for a Resolution choice: a fixed size is its 16:9
 // width, Native the widest 16:9 image the display's pixels hold, and Auto is

@@ -32,7 +32,7 @@ with tempfile.TemporaryDirectory(prefix="armigo-player-choices-") as directory:
     }
     environment = {key: value for key, value in os.environ.items() if not key.startswith("ARMIGO_")}
 
-    def check(policy, expected, *arguments):
+    def check(policy, expected, *arguments, clock=60, fallback=0, options="0,30,60,"):
         metadata = dict(base)
         if policy is not None:
             metadata["ArmigoTitleFrameRate"] = policy
@@ -40,14 +40,24 @@ with tempfile.TemporaryDirectory(prefix="armigo-player-choices-") as directory:
             plistlib.dump(metadata, stream)
         result = subprocess.run([str(executable), *arguments], env=environment,
                                 text=True, capture_output=True, check=True)
+        expected += f"\nclock={clock} fallback={fallback} options={options}"
         assert result.stdout.strip() == expected, (result.stdout, result.stderr, expected)
 
     check(None, "60 0 0 unset 60")
     policy = {"Default": 30, "DisplayRefresh": 60}
-    check(policy, "30 1 60 30 60")
+    check(policy, "30 1 60 30 60", "-expect_default", "30")
+    check({"Default": 60, "DisplayRefresh": 60}, "60 1 60 60 60", "-expect_default", "60")
     check(policy, "60 1 60 60 60", "-frame_rate", "60")
     check(policy, "0 1 60 0 60", "-frame_rate", "0")
-    check(policy, "60 1 60 60 60", "-frame_rate", "120")
+    check(policy, "60 1 60 60 60", "-frame_rate", "120", fallback=1)
+    high = dict(policy, SupportedRates=[30, 60, 120])
+    check(high, "60 1 60 60 60", "-frame_rate", "120", fallback=1)
+    check(high, "120 1 120 120 120", "-frame_rate", "120", "-display_hz", "120",
+          clock=120, options="0,30,60,120,")
+    check(high, "0 1 60 0 60", "-frame_rate", "0", "-display_hz", "120", options="0,30,60,120,")
+    check(dict(policy, SupportedRates=[30, 120]), "30 1 60 30 60", "-frame_rate", "120",
+          fallback=1, options="0,30,")
+    check(None, "60 0 0 unset 60", "-frame_rate", "120", "-display_hz", "120", fallback=1)
     check({"Default": "30", "DisplayRefresh": 60}, "60 0 0 unset 60")
     environment["ARMIGO_COMPAT_FRAME_RATE"] = "30"
     check(policy, "60 1 60 30 60", "-frame_rate", "60")

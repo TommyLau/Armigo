@@ -55,4 +55,8 @@ struct DisplayCapabilities {
 // when the platform cannot answer.
 [[nodiscard]] DisplayCapabilities query_display_capabilities() noexcept;
 
+// macOS: query one display by its native numeric identifier. Framework types
+// stay in the adapter; the application supplies the launch window's display.
+[[nodiscard]] DisplayCapabilities query_display_capabilities(std::uint32_t display_id) noexcept;
+
 } // namespace armigo::platform

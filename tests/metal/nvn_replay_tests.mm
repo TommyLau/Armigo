@@ -1038,6 +1038,83 @@ void test_report_attachment_alias(id<MTLDevice> device, id<MTL4CommandQueue> que
     munmap(bytes, size);
 }
 
+void test_shutdown_waits_for_feedback_logging_tail(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    struct Observation {
+        std::promise<void> joined, tail_entered, release_tail;
+        std::shared_future<void> released = release_tail.get_future().share();
+        std::atomic<bool> reported_join{false};
+    } observation;
+    replay::ReplaySchedulingPolicy policy;
+    policy.context = &observation;
+    policy.observe_shutdown_workers_joined = [](void* context) {
+        auto& state = *static_cast<Observation*>(context);
+        if (!state.reported_join.exchange(true)) state.joined.set_value();
+    };
+    policy.observe_retired_log = [](void* context, std::uint64_t) {
+        auto& state = *static_cast<Observation*>(context);
+        state.tail_entered.set_value();
+        state.released.wait();
+    };
+    auto backend = replay::create_replay_backend(device, queue, resources, policy);
+    id<MTLSharedEvent> gate = [device newSharedEvent];
+    [queue waitForEvent:gate value:1];
+    Recorder recorder;
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferCopyBufferToBuffer>()(&recorder.commands,
+        TestResources::base, TestResources::base + 0x100, 16, 0);
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence != 0);
+    auto stopped = std::async(std::launch::async, [&] {
+        return backend->stop_submission_workers();
+    });
+    // Keep the GPU blocked until the replay worker has joined. Retirement and
+    // its logging tail must therefore execute on GPU feedback, not that worker.
+    CHECK(observation.joined.get_future().wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+    gate.signaledValue = 1;
+    CHECK(observation.tail_entered.get_future().wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+    CHECK(backend->completed_fence() >= fence);
+    // Both handshakes completed: the worker joined and the GPU published its
+    // fence. With no shutdown deadline, a fence timeout cannot pass this test.
+    // Only the held logging tail keeps shutdown pending, until explicitly released.
+    CHECK(stopped.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout);
+    observation.release_tail.set_value();
+    CHECK(stopped.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    CHECK(stopped.get());
+    CHECK(backend->stop_submission_workers(std::chrono::steady_clock::now() + std::chrono::seconds(5)));
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+void test_submission_shutdown_joins_and_retries(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    std::promise<void> entered, release;
+    auto released = release.get_future().share();
+    resources.on_begin_walk = [&] {
+        entered.set_value();
+        released.wait();
+    };
+    Recorder recorder;
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence != 0);
+    CHECK(entered.get_future().wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    // A blocked command walk cannot be reported quiescent. Timeout leaves the
+    // submission retained, closes admission, and supports a later drain retry.
+    CHECK(!backend->stop_submission_workers(std::chrono::steady_clock::now() + std::chrono::milliseconds(10)));
+    CHECK(backend->submit({&handle, 1}) == 0);
+    release.set_value();
+    CHECK(backend->stop_submission_workers(std::chrono::steady_clock::now() + std::chrono::seconds(5)));
+    CHECK(backend->completed_fence() >= fence);
+    CHECK(backend->stop_submission_workers());
+    // Command registration can retire while the process-wide backend still
+    // exists: no worker can walk this list or its registry after the join.
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+    CHECK(backend->submit({&handle, 1}) == 0);
+}
+
 void test_submission_scheduling_period(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
     TestResources resources(device);
     auto backend = replay::create_replay_backend(device, queue, resources);
@@ -4959,6 +5036,8 @@ vertex RasterOut fetch_vertex(uint vertex_id [[vertex_id]], uint instance_id [[i
             }
             test_report_texture_alias(device, queue, 0, true, false, true, false, true);
             test_report_texture_alias(device, queue, 0, true, false, false, false, true);
+            test_shutdown_waits_for_feedback_logging_tail(device, queue);
+            test_submission_shutdown_joins_and_retries(device, queue);
             test_submission_scheduling_period(device, queue);
             test_submission_encode_wait_budget(device, queue);
             test_scheduling_failures_and_encode_policy(device, queue);

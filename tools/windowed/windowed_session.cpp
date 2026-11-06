@@ -15,6 +15,7 @@
 #include "runner_shell_internal.h"
 
 #include <armigo/platform/apple_input.h>
+#include <armigo/common/diagnostics.h>
 #include <armigo/runtime/host_controller.h>
 
 #include <cstdlib>
@@ -27,9 +28,11 @@
 
 namespace armigo::tools {
 
-ShellReport run_windowed_shell(const RunnerArguments& arguments,
+ShellReport run_windowed_shell(const RunnerArguments& initial_arguments,
                                const ShellEnvironment& environment,
-                               const WindowedHostFactory& host_factory) {
+                               const WindowedHostFactory& host_factory,
+                               const WindowedLaunchConfiguration& configure_launch) {
+    auto arguments = initial_arguments;
     using runtime::LaunchError;
     using runtime::LaunchFailure;
     using runtime::LaunchStage;
@@ -83,6 +86,8 @@ ShellReport run_windowed_shell(const RunnerArguments& arguments,
             "The platform application did not supply a presenter."));
     }
 
+    const auto launch_display = host->display_capabilities();
+    if (configure_launch) configure_launch(arguments, launch_display);
     auto clock_result = shell_detail::create_shell_clocks(arguments, environment);
     if (auto* failed = std::get_if<LaunchFailure>(&clock_result)) {
         return shell_detail::failed_report(std::move(*failed));
@@ -105,6 +110,23 @@ ShellReport run_windowed_shell(const RunnerArguments& arguments,
             clock->observe_display_refresh(vblank, period);
             if (frame_rate) frame_rate->observe(vblank);
         });
+
+    // A display move never changes the launch clock. Warn once on an actual
+    // screen transition, not on variable-refresh samples from the same screen.
+    if (arguments.refresh_hz >= 120.0) {
+        host->set_display_change_handler(
+            [clock = presentation_clock, seen_fast = launch_display.current.refresh_hz >= 120.0,
+             warned = false](const platform::DisplayCapabilities& display) mutable {
+                const double hz = display.current.refresh_hz;
+                if (hz >= 120.0) seen_fast = true;
+                if (seen_fast && !warned && display.available() && hz > 0.0 && hz < 120.0) {
+                    warned = true;
+                    diag::warning("Armigo: window moved to a %.3f Hz display; keeping the launch presentation/VI "
+                                  "clock at %.3f Hz.\n", hz,
+                                  1e9 / static_cast<double>(clock->configuration().refresh_period.count()));
+                }
+            });
+    }
 
     if (!environment.create_runtime) {
         return shell_detail::failed_report(shell_detail::failure(

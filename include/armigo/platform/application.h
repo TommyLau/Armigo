@@ -11,6 +11,7 @@
 #pragma once
 
 #include <armigo/platform/presenter.h>
+#include <armigo/platform/display_capabilities.h>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -30,6 +31,8 @@ using DisplayRefreshCallback =
 // The worker drains guest and graphics work before the main thread quits.
 // Resize and fullscreen change the drawable size, not guest metadata.
 // A frame counts only after real consumer completion, never after a clear or draw alone.
+using DisplayChangeCallback = std::function<void(const DisplayCapabilities&)>;
+
 struct ApplicationCallbacks {
     // Called once on main thread; must be nonblocking and must not destroy the
     // application. Captures remain owned until the event loop and shutdown end.
@@ -48,11 +51,16 @@ struct ApplicationCallbacks {
     // (not the main thread); it follows the window to another screen.
     // Optional: without it no display link runs.
     DisplayRefreshCallback display_refresh;
+    // Main-thread notification when the window moves to another display.
+    DisplayChangeCallback display_changed;
 };
 class Application {
 public:
     virtual ~Application() = default;
     virtual std::shared_ptr<Presenter> presenter() const noexcept = 0;
+    // Main-thread snapshot of the window's display; unavailable on adapters
+    // without a display query. The macOS player reads it once at launch.
+    virtual DisplayCapabilities display_capabilities() const noexcept { return {}; }
     // Main-thread call. Pump until request_quit/stop; all native resize/fullscreen
     // events update drawable dimensions without changing guest buffer metadata.
     virtual PresenterStatus run(std::stop_token stop = {}) = 0;

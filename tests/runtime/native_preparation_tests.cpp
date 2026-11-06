@@ -11,6 +11,7 @@
 #include "../../src/runtime/native_preparation.h"
 #include "preparation_fixture.h"
 #include <armigo/runtime/launch_plan.h>
+#include <armigo/common/diagnostics.h>
 #include <armigo/execution/embedded_patch.h>
 
 #include <armigo/aarch64/instruction.h>
@@ -761,10 +762,75 @@ void test_embedded_native_launch() {
         auto selected = load_native_launch(input, profile, std::make_shared<platform::ThreadSlotKey>(),
             std::span(&rate_patch, 1));
         CHECK(std::holds_alternative<PreparedLaunch>(selected));
-        if (const auto* prepared = std::get_if<PreparedLaunch>(&selected))
+        if (const auto* prepared = std::get_if<PreparedLaunch>(&selected)) {
             CHECK(word_at(*prepared) == (std::string_view(rate) == "120" ? 0xd2800060u :
                 std::string_view(rate) == "60" ? 0xd2800040u : 0xd2800020u));
+            CHECK(prepared->title_frame_rate == (std::string_view(rate) == "120" ? 120u :
+                std::string_view(rate) == "60" ? 60u : 30u));
+        }
         CHECK(input.modules[0].bytes == source);
+    }
+    // Conditional hooks are selected before code capture and only after the
+    // actual driver choice. Inactive hooks leave the original BL untouched.
+    auto variable_patch = rate_patch;
+    variable_patch.frame_rate->supported_rates.push_back(compat::variable_frame_rate);
+    variable_patch.calls.front().frame_rate = compat::variable_frame_rate;
+    for (const char* rate : {"0", "30", "60", "120", "variable"}) {
+        setenv("ARMIGO_COMPAT_FRAME_RATE", rate, 1);
+        std::vector<std::string> warnings;
+        const auto prior_level = diag::minimum_level();
+        diag::testing_set_level(diag::Level::warning);
+        diag::testing_set_sink([](diag::Level level, std::string_view line, void* context) {
+            if (level == diag::Level::warning)
+                static_cast<std::vector<std::string>*>(context)->emplace_back(line);
+        }, &warnings);
+        auto selected = load_native_launch(input, profile, std::make_shared<platform::ThreadSlotKey>(),
+            std::span(&variable_patch, 1));
+        diag::testing_set_sink(nullptr, nullptr);
+        diag::testing_set_level(prior_level);
+        CHECK(warnings.size() == (std::string_view(rate) == "variable" ? 1u : 0u));
+        if (!warnings.empty()) CHECK(warnings.front() == std::string(compat::variable_frame_rate_warning) + "\n");
+        CHECK(std::holds_alternative<PreparedLaunch>(selected));
+        if (const auto* prepared = std::get_if<PreparedLaunch>(&selected)) {
+            const bool active = std::string_view(rate) == "variable";
+            CHECK(bool(prepared->compatibility_patch) == active);
+            CHECK(bool(prepared->call_hooks) == active);
+            if (active) CHECK(prepared->call_hooks->sites().size() == 1);
+            else {
+                std::uint32_t instruction = 0;
+                const auto bytes = prepared->modules->mapping(1).readable_bytes(0x400, 4);
+                CHECK(bytes.has_value());
+                if (bytes) std::memcpy(&instruction, bytes->data(), 4);
+                CHECK(instruction == call);
+            }
+        }
+    }
+    variable_patch.calls.front().nvn_driver_only = true;
+    setenv("ARMIGO_NVN", "stream", 1);
+    CHECK(std::holds_alternative<LaunchFailure>(load_native_launch(input, profile,
+        std::make_shared<platform::ThreadSlotKey>(), std::span(&variable_patch, 1))));
+    unsetenv("ARMIGO_NVN");
+    EmbeddedNativeArtifacts conditional_capture;
+    auto conditional_selected = load_native_launch(input, profile, std::make_shared<platform::ThreadSlotKey>(),
+        std::span(&variable_patch, 1), {true, &conditional_capture});
+    CHECK(std::holds_alternative<PreparedLaunch>(conditional_selected));
+    if (const auto* prepared = std::get_if<PreparedLaunch>(&conditional_selected)) {
+        CHECK(!prepared->call_hooks && !prepared->compatibility_patch);
+        CHECK(conditional_capture.modules[1].hooks.empty());
+    }
+    const auto conditional_directory = cleanup.path / "conditional";
+    CHECK(std::holds_alternative<std::monostate>(write_embedded_modules(conditional_directory, conditional_capture)));
+    auto conditional_files = open_embedded_modules(conditional_directory);
+    CHECK(std::holds_alternative<EmbeddedNativeFiles>(conditional_files));
+    if (const auto* files = std::get_if<EmbeddedNativeFiles>(&conditional_files)) {
+        setenv("ARMIGO_COMPAT_FRAME_RATE", "variable", 1);
+        CHECK(std::holds_alternative<LaunchFailure>(load_native_launch(input, profile,
+            std::make_shared<platform::ThreadSlotKey>(), std::span(&variable_patch, 1),
+            {true, nullptr, &files->artifacts(), files->backings()})));
+        setenv("ARMIGO_COMPAT_FRAME_RATE", "30", 1);
+        CHECK(std::holds_alternative<PreparedLaunch>(load_native_launch(input, profile,
+            std::make_shared<platform::ThreadSlotKey>(), std::span(&variable_patch, 1),
+            {true, nullptr, &files->artifacts(), files->backings()})));
     }
     auto high_only = rate_patch;
     high_only.words.erase(high_only.words.begin());

@@ -9,8 +9,12 @@
 // ============================================================================
 
 #include "runner_shell.h"
+#include "player_settings.h"
 
 #include <armigo/runtime/presentation.h>
+#include <armigo/common/diagnostics.h>
+#include <armigo/services/vsync_source.h>
+#include <cstdlib>
 #include <armigo/runtime/process_runtime.h>
 
 #include <algorithm>
@@ -204,6 +208,17 @@ public:
     std::shared_ptr<platform::Presenter> presenter() const noexcept override {
         return window_presenter_;
     }
+    platform::DisplayCapabilities display_capabilities() const noexcept override { return display; }
+    platform::DisplayCapabilities display;
+    std::vector<double> display_moves;
+    platform::DisplayChangeCallback display_changed;
+    platform::DisplayRefreshCallback display_refresh;
+    void set_display_change_handler(platform::DisplayChangeCallback handler) override {
+        display_changed = std::move(handler);
+    }
+    void set_display_refresh_handler(platform::DisplayRefreshCallback handler) override {
+        display_refresh = std::move(handler);
+    }
     void set_close_handler(std::function<void()> close) override {
         log_->record("close-handler-set");
         const std::lock_guard lock(mutex_);
@@ -211,6 +226,16 @@ public:
     }
     platform::PresenterStatus pump(std::stop_token) override {
         log_->record("pump");
+        // Cadence changes without a screen move must not emit move warnings.
+        if (display_refresh) {
+            display_refresh(std::chrono::steady_clock::now(), std::chrono::nanoseconds(16'666'667));
+            display_refresh(std::chrono::steady_clock::now(), std::chrono::nanoseconds(8'333'333));
+        }
+        for (double hz : display_moves) {
+            auto moved = display;
+            moved.current.refresh_hz = hz;
+            if (display_changed) display_changed(moved);
+        }
         {
             const std::lock_guard lock(mutex_);
             if (close_handler_ && fire_close_on_pump) {
@@ -267,6 +292,9 @@ struct FakeEnvironment {
     std::optional<LaunchFailure> clock_failure;
     std::optional<LaunchFailure> runtime_factory_failure;
     std::optional<runtime::LaunchDescription> last_description;
+    std::chrono::nanoseconds runtime_refresh_period{};
+    std::shared_ptr<runtime::PresentationClock> runtime_clock;
+    std::chrono::nanoseconds vi_period{};
 
     FakeEnvironment() {
         environment.create_guest_clock = [this] {
@@ -289,7 +317,11 @@ struct FakeEnvironment {
         };
         environment.create_runtime =
             [this](const runtime::LaunchDescription& description,
-                   runtime::RuntimeDependencies&&) {
+                   runtime::RuntimeDependencies&& dependencies) {
+                runtime_clock = dependencies.presentation_clock;
+                runtime_refresh_period = runtime_clock->configuration().refresh_period;
+                services::vi::VsyncSource vsync(runtime_clock);
+                vi_period = vsync.interval();
                 ++runtime_factory_calls;
                 if (runtime_factory_failure) {
                     return runtime::LaunchResult<std::unique_ptr<runtime::ProcessRuntime>>(
@@ -314,6 +346,126 @@ struct FakeEnvironment {
 
 int main() {
     using tools::run_windowed_shell;
+
+    // Exercise the exact production callback installed by the packed player,
+    // with clocks created by the shell and screen notifications from the host.
+    struct RateCase {
+        int stored;
+        const char* override;
+        double display_hz;
+        double input_hz;
+        bool explicit_hz;
+        int effective;
+        double clock_hz;
+        unsigned fallback_warnings;
+        bool moves = false;
+        bool high_only = false;
+        std::uint32_t title_default = 30;
+    };
+    const RateCase rate_cases[] = {
+        {0, nullptr, 60, 30, true, 0, 30, 0},
+        {30, nullptr, 60, 30, true, 30, 30, 0},
+        {60, nullptr, 60, 30, true, 60, 30, 0},
+        {0, nullptr, 120, 72, false, 0, 72, 0},
+        {30, nullptr, 120, 72, false, 30, 72, 0},
+        {60, nullptr, 120, 72, false, 60, 72, 0},
+        {120, nullptr, 120, 60, false, 120, 120, 0},
+        {120, nullptr, 120, 60, false, 120, 120, 0, true},
+        {120, nullptr, 60, 60, false, 60, 60, 1},
+        {120, nullptr, 120, 30, true, 30, 30, 1},
+        {120, nullptr, 120, 60, true, 60, 60, 1},
+        {120, nullptr, 120, 90, true, 60, 90, 1},
+        {120, nullptr, 120, 120, true, 120, 120, 0},
+        {120, "0", 120, 60, false, 0, 60, 0},
+        {120, "30", 120, 60, false, 30, 60, 0},
+        {120, "60", 120, 60, false, 60, 60, 0},
+        {120, "60", 60, 60, false, 60, 60, 0},
+        {30, "120", 120, 60, false, 120, 120, 0},
+        {30, "120", 60, 60, false, 120, 60, 0},
+        {120, "120", 60, 30, true, 120, 30, 0},
+        {30, "120", 120, 30, true, 120, 30, 0},
+        {30, "120", 120, 60, true, 120, 60, 0},
+        {120, "", 120, 60, false, 0, 60, 0},
+        {120, "invalid", 120, 60, false, 0, 60, 0},
+        {60, nullptr, 120, 60, false, 30, 60, 1, false, true},
+        {120, nullptr, 60, 24, true, 30, 24, 1},
+        {120, nullptr, 120, 24, true, 60, 24, 1, false, false, 60},
+        {120, "120", 60, 24, true, 120, 24, 0},
+    };
+    for (const auto& test : rate_cases) {
+        for (const char* key : {"ARMIGO_COMPAT_FRAME_RATE", "ARMIGO_VI_REFRESH_HZ",
+                               "ARMIGO_COMPAT_RESOLUTION_RATE", "ARMIGO_COMPAT_RESOLUTION_WIDTH"}) unsetenv(key);
+        if (test.override) setenv("ARMIGO_COMPAT_FRAME_RATE", test.override, 1);
+        auto log = std::make_shared<EventLog>();
+        FakeEnvironment environment;
+        environment.log = log;
+        environment.runtime_result.outcome = runtime::RunSuccess{1};
+        environment.runtime_result.quiescent = true;
+        std::vector<std::string> tokens{"--exefs", ".", "--romfs", "."};
+        if (test.explicit_hz) { tokens.push_back("--refresh-hz"); tokens.push_back(std::to_string(test.input_hz)); }
+        std::vector<char*> argv;
+        for (auto& token : tokens) argv.push_back(token.data());
+        auto parsed = tools::parse_runner_arguments(platform::PresentationMode::windowed, argv);
+        check(parsed.ok, "explicit refresh parses for production launch");
+        check(parsed.arguments.refresh_hz_explicit == test.explicit_hz, "parser records explicit refresh precedence");
+        if (!test.explicit_hz) parsed.arguments.refresh_hz = test.input_hz;
+        const auto factory = [&]() -> tools::WindowedHostCreation {
+            auto host = std::make_unique<FakeHost>(log);
+            host->give_presenter(std::make_shared<FakePresenter>());
+            host->display.current = {1920, 1080, test.display_hz, false};
+            if (test.moves) host->display_moves = {120, 60, 60, 120, 60};
+            return tools::WindowedHostCreation{std::move(host)};
+        };
+        tools::PlayerChoices choices;
+        choices.title_frame_rate = true;
+        choices.supported_frame_rates = test.high_only ? std::vector<std::uint32_t>{30, 120}
+                                                      : std::vector<std::uint32_t>{30, 60, 120};
+        choices.display_refresh_rate = 60;
+        choices.default_frame_rate = test.title_default;
+        choices.frame_rate = test.stored;
+        int calls = 0;
+        auto configure = tools::mac_player_launch_configuration(choices, 1280,
+            [&](const tools::PlayerChoices& effective, const tools::MacFrameRateSelection& selection) {
+                ++calls;
+                check(log->count("create") == 1, "selection follows window creation");
+                check(environment.runtime_factory_calls == 0, "selection precedes title preparation");
+                check(effective.frame_rate == test.effective, "production callback selects the effective rate");
+                check(selection.refresh_hz == test.clock_hz, "production callback preserves clock precedence");
+            });
+        std::vector<std::string> warnings;
+        diag::testing_set_sink([](diag::Level level, std::string_view line, void* context) {
+            if (level == diag::Level::warning)
+                static_cast<std::vector<std::string>*>(context)->emplace_back(line);
+        }, &warnings);
+        const auto report = run_windowed_shell(parsed.arguments, environment.environment, factory, configure);
+        diag::testing_set_sink(nullptr, nullptr);
+        check(report.exit_code == tc::success, "production clock policy launch succeeds");
+        const auto period = std::chrono::nanoseconds(static_cast<std::int64_t>(1e9 / test.clock_hz));
+        check(environment.runtime_refresh_period == period, "runtime receives the selected presentation period");
+        check(environment.vi_period == period, "VI receives the same period, including 8,333,333 ns at 120 Hz");
+        check(environment.runtime_clock->configuration().refresh_period == period, "display moves keep the launch clock");
+        check(calls == 1, "production launch policy runs exactly once");
+        const auto selected = std::getenv("ARMIGO_COMPAT_FRAME_RATE");
+        check(selected && std::string_view(selected) == (test.override ? test.override : std::to_string(test.effective)),
+              "environment override stays verbatim; UI fallback selects only the effective words");
+        check(warnings.size() == test.fallback_warnings + (test.moves ? 1u : 0u), "exactly one fallback or display-move warning");
+        if (!warnings.empty())
+            check(warnings.front().find(test.moves ? "window moved" : "stored " + std::to_string(test.stored) + " fps") != std::string::npos,
+                  "warning describes the actual fallback or move");
+        if (test.input_hz == 24 && !test.override) {
+            check(warnings.size() == 1, "no fitting rate produces one Settings warning");
+            if (!warnings.empty()) {
+                check(warnings.front().find("24.000 Hz") != std::string::npos, "warning names the explicit clock");
+                check(warnings.front().find("every declared rate exceeds it") != std::string::npos,
+                      "warning explains why no declared rate fits");
+                check(warnings.front().find("title default of " + std::to_string(test.title_default) + " fps") != std::string::npos,
+                      "warning names the actual title default");
+                check(warnings.front().find("using 0 fps") == std::string::npos, "Auto is never described as zero fps");
+            }
+        }
+    }
+    for (const char* key : {"ARMIGO_COMPAT_FRAME_RATE", "ARMIGO_VI_REFRESH_HZ",
+                           "ARMIGO_COMPAT_RESOLUTION_RATE", "ARMIGO_COMPAT_RESOLUTION_WIDTH"}) unsetenv(key);
 
     // Success flow: create, run on a worker, shutdown, quit, destroy last.
     {

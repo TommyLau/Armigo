@@ -42,6 +42,7 @@ struct BundleSpec {
     // a macOS title mode whose simulation rate is separate from display cadence.
     std::uint32_t default_frame_rate = 0;
     std::uint32_t display_refresh_rate = 0;
+    std::vector<std::uint32_t> supported_frame_rates;
 };
 
 [[nodiscard]] std::string info_plist(const BundleSpec& spec);

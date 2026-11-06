@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include <chrono>
+#include <optional>
 #include <memory>
 #include <string>
 
@@ -35,6 +37,12 @@ namespace armigo::platform::metal::nvn_driver {
 [[nodiscard]] std::string install_driver(std::shared_ptr<MetalShaderPackage> package,
                                          const std::string& pso_manifest = {},
                                          const std::string& title_cache = {});
+
+// Called only after guest threads have joined. Leaves the process-wide backend
+// alive for late fence readers, but joins its submission workers before process
+// exit can destroy the command registries. False retains owners for retry.
+[[nodiscard]] bool stop_submission_workers(
+    std::optional<std::chrono::steady_clock::time_point> deadline);
 
 // Native windows the guest builds present through this display's layer.
 void bind_native_windows(std::weak_ptr<services::vi::DisplaySession> display);

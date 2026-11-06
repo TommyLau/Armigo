@@ -15,9 +15,13 @@
 #include <armigo/runtime/presentation.h>
 #include <armigo/runtime/thread_runtime.h>
 #include <memory>
+#include <functional>
 #include <stop_token>
 
 namespace armigo::runtime {
+
+class ServiceRegistry;
+struct ServiceRegistryDependencies;
 
 // Lane F owns the process facade; lane I uses it from a worker while AppKit
 // pumps on the main thread. Reuse ModuleSet, ProcessRecord, HandleTable, IPC,
@@ -33,6 +37,9 @@ struct RuntimeDependencies {
     std::shared_ptr<GuestClock> clock;
     std::shared_ptr<PresentationClock> presentation_clock;
     std::shared_ptr<platform::Presenter> presenter;
+    // Synthetic-test construction seam, rejected for production profiles.
+    // Empty uses the production registry; consumed during initialize.
+    std::function<LaunchResult<std::shared_ptr<ServiceRegistry>>(ServiceRegistryDependencies)> create_services;
 };
 class ProcessRuntime {
 public:

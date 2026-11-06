@@ -111,6 +111,45 @@ int main() {
         CHECK(std::holds_alternative<std::string>(parse(replace(json, R"("base_interval":"0xc"})",
                                                                 R"("base_interval":"0xc","frame_step":"0x0"})"))));
     }
+    const auto counter_json = replace(json,
+        R"("layout":{"framework_pointer":"0x200","framework_period":"0x10",)"
+        "\n" R"("override_flag":"0x0","ratio":"0x4","interval":"0x8","base_interval":"0xc"})",
+        R"("layout":{"variant":"fractional-counter-30","framework_pointer":"0x200","framework_period":"0x10",)"
+        R"("object_register":22,"state":"0x0","active_state":2,"counter":"0x48"})");
+    const auto counter_read = parse(counter_json);
+    CHECK(std::holds_alternative<compat::PatchDescriptions>(counter_read));
+    if (const auto* descriptions = std::get_if<compat::PatchDescriptions>(&counter_read)) {
+        CHECK(descriptions->front().layout.variant == titles::FrameRateVariant::FractionalCounter30);
+        CHECK(descriptions->front().layout.object_register == 22);
+        CHECK(compat::validate_patch(descriptions->front(), image).empty());
+    }
+    const auto countdown_read = parse(replace(counter_json, "fractional-counter-30", "fractional-countdown-30"));
+    CHECK(std::holds_alternative<compat::PatchDescriptions>(countdown_read));
+    if (const auto* descriptions = std::get_if<compat::PatchDescriptions>(&countdown_read)) {
+        CHECK(descriptions->front().layout.variant == titles::FrameRateVariant::FractionalCountdown30);
+        CHECK(compat::validate_patch(descriptions->front(), image).empty());
+    }
+    const auto repeat_json = replace(replace(counter_json, "fractional-counter-30", "fractional-repeat-30"),
+        R"("counter":"0x48")", R"("counter":"0x48","repeat_flag":"0x4c","repeat_frames":5)");
+    const auto repeat_read = parse(repeat_json);
+    CHECK(std::holds_alternative<compat::PatchDescriptions>(repeat_read));
+    if (const auto* descriptions = std::get_if<compat::PatchDescriptions>(&repeat_read)) {
+        CHECK(descriptions->front().layout.variant == titles::FrameRateVariant::FractionalRepeat30);
+        CHECK(descriptions->front().layout.repeat_flag == 0x4c && descriptions->front().layout.repeat_frames == 5);
+        CHECK(compat::validate_patch(descriptions->front(), image).empty());
+    }
+    CHECK(std::holds_alternative<std::string>(parse(replace(repeat_json, R"("repeat_frames":5)", R"("repeat_frames":0)"))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(repeat_json, R"("repeat_flag":"0x4c")", R"("repeat_flag":"0x49")"))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(repeat_json, R"(,"repeat_flag":"0x4c")", ""))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(repeat_json, "fractional-repeat-30", "fractional-countdown-30"))));
+    for (const auto* value : {"31", "-1", "true", "22.5"})
+        CHECK(std::holds_alternative<std::string>(parse(replace(counter_json,
+            R"("object_register":22)", (std::string("\"object_register\":") + value).c_str()))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(counter_json, "fractional-counter-30", "unknown"))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(counter_json,
+        R"("counter":"0x48")", R"("counter":"0x0")"))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(counter_json,
+        R"("counter":"0x48")", R"("counter":"0x49")"))));
     // A call note is required, a string of 1 to 200 characters. The description
     // note is the same string when present and may be omitted.
     CHECK(std::holds_alternative<std::string>(parse(replace(json, R"(,"note":"Synthetic interval-update hook.")", ""))));
@@ -231,7 +270,12 @@ int main() {
         high_only.frame_rate->supported_rates = {30, 60, 120};
         CHECK(std::holds_alternative<std::string>(compat::select_patch_words(high_only, "60")));
         high_only.words.front().nvn_driver_only = true;
-        CHECK(std::holds_alternative<std::string>(compat::select_patch_words(high_only, "120", false)));
+        std::uint32_t admitted = 0;
+        CHECK(std::holds_alternative<std::vector<compat::WordPatch>>(
+            compat::select_patch_words(high_only, "120", true, &admitted)));
+        CHECK(admitted == 120);
+        CHECK(std::holds_alternative<std::string>(compat::select_patch_words(high_only, "120", false, &admitted)));
+        CHECK(admitted == 0);
         CHECK(std::get<std::vector<compat::WordPatch>>(compat::select_patch_words(high_only, "30", false)).empty());
         modes.words.front().frame_rate = 60;
         CHECK(!compat::validate_patch(modes, image).empty());
@@ -249,6 +293,61 @@ int main() {
     CHECK(std::holds_alternative<std::string>(parse(replace(rate_json,
         R"("display_refresh_rate":60)", R"("display_refresh_rate":120)"))));
     CHECK(std::get<std::vector<compat::WordPatch>>(compat::select_patch_words(patch, "unrelated")).empty());
+    // Variable is an explicitly declared hidden mode; it cannot become a
+    // default/display rate, and fixed selections keep their original call set.
+    const auto variable_json = replace(replace(variants_json, "[30,60,120]", "[30,60,120,\"variable\"]"),
+        R"("note":"Synthetic interval-update hook.")",
+        R"("note":"Synthetic interval-update hook.","frame_rate":"variable","nvn_driver_only":true)");
+    const auto variable = parse(variable_json);
+    CHECK(std::holds_alternative<compat::PatchDescriptions>(variable));
+    if (const auto* descriptions = std::get_if<compat::PatchDescriptions>(&variable)) {
+        const auto& mode = descriptions->front();
+        CHECK(compat::validate_patch(mode, image).empty());
+        for (const char* rate : {"", "0", "30", "60", "120"}) {
+            const auto calls = compat::select_patch_calls(mode, rate);
+            CHECK(std::holds_alternative<std::vector<compat::CallPatch>>(calls));
+            if (const auto* selected = std::get_if<std::vector<compat::CallPatch>>(&calls)) CHECK(selected->empty());
+        }
+        std::uint32_t admitted = 99;
+        const auto words = compat::select_patch_words(mode, "variable", true, &admitted);
+        CHECK(std::holds_alternative<std::vector<compat::WordPatch>>(words) && admitted == 0);
+        const auto calls = compat::select_patch_calls(mode, "variable");
+        CHECK(std::holds_alternative<std::vector<compat::CallPatch>>(calls));
+        if (const auto* selected = std::get_if<std::vector<compat::CallPatch>>(&calls))
+            CHECK(selected->size() == 1 && selected->front().offset == patch.calls.front().offset &&
+                  selected->front().expected_instruction == patch.calls.front().expected_instruction);
+        CHECK(std::holds_alternative<std::string>(compat::select_patch_calls(mode, "variable", false)));
+        CHECK(std::holds_alternative<std::string>(compat::select_patch_words(mode, "4294967295")));
+        auto undeclared = mode; undeclared.frame_rate->supported_rates.pop_back();
+        CHECK(!compat::validate_patch(undeclared, image).empty());
+        CHECK(std::holds_alternative<std::string>(compat::select_patch_calls(undeclared, "variable")));
+    }
+    const auto variable_word_json = replace(variable_json, R"("frame_rate":120)", R"("frame_rate":"variable")");
+    const auto variable_word = parse(variable_word_json);
+    CHECK(std::holds_alternative<compat::PatchDescriptions>(variable_word));
+    if (const auto* descriptions = std::get_if<compat::PatchDescriptions>(&variable_word)) {
+        const auto selected = compat::select_patch_words(descriptions->front(), "variable");
+        CHECK(std::holds_alternative<std::vector<compat::WordPatch>>(selected));
+        if (const auto* words = std::get_if<std::vector<compat::WordPatch>>(&selected))
+            CHECK(words->size() == 1 && words->front().replacement_instruction == 0xd503203fu);
+    }
+    CHECK(std::holds_alternative<std::string>(parse(replace(variable_json,
+        R"("default":30)", R"("default":"variable")"))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(variable_json,
+        R"("display_refresh_rate":60)", R"("display_refresh_rate":"variable")"))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(variable_json,
+        "[30,60,120,\"variable\"]", "[30,60,120]"))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(variable_json,
+        R"("nvn_driver_only":true)", R"("nvn_driver_only":1)"))));
+    CHECK(std::holds_alternative<std::string>(compat::select_patch_calls(
+        std::get<compat::PatchDescriptions>(variants).front(), "variable")));
+    for (const char* rate : {"", "0", "30", "60", "120"}) {
+        const auto selected = compat::select_patch_calls(std::get<compat::PatchDescriptions>(variants).front(), rate);
+        CHECK(std::holds_alternative<std::vector<compat::CallPatch>>(selected));
+        if (const auto* calls = std::get_if<std::vector<compat::CallPatch>>(&selected))
+            CHECK(calls->size() == 1 && calls->front().offset == patch.calls.front().offset &&
+                  calls->front().expected_instruction == patch.calls.front().expected_instruction);
+    }
     // Resolution sites: the swapchain size takes one pair or a list of pairs,
     // one per copy of its initializer.
     const std::string resolution = R"(,"resolution":{"tv_size":TV,"screen_widths":["0x60","0x64"],)"

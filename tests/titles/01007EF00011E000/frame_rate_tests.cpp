@@ -19,6 +19,7 @@
 #include <limits>
 #include <span>
 #include <type_traits>
+#include <vector>
 
 namespace {
 
@@ -39,12 +40,20 @@ unsigned failures = 0;
 struct Memory {
     static constexpr std::uint64_t origin = 0x1000;
     std::array<std::byte, 0x800> bytes{};
+    struct Access {
+        bool write;
+        std::uint64_t address;
+        std::vector<std::byte> bytes;
+        bool operator==(const Access&) const = default;
+    };
+    std::vector<Access> accesses;
     std::uint64_t failed_read = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t failed_write = std::numeric_limits<std::uint64_t>::max();
 
     static bool read(void* context, std::uint64_t address,
                      std::span<std::byte> destination) noexcept {
         auto& memory = *static_cast<Memory*>(context);
+        memory.accesses.push_back({false, address, std::vector<std::byte>(destination.size())});
         if (address == memory.failed_read || address < origin ||
             destination.size() > memory.bytes.size() ||
             address - origin > memory.bytes.size() - destination.size()) {
@@ -58,6 +67,7 @@ struct Memory {
     static bool write(void* context, std::uint64_t address,
                       std::span<const std::byte> source) noexcept {
         auto& memory = *static_cast<Memory*>(context);
+        memory.accesses.push_back({true, address, {source.begin(), source.end()}});
         if (address == memory.failed_write || address < origin ||
             source.size() > memory.bytes.size() ||
             address - origin > memory.bytes.size() - source.size()) {
@@ -230,6 +240,26 @@ void test_maximum_rate_hint() {
     CHECK(maximum_rate == 0);
 }
 
+// Publication order and failure boundaries are part of the guest contract.
+void test_publication_order() {
+    Fixture fixture;
+    auto stepped = layout;
+    stepped.frame_step = 0x80;
+    CHECK(update_frame_rate(stepped, module_base, vfr_object, 1, fixture.buffers));
+    std::vector<std::uint64_t> writes;
+    for (const auto& access : fixture.memory.accesses)
+        if (access.write) writes.push_back(access.address);
+    CHECK((writes == std::vector<std::uint64_t>{module_base + stepped.frame_step,
+        vfr_object + layout.interval, vfr_object + layout.ratio}));
+
+    Fixture failed;
+    failed.memory.failed_write = vfr_object + layout.interval;
+    CHECK(!update_frame_rate(stepped, module_base, vfr_object, 1, failed.buffers));
+    CHECK(failed.memory.load<float>(module_base + stepped.frame_step) == 2.0f);
+    CHECK(failed.memory.load<float>(vfr_object + layout.ratio) == -7.0f);
+    CHECK(failed.memory.accesses.back().address == vfr_object + layout.interval);
+}
+
 void test_memory_failures_and_address_overflow() {
     Fixture fixture;
     fixture.memory.failed_read = vfr_object + layout.base_interval;
@@ -250,6 +280,7 @@ void test_memory_failures_and_address_overflow() {
 }  // namespace
 
 int main() {
+    test_publication_order();
     test_measured_ratios();
     test_clamps();
     test_frame_step();

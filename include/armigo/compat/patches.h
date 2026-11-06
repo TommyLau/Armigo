@@ -10,7 +10,7 @@
 
 #pragma once
 
-#include <armigo/titles/01007EF00011E000/frame_rate.h>
+#include <armigo/titles/frame_rate.h>
 #include <armigo/loader/nso_module.h>
 #include <armigo/execution/gate.h>
 #include <array>
@@ -22,6 +22,12 @@
 #include <vector>
 
 namespace armigo::compat {
+// Internal mode identity; profiles and the environment spell it "variable".
+// It is never a numeric rate, default, display cadence or player preference.
+inline constexpr std::uint32_t variable_frame_rate = UINT32_MAX;
+inline constexpr char variable_frame_rate_warning[] =
+    "Armigo: variable frame rate is experimental; movie timing and later menu repeats remain unresolved.";
+
 struct TitleIdentity {
     std::uint64_t title_id = 0;
     std::array<std::byte, 32> main_build_id{};
@@ -33,6 +39,8 @@ struct CallPatch {
     // Plain English from the profile: what this call changes and why.
     // Required there, 1 to 200 characters. Empty for a call built in code.
     std::string note;
+    std::uint32_t frame_rate = 0;
+    bool nvn_driver_only = false;
 };
 // One instruction of the main module replaced at load time. The expected word
 // must be present, unchanged by preparation, or the title is not patched.
@@ -96,7 +104,7 @@ struct PatchDescription {
     std::string module;
     std::uint64_t original_callee = 0;
     std::vector<CallPatch> calls;
-    titles::title_01007ef00011e000::FrameRateLayout layout;
+    titles::FrameRateLayout layout;
     bool nvn_driver = false;
     // The title's control data requires a user account at startup, so the
     // launcher preselects the local user and hands it to the application as
@@ -136,8 +144,14 @@ using PatchReadResult = std::variant<PatchDescriptions, std::string>;
 PatchReadResult read_patch_descriptions(const std::filesystem::path& path);
 // Empty or "0" selects the title's default. A title without a rate policy
 // retains all of its ordinary words and ignores this title-only setting.
-// A nondefault mode needs an effective rate-conditioned word after driver filtering.
+// A nondefault mode needs an effective rate-conditioned patch after driver filtering.
+// When requested, admitted_rate is zero on failure, without a policy, or for
+// variable mode (which has no fixed pacing target).
 std::variant<std::vector<WordPatch>, std::string> select_patch_words(
+    const PatchDescription& patch, std::string_view requested_rate = {}, bool nvn_driver_enabled = true,
+    std::uint32_t* admitted_rate = nullptr);
+// Uses the same admitted mode and actual driver choice as word selection.
+std::variant<std::vector<CallPatch>, std::string> select_patch_calls(
     const PatchDescription& patch, std::string_view requested_rate = {}, bool nvn_driver_enabled = true);
 const PatchDescription* match_patch(std::span<const PatchDescription> patches,
                                     const TitleIdentity& identity) noexcept;

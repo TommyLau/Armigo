@@ -13,6 +13,10 @@
 #include <armigo/runtime/guest_memory.h>
 #include <armigo/memory/write_tracker.h>
 #include "../../src/platform/process_memory.h"
+#include "../../src/runtime/service_registry.h"
+#include "../../tools/headless/pacing_clock.h"
+#include <barrier>
+#include <sstream>
 
 #include <algorithm>
 #include <array>
@@ -1124,9 +1128,123 @@ void test_ipc_copy_uses_registered_alias() {
     memory::WriteTracker::remove_range(host, writable);
 }
 
+// Expose the same mapping authority through both readers. The IPC reader
+// deliberately stretches its pin lifetime across the mutation rendezvous, so
+// reverting the production observer adapter to IPC fails deterministically.
+class RendezvousMemory final : public GuestMemory {
+public:
+    explicit RendezvousMemory(std::shared_ptr<GuestMemory> memory) : memory(std::move(memory)) {}
+    std::shared_ptr<horizon::ProcessRecord> process() const noexcept override { return memory->process(); }
+    LaunchResult<GuestMemoryPin> allocate(std::uint64_t bytes, horizon::MemoryType type, memory::Permission access) override {
+        return memory->allocate(bytes, type, access);
+    }
+    LaunchStatus release(horizon::AddressRange range) override { return memory->release(range); }
+    LaunchResult<horizon::QueryDisposition> dispatch(std::uint16_t svc, horizon::QueryRegisters& r) override {
+        return memory->dispatch(svc, r);
+    }
+    LaunchResult<GuestMemoryPin> pin(horizon::AddressRange range, memory::Permission access) override {
+        return memory->pin(range, access);
+    }
+    bool copy_observation(std::uint64_t address, std::span<std::byte> out) const noexcept override {
+        const auto copied = memory->copy_observation(address, out);
+        ++checked_reads;
+        rendezvous.arrive_and_wait();
+        rendezvous.arrive_and_wait();
+        return copied;
+    }
+    horizon::GuestCopyOut copy_out() noexcept override { return memory->copy_out(); }
+    horizon::GuestMemoryMapper service_mapper() noexcept override { return memory->service_mapper(); }
+    horizon::GuestBuffers ipc_buffers() noexcept override {
+        return {[](void* context, std::uint64_t address, std::span<std::byte> out) noexcept {
+            auto& self = *static_cast<RendezvousMemory*>(context);
+            auto retained = self.memory->pin({address, out.size()}, memory::Permission::read);
+            auto* pin = std::get_if<GuestMemoryPin>(&retained);
+            if (pin) std::copy((*pin)->bytes().begin(), (*pin)->bytes().end(), out.begin());
+            ++self.ipc_reads;
+            self.rendezvous.arrive_and_wait();
+            self.rendezvous.arrive_and_wait();
+            return pin != nullptr;
+        }, nullptr, this};
+    }
+    std::shared_ptr<GuestMemory> memory;
+    mutable std::barrier<> rendezvous{2};
+    mutable unsigned checked_reads = 0, ipc_reads = 0;
+};
+
+void test_observation_copy_does_not_retain_mappings() {
+    Fixture fixture;
+    if (!fixture.memory) return;
+    auto allocation = allocate(fixture, native_page_size(), horizon::MemoryType::normal,
+                               memory::Permission::read | memory::Permission::write);
+    CHECK(allocation != nullptr);
+    if (!allocation) return;
+    const auto range = allocation->range();
+    std::fill(allocation->writable_bytes().begin(), allocation->writable_bytes().end(), std::byte{0x5a});
+    allocation.reset();
+    std::array<std::byte, 9> bytes{};
+    for (const std::size_t width : {1u, 2u, 4u, 8u}) {
+        CHECK(fixture.memory->copy_observation(range.address, std::span(bytes).first(width)));
+        CHECK(bytes[width - 1] == std::byte{0x5a});
+    }
+    CHECK(!fixture.memory->copy_observation(range.address, bytes));
+    CHECK(!fixture.memory->copy_observation(range.address, {}));
+    CHECK(!fixture.memory->copy_observation(UINT64_MAX - 1, std::span(bytes).first(4)));
+    CHECK(!fixture.memory->copy_observation(range.address + range.size - 1, std::span(bytes).first(4)));
+
+    const auto exercise = [&](std::uint64_t address, unsigned rounds, const auto& mutate) {
+        auto wrapped = std::make_shared<RendezvousMemory>(fixture.memory);
+        auto guest = std::get<std::shared_ptr<GuestClock>>(create_guest_clock());
+        const auto sample = std::get<ClockSample>(guest->sample());
+        auto base = std::get<std::shared_ptr<PresentationClock>>(create_presentation_clock(
+            guest, {sample.instant, std::chrono::nanoseconds{16'666'667}}));
+        auto clock = std::make_shared<tools::PacingClock>(base, std::nullopt,
+            std::make_unique<std::ostringstream>(),
+            std::get<std::vector<tools::PacingWatch>>(tools::parse_pacing_watches(std::to_string(address) + ":8")));
+        auto observer = attach_presentation_observer(
+            [](const services::GraphicsPresentation&) { return services::GraphicsPresentationResult{true, {}}; },
+            clock, wrapped);
+        std::thread watcher([&] {
+            for (unsigned i = 0; i < rounds; ++i) {
+                services::GraphicsPresentation frame;
+                frame.frame_number = i + 1;
+                frame.swap_interval = 1;
+                CHECK(observer(frame).completed);
+            }
+        });
+        for (unsigned i = 0; i < rounds; ++i) {
+            wrapped->rendezvous.arrive_and_wait();
+            mutate(i);
+            wrapped->rendezvous.arrive_and_wait();
+        }
+        watcher.join();
+        CHECK(wrapped->checked_reads == rounds && wrapped->ipc_reads == 0);
+        CHECK(!clock->observation_failure());
+    };
+    exercise(range.address, 128, [&](unsigned i) {
+        auto registers = registers_with();
+        registers[0] = range.address;
+        registers[1] = range.size;
+        registers[2] = i % 2 ? 3 : 0;
+        CHECK(handled(fixture.memory->dispatch(2, registers)) && registers[0] == 0);
+    });
+    exercise(range.address, 1, [&](unsigned) { CHECK(succeeded(fixture.memory->release(range))); });
+    CHECK(!fixture.memory->copy_observation(range.address, std::span(bytes).first(8)));
+
+    auto heap = registers_with();
+    heap[1] = 2 * mib;
+    CHECK(handled(fixture.memory->dispatch(1, heap)) && heap[0] == 0);
+    const auto heap_address = heap[1];
+    exercise(heap_address, 32, [&](unsigned i) {
+        auto registers = registers_with();
+        registers[1] = i % 2 ? 2 * mib : 0;
+        CHECK(handled(fixture.memory->dispatch(1, registers)) && registers[0] == 0);
+    });
+}
+
 } // namespace
 
 int main() {
+    test_observation_copy_does_not_retain_mappings();
     test_factory_and_host_allocations();
     test_pin_validation_and_backing_lifetime();
     test_release_after_partial_protection();

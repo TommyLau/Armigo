@@ -420,22 +420,8 @@ LaunchResult<PreparedLaunch> load_prepared_launch(
                         loading.words = std::move(words);
                     }
                     if (!patch->module.empty()) {
-                        const auto& prepared = payloads[index].image;
-                        if (!preparation::covers(prepared, patch->original_callee))
-                            return fail(LaunchError::artifact_mismatch, "compatibility-preflight",
-                                        "Compatibility callee lacks prepared instruction coverage.");
-                        for (const auto& call : patch->calls) {
-                            if (!preparation::covers(prepared, call.offset) ||
-                                std::any_of(prepared.replacements.begin(), prepared.replacements.end(),
-                                    [&](const auto& item) { return item.image_offset == call.offset; }) ||
-                                std::any_of(prepared.fixups.begin(), prepared.fixups.end(),
-                                    [&](const auto& item) { return item.image_offset == call.offset; }))
-                                return fail(LaunchError::artifact_mismatch, "compatibility-preflight",
-                                    "Compatibility call must be covered and unchanged by offline preparation.");
-                        }
                         loading.compatibility_module = index;
                         loading.compatibility_patch = std::make_shared<compat::InstalledPatch>(compat::InstalledPatch{*patch, 0});
-                        compat::set_present_link(patch->present_link);
                         loading.hook_gate = execution::make_local_gate_code();
                     }
                 }
@@ -460,10 +446,38 @@ LaunchResult<PreparedLaunch> load_prepared_launch(
             }
         }
         // Words meant for the NVN driver apply only when it replaces the game's own.
+        std::uint32_t admitted_frame_rate = 0;
         if (rate_patch) {
-            auto effective = compat::select_patch_words(*rate_patch, requested_title_rate, loading.nvn_module.has_value());
+            auto effective = compat::select_patch_words(*rate_patch, requested_title_rate,
+                loading.nvn_module.has_value(), &admitted_frame_rate);
             if (const auto* failure = std::get_if<std::string>(&effective))
                 return fail(LaunchError::invalid_input, "compatibility-frame-rate", *failure);
+        }
+        if (loading.compatibility_patch) {
+            auto& description = loading.compatibility_patch->description;
+            auto selected = compat::select_patch_calls(description, requested_title_rate, loading.nvn_module.has_value());
+            if (const auto* failure = std::get_if<std::string>(&selected))
+                return fail(LaunchError::invalid_input, "compatibility-frame-rate", *failure);
+            description.calls = std::get<std::vector<compat::CallPatch>>(std::move(selected));
+            if (description.calls.empty()) {
+                loading.compatibility_patch.reset();
+                loading.compatibility_module.reset();
+            } else {
+                const auto& prepared = payloads[*loading.compatibility_module].image;
+                if (!preparation::covers(prepared, description.original_callee))
+                    return fail(LaunchError::artifact_mismatch, "compatibility-preflight",
+                                "Compatibility callee lacks prepared instruction coverage.");
+                for (const auto& call : description.calls) {
+                    if (!preparation::covers(prepared, call.offset) ||
+                        std::any_of(prepared.replacements.begin(), prepared.replacements.end(),
+                            [&](const auto& item) { return item.image_offset == call.offset; }) ||
+                        std::any_of(prepared.fixups.begin(), prepared.fixups.end(),
+                            [&](const auto& item) { return item.image_offset == call.offset; }))
+                        return fail(LaunchError::artifact_mismatch, "compatibility-preflight",
+                            "Compatibility call must be covered and unchanged by offline preparation.");
+                }
+                compat::set_present_link(description.present_link);
+            }
         }
         if (!loading.nvn_module)
             std::erase_if(loading.words, [](const compat::WordPatch& word) { return word.nvn_driver_only; });
@@ -524,6 +538,7 @@ LaunchResult<PreparedLaunch> load_prepared_launch(
         const auto entry = loaded.modules->mapping(entry_index).executable_address(plan.entry.image_offset);
         if (!entry) return fail(LaunchError::artifact_mismatch, "load-prepared", "Prepared entry has no executable mapping.");
         PreparedLaunch result;
+        result.title_frame_rate = admitted_frame_rate;
         result.modules = std::make_shared<ModuleSet>(std::move(*loaded.modules));
         if (loading.compatibility_patch) {
             auto hooks = execution::CallHookTable::build(loading.call_hooks);
@@ -556,6 +571,8 @@ LaunchResult<PreparedLaunch> load_prepared_launch(
         // Synthetic loading applies one host LinkPlan. Original loading leaves
         // relocation targets untouched for the guest bootstrap. Neither path
         // invokes initializers.
+        if (rate_patch && requested_title_rate == "variable")
+            armigo::diag::warning("%s\n", compat::variable_frame_rate_warning);
         return result;
     } catch (const std::bad_alloc&) {
         return fail(LaunchError::resource_limit, "load-prepared", "Prepared launch allocation failed.");

@@ -17,6 +17,8 @@
 #include <armigo/runtime/preparation_format.h>
 
 #include "runner_shell_internal.h"
+#include "pacing_clock.h"
+#include "input_log.h"
 
 #include <armigo/services/file_system.h>
 
@@ -279,7 +281,38 @@ runtime::LaunchResult<std::shared_ptr<runtime::PresentationClock>> create_shell_
     runtime::PresentationClockConfiguration configuration;
     configuration.epoch = std::get<runtime::ClockSample>(sample).instant;
     configuration.refresh_period = std::get<std::chrono::nanoseconds>(period);
-    return environment.create_presentation_clock(clock, configuration);
+    auto created = environment.create_presentation_clock(clock, configuration);
+    if (std::holds_alternative<LaunchFailure>(created) ||
+        (!arguments.pacing_schedule_file && !arguments.frame_log_file)) return created;
+    if (arguments.mode != platform::PresentationMode::headless)
+        return failure(LaunchStage::presentation, LaunchError::invalid_input, "headless.pacing",
+                       "Pacing schedules and frame logs require headless mode.");
+    std::optional<PacingSchedule> schedule;
+    if (arguments.pacing_schedule_file) {
+        std::ifstream input(*arguments.pacing_schedule_file);
+        auto parsed = parse_pacing_schedule(input, arguments.pacing_max_hz.value_or(arguments.refresh_hz));
+        if (const auto* error = std::get_if<std::string>(&parsed))
+            return failure(LaunchStage::presentation, LaunchError::invalid_input, "headless.pacing", *error);
+        schedule = std::get<PacingSchedule>(std::move(parsed));
+    }
+    std::unique_ptr<std::ofstream> log;
+    std::vector<PacingWatch> watches;
+    if (arguments.frame_log_file) {
+        if (const char* list = std::getenv("ARMIGO_FRAME_WATCH")) {
+            auto parsed = parse_pacing_watches(list);
+            if (const auto* error = std::get_if<std::string>(&parsed))
+                return failure(LaunchStage::presentation, LaunchError::invalid_input, "headless.pacing", *error);
+            watches = std::get<std::vector<PacingWatch>>(std::move(parsed));
+        }
+        log = std::make_unique<std::ofstream>(*arguments.frame_log_file);
+        if (!*log) return failure(LaunchStage::presentation, LaunchError::invalid_input,
+                                "headless.pacing", "Could not open frame log.");
+    }
+    auto paced = std::make_shared<PacingClock>(
+        std::get<std::shared_ptr<runtime::PresentationClock>>(std::move(created)),
+        std::move(schedule), std::move(log), std::move(watches));
+    if (auto error = paced->observation_failure()) return *error;
+    return std::shared_ptr<runtime::PresentationClock>(std::move(paced));
 }
 
 runtime::LaunchResult<platform::PresenterOptions> shell_presenter_options(
@@ -478,6 +511,22 @@ ParsedRunArguments parse_runner_arguments(platform::PresentationMode mode,
                 return parsed;
             }
             options.time_limit = limit;
+        } else if (flag == "--pacing-schedule" || flag == "--frame-log" || flag == "--input-log" || flag == "--pacing-max-hz") {
+            if (mode != platform::PresentationMode::headless || !consume_value(arguments, value)) {
+                parsed.error = "Pacing options require headless mode and a value.";
+                return parsed;
+            }
+            if (flag == "--pacing-schedule") options.pacing_schedule_file = value;
+            else if (flag == "--frame-log") options.frame_log_file = value;
+            else if (flag == "--input-log") options.input_log_file = value;
+            else {
+                double ceiling = 0;
+                if (!parse_positive_double(value, ceiling) || ceiling < 1 || ceiling > 1000) {
+                    parsed.error = "--pacing-max-hz requires a rate between 1 and 1000.";
+                    return parsed;
+                }
+                options.pacing_max_hz = ceiling;
+            }
         } else if (flag == "--refresh-hz") {
             double refresh_hz = 0.0;
             if (!consume_value(arguments, value) ||
@@ -486,6 +535,7 @@ ParsedRunArguments parse_runner_arguments(platform::PresentationMode mode,
                 return parsed;
             }
             options.refresh_hz = refresh_hz;
+            options.refresh_hz_explicit = true;
         } else if (flag == "--width") {
             std::uint32_t width = 0;
             if (!consume_value(arguments, value) ||
@@ -645,6 +695,20 @@ ParsedRunArguments parse_runner_arguments(platform::PresentationMode mode,
         parsed.error = "--width and --height must be given together.";
         return parsed;
     }
+    if (options.input_log_file && !options.input_script_file) {
+        parsed.error = "--input-log requires --input-script.";
+        return parsed;
+    }
+    if (options.input_log_file && options.frame_log_file &&
+        std::filesystem::absolute(*options.input_log_file).lexically_normal() ==
+        std::filesystem::absolute(*options.frame_log_file).lexically_normal()) {
+        parsed.error = "Input and frame logs require different paths.";
+        return parsed;
+    }
+    if (options.pacing_max_hz && !options.pacing_schedule_file) {
+        parsed.error = "--pacing-max-hz requires --pacing-schedule.";
+        return parsed;
+    }
     if (!(options.refresh_hz > 0.0) || !std::isfinite(options.refresh_hz)) {
         parsed.error = "--refresh-hz requires a positive number.";
         return parsed;
@@ -682,6 +746,10 @@ std::string runner_run_usage() {
            "                         (default console).\n"
            "  --width N --height N   Present at this host size.\n"
            "  --fullscreen           Present fullscreen.\n"
+           "  --pacing-schedule FILE Headless elapsed-time rate/hitch schedule (default off).\n"
+           "  --pacing-max-hz HZ     Schedule ceiling (default --refresh-hz).\n"
+           "  --input-log FILE      Log actual scripted HID deliveries (headless only).\n"
+           "  --frame-log FILE      Headless per-present TSV; ARMIGO_FRAME_WATCH=address:width,...\n"
            "  --refresh-hz HZ        Host presentation refresh rate (default 60).\n"
            "Exit codes: 0 frame-target success or window closed, 1 guest exit,\n"
            "  2 usage error, 3 unsupported stop, 4 failure, 5 timeout, 6 cancelled.\n"
@@ -879,9 +947,30 @@ ShellReport run_headless_shell(const RunnerArguments& arguments,
     if (container_title_id != 0) description.container_title_id = container_title_id;
     runtime::RuntimeDependencies dependencies;
     dependencies.clock = presentation_clock->clock();
+    InputDeliveryObserver input_observer;
+    InputDeliveryFlush flush_input;
+    if (arguments.input_script_file && (arguments.frame_log_file || arguments.input_log_file)) {
+        const auto path = arguments.input_log_file.value_or(
+            std::filesystem::path(arguments.frame_log_file.value_or(std::filesystem::path{}).string() + ".inputs.tsv"));
+        auto delivery_log = std::make_shared<InputDeliveryLog>(presentation_clock->clock(),
+            presentation_clock->configuration().epoch, input_script.clock,
+            environment.open_input_log ? environment.open_input_log(path) : std::make_unique<std::ofstream>(path));
+        if (!delivery_log->ready())
+            return shell_detail::failed_report(shell_detail::failure(runtime::LaunchStage::inputs,
+                LaunchError::host_failure, "input delivery log", "Could not open or initialize input delivery log."));
+        input_observer = [delivery_log](std::size_t index, const ScriptInputState& state) {
+            return delivery_log->record(index, state);
+        };
+        flush_input = [delivery_log] { return delivery_log->flush(); };
+    }
     dependencies.presentation_clock = std::move(presentation_clock);
+    platform::PresenterStatus initial_input_status = std::monostate{};
     dependencies.presenter = arguments.input_script_file
-        ? scripted_presenter(presenter, std::move(input_script)) : presenter;
+        ? scripted_presenter(presenter, std::move(input_script), {}, {}, std::move(input_observer),
+                             std::move(flush_input), &initial_input_status) : presenter;
+    if (const auto* error = std::get_if<platform::PresentationFailure>(&initial_input_status))
+        return shell_detail::failed_report(shell_detail::failure(runtime::LaunchStage::inputs,
+            LaunchError::host_failure, "input delivery log", error->detail));
     auto runtime_result = environment.create_runtime(description, std::move(dependencies));
     if (auto* failed = std::get_if<runtime::LaunchFailure>(&runtime_result)) {
         return shell_detail::failed_report(std::move(*failed));

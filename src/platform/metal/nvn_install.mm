@@ -167,6 +167,11 @@ std::string install_driver(std::shared_ptr<MetalShaderPackage> package, const st
     return {};
 }
 
+bool stop_submission_workers(std::optional<std::chrono::steady_clock::time_point> deadline) {
+    auto& driver = installed();
+    return !driver.replay || driver.replay->stop_submission_workers(deadline);
+}
+
 void bind_native_windows(std::weak_ptr<services::vi::DisplaySession> session) {
     const std::lock_guard lock(display_mutex);
     display = std::move(session);

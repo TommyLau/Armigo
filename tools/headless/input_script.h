@@ -30,6 +30,11 @@ struct InputScript {
     Clock clock = Clock::presents;
     std::vector<ScriptInputState> states;
 };
+// Invoked once after each state was actually passed to the publication
+// callback, including initial state zero. Failure stops further delivery.
+using InputDeliveryFlush = std::function<platform::PresenterStatus()>;
+using InputDeliveryObserver = std::function<platform::PresenterStatus(std::size_t, const ScriptInputState&)>;
+
 // Retains the scripted controller across host polls. Buttons combine, triggers
 // take the greater value, and each stick takes the greater deflection. Physical
 // controller motion and keyboard state survive; the normal poller applies focus.
@@ -48,9 +53,14 @@ std::variant<InputScript, std::string> parse_input_script(std::istream& source);
 // Millisecond scripts start their steady clock at the first successful present.
 // Uses the same host-to-HID mapping as keyboard/controller input. The optional
 // publication and clock callbacks are test seams; production leaves them empty.
+// Observations capture each applied state; flushing runs once after the whole
+// due batch. Callers can reject initial delivery failure before guest launch.
 std::shared_ptr<platform::Presenter> scripted_presenter(
     std::shared_ptr<platform::Presenter> presenter, InputScript script,
     std::function<void(const platform::HostInputSnapshot&)> publish = {},
-    std::function<std::chrono::steady_clock::time_point()> now = {});
+    std::function<std::chrono::steady_clock::time_point()> now = {},
+    InputDeliveryObserver observe_delivery = {},
+    InputDeliveryFlush flush_delivery = {},
+    platform::PresenterStatus* initial_delivery_status = nullptr);
 
 } // namespace armigo::tools

@@ -630,7 +630,6 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
                     loading.compatibility_module = *main;
                     loading.compatibility_patch =
                         std::make_shared<compat::InstalledPatch>(compat::InstalledPatch{*patch, 0});
-                    compat::set_present_link(patch->present_link);
                     loading.hook_gate = gate;
                 }
             }
@@ -657,10 +656,25 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
             }
         }
         // Words meant for the NVN driver apply only when it replaces the game's own.
+        std::uint32_t admitted_frame_rate = 0;
         if (rate_patch) {
-            auto effective = compat::select_patch_words(*rate_patch, requested_title_rate, loading.nvn_module.has_value());
+            auto effective = compat::select_patch_words(*rate_patch, requested_title_rate,
+                loading.nvn_module.has_value(), &admitted_frame_rate);
             if (const auto* failure = std::get_if<std::string>(&effective))
                 return fail(LaunchError::invalid_input, "compatibility-frame-rate", *failure);
+        }
+        if (loading.compatibility_patch) {
+            auto& description = loading.compatibility_patch->description;
+            auto selected = compat::select_patch_calls(description, requested_title_rate, loading.nvn_module.has_value());
+            if (const auto* failure = std::get_if<std::string>(&selected))
+                return fail(LaunchError::invalid_input, "compatibility-frame-rate", *failure);
+            description.calls = std::get<std::vector<compat::CallPatch>>(std::move(selected));
+            if (description.calls.empty()) {
+                loading.compatibility_patch.reset();
+                loading.compatibility_module.reset();
+            } else {
+                compat::set_present_link(description.present_link);
+            }
         }
         if (!loading.nvn_module)
             std::erase_if(loading.words, [](const compat::WordPatch& word) { return word.nvn_driver_only; });
@@ -761,6 +775,7 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
         if (!table.ok()) return fail(LaunchError::host_failure, "load-native", execution::describe(table.error.kind));
 
         PreparedLaunch result;
+        result.title_frame_rate = admitted_frame_rate;
         result.modules = std::make_shared<ModuleSet>(std::move(*loaded.modules));
         const auto& modules = *result.modules;
         // The SDK's own startup sequence, in the order its loader runs it.
@@ -812,6 +827,8 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
             armigo::diag::write(armigo::diag::Level::info,  "Armigo NVN: driver selected for API %d.%d.\n", nvn_version->major, nvn_version->minor);
         }
         if (native_options.capture) *native_options.capture = std::move(capture);
+        if (rate_patch && requested_title_rate == "variable")
+            armigo::diag::warning("%s\n", compat::variable_frame_rate_warning);
         return result;
     } catch (const std::bad_alloc&) {
         return fail(LaunchError::resource_limit, "load-native", "Native launch allocation failed.");

@@ -123,11 +123,15 @@ std::string info_plist(const BundleSpec& spec) {
     const auto display = xml_escape(spec.display_name);
     const auto name = xml_escape(spec.bundle_name);
     const auto identifier = xml_escape(spec.bundle_identifier);
+    std::string supported_rates = "<key>SupportedRates</key><array>";
+    for (const auto rate : spec.supported_frame_rates)
+        supported_rates += "<integer>" + std::to_string(rate) + "</integer>";
+    supported_rates += "</array>";
     const auto frame_rate = spec.default_frame_rate && spec.display_refresh_rate
         ? "<key>ArmigoTitleFrameRate</key><dict><key>Default</key><integer>" +
             std::to_string(spec.default_frame_rate) +
             "</integer><key>DisplayRefresh</key><integer>" +
-            std::to_string(spec.display_refresh_rate) + "</integer></dict>\n"
+            std::to_string(spec.display_refresh_rate) + "</integer>" + supported_rates + "</dict>\n"
         : std::string{};
     if (spec.platform == "ios") {
         return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"

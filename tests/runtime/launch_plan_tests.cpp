@@ -9,6 +9,7 @@
 // ============================================================================
 
 #include <armigo/graphics/presentation_hints.h>
+#include <armigo/common/diagnostics.h>
 #include <armigo/execution/guest_dispatch.h>
 #include <armigo/platform/thread_slot.h>
 #include <armigo/runtime/guest_memory.h>
@@ -703,9 +704,11 @@ void rejects_unsupported_and_filtered_prepared_rates() {
         return load_prepared_launch(input, *value(artifacts), profile, *value(plan),
             std::make_shared<platform::ThreadSlotKey>(), {}, std::span(&patch, 1));
     };
-    const auto check_word = [](const LaunchResult<PreparedLaunch>& result, std::uint32_t expected) {
+    const auto check_word = [](const LaunchResult<PreparedLaunch>& result, std::uint32_t expected,
+                               std::uint32_t rate) {
         CHECK(value(result));
         if (const auto* loaded = value(result)) {
+            CHECK(loaded->title_frame_rate == rate);
             const auto bytes = loaded->modules->mapping(0).readable_bytes(0x100, 4);
             CHECK(bytes.has_value());
             std::uint32_t word = 0;
@@ -728,11 +731,11 @@ void rejects_unsupported_and_filtered_prepared_rates() {
     setenv("ARMIGO_COMPAT_FRAME_RATE", "60", 1);
     check_refusal(load());
     setenv("ARMIGO_COMPAT_FRAME_RATE", "120", 1);
-    check_word(load(), 0xd2800060u);
+    check_word(load(), 0xd2800060u, 120);
     patch.words.front().nvn_driver_only = true;
     check_refusal(load());
     setenv("ARMIGO_COMPAT_FRAME_RATE", "30", 1);
-    check_word(load(), 0xd2800020u);
+    check_word(load(), 0xd2800020u, 30);
     if (old_rate) setenv("ARMIGO_COMPAT_FRAME_RATE", old_rate->c_str(), 1);
     else unsetenv("ARMIGO_COMPAT_FRAME_RATE");
     if (old_driver) setenv("ARMIGO_NVN", old_driver->c_str(), 1);
@@ -794,6 +797,44 @@ void loads_identity_selected_call_hooks() {
     CHECK(failed(load(&mismatch), LaunchError::artifact_mismatch));
     mismatch = patch; mismatch.calls[1].offset = 0x300;
     CHECK(failed(load(&mismatch), LaunchError::artifact_mismatch));
+    auto conditional = patch;
+    conditional.frame_rate = compat::FrameRateSettings{30, 60, {30, 60, 120, compat::variable_frame_rate}};
+    conditional.calls[0].frame_rate = 60;
+    conditional.calls[1].frame_rate = compat::variable_frame_rate;
+    // One mode uses words so the two independently selected hooks stay unique.
+    conditional.words.push_back({0x100, 0xf81f0ffeu, 0xf81f0ffeu, false, "Synthetic unchanged instruction.", 120});
+    const char* prior = std::getenv("ARMIGO_COMPAT_FRAME_RATE");
+    const auto prior_rate = prior ? std::optional<std::string>(prior) : std::nullopt;
+    for (const char* rate : {"0", "30", "60", "120", "variable"}) {
+        setenv("ARMIGO_COMPAT_FRAME_RATE", rate, 1);
+        std::vector<std::string> warnings;
+        const auto prior_level = diag::minimum_level();
+        diag::testing_set_level(diag::Level::info);
+        diag::testing_set_sink([](diag::Level level, std::string_view line, void* context) {
+            if (level == diag::Level::warning)
+                static_cast<std::vector<std::string>*>(context)->emplace_back(line);
+        }, &warnings);
+        auto selected = load(&conditional);
+        diag::testing_set_sink(nullptr, nullptr);
+        diag::testing_set_level(prior_level);
+        CHECK(warnings.size() == (std::string_view(rate) == "variable" ? 1u : 0u));
+        if (!warnings.empty()) CHECK(warnings.front() == std::string(compat::variable_frame_rate_warning) + "\n");
+        CHECK(value(selected));
+        if (value(selected)) {
+            const bool active = std::string_view(rate) == "60" || std::string_view(rate) == "variable";
+            CHECK(bool(value(selected)->compatibility_patch) == active);
+            CHECK(bool(value(selected)->call_hooks) == active);
+            if (active) {
+                const auto& calls = value(selected)->compatibility_patch->description.calls;
+                CHECK(calls.size() == 1 && calls.front().offset ==
+                    (std::string_view(rate) == "60" ? 0x104u : 0x304u));
+            }
+        }
+    }
+    conditional.calls[1].nvn_driver_only = true;
+    CHECK(failed(load(&conditional), LaunchError::invalid_input));
+    if (prior_rate) setenv("ARMIGO_COMPAT_FRAME_RATE", prior_rate->c_str(), 1);
+    else unsetenv("ARMIGO_COMPAT_FRAME_RATE");
     const auto loaded = load(&patch);
     if (const auto* error = std::get_if<LaunchFailure>(&loaded))
         std::fprintf(stderr, "Compatibility load failed: %s %s\n", error->operation.c_str(), error->detail.c_str());
@@ -837,9 +878,70 @@ void loads_identity_selected_call_hooks() {
           std::chrono::nanoseconds::zero());
 }
 
+void fractional_hook_uses_declared_register(titles::FrameRateVariant variant, unsigned reg, float expected) {
+    test::ModuleSpec module;
+    module.name = "main";
+    module.symbols = {{"_start", 0x100, 28, true}, {"callee", 0x200, 16, true}};
+    test::put_word(module, 0x100, 0xf81f0fe0u | reg); // STR the selected callee-saved register,[SP,#-16]!
+    test::put_word(module, 0x104, 0xf81f0ffeu); // STR X30,[SP,#-16]!
+    test::put_word(module, 0x108, 0x91002000u | reg); // ADD the selected register,X0,#8
+    test::put_word(module, 0x10c, aarch64::encode_bl(0x10c, 0x200).word);
+    test::put_word(module, 0x110, 0xf84107feu); // LDR X30,[SP],#16
+    test::put_word(module, 0x114, 0xf84107e0u | reg); // LDR the selected callee-saved register,[SP],#16
+    test::put_word(module, 0x118, aarch64::encode_ret().word);
+    test::put_word(module, 0x200, 0xb9400c02u); // LDR W2,[X0,#12]
+    test::put_word(module, 0x204, 0xb9001402u); // STR W2,[X0,#20]
+    test::put_word(module, 0x208, 0xb9001801u); // STR W1,[X0,#24]
+    test::put_word(module, 0x20c, aarch64::encode_ret().word);
+    loader::ExeFsDirectoryInput input;
+    input.modules.push_back({"main", test::build_module(std::move(module))});
+    auto profile = synthetic_profile(); profile.title_id = 0x123;
+    const auto artifacts = prepare_modules(input, preparation_options());
+    CHECK(value(artifacts)); if (!value(artifacts)) return;
+    const auto plan = plan_launch(input, profile, *value(artifacts));
+    CHECK(value(plan)); if (!value(plan)) return;
+    const auto image = loader::read_nso_module(input.modules[0].bytes);
+    CHECK(image.ok()); if (!image.ok()) return;
+    compat::PatchDescription patch;
+    patch.identity = {profile.title_id, image.image->build_id};
+    patch.module = "frame-rate";
+    patch.original_callee = 0x200;
+    patch.calls = {{0x10c, aarch64::encode_bl(0x10c, 0x200).word, "Synthetic counter hook."}};
+    patch.layout.framework_pointer = test::data_offset;
+    patch.layout.variant = variant;
+    patch.layout.object_register = reg;
+    patch.layout.active_state = 2;
+    patch.layout.counter = 4;
+    auto key = std::make_shared<platform::ThreadSlotKey>();
+    auto loaded = load_prepared_launch(input, *value(artifacts), profile, *value(plan), key, {}, std::span(&patch, 1));
+    CHECK(value(loaded)); if (!value(loaded)) return;
+    auto& launch = *value(loaded);
+    CompatibilityMemory memory;
+    memory.installed = launch.compatibility_patch.get();
+    const std::uint32_t state = 2;
+    const float initial = 3.0f;
+    std::memcpy(memory.object.data() + 8, &state, 4);
+    std::memcpy(memory.object.data() + 12, &initial, 4);
+    GuestThreadContext context;
+    GuestDispatchScope dispatch(launch.sites, context, {}, GateFailurePolicy::trap,
+        launch.call_hooks, {CompatibilityMemory::handle, &memory});
+    platform::ThreadSlotBinding binding(*key, context.bound_register_cell());
+    CHECK(dispatch.setup_error() == GuestDispatchFailureKind::none && binding.native_access());
+    if (dispatch.setup_error() != GuestDispatchFailureKind::none || !binding.native_access()) return;
+    reinterpret_cast<void (*)(void*, std::uint32_t)>(launch.entry_address)(memory.object.data(), 77);
+    float observed = 0;
+    std::uint32_t interval = 0;
+    std::memcpy(&observed, memory.object.data() + 20, 4);
+    std::memcpy(&interval, memory.object.data() + 24, 4);
+    CHECK(memory.callbacks == 1 && observed == expected && interval == 77);
+    CHECK(dispatch.failure_count() == 0);
+}
+
 } // namespace
 
 int main() {
+    fractional_hook_uses_declared_register(titles::FrameRateVariant::FractionalCounter30, 22, 3.5f);
+    fractional_hook_uses_declared_register(titles::FrameRateVariant::FractionalCountdown30, 25, 2.5f);
     loads_identity_selected_call_hooks();
     rejects_unsupported_and_filtered_prepared_rates();
     derives_dependency_order_and_rejects_unsupported_profiles();

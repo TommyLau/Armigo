@@ -10,6 +10,8 @@
 
 #include "../../src/runtime/service_registry.h"
 #include "../loader/npdm_fixture.h"
+#include "../../tools/headless/pacing_clock.h"
+#include <sstream>
 
 #include <armigo/romfs/romfs_virtual.h>
 #include <armigo/runtime/preparation_format.h>
@@ -355,9 +357,38 @@ void test_factory_rejects_inconsistent_dependencies() {
     }
 }
 
+void test_pacing_log_failure_is_visible_to_runtime_polling() {
+    struct FailingBuffer : std::stringbuf {
+        bool fail = false;
+        int sync() override { return fail ? -1 : std::stringbuf::sync(); }
+    } output;
+    RegistryFixture fixture;
+    auto observed = std::make_shared<tools::PacingClock>(fixture.presentation_clock, std::nullopt,
+        std::make_unique<std::ostream>(&output));
+    fixture.presentation_clock = observed;
+    auto made = create_service_registry(fixture.dependencies());
+    CHECK(value(made) != nullptr);
+    if (!value(made)) return;
+    auto registry = *value(made);
+    CHECK(!registry->failure());
+    output.fail = true;
+    auto status = observed->observe_present(1, 1, {});
+    CHECK(failure(status) != nullptr);
+    const auto polled = registry->failure();
+    CHECK(polled && polled->stage == LaunchStage::presentation &&
+          polled->code == LaunchError::host_failure && polled->operation == "headless.pacing");
+    // Recovery of the stream must not erase the first causal runtime failure.
+    output.fail = false;
+    CHECK(failure(observed->observe_present(2, 1, {})) != nullptr);
+    CHECK(registry->failure()->detail == polled->detail);
+    registry->request_stop();
+    CHECK(std::holds_alternative<std::monostate>(registry->drain(std::nullopt)));
+}
+
 } // namespace
 
 int main() {
+    test_pacing_log_failure_is_visible_to_runtime_polling();
     test_inventory_is_reachable_through_sm();
     test_named_port_and_service_acl_denial();
     test_file_system_acl_is_fail_closed();

@@ -215,6 +215,7 @@ void VsyncSource::run(std::stop_token stop) {
                 }
                 ++sequence_;
                 for (auto& [display, event] : events_) event->signal();
+                presentation_clock_->observe_vsync(std::get<runtime::PresentationSchedule>(scheduled));
             }
             last_index = index;
             sequence_changed_.notify_all();

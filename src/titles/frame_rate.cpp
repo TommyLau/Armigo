@@ -8,18 +8,20 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
-#include <armigo/titles/01007EF00011E000/frame_rate.h>
+#include <armigo/titles/frame_rate.h>
 
 #include <armigo/horizon/ipc.h>
 
 #include <array>
+#include <algorithm>
 #include <cstddef>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <span>
 #include <type_traits>
 
-namespace armigo::titles::title_01007ef00011e000 {
+namespace armigo::titles {
 namespace {
 
 constexpr double ticks_per_second = 19'200'000.0;
@@ -28,6 +30,10 @@ constexpr float minimum_ratio = 30.0f / maximum_measured_rate;
 constexpr float maximum_ratio = 30.0f / 20.0f;
 constexpr float minimum_step = 60.0f / maximum_measured_rate;
 constexpr float maximum_step = 60.0f / 20.0f;
+
+double measured_seconds(std::int64_t period_ticks) noexcept {
+    return static_cast<double>(period_ticks) / ticks_per_second;
+}
 
 bool checked_address(std::uint64_t base, std::uint64_t offset, std::uint64_t& address) noexcept {
     if (offset > std::numeric_limits<std::uint64_t>::max() - base)
@@ -76,6 +82,35 @@ bool read_period(const FrameRateLayout& layout, std::uint64_t module_base,
     return true;
 }
 
+bool update_fractional_counter(const FrameRateLayout& layout, std::uint64_t module_base,
+                               std::uint64_t object, const horizon::GuestBuffers& buffers) noexcept {
+    std::uint32_t state = 0;
+    if (!read_value(buffers, object, layout.state, state)) return false;
+    if (state != layout.active_state) return true;
+    std::int64_t ticks = 0;
+    if (!read_period(layout, module_base, buffers, ticks)) return false;
+    if (ticks <= 0) return true;
+    // Match a native float-seconds getter followed by multiplication. The
+    // interval-ratio variant keeps its distinct double-before-float order.
+    const float seconds = static_cast<float>(measured_seconds(ticks));
+    const float step = std::min(seconds, 0.05f) * 30.0f;
+    float counter = 0;
+    if (!read_value(buffers, object, layout.counter, counter) ||
+        !std::isfinite(counter) || counter < 0) return false;
+    if (layout.variant == FrameRateVariant::FractionalRepeat30) {
+        if (layout.repeat_frames == 0) return false;
+        if (counter == 0.0f) {
+            std::uint8_t held = 0;
+            if (!read_value(buffers, object, layout.repeat_flag, held)) return false;
+            if (held != 0) counter = static_cast<float>(layout.repeat_frames);
+        }
+    }
+    const float updated = layout.variant == FrameRateVariant::FractionalCounter30
+        ? counter + step : std::max(0.0f, counter - step);
+    if (!std::isfinite(updated)) return false;
+    return write_value(buffers, object, layout.counter, updated);
+}
+
 }  // namespace
 
 bool update_frame_rate(const FrameRateLayout& layout, std::uint64_t module_base,
@@ -83,6 +118,11 @@ bool update_frame_rate(const FrameRateLayout& layout, std::uint64_t module_base,
                             const horizon::GuestBuffers& buffers,
                             std::uint32_t* maximum_rate) noexcept {
     if (maximum_rate) *maximum_rate = 0;
+    if (layout.variant == FrameRateVariant::FractionalCounter30 ||
+        layout.variant == FrameRateVariant::FractionalCountdown30 ||
+        layout.variant == FrameRateVariant::FractionalRepeat30)
+        return update_fractional_counter(layout, module_base, vfr_object, buffers);
+    if (layout.variant != FrameRateVariant::IntervalRatio60) return false;
     // The frame step follows the measured period whatever the frame-rate
     // object's state, so counters keep time while the override is set too.
     std::int64_t period_ticks = 0;
@@ -91,7 +131,7 @@ bool update_frame_rate(const FrameRateLayout& layout, std::uint64_t module_base,
         if (!read_period(layout, module_base, buffers, period_ticks))
             return false;
         if (period_ticks > 0) {
-            float step = static_cast<float>(static_cast<double>(period_ticks) / ticks_per_second * 60.0);
+            float step = static_cast<float>(measured_seconds(period_ticks) * 60.0);
             if (step < minimum_step)
                 step = minimum_step;
             if (step > maximum_step)
@@ -118,7 +158,7 @@ bool update_frame_rate(const FrameRateLayout& layout, std::uint64_t module_base,
     if (period_ticks <= 0)
         return true;
 
-    float ratio = static_cast<float>(static_cast<double>(period_ticks) / ticks_per_second * 60.0 /
+    float ratio = static_cast<float>(measured_seconds(period_ticks) * 60.0 /
                                      static_cast<double>(base_interval));
     if (ratio < minimum_ratio)
         ratio = minimum_ratio;
@@ -135,4 +175,4 @@ bool update_frame_rate(const FrameRateLayout& layout, std::uint64_t module_base,
     return true;
 }
 
-}  // namespace armigo::titles::title_01007ef00011e000
+}  // namespace armigo::titles

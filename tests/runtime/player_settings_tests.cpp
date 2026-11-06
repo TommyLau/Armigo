@@ -11,12 +11,15 @@
 #include "player_settings.h"
 
 #include <armigo/services/settings.h>
+#include <armigo/compat/patches.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <algorithm>
+#include <limits>
 #include <string_view>
 
 namespace {
@@ -131,8 +134,66 @@ void test_resolution_and_choices() {
     unsetenv("ARMIGO_COMPAT_RESOLUTION_RATE");
 }
 
+void test_mac_frame_rates() {
+    using namespace armigo::tools;
+    // All valid declared sets: each has a 30/60 default, optionally 120.
+    struct Policy {
+        std::vector<std::uint32_t> rates;
+        std::vector<int> low_options;
+        std::vector<int> high_options;
+    };
+    const Policy policies[] = {
+        {{30}, {0, 30}, {0, 30}},
+        {{60}, {0, 60}, {0, 60}},
+        {{30, 60}, {0, 30, 60}, {0, 30, 60}},
+        {{30, 120}, {0, 30}, {0, 30, 120}},
+        {{60, 120}, {0, 60}, {0, 60, 120}},
+        {{30, 60, 120}, {0, 30, 60}, {0, 30, 60, 120}},
+        {{120, 30, 60}, {0, 30, 60}, {0, 30, 60, 120}},
+    };
+    for (const auto& policy : policies) {
+        for (double hz : {0.0, 30.0, 59.94, 60.0, 90.0, 119.88, 120.0, 144.0, 240.0,
+                          std::numeric_limits<double>::quiet_NaN()}) {
+            armigo::platform::DisplayCapabilities display;
+            display.current = {1920, 1080, hz, false};
+            // A faster available mode must not admit 120 on an active 60 Hz mode.
+            display.max_refresh_hz = 240;
+            const auto& expected = hz >= 120 ? policy.high_options : policy.low_options;
+            for (int requested : {0, 30, 60, 120}) {
+                PlayerChoices choices;
+                choices.title_frame_rate = true;
+                choices.supported_frame_rates = policy.rates;
+                choices.frame_rate = requested;
+                const auto result = select_mac_frame_rate(choices, display);
+                CHECK(result.options == expected);
+                const bool admitted = std::find(expected.begin(), expected.end(), requested) != expected.end();
+                CHECK(result.frame_rate == (admitted ? requested : expected.back()));
+                CHECK(result.fell_back == !admitted);
+                CHECK(result.refresh_hz == (result.frame_rate == 120 ? 120.0 : 60.0));
+            }
+        }
+    }
+    PlayerChoices legacy;
+    armigo::platform::DisplayCapabilities fast;
+    fast.current = {1920, 1080, 120, true};
+    CHECK(select_mac_frame_rate(legacy, fast).options == std::vector<int>({0, 30, 60}));
+    legacy.supported_frame_rates = {30, 60, 120};
+    legacy.frame_rate = 120;
+    CHECK(select_mac_frame_rate(legacy, {}).frame_rate == 60);
+    legacy.supported_frame_rates.push_back(armigo::compat::variable_frame_rate);
+    legacy.frame_rate = 0;
+    const auto hidden = select_mac_frame_rate(legacy, fast);
+    CHECK(hidden.options == std::vector<int>({0, 30, 60, 120}));
+    CHECK(hidden.frame_rate == 0 && !hidden.fell_back);
+    legacy.frame_rate = -1;
+    const auto rejected = select_mac_frame_rate(legacy, fast);
+    CHECK(rejected.frame_rate == 120 && rejected.fell_back);
+
+}
+
 int main() {
     test_manifest_and_language_selection();
     test_resolution_and_choices();
+    test_mac_frame_rates();
     return failures == 0 ? 0 : 1;
 }

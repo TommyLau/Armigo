@@ -151,6 +151,11 @@ public:
         return GuestMemoryPin{std::make_shared<TestPin>(
             storage_, range, static_cast<std::size_t>(range.address - test_memory_base))};
     }
+    bool copy_observation(std::uint64_t address, std::span<std::byte> out) const noexcept override {
+        ++observation_reads;
+        return read(const_cast<TestMemory*>(this), address, out);
+    }
+    mutable unsigned observation_reads = 0;
     horizon::GuestCopyOut copy_out() noexcept override { return {}; }
     horizon::GuestBuffers ipc_buffers() noexcept override {
         return {&TestMemory::read, &TestMemory::write, this};
@@ -1208,6 +1213,52 @@ void test_stop_drains_and_refuses_new_work() {
     CHECK(!registry->failure().has_value());
 }
 
+void test_presentation_observer_preserves_authority_lifetime() {
+    struct Clock final : PresentationClock {
+        bool enabled = false, readable = false;
+        unsigned observations = 0;
+        std::shared_ptr<GuestClock> clock() const noexcept override { return {}; }
+        PresentationClockConfiguration configuration() const noexcept override { return {}; }
+        LaunchResult<PresentationSchedule> schedule(std::optional<std::uint64_t>, std::int32_t) const override {
+            return PresentationSchedule{};
+        }
+        LaunchResult<PresentationSchedule> next_refresh() const override { return PresentationSchedule{}; }
+        bool observes_presents() const noexcept override { return enabled; }
+        LaunchStatus observe_present(std::uint64_t, std::int32_t, const PresentationMemoryReader& read) override {
+            ++observations;
+            std::array<std::byte, 4> bytes{};
+            readable = read(test_memory_base, bytes);
+            return std::monostate{};
+        }
+    };
+    auto clock = std::make_shared<Clock>();
+    auto memory = std::make_shared<TestMemory>();
+    std::weak_ptr<GuestMemory> memory_lifetime = memory;
+    std::weak_ptr<PresentationClock> clock_lifetime = clock;
+    unsigned calls = 0;
+    services::GraphicsPresenter original = [&](const services::GraphicsPresentation&) {
+        ++calls;
+        return services::GraphicsPresentationResult{true, {}};
+    };
+    auto unobserved = attach_presentation_observer(original, clock, memory);
+    CHECK(unobserved.target_type() == original.target_type());
+    CHECK(memory.use_count() == 1 && clock.use_count() == 1);
+    CHECK(unobserved({}).completed && calls == 1 && clock->observations == 0);
+    clock->enabled = true;
+    auto observed = attach_presentation_observer(original, clock, memory);
+    CHECK(memory.use_count() == 1);
+    CHECK(observed({}).completed && calls == 2 && clock->observations == 1 && clock->readable);
+    CHECK(memory->observation_reads == 1);
+    CHECK(memory.use_count() == 1);
+    memory.reset();
+    CHECK(memory_lifetime.expired());
+    CHECK(observed({}).completed && calls == 3 && clock->observations == 2 && !clock->readable);
+    observed = {};
+    clock.reset();
+    CHECK(clock_lifetime.expired());
+    CHECK(unobserved({}).completed && calls == 4);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1219,6 +1270,7 @@ int main(int argc, char** argv) {
         test_registry_gpu_memory_release();
         return failures == 0 ? 0 : 1;
     }
+    test_presentation_observer_preserves_authority_lifetime();
     test_registry_presentation_counts_follow_vi_release();
     test_registry_counts_native_window_presents();
     test_operation_mode_reaches_registered_services();

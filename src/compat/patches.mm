@@ -75,23 +75,31 @@ std::uint64_t hex(id value, std::size_t digits = 0) {
             "Compatibility hexadecimal integer is invalid.");
     return number;
 }
+std::uint32_t layout_count(id value, std::uint32_t limit) {
+    require([value isKindOfClass:[NSNumber class]] && CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID() &&
+            [value doubleValue] >= 0 && [value doubleValue] <= limit &&
+            [value doubleValue] == [value unsignedIntValue], "Compatibility layout number is out of range.");
+    return [value unsignedIntValue];
+}
 bool exclusive_word_modes(const WordPatch& left, const WordPatch& right) {
     return left.frame_rate && right.frame_rate && left.frame_rate != right.frame_rate &&
            left.expected_instruction == right.expected_instruction;
 }
 bool valid_frame_rates(const FrameRateSettings& settings) {
     if (settings.default_rate != 30 && settings.default_rate != 60) return false;
-    if (settings.supported_rates.empty() || settings.supported_rates.size() > 3) return false;
+    if (settings.supported_rates.empty() || settings.supported_rates.size() > 4) return false;
     std::set<std::uint32_t> rates;
     for (auto rate : settings.supported_rates)
-        if ((rate != 30 && rate != 60 && rate != 120) || !rates.insert(rate).second) return false;
+        if ((rate != 30 && rate != 60 && rate != 120 && rate != variable_frame_rate) || !rates.insert(rate).second) return false;
     return rates.contains(settings.default_rate);
 }
 std::uint32_t frame_rate_value(id value, bool private_rate = false) {
+    if (private_rate && [value isKindOfClass:[NSString class]] && [value isEqual:@"variable"])
+        return variable_frame_rate;
     require([value isKindOfClass:[NSNumber class]] &&
             CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID() &&
             ([value isEqual:@30] || [value isEqual:@60] || (private_rate && [value isEqual:@120])),
-            private_rate ? "Compatibility word frame rate must be 30, 60 or 120."
+            private_rate ? "Compatibility mode must be 30, 60, 120 or variable."
                          : "Compatibility default and display frame rates must be 30 or 60.");
     return [value unsignedIntValue];
 }
@@ -235,7 +243,7 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                     patch.frame_rate = FrameRateSettings{frame_rate_value(settings[@"default"]),
                         frame_rate_value(settings[@"display_refresh_rate"]), {}};
                     id supported = record[@"frame_rates"];
-                    require([supported isKindOfClass:[NSArray class]] && [supported count] > 0 && [supported count] <= 3,
+                    require([supported isKindOfClass:[NSArray class]] && [supported count] > 0 && [supported count] <= 4,
                             "A title frame-rate policy requires an explicit frame_rates array.");
                     for (id value in supported) patch.frame_rate->supported_rates.push_back(frame_rate_value(value, true));
                     require(valid_frame_rates(*patch.frame_rate),
@@ -244,7 +252,7 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                 require(!record[@"frame_rates"] || patch.frame_rate.has_value(),
                         "Supported frame rates require a title frame-rate policy.");
                 if (id words = record[@"words"]) {
-                    require([words isKindOfClass:[NSArray class]] && [words count] > 0 && [words count] <= 64,
+                    require([words isKindOfClass:[NSArray class]] && [words count] > 0 && [words count] <= 128,
                             "Compatibility words must be a nonempty bounded array.");
                     for (id item in words) {
                         auto word = object(item, {"offset", "expected_instruction", "replacement_instruction", "note"},
@@ -332,19 +340,66 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                             "Compatibility calls must be a nonempty bounded array.");
                     std::set<std::uint64_t> offsets;
                     for (id item in calls) {
-                        auto call = object(item, {"offset", "expected_instruction", "note"});
+                        auto call = object(item, {"offset", "expected_instruction", "note"}, {"frame_rate", "nvn_driver_only"});
                         CallPatch site{hex(call[@"offset"]), static_cast<std::uint32_t>(hex(call[@"expected_instruction"], 8))};
                         site.note = note_text(call[@"note"]);
+                        if (id rate = call[@"frame_rate"]) {
+                            site.frame_rate = frame_rate_value(rate, true);
+                            require(patch.frame_rate && std::find(patch.frame_rate->supported_rates.begin(),
+                                patch.frame_rate->supported_rates.end(), site.frame_rate) != patch.frame_rate->supported_rates.end(),
+                                "A call's frame rate is not declared in frame_rates.");
+                        }
+                        if (id driver = call[@"nvn_driver_only"]) {
+                            require(CFGetTypeID((__bridge CFTypeRef)driver) == CFBooleanGetTypeID(),
+                                    "Compatibility nvn_driver_only must be a JSON boolean.");
+                            site.nvn_driver_only = [driver boolValue];
+                        }
                         require(offsets.insert(site.offset).second, "Duplicate compatibility call offset.");
                         patch.calls.push_back(site);
                     }
-                    auto layout = object(record[@"layout"], {"framework_pointer", "framework_period", "override_flag", "ratio", "interval", "base_interval"},
-                                         {"frame_step"});
-                    patch.layout = {hex(layout[@"framework_pointer"]), hex(layout[@"framework_period"]),
-                        hex(layout[@"override_flag"]), hex(layout[@"ratio"]), hex(layout[@"interval"]), hex(layout[@"base_interval"])};
-                    if (id step = layout[@"frame_step"]) {
-                        patch.layout.frame_step = hex(step);
-                        require(patch.layout.frame_step != 0, "Compatibility frame step must be nonzero when present.");
+                    const id layout_record = record[@"layout"];
+                    require([layout_record isKindOfClass:[NSDictionary class]], "Compatibility layout must be an object.");
+                    const id variant = layout_record[@"variant"];
+                    const bool countdown = variant && [variant isEqual:@"fractional-countdown-30"];
+                    const bool repeating = variant && [variant isEqual:@"fractional-repeat-30"];
+                    if (repeating || countdown || (variant && [variant isEqual:@"fractional-counter-30"])) {
+                        auto layout = object(layout_record, {"variant", "framework_pointer", "framework_period",
+                            "object_register", "state", "active_state", "counter"}, {"repeat_flag", "repeat_frames"});
+                        patch.layout.variant = repeating ? titles::FrameRateVariant::FractionalRepeat30
+                            : countdown ? titles::FrameRateVariant::FractionalCountdown30
+                            : titles::FrameRateVariant::FractionalCounter30;
+                        patch.layout.framework_pointer = hex(layout[@"framework_pointer"]);
+                        patch.layout.framework_period = hex(layout[@"framework_period"]);
+                        patch.layout.object_register = layout_count(layout[@"object_register"], 30);
+                        patch.layout.state = hex(layout[@"state"]);
+                        patch.layout.active_state = layout_count(layout[@"active_state"], UINT32_MAX);
+                        patch.layout.counter = hex(layout[@"counter"]);
+                        require(patch.layout.counter % 4 == 0 && patch.layout.state % 4 == 0 &&
+                                patch.layout.counter != patch.layout.state,
+                                "Compatibility counter fields must be aligned and distinct.");
+                        if (repeating) {
+                            patch.layout.repeat_flag = hex(layout[@"repeat_flag"]);
+                            patch.layout.repeat_frames = layout_count(layout[@"repeat_frames"], UINT32_MAX);
+                            require(patch.layout.repeat_frames != 0,
+                                    "Compatibility repeat delay must be positive.");
+                            const auto flag = patch.layout.repeat_flag;
+                            require(!(flag >= patch.layout.state && flag - patch.layout.state < 4) &&
+                                    !(flag >= patch.layout.counter && flag - patch.layout.counter < 4),
+                                    "Compatibility repeat flag must not overlap the state or counter.");
+                        } else {
+                            require(!layout[@"repeat_flag"] && !layout[@"repeat_frames"],
+                                    "Repeat fields require the fractional-repeat-30 layout.");
+                        }
+                    } else {
+                        require(!variant || [variant isEqual:@"interval-ratio-60"], "Unknown compatibility layout variant.");
+                        auto layout = object(layout_record, {"framework_pointer", "framework_period", "override_flag", "ratio", "interval", "base_interval"},
+                                             {"frame_step", "variant"});
+                        patch.layout = {hex(layout[@"framework_pointer"]), hex(layout[@"framework_period"]),
+                            hex(layout[@"override_flag"]), hex(layout[@"ratio"]), hex(layout[@"interval"]), hex(layout[@"base_interval"])};
+                        if (id step = layout[@"frame_step"]) {
+                            patch.layout.frame_step = hex(step);
+                            require(patch.layout.frame_step != 0, "Compatibility frame step must be nonzero when present.");
+                        }
                     }
                 }
                 require(match_patch(result, patch.identity) == nullptr, "Duplicate compatibility title/build identity.");
@@ -355,14 +410,17 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
     }
 }
 std::variant<std::vector<WordPatch>, std::string> select_patch_words(
-    const PatchDescription& patch, std::string_view requested_rate, bool nvn_driver_enabled) {
+    const PatchDescription& patch, std::string_view requested_rate, bool nvn_driver_enabled,
+    std::uint32_t* admitted_rate) {
+    if (admitted_rate) *admitted_rate = 0;
     if (!patch.frame_rate) return patch.words;
     auto rate = patch.frame_rate->default_rate;
     if (!requested_rate.empty() && requested_rate != "0") {
         if (requested_rate == "30") rate = 30;
         else if (requested_rate == "60") rate = 60;
         else if (requested_rate == "120") rate = 120;
-        else return "The title frame rate must be Auto (0), 30, 60 or private 120.";
+        else if (requested_rate == "variable") rate = variable_frame_rate;
+        else return "The title frame rate must be Auto (0), 30, 60, 120 or variable.";
     }
     if (!valid_frame_rates(*patch.frame_rate)) return "The title's supported frame rates are invalid.";
     if (std::find(patch.frame_rate->supported_rates.begin(), patch.frame_rate->supported_rates.end(), rate) ==
@@ -377,17 +435,37 @@ std::variant<std::vector<WordPatch>, std::string> select_patch_words(
             result.push_back(word);
         }
     if (rate != patch.frame_rate->default_rate && std::none_of(result.begin(), result.end(),
-            [rate](const auto& word) { return word.frame_rate == rate; }))
-        return "The requested frame rate has no effective instruction words for the selected graphics driver.";
+            [rate](const auto& word) { return word.frame_rate == rate; }) &&
+        std::none_of(patch.calls.begin(), patch.calls.end(), [=](const auto& call) {
+            return call.frame_rate == rate && (nvn_driver_enabled || !call.nvn_driver_only);
+        }))
+        return "The requested frame rate has no effective patches for the selected graphics driver.";
+    if (admitted_rate) *admitted_rate = rate == variable_frame_rate ? 0 : rate;
+    return result;
+}
+std::variant<std::vector<CallPatch>, std::string> select_patch_calls(
+    const PatchDescription& patch, std::string_view requested_rate, bool nvn_driver_enabled) {
+    const auto words = select_patch_words(patch, requested_rate, nvn_driver_enabled);
+    if (const auto* error = std::get_if<std::string>(&words)) return *error;
+    auto rate = patch.frame_rate ? patch.frame_rate->default_rate : 0;
+    if (patch.frame_rate && requested_rate == "variable") rate = variable_frame_rate;
+    else if (patch.frame_rate && !requested_rate.empty() && requested_rate != "0")
+        std::from_chars(requested_rate.data(), requested_rate.data() + requested_rate.size(), rate);
+    std::vector<CallPatch> result;
+    for (const auto& call : patch.calls)
+        if ((nvn_driver_enabled || !call.nvn_driver_only) && (call.frame_rate == 0 || call.frame_rate == rate))
+            result.push_back(call);
     return result;
 }
 execution::GateStatus handle_patch(const InstalledPatch& patch, execution::GateCall& call,
                                     const horizon::GuestBuffers& memory) noexcept {
     if (patch.description.module == "frame-rate") {
         std::uint32_t maximum_rate = 0;
-        const bool updated = titles::title_01007ef00011e000::update_frame_rate(
+        const bool updated = titles::update_frame_rate(
             patch.description.layout, patch.module_base,
-            call.x(0), static_cast<std::uint32_t>(call.x(1)), memory, &maximum_rate);
+            call.x(patch.description.layout.variant != titles::FrameRateVariant::IntervalRatio60
+                ? patch.description.layout.object_register : 0),
+            static_cast<std::uint32_t>(call.x(1)), memory, &maximum_rate);
         graphics::set_maximum_presentation_rate(maximum_rate);
         if (updated) return execution::GateStatus::resume;
     }
@@ -434,6 +512,20 @@ std::string validate_patch(const PatchDescription& patch, const loader::NsoModul
     }
     if (patch.module.empty() && patch.calls.empty()) return {};
     if (patch.module != "frame-rate") return "Unknown compatibility module.";
+    if (patch.layout.variant == titles::FrameRateVariant::FractionalCounter30 ||
+        patch.layout.variant == titles::FrameRateVariant::FractionalCountdown30 ||
+        patch.layout.variant == titles::FrameRateVariant::FractionalRepeat30) {
+        if (patch.layout.object_register > 30 || patch.layout.counter % 4 || patch.layout.state % 4 ||
+            patch.layout.counter == patch.layout.state || patch.layout.frame_step != 0)
+            return "Compatibility fractional counter layout is invalid.";
+        if (patch.layout.variant == titles::FrameRateVariant::FractionalRepeat30 &&
+            (patch.layout.repeat_frames == 0 ||
+             (patch.layout.repeat_flag >= patch.layout.state && patch.layout.repeat_flag - patch.layout.state < 4) ||
+             (patch.layout.repeat_flag >= patch.layout.counter && patch.layout.repeat_flag - patch.layout.counter < 4)))
+            return "Compatibility fractional repeat layout is invalid.";
+    } else if (patch.layout.variant != titles::FrameRateVariant::IntervalRatio60) {
+        return "Unknown compatibility layout variant.";
+    }
     if (patch.calls.empty() || patch.calls.size() > 64) return "Compatibility call count is invalid.";
     if (!executable(patch.original_callee)) return "Compatibility original callee is outside executable text.";
     const auto& data = image.segment(loader::NsoSegmentKind::data);
@@ -451,6 +543,10 @@ std::string validate_patch(const PatchDescription& patch, const loader::NsoModul
         return "Compatibility frame step overlaps the framework pointer.";
     std::set<std::uint64_t> seen;
     for (const auto& call : patch.calls) {
+        if (call.frame_rate != 0 && (!patch.frame_rate ||
+            std::find(patch.frame_rate->supported_rates.begin(), patch.frame_rate->supported_rates.end(),
+                      call.frame_rate) == patch.frame_rate->supported_rates.end()))
+            return "Compatibility call has an invalid frame-rate condition.";
         if (!executable(call.offset) || !seen.insert(call.offset).second)
             return "Compatibility call site is invalid or duplicated.";
         std::uint32_t word = 0;

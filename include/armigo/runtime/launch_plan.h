@@ -82,6 +82,8 @@ struct PreparedLaunch {
     std::string nvn_pso_manifest;
     // The title requires a startup user: the launch preselects the local user.
     bool startup_user = false;
+    // Admitted title mode after renderer filtering; zero means no rate policy.
+    std::uint32_t title_frame_rate = 0;
 };
 // No guest execution. Failure publishes no addresses; successful objects retain
 // mappings/site tables through all thread bindings. Synthetic relocations are

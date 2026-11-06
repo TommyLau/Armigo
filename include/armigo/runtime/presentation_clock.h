@@ -11,12 +11,24 @@
 #pragma once
 
 #include <armigo/runtime/guest_clock.h>
+#include <functional>
+#include <span>
+#include <string_view>
 #include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
 
 namespace armigo::runtime {
+
+// A bounded observational copy, never an IPC reader that publishes a pin.
+using PresentationMemoryReader = std::function<bool(std::uint64_t, std::span<std::byte>)>;
+
+// Loaded names and bases only; no module or memory ownership is retained.
+struct PresentationModule {
+    std::string_view name;
+    std::uint64_t base_address = 0;
+};
 
 // Lane E implements a refresh grid on the SAME injected monotonic timeline.
 // Lane G uses it for both VsyncSource signaling and queue pacing, with distinct
@@ -41,6 +53,20 @@ public:
     virtual ~PresentationClock() = default;
     virtual std::shared_ptr<GuestClock> clock() const noexcept = 0;
     virtual PresentationClockConfiguration configuration() const noexcept = 0;
+    // Optional headless instrumentation and imposed pacing. The ordinary clock
+    // leaves these disabled, retaining its existing native presentation path.
+    virtual bool observes_presents() const noexcept { return false; }
+    // Called after all modules have loaded and before guest execution starts.
+    virtual void bind_observation_modules(std::span<const PresentationModule>) {}
+    virtual bool imposed_pacing() const noexcept { return false; }
+    virtual void observe_vsync(const PresentationSchedule&) noexcept {}
+    virtual LaunchStatus observe_present(std::uint64_t, std::int32_t,
+                                         const PresentationMemoryReader&) {
+        return std::monostate{};
+    }
+    // First instrumentation failure, polled even after a native callback has
+    // returned. The default clock never observes frames and has no such error.
+    virtual std::optional<LaunchFailure> observation_failure() const { return std::nullopt; }
     // Rebase the grid at the current completed refresh with a new period.
     // Refresh indices remain continuous for streams retaining a last index.
     // Clocks without runtime rate control return false and stay unchanged.

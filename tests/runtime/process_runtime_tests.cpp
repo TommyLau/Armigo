@@ -9,8 +9,130 @@
 // ============================================================================
 
 #include "process_runtime_fixture.h"
+#include "player_settings.h"
+#include "../../src/runtime/service_registry.h"
+#include <future>
+#include <cmath>
+#include <armigo/common/diagnostics.h>
+#include <armigo/compat/title_settings.h>
+#include <cstdlib>
+#include <iomanip>
+#include <sstream>
 
 namespace {
+void test_title_rate_clock_warning_for_both_runners() {
+    Fixture fixture;
+    const std::uint64_t title = 0xffff000000000000ull |
+        (std::uint64_t(::getpid()) << 16) | (arc4random() & 0xffffu);
+    fixture.description.synthetic_profile->title_id = title;
+    const auto cache = compat::title_cache_directory(title);
+    CHECK(!std::filesystem::exists(cache));
+    if (std::filesystem::exists(cache)) return;
+    const auto image = loader::read_nso_module(fixture.input.modules.front().bytes);
+    CHECK(image.ok()); if (!image.ok()) return;
+    const auto offset = fixture_offset(armigo_process_fixture_main) + 8;
+    std::uint32_t expected = 0;
+    std::memcpy(&expected, image.image->bytes.data() + offset, 4);
+    std::ostringstream identity;
+    identity << "{\"title_id\":\"0x" << compat::title_id_text(title) << "\",\"main_build_id\":\"";
+    for (auto byte : image.image->build_id)
+        identity << std::hex << std::setfill('0') << std::setw(2) << std::to_integer<unsigned>(byte);
+    identity << "\"";
+    std::ostringstream policy;
+    policy << ",\"frame_rate\":{\"default\":30,\"display_refresh_rate\":60},"
+              "\"frame_rates\":[30,120],\"words\":[{\"offset\":\"0x" << std::hex << offset
+           << "\",\"expected_instruction\":\"0x" << std::setfill('0') << std::setw(8) << expected
+           << "\",\"replacement_instruction\":\"0xd503201f\",\"frame_rate\":120,"
+              "\"note\":\"Synthetic clock diagnostic word; guest code is not executed.\"}]";
+    const auto titles = fixture.temporary.path / "titles";
+    const auto folder = titles / compat::title_id_text(title);
+    std::filesystem::create_directories(folder);
+    const auto environment = [](const char* name) -> std::optional<std::string> {
+        if (const char* value = std::getenv(name)) return std::string(value);
+        return {};
+    };
+    const auto old_titles = environment("ARMIGO_TITLES");
+    const auto old_rate = environment("ARMIGO_COMPAT_FRAME_RATE");
+    const auto old_refresh = environment("ARMIGO_VI_REFRESH_HZ");
+    const auto old_resolution_rate = environment("ARMIGO_COMPAT_RESOLUTION_RATE");
+    const auto old_level = diag::minimum_level();
+    setenv("ARMIGO_TITLES", titles.c_str(), 1);
+    setenv("ARMIGO_VI_REFRESH_HZ", "120", 1);
+    diag::testing_set_level(diag::Level::warning);
+    struct Captured { std::mutex mutex; std::vector<std::string> warnings; } captured;
+    diag::testing_set_sink([](diag::Level level, std::string_view line, void* context) {
+        if (level != diag::Level::warning ||
+            (line.find("admitted title frame rate") == std::string_view::npos &&
+             line.find("Armigo settings: stored") == std::string_view::npos)) return;
+        auto& output = *static_cast<Captured*>(context);
+        const std::lock_guard lock(output.mutex);
+        output.warnings.emplace_back(line);
+    }, &captured);
+    struct Case { const char* requested; std::chrono::nanoseconds period; bool policy; bool warning; };
+    for (auto mode : {platform::PresentationMode::headless, platform::PresentationMode::windowed}) {
+        for (const auto& test : {Case{"120", 16'666'667ns, true, true},
+                                Case{"120", 8'333'333ns, true, false},
+                                Case{"0", 16'666'667ns, true, false},
+                                Case{"120", 16'666'667ns, false, false}}) {
+            std::ofstream(folder / "profile.json") << "{\"version\":1,\"patches\":[" << identity.str()
+                << (test.policy ? policy.str() : "") << "}]}";
+            setenv("ARMIGO_COMPAT_FRAME_RATE", test.requested, 1);
+            fixture.description.presentation.mode = mode;
+            auto presenter = std::make_shared<TestPresenter>(mode);
+            auto deps = dependencies(presenter);
+            auto configuration = deps.presentation_clock->configuration();
+            { const std::lock_guard lock(captured.mutex); captured.warnings.clear(); }
+            configuration.refresh_period = test.period;
+            if (mode == platform::PresentationMode::windowed) {
+                // The real player callback must preserve the explicit override,
+                // suppress UI fallback warnings and leave only the runtime's
+                // admitted-rate mismatch warning for a slower clock.
+                tools::PlayerChoices choices;
+                choices.title_frame_rate = test.policy;
+                choices.supported_frame_rates = {30, 120};
+                choices.frame_rate = 120;
+                choices.display_refresh_rate = 60;
+                tools::RunnerArguments arguments;
+                arguments.refresh_hz = 1e9 / static_cast<double>(test.period.count());
+                arguments.refresh_hz_explicit = test.period != 8'333'333ns;
+                platform::DisplayCapabilities display;
+                display.current = {1920, 1080, arguments.refresh_hz_explicit ? 60.0 : 120.0, false};
+                tools::mac_player_launch_configuration(choices, 0)(arguments, display);
+                CHECK(std::string_view(std::getenv("ARMIGO_COMPAT_FRAME_RATE")) == test.requested);
+                configuration.refresh_period = std::chrono::nanoseconds(std::llround(1e9 / arguments.refresh_hz));
+            }
+            auto selected_clock = create_presentation_clock(deps.clock, configuration);
+            CHECK(value(selected_clock));
+            if (!value(selected_clock)) continue;
+            deps.presentation_clock = *value(selected_clock);
+            auto clock = deps.presentation_clock;
+            auto created = ProcessRuntime::create(fixture.description, std::move(deps));
+            CHECK(value(created));
+            if (const auto* error = failure(created))
+                std::fprintf(stderr, "Clock diagnostic fixture: %s: %s\n", error->operation.c_str(), error->detail.c_str());
+            if (value(created)) CHECK(ok((*value(created))->shutdown(std::chrono::steady_clock::now() + 1s)));
+            CHECK(clock->configuration().refresh_period == test.period);
+            CHECK(presenter->present_calls == 0);
+            const std::lock_guard lock(captured.mutex);
+            CHECK(captured.warnings.size() == (test.warning ? 1u : 0u));
+            if (!captured.warnings.empty()) {
+                CHECK(captured.warnings.front().find("120 fps") != std::string::npos);
+                CHECK(captured.warnings.front().find("--refresh-hz") != std::string::npos);
+                CHECK(captured.warnings.front().find("continuing with the configured clock") != std::string::npos);
+            }
+        }
+    }
+    diag::testing_set_sink(nullptr, nullptr);
+    diag::testing_set_level(old_level);
+    diag::testing_close_log();
+    std::filesystem::remove_all(cache);
+    if (old_titles) setenv("ARMIGO_TITLES", old_titles->c_str(), 1); else unsetenv("ARMIGO_TITLES");
+    if (old_rate) setenv("ARMIGO_COMPAT_FRAME_RATE", old_rate->c_str(), 1); else unsetenv("ARMIGO_COMPAT_FRAME_RATE");
+    if (old_refresh) setenv("ARMIGO_VI_REFRESH_HZ", old_refresh->c_str(), 1); else unsetenv("ARMIGO_VI_REFRESH_HZ");
+    if (old_resolution_rate) setenv("ARMIGO_COMPAT_RESOLUTION_RATE", old_resolution_rate->c_str(), 1);
+    else unsetenv("ARMIGO_COMPAT_RESOLUTION_RATE");
+}
+
 void test_native_ipc_romfs_worker_and_exit() {
     Fixture fixture;
     auto presenter = std::make_shared<TestPresenter>(platform::PresentationMode::headless);
@@ -279,6 +401,122 @@ void test_shutdown_before_and_during_run_is_cancellation() {
             CHECK(!result->teardown_failure.has_value());
         }
     }
+}
+
+void test_guest_join_precedes_native_shutdown_and_mapping_retirement() {
+    struct Trace {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool producer_entered = false, allow_return = false, producer_returned = false;
+        bool drained = false, early_finish = false, allow_finish = false;
+        unsigned finish_calls = 0, pending_native_work = 0;
+        std::weak_ptr<GuestMemory> memory;
+        std::weak_ptr<ServiceRegistry> services;
+    };
+    class Registry final : public ServiceRegistry {
+    public:
+        Registry(std::shared_ptr<ServiceRegistry> inner, std::shared_ptr<Trace> trace)
+            : inner_(std::move(inner)), trace_(std::move(trace)) {}
+        horizon::SessionConnection connect_named_port(std::string_view port) override {
+            {
+                std::unique_lock lock(trace_->mutex);
+                // A synthetic host submission retains work beyond its guest
+                // caller. The real process must join that caller first.
+                ++trace_->pending_native_work;
+                trace_->producer_entered = true;
+                trace_->changed.notify_all();
+                trace_->changed.wait(lock, [&] { return trace_->allow_return; });
+            }
+            auto result = inner_->connect_named_port(port);
+            {
+                const std::lock_guard lock(trace_->mutex);
+                trace_->producer_returned = true;
+                trace_->changed.notify_all();
+            }
+            return result;
+        }
+        std::optional<LaunchFailure> failure() const override { return inner_->failure(); }
+        void request_stop() noexcept override { inner_->request_stop(); }
+        LaunchStatus drain(std::optional<ClockInstant> deadline) override {
+            auto status = inner_->drain(deadline);
+            const std::lock_guard lock(trace_->mutex);
+            trace_->drained = true;
+            trace_->changed.notify_all();
+            return status;
+        }
+        LaunchStatus finish_guest_shutdown(std::optional<ClockInstant> deadline) override {
+            const std::lock_guard lock(trace_->mutex);
+            ++trace_->finish_calls;
+            trace_->early_finish |= !trace_->producer_returned;
+            CHECK(trace_->producer_returned);
+            CHECK(!trace_->memory.expired());
+            if (!trace_->allow_finish) {
+                LaunchFailure error;
+                error.stage = LaunchStage::shutdown;
+                error.code = LaunchError::deadline_expired;
+                error.operation = "synthetic.native_shutdown";
+                error.detail = "Synthetic native submission remains retained.";
+                return error;
+            }
+            CHECK(trace_->pending_native_work != 0);
+            auto status = inner_->finish_guest_shutdown(deadline);
+            trace_->pending_native_work = 0;
+            return status;
+        }
+        ServiceRegistryStatistics statistics() const noexcept override { return inner_->statistics(); }
+    private:
+        std::shared_ptr<ServiceRegistry> inner_;
+        std::shared_ptr<Trace> trace_;
+    };
+    Fixture fixture;
+    auto trace = std::make_shared<Trace>();
+    auto deps = dependencies();
+    deps.create_services = [trace](ServiceRegistryDependencies dependencies)
+        -> LaunchResult<std::shared_ptr<ServiceRegistry>> {
+        trace->memory = dependencies.memory;
+        auto made = create_service_registry(std::move(dependencies));
+        if (const auto* error = std::get_if<LaunchFailure>(&made)) return *error;
+        auto registry = std::make_shared<Registry>(std::get<std::shared_ptr<ServiceRegistry>>(std::move(made)), trace);
+        trace->services = registry;
+        return std::shared_ptr<ServiceRegistry>(std::move(registry));
+    };
+    auto created = ProcessRuntime::create(fixture.description, std::move(deps));
+    CHECK(value(created) != nullptr);
+    if (!value(created)) return;
+    auto runtime = std::move(std::get<std::unique_ptr<ProcessRuntime>>(created));
+    auto running = std::async(std::launch::async, [&] { return runtime->run({}, {}); });
+    {
+        std::unique_lock lock(trace->mutex);
+        CHECK(trace->changed.wait_for(lock, 2s, [&] { return trace->producer_entered; }));
+    }
+    runtime->request_stop();
+    {
+        std::unique_lock lock(trace->mutex);
+        CHECK(trace->changed.wait_for(lock, 2s, [&] { return trace->drained; }));
+        // The actual NativeProcessRuntime is now trying to join a guest that
+        // remains inside its host call. A misplaced native phase must not run.
+        CHECK(!trace->changed.wait_for(lock, 50ms, [&] { return trace->finish_calls != 0; }));
+        CHECK(trace->finish_calls == 0 && !trace->memory.expired());
+        trace->allow_return = true;
+        trace->changed.notify_all();
+    }
+    const auto ran = running.get();
+    CHECK(!ran.quiescent && ran.teardown_failure.has_value());
+    CHECK(!trace->early_finish && trace->producer_returned && trace->finish_calls == 1);
+    CHECK(!trace->memory.expired() && !trace->services.expired());
+    CHECK(trace->pending_native_work != 0);
+    if (ran.teardown_failure) CHECK(ran.teardown_failure->operation == "synthetic.native_shutdown");
+    // Failure must retain mappings and services for an explicit later retry.
+    {
+        const std::lock_guard lock(trace->mutex);
+        trace->allow_finish = true;
+    }
+    CHECK(ok(runtime->shutdown(std::chrono::steady_clock::now() + 2s)));
+    CHECK(trace->finish_calls == 2 && !trace->early_finish);
+    CHECK(trace->memory.expired() && trace->services.expired());
+    CHECK(trace->pending_native_work == 0);
+    CHECK(ok(runtime->shutdown(std::nullopt)));
+    CHECK(trace->finish_calls == 2);
 }
 
 void test_successful_shutdown_releases_owned_dependencies() {
@@ -553,6 +791,7 @@ void test_capture_policy_selects_readback_frames() {
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--construction-drain-failure")
         return construction_drain_failure_child();
+    test_title_rate_clock_warning_for_both_runners();
     test_capture_policy_selects_readback_frames();
     test_construction_drain_failure_returns_without_abort(argv[0]);
     test_concurrent_drain_failure_preserves_cancellation();
@@ -567,6 +806,7 @@ int main(int argc, char** argv) {
     test_failed_drain_retains_runtime_for_shutdown_retry();
     test_pre_stop_active_cancellation_and_timeout();
     test_shutdown_before_and_during_run_is_cancellation();
+    test_guest_join_precedes_native_shutdown_and_mapping_retirement();
     test_successful_shutdown_releases_owned_dependencies();
     test_stop_refusal_retains_observed_mutex_owner();
     test_invalid_run_limits_fail_without_execution();

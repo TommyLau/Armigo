@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <ostream>
 #include <memory>
 #include <optional>
 #include <span>
@@ -101,6 +102,11 @@ struct RunnerArguments {
     // Explicit host refresh period for the presentation clock; the shell
     // default is host policy and is never read as a firmware constant.
     double refresh_hz = 60.0;
+    std::optional<std::filesystem::path> pacing_schedule_file;
+    std::optional<std::filesystem::path> frame_log_file;
+    std::optional<std::filesystem::path> input_log_file;
+    std::optional<double> pacing_max_hz;
+    bool refresh_hz_explicit = false; // --refresh-hz always wins over player policy
 };
 
 struct ParsedRunArguments {
@@ -118,8 +124,8 @@ struct ParsedRunArguments {
 // --warm-only loads an existing archive without replacing it.
 int run_pso_archive_command(int argc, char* argv[]);
 
-// Construction seams for tests. Every hook must be nonnull in practice; the
-// session reports a structured host failure when one is missing or fails.
+// Required construction seams for tests. The session reports a structured
+// host failure when one is missing or fails; the optional output seam is marked.
 struct ShellEnvironment {
     std::function<runtime::LaunchResult<std::shared_ptr<runtime::GuestClock>>()> create_guest_clock;
     std::function<runtime::LaunchResult<std::shared_ptr<runtime::PresentationClock>>(
@@ -129,6 +135,8 @@ struct ShellEnvironment {
     std::function<runtime::LaunchResult<std::unique_ptr<runtime::ProcessRuntime>>(
         const runtime::LaunchDescription&, runtime::RuntimeDependencies&&)>
         create_runtime;
+    // Optional synthetic failure seam; empty opens the requested output file.
+    std::function<std::unique_ptr<std::ostream>(const std::filesystem::path&)> open_input_log;
 };
 // Real clock and presenter creation. The process runtime factory is not linked
 // in this build (lane F): it reports LaunchError::unsupported with the detail
@@ -208,11 +216,15 @@ public:
     virtual ~WindowedHost() = default;
     virtual platform::ApplicationCreation create(const platform::PresenterOptions& options) = 0;
     [[nodiscard]] virtual std::shared_ptr<platform::Presenter> presenter() const noexcept = 0;
+    virtual platform::DisplayCapabilities display_capabilities() const noexcept { return {}; }
     virtual void set_close_handler(std::function<void()> close) = 0;
     // Receives every refresh of the window's display, on a display thread,
     // from now on; an empty handler stops forwarding. Hosts without a display
     // link ignore it.
     virtual void set_display_refresh_handler(platform::DisplayRefreshCallback handler) {
+        static_cast<void>(handler);
+    }
+    virtual void set_display_change_handler(platform::DisplayChangeCallback handler) {
         static_cast<void>(handler);
     }
     virtual bool set_display_refresh_rate(double rate) noexcept {
@@ -226,12 +238,19 @@ using WindowedHostCreation =
     std::variant<platform::PresentationFailure, std::unique_ptr<WindowedHost>>;
 using WindowedHostFactory = std::function<WindowedHostCreation()>;
 
+// Called once after window creation, before clocks or title preparation. Only
+// refresh_hz and launch environment should change here; window options already
+// took effect. The default leaves headless-style CLI and iOS policy untouched.
+using WindowedLaunchConfiguration =
+    std::function<void(RunnerArguments&, const platform::DisplayCapabilities&)>;
+
 // Windowed orchestration, called on the application main thread: create the
 // host, run the runtime on a worker, pump until the worker finished shutdown,
 // then request_quit and destroy the host. Window close flows through the host
 // close handler into request_stop(window_closed).
 [[nodiscard]] ShellReport run_windowed_shell(const RunnerArguments& arguments,
                                              const ShellEnvironment& environment,
-                                             const WindowedHostFactory& host_factory);
+                                             const WindowedHostFactory& host_factory,
+                                             const WindowedLaunchConfiguration& configure_launch = {});
 
 } // namespace armigo::tools

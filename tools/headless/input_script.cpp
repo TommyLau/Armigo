@@ -60,14 +60,21 @@ class ScriptedPresenter final : public platform::Presenter {
 public:
     ScriptedPresenter(std::shared_ptr<platform::Presenter> presenter, InputScript script,
                       std::function<void(const platform::HostInputSnapshot&)> publish_input,
-                      std::function<std::chrono::steady_clock::time_point()> now)
+                      std::function<std::chrono::steady_clock::time_point()> now,
+                      InputDeliveryObserver observe_delivery, InputDeliveryFlush flush_delivery)
         : presenter_(std::move(presenter)), script_(std::move(script)),
-          publish_input_(std::move(publish_input)), now_(std::move(now)) { publish(); }
+          publish_input_(std::move(publish_input)), now_(std::move(now)),
+          observe_delivery_(std::move(observe_delivery)), flush_delivery_(std::move(flush_delivery)) { publish(); }
+    platform::PresenterStatus delivery_status() const {
+        if (delivery_failure_) return *delivery_failure_;
+        return std::monostate{};
+    }
     platform::PresentationMode mode() const noexcept override { return presenter_->mode(); }
     std::uint64_t presented_count() const noexcept override { return presenter_->presented_count(); }
     platform::PresentResult present(const platform::PresentationFrame& frame,
         std::optional<std::chrono::steady_clock::time_point> deadline,
         std::stop_token stop) override {
+        if (delivery_failure_) return *delivery_failure_;
         auto result = presenter_->present(frame, deadline, stop);
         if (std::holds_alternative<platform::PresentedFrame>(result)) {
             if (script_.clock == InputScript::Clock::milliseconds) {
@@ -79,6 +86,7 @@ public:
                 ++completed_;
             }
             publish();
+            if (delivery_failure_) return *delivery_failure_;
         }
         return result;
     }
@@ -88,15 +96,33 @@ public:
     }
 private:
     void publish() {
+        bool delivered = false;
         while (next_ < script_.states.size() && script_.states[next_].frame <= completed_) {
-            publish_input_(script_.states[next_].input);
+            const auto index = next_;
+            publish_input_(script_.states[index].input);
             ++next_;
+            delivered = true;
+            if (observe_delivery_) {
+                const auto observed = observe_delivery_(index, script_.states[index]);
+                if (const auto* error = std::get_if<platform::PresentationFailure>(&observed)) {
+                    delivery_failure_ = *error;
+                    break;
+                }
+            }
+        }
+        if (delivered && flush_delivery_) {
+            const auto flushed = flush_delivery_();
+            if (const auto* error = std::get_if<platform::PresentationFailure>(&flushed); error && !delivery_failure_)
+                delivery_failure_ = *error;
         }
     }
     std::shared_ptr<platform::Presenter> presenter_;
     InputScript script_;
     std::function<void(const platform::HostInputSnapshot&)> publish_input_;
     std::function<std::chrono::steady_clock::time_point()> now_;
+    InputDeliveryObserver observe_delivery_;
+    InputDeliveryFlush flush_delivery_;
+    std::optional<platform::PresentationFailure> delivery_failure_;
     std::optional<std::chrono::steady_clock::time_point> started_;
     std::size_t next_ = 0;
     std::uint64_t completed_ = 0;
@@ -200,12 +226,16 @@ std::variant<InputScript, std::string> parse_input_script(std::istream& source) 
 std::shared_ptr<platform::Presenter> scripted_presenter(
     std::shared_ptr<platform::Presenter> presenter, InputScript script,
     std::function<void(const platform::HostInputSnapshot&)> publish,
-    std::function<std::chrono::steady_clock::time_point()> now) {
+    std::function<std::chrono::steady_clock::time_point()> now,
+    InputDeliveryObserver observe_delivery, InputDeliveryFlush flush_delivery,
+    platform::PresenterStatus* initial_delivery_status) {
     if (!now) now = [] { return std::chrono::steady_clock::now(); };
     if (!publish) publish = [](const platform::HostInputSnapshot& input) {
         services::hid::set_host_full_key_input(runtime::full_key_input(input));
     };
-    return std::make_shared<ScriptedPresenter>(std::move(presenter), std::move(script),
-                                             std::move(publish), std::move(now));
+    auto result = std::make_shared<ScriptedPresenter>(std::move(presenter), std::move(script),
+        std::move(publish), std::move(now), std::move(observe_delivery), std::move(flush_delivery));
+    if (initial_delivery_status) *initial_delivery_status = result->delivery_status();
+    return result;
 }
 } // namespace armigo::tools

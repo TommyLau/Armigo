@@ -12,6 +12,7 @@
 #include "application_host.h"
 #include "armigo/compat/title_settings.h"
 #include "player_settings.h"
+#include "player_frame_rate_menu.h"
 #include "report_json.h"
 #include "runner_shell.h"
 #include <armigo/services/settings.h>
@@ -27,16 +28,22 @@
 #include <vector>
 
 // The Settings window of a packed app (the app menu's Settings..., Command-,):
-// the same choices the iOS player offers in Settings, kept under the same
-// keys in the app's defaults. They take effect the next time the game starts.
+// choices are kept under the same keys as iOS, with declared 120 fps modes
+// admitted on capable Mac displays. They take effect on the next launch.
 @interface ArmigoSettingsWindow : NSObject <NSWindowDelegate>
 - (void)install;
+- (void)setFrameRates:(const armigo::tools::MacFrameRateSelection&)selection;
 - (void)show:(id)sender;
 - (BOOL)writeSnapshot:(NSString*)path;
 @end
 
 @implementation ArmigoSettingsWindow {
     NSWindow* _window;
+    armigo::tools::MacFrameRateSelection _frameRates;
+}
+
+- (void)setFrameRates:(const armigo::tools::MacFrameRateSelection&)selection {
+    _frameRates = selection;
 }
 
 - (void)install {
@@ -80,10 +87,12 @@
     NSPopUpButton* resolution = [self popUpForKey:@"resolution"
         titles:@[@"Auto (Native)", @"720p", @"900p", @"1080p", @"1440p", @"4K", @"Native"]
         values:@[@"auto", @"720p", @"900p", @"1080p", @"1440p", @"2160p", @"native"]];
-    // No 120 fps: the title's menu and loading flow still depends on the frame
-    // rate there (a scripted run takes another path at 120 Hz than at 60 Hz).
-    NSPopUpButton* rate = [self popUpForKey:@"frame_rate" titles:@[@"Auto", @"30 fps", @"60 fps"]
-                                     values:@[@0, @30, @60]];
+    NSPopUpButton* rate = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    armigo::tools::populate_player_frame_rate_menu(rate, _frameRates,
+        static_cast<int>([NSUserDefaults.standardUserDefaults integerForKey:@"frame_rate"]));
+    rate.target = self;
+    rate.action = @selector(choose:);
+    [rate.widthAnchor constraintEqualToConstant:240].active = YES;
     NSPopUpButton* vsync = [self popUpForKey:@"vsync" titles:@[@"On", @"Off"] values:@[@YES, @NO]];
     NSPopUpButton* overlay = [self popUpForKey:@"performance_overlay" titles:@[@"Off", @"On"] values:@[@NO, @YES]];
     NSGridView* grid = [NSGridView gridViewWithViews:@[
@@ -166,6 +175,7 @@ int main(int argc, char* argv[]) {
         const std::vector<char*> arguments(argv + (packed_launch ? 1 : 2), argv + argc);
         auto parsed = armigo::tools::parse_runner_arguments(
             armigo::platform::PresentationMode::windowed, arguments);
+        armigo::tools::WindowedLaunchConfiguration configure_launch;
         // The packed game, whether opened from the Finder or run without
         // explicit inputs, starts with the player's settings; runs with
         // explicit inputs stay on the deterministic defaults (American English,
@@ -202,25 +212,33 @@ int main(int argc, char* argv[]) {
                 armigo::diag::error("%s", "The Resolution setting is not recognised.\n");
                 return 1;
             }
-            const auto mode = parsed.arguments.operation_mode;
-            armigo::tools::apply_player_choices(choices, width, parsed.arguments);
-            if (std::any_of(arguments.begin(), arguments.end(),
+            // Window geometry and synchronization are needed before creating
+            // the host. Frame-rate policy waits for that window's display.
+            parsed.arguments.content_width = width;
+            parsed.arguments.display_sync = choices.vsync;
+            if (std::none_of(arguments.begin(), arguments.end(),
                             [](const char* argument) { return std::string_view(argument) == "--operation-mode"; }))
-                parsed.arguments.operation_mode = mode;
-            static ArmigoSettingsWindow* settings;
-            settings = [ArmigoSettingsWindow new];
-            if (const char* snapshot = std::getenv("ARMIGO_SETTINGS_SNAPSHOT"); snapshot && *snapshot) {
-                // Verification aid: write the Settings window's contents as a PNG.
-                if (![settings writeSnapshot:@(snapshot)]) armigo::diag::write(armigo::diag::Level::error,  "Cannot write %s\n", snapshot);
-            }
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [settings install];
+                parsed.arguments.operation_mode = choices.handheld ? armigo::services::OperationMode::Handheld
+                                                                  : armigo::services::OperationMode::Console;
+            configure_launch = armigo::tools::mac_player_launch_configuration(choices, width,
+                [language, width](const armigo::tools::PlayerChoices& effective,
+                                  const armigo::tools::MacFrameRateSelection& selection) {
+                static ArmigoSettingsWindow* settings;
+                settings = [ArmigoSettingsWindow new];
+                [settings setFrameRates:selection];
+                if (const char* snapshot = std::getenv("ARMIGO_SETTINGS_SNAPSHOT"); snapshot && *snapshot) {
+                    // Verification aid: write the Settings window's contents as a PNG.
+                    if (![settings writeSnapshot:@(snapshot)])
+                        armigo::diag::write(armigo::diag::Level::error, "Cannot write %s\n", snapshot);
+                }
+                dispatch_async(dispatch_get_main_queue(), ^{ [settings install]; });
+                armigo::diag::write(armigo::diag::Level::info,
+                    "Armigo settings: language=%s region=%u mode=%s resolution=%s/%u frame_rate=%s "
+                    "vsync=%s overlay=%s\n", language.c_str(), armigo::services::set::console_region_code(),
+                    effective.handheld ? "handheld" : "docked", effective.resolution.c_str(), width,
+                    effective.frame_rate ? std::to_string(effective.frame_rate).c_str() : "auto",
+                    effective.vsync ? "on" : "off", effective.performance_overlay ? "on" : "off");
             });
-            armigo::diag::write(armigo::diag::Level::info,  "Armigo settings: language=%s region=%u mode=%s resolution=%s/%u frame_rate=%s "
-                         "vsync=%s overlay=%s\n", language.c_str(), armigo::services::set::console_region_code(),
-                         choices.handheld ? "handheld" : "docked", choices.resolution.c_str(), width,
-                         choices.frame_rate ? std::to_string(choices.frame_rate).c_str() : "auto",
-                         choices.vsync ? "on" : "off", choices.performance_overlay ? "on" : "off");
         }
         if (parsed.help) {
             std::printf("Usage: armigo run --exefs DIR --romfs DIR [--shaders DIR] [options]\n"
@@ -234,7 +252,7 @@ int main(int argc, char* argv[]) {
         }
         const auto environment = armigo::tools::default_shell_environment();
         const auto report = armigo::tools::run_windowed_shell(
-            parsed.arguments, environment, armigo::tools::create_application_host);
+            parsed.arguments, environment, armigo::tools::create_application_host, configure_launch);
         const auto fields = armigo::tools::report_fields(report);
         if (!armigo::tools::emit_shell_report(@"run-windowed", fields,
                                               parsed.arguments.report_file)) {
