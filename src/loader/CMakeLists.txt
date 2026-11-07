@@ -19,18 +19,32 @@ set(ARMIGO_LOADER_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 find_library(ARMIGO_SECURITY_FRAMEWORK Security REQUIRED)
 find_library(ARMIGO_COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
 
+include("${CMAKE_CURRENT_LIST_DIR}/nso_component.cmake")
+armigo_add_nso_component()
+
 add_library(armigo_loader STATIC
+    $<TARGET_OBJECTS:armigo_loader_nso>
     exefs_directory.cpp
-    lz4_block.cpp
+    zbic.cpp
     npdm.cpp
-    nso_module.cpp
-    sha256_commoncrypto.cpp
+    nup.cpp
     container/keys.cpp
     container/crypto.cpp
     container/nca.cpp
     container/container.cpp
 )
 add_library(armigo::loader ALIAS armigo_loader)
+
+# ZBIC changes entropy headers; the standard frame decoder is an optional static dependency.
+# Cross builds must supply a package built for their target platform.
+find_package(zstd CONFIG QUIET)
+if(TARGET zstd::libzstd_static)
+    target_link_libraries(armigo_loader PRIVATE zstd::libzstd_static)
+    target_compile_definitions(armigo_loader PRIVATE ARMIGO_HAS_ZSTD=1)
+else()
+    target_compile_definitions(armigo_loader PRIVATE ARMIGO_HAS_ZSTD=0)
+endif()
+
 
 target_include_directories(armigo_loader
     PUBLIC "${ARMIGO_LOADER_SOURCE_ROOT}/include"
@@ -44,6 +58,19 @@ target_link_libraries(armigo_loader
     PUBLIC "${ARMIGO_SECURITY_FRAMEWORK}" "${ARMIGO_COREFOUNDATION_FRAMEWORK}")
 
 if(BUILD_TESTING)
+    if(TARGET zstd::libzstd_static)
+        add_executable(armigo_loader_zbic_tests
+            "${ARMIGO_LOADER_SOURCE_ROOT}/tests/loader/zbic_tests.cpp")
+        target_include_directories(armigo_loader_zbic_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_link_libraries(armigo_loader_zbic_tests PRIVATE armigo::loader)
+        add_test(NAME loader.zbic COMMAND armigo_loader_zbic_tests)
+    endif()
+    add_executable(armigo_loader_nup_tests
+        "${ARMIGO_LOADER_SOURCE_ROOT}/tests/loader/nup_tests.cpp")
+    target_include_directories(armigo_loader_nup_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(armigo_loader_nup_tests PRIVATE armigo::loader)
+    add_test(NAME loader.nup COMMAND armigo_loader_nup_tests)
+
     add_executable(armigo_loader_lz4_tests
         "${ARMIGO_LOADER_SOURCE_ROOT}/tests/loader/test_lz4_block.cpp")
     target_link_libraries(armigo_loader_lz4_tests PRIVATE armigo::loader)
@@ -85,3 +112,6 @@ target_link_libraries(armigo-nso-inspect PRIVATE armigo::loader)
 if(BUILD_TESTING)
     add_test(NAME loader.nso_inspect_help COMMAND armigo-nso-inspect --help)
 endif()
+
+add_executable(armigo-nup-inspect tools/nup_inspect.cpp)
+target_link_libraries(armigo-nup-inspect PRIVATE armigo::loader)

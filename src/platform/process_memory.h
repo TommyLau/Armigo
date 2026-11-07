@@ -13,6 +13,8 @@
 #include <armigo/memory/guest_memory_model.h>
 
 #include <cstdint>
+#include <string>
+#include <optional>
 #include <variant>
 
 namespace armigo::platform {
@@ -44,12 +46,22 @@ struct ProcessMemoryStatus {
 // Returns the native virtual-memory page size, or zero when it is unavailable.
 std::uint64_t native_page_size() noexcept;
 
+// Current native protection at an owned mapped address, for exact rollback.
+// Optionally returns the remaining bytes in this native protection run.
+std::optional<memory::Permission> process_memory_permissions(
+    std::uint64_t address, std::uint64_t* contiguous_bytes = nullptr) noexcept;
+
 // Changes protections on an existing native mapping without taking ownership.
 // The complete range must consist of native pages and already be mapped.
 ProcessMemoryStatus protect_process_memory(
     std::uint64_t address, std::uint64_t size, memory::Permission permission) noexcept;
 
 class ProcessMemoryRegion;
+
+// A summary of the host address space below the 39-bit guest limit: how many
+// regions are mapped, the largest free gaps and the large mappings with their
+// memory tags. For diagnostics when a guest reservation does not fit.
+std::string describe_guest_address_space();
 using ProcessMemoryResult = std::variant<ProcessMemoryError, ProcessMemoryRegion>;
 
 // Owns one bounded native virtual-address reservation. The mapping is initially
@@ -62,6 +74,12 @@ public:
     // Fixed reservations never replace an existing mapping.
     static ProcessMemoryResult reserve(std::uint64_t bytes,
                                        std::uint64_t requested_address = 0) noexcept;
+
+    // Searches actual native gaps below the 39-bit query end. Alignment must
+    // be a power of two at least as large as a native page. Never overwrites
+    // a mapping; concurrent occupation is retried with a bounded scan.
+    static ProcessMemoryResult reserve_low_aligned(std::uint64_t bytes,
+                                                   std::uint64_t alignment) noexcept;
 
     // Creates a separately owned, shared alias of an existing native mapping.
     // It does not copy or freeze bytes. The source owner must retain a valid

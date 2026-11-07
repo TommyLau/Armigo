@@ -19,7 +19,10 @@ void populate_player_frame_rate_menu(NSPopUpButton* button,
     [button removeAllItems];
     button.menu.autoenablesItems = NO;
     for (int rate : selection.options) {
-        [button addItemWithTitle:rate ? [NSString stringWithFormat:@"%d fps", rate] : @"Auto"];
+        const bool experimental = std::find(selection.experimental_rates.begin(),
+            selection.experimental_rates.end(), rate) != selection.experimental_rates.end();
+        NSString* title = rate ? [NSString stringWithFormat:experimental ? @"%d fps (Experimental)" : @"%d fps", rate] : @"Auto";
+        [button addItemWithTitle:title];
         button.lastItem.representedObject = @[@"frame_rate", @(rate)];
     }
     int selected_rate = stored_rate;

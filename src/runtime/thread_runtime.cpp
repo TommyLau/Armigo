@@ -10,9 +10,11 @@
 
 #include <armigo/common/diagnostics.h>
 #include <armigo/runtime/thread_runtime.h>
+#include <armigo/execution/guest_fault.h>
 #include <armigo/execution/guest_preempt.h>
 #include <armigo/aarch64/instruction.h>
 #include "../horizon/thread_lifecycle.h"
+#include "../nvn/backend.h"
 
 #include <algorithm>
 #include <atomic>
@@ -27,7 +29,9 @@
 #ifdef __APPLE__
 #include <cstdio>
 #include <cstdlib>
+#include <cxxabi.h>
 #include <pthread/qos.h>
+#include <typeinfo>
 #endif
 
 namespace armigo::runtime {
@@ -135,7 +139,7 @@ class NativeThreadRuntime final : public ThreadRuntime {
         execution::GuestSupervisor supervisor;
         execution::GuestSupervisor scheduling_boundary;
     };
-    static execution::GateStatus compatibility_call(const execution::CallHookSite&,
+    static execution::GateStatus compatibility_call(const execution::CallHookSite& site,
         execution::GateCall& call, execution::GuestThreadContext&, void* raw) {
         auto& runtime = *static_cast<NativeThreadRuntime*>(raw);
         const auto& patch = runtime.dependencies_.launch.compatibility_patch;
@@ -143,7 +147,11 @@ class NativeThreadRuntime final : public ThreadRuntime {
             call.set_failure_message("Compatibility hook has no retained module state.");
             return execution::GateStatus::failed;
         }
-        return compat::handle_patch(*patch, call, runtime.dependencies_.memory->ipc_buffers());
+        return compat::handle_patch(*patch, call, runtime.dependencies_.memory->ipc_buffers(),
+                                   site.call_return_address, {[](void*) noexcept {
+                                       auto* backend = nvn::backends().replay;
+                                       return backend ? backend->gpu_frame_work_ns() : std::uint64_t{0};
+                                   }, nullptr});
     }
     static thread_local Invocation* current_;
     static thread_local NativeThreadRuntime* active_runtime_;
@@ -171,6 +179,11 @@ public:
                         guest_code_.push_back({mapping.base_address() + region.offset,
                                                mapping.base_address() + region.offset + region.size});
             }
+        // The same ranges tell the guest fault handler which faults to report.
+        guest_code_registration_.emplace(guest_code_);
+        if (!guest_code_registration_->registered())
+            armigo::diag::write(armigo::diag::Level::warning,
+                "Armigo runtime: too many guest code ranges; guest faults end the process unreported\n");
     }
     ~NativeThreadRuntime() override {
         // A callback must not own the runtime: it would either create a cycle or
@@ -263,6 +276,7 @@ public:
             const auto handle = dependencies_.handles->insert(worker->record);
             if (!handle) return fail(LaunchError::resource_limit, "create_thread", "Thread handle table is full.");
             worker->handle = *handle;
+            worker->record->set_creation_handle(*handle);
             if (launch.original_process) {
                 worker->entry.x0 = 0;
                 worker->entry.x1 = *handle;
@@ -472,6 +486,72 @@ private:
         const auto guard = std::lock_guard(mutex_);
         if (!worker.failure) worker.failure = error;
         if (!failure_) failure_ = std::move(error);
+    }
+    // "module+0x..." for an address inside a loaded module, else the address.
+    std::string describe_code_address(std::uint64_t address) const {
+        char text[96];
+        if (const auto& modules = dependencies_.launch.modules)
+            for (std::size_t index = 0; index != modules->module_count(); ++index) {
+                const auto& mapping = modules->mapping(index);
+                const std::uint64_t base = mapping.base_address();
+                if (address < base || address - base >= mapping.mapping_size()) continue;
+                const auto name = modules->module_name(index);
+                std::snprintf(text, sizeof text, "%.*s+0x%llx", static_cast<int>(name.size()), name.data(),
+                              static_cast<unsigned long long>(address - base));
+                return text;
+            }
+        std::snprintf(text, sizeof text, "0x%llx", static_cast<unsigned long long>(address));
+        return text;
+    }
+    // A guest fault ended the worker's invocation (guest_fault.h): report the
+    // fault and stop the process, as any other thread failure does.
+    void report_guest_fault(Worker& worker) {
+        const auto fault = execution::take_guest_fault(worker.preempt);
+        if (!fault) return;
+        std::string detail;
+        char text[160];
+        const auto append = [&](const char* format, auto... values) {
+            std::snprintf(text, sizeof text, format, values...);
+            detail += text;
+        };
+        append("Guest %s at %s (pc 0x%llx), address 0x%llx, syndrome 0x%x, thread %llu.",
+               execution::describe_guest_fault_signal(fault->signal), describe_code_address(fault->pc).c_str(),
+               static_cast<unsigned long long>(fault->pc), static_cast<unsigned long long>(fault->address),
+               fault->syndrome, static_cast<unsigned long long>(worker.record->id()));
+        const auto note = worker.record->call_note();
+        if (note.svc == 0) {
+            detail += " No supervisor call yet.";
+        } else {
+            append(" Last supervisor call 0x%02x (x0 0x%llx, x1 0x%llx, x2 0x%llx)", note.svc,
+                   static_cast<unsigned long long>(note.arguments[0]),
+                   static_cast<unsigned long long>(note.arguments[1]),
+                   static_cast<unsigned long long>(note.arguments[2]));
+            // SendSyncRequest takes the session in x0, the user-buffer forms in x2.
+            const auto session = note.svc == 0x21 ? note.arguments[0]
+                               : note.svc == 0x22 || note.svc == 0x23 ? note.arguments[2] : 0;
+            const auto object = session && dependencies_.handles
+                ? dependencies_.handles->lookup(static_cast<Handle>(session)) : nullptr;
+            if (object) {
+                const auto& value = *object;
+                const char* mangled = typeid(value).name();
+                int status = 0;
+                char* demangled = abi::__cxa_demangle(mangled, nullptr, nullptr, &status);
+                append(" on %s", status == 0 && demangled ? demangled : mangled);
+                std::free(demangled);
+            }
+            detail += ".";
+        }
+        detail += " Registers:";
+        for (std::size_t index = 0; index != 29; ++index)
+            append(" x%zu=0x%llx", index, static_cast<unsigned long long>(fault->x[index]));
+        append(" fp=0x%llx lr=%s sp=0x%llx pstate=0x%llx fpcr=0x%llx fpsr=0x%llx",
+               static_cast<unsigned long long>(fault->x[29]), describe_code_address(fault->x[30]).c_str(),
+               static_cast<unsigned long long>(fault->sp), static_cast<unsigned long long>(fault->pstate),
+               static_cast<unsigned long long>(fault->fpcr), static_cast<unsigned long long>(fault->fpsr));
+        armigo::diag::write(armigo::diag::Level::error, "Armigo runtime: %s\n", detail.c_str());
+        auto error = fail(LaunchError::guest_fault, "guest_fault", detail.c_str());
+        error.guest_pc = fault->pc;
+        record_failure(worker, std::move(error));
     }
     void retire_suspended() noexcept {
         // Creation is closed before this call. The background reaper may still
@@ -696,7 +776,10 @@ private:
             request.x1 = 0;
             request.returns = true;
             const auto entered = execution::invoke_guest_thread(worker.stack->writable_bytes(), request);
-            if (entered.exited()) return;
+            if (entered.exited()) {
+                report_guest_fault(worker);
+                return;
+            }
             if (!entered.returned()) {
                 auto error = fail(LaunchError::host_failure, "startup_call", execution::describe(entered.error));
                 error.detail += " (" + call.phase + ")";
@@ -753,7 +836,9 @@ private:
                                     run_startup(worker);
                                 } else if (!stop_.stop_requested()) {
                                     const auto entered = execution::invoke_guest_thread(worker.stack->writable_bytes(), worker.entry);
-                                    if (!entered.exited())
+                                    if (entered.exited())
+                                        report_guest_fault(worker);
+                                    else
                                         record_failure(worker, fail(LaunchError::host_failure, "enter_thread", execution::describe(entered.error)));
                                 }
                             }
@@ -786,6 +871,7 @@ private:
     std::timed_mutex join_mutex_;
     ThreadRuntimeDependencies dependencies_;
     std::vector<execution::GuestCodeRange> guest_code_;
+    std::optional<execution::GuestCodeRegistration> guest_code_registration_;
     std::vector<std::unique_ptr<Worker>> workers_;
     std::stop_source stop_;
     std::optional<LaunchFailure> failure_;

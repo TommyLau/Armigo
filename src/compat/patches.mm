@@ -13,6 +13,10 @@
 #include <atomic>
 
 #include <armigo/compat/patches.h>
+#include <armigo/titles/01007EF00011E000/resolution.h>
+#include <armigo/execution/gate_patch.h>
+#include <bit>
+#include <mutex>
 #include <armigo/graphics/presentation_hints.h>
 #include <armigo/aarch64/instruction.h>
 #import <Foundation/Foundation.h>
@@ -91,6 +95,9 @@ bool valid_frame_rates(const FrameRateSettings& settings) {
     std::set<std::uint32_t> rates;
     for (auto rate : settings.supported_rates)
         if ((rate != 30 && rate != 60 && rate != 120 && rate != variable_frame_rate) || !rates.insert(rate).second) return false;
+    std::set<std::uint32_t> experimental;
+    for (auto rate : settings.experimental_rates)
+        if (!rates.contains(rate) || !experimental.insert(rate).second) return false;
     return rates.contains(settings.default_rate);
 }
 std::uint32_t frame_rate_value(id value, bool private_rate = false) {
@@ -239,13 +246,19 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                 }
                 if (id note = record[@"note"]) patch.note = note_text(note);
                 if (id rate = record[@"frame_rate"]) {
-                    auto settings = object(rate, {"default", "display_refresh_rate"});
+                    auto settings = object(rate, {"default", "display_refresh_rate"}, {"experimental_rates"});
                     patch.frame_rate = FrameRateSettings{frame_rate_value(settings[@"default"]),
                         frame_rate_value(settings[@"display_refresh_rate"]), {}};
                     id supported = record[@"frame_rates"];
                     require([supported isKindOfClass:[NSArray class]] && [supported count] > 0 && [supported count] <= 4,
                             "A title frame-rate policy requires an explicit frame_rates array.");
                     for (id value in supported) patch.frame_rate->supported_rates.push_back(frame_rate_value(value, true));
+                    if (id experimental = settings[@"experimental_rates"]) {
+                        require([experimental isKindOfClass:[NSArray class]] && [experimental count] <= 4,
+                                "Experimental frame rates must be a bounded array of declared modes.");
+                        for (id value in experimental)
+                            patch.frame_rate->experimental_rates.push_back(frame_rate_value(value, true));
+                    }
                     require(valid_frame_rates(*patch.frame_rate),
                             "Supported frame rates must be unique and include the title default.");
                 }
@@ -285,7 +298,7 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                 if (id resolution = record[@"resolution"]) {
                     auto sites = object(resolution, {"tv_size", "screen_widths", "display_size", "window_crop", "floor",
                         "render_target_pool", "graphics_heap", "process_heap", "root_heap", "load_scale",
-                        "swapchain_textures", "pool_size", "minimum_render_width"}, {"maximum_width", "target_rate"});
+                        "swapchain_textures", "pool_size", "minimum_render_width"}, {"maximum_width", "target_rate", "gpu_budget_note", "gpu_budget_rate"});
                     const auto pair = [&](id value) {
                         require([value isKindOfClass:[NSArray class]] && [value count] == 2,
                                 "Compatibility resolution site pairs need two offsets.");
@@ -326,6 +339,14 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                     site.minimum_render_width = count(sites[@"minimum_render_width"], 8192);
                     if (id value = sites[@"maximum_width"]) site.maximum_width = count(value, 8192);
                     if (id value = sites[@"target_rate"]) site.target_rate = count(value, 1000);
+                    if (id value = sites[@"gpu_budget_note"]) site.gpu_budget_note = note_text(value);
+                    if (id value = sites[@"gpu_budget_rate"]) {
+                        site.gpu_budget_rate = count(value, 120);
+                        require(site.gpu_budget_rate == 120 && !site.gpu_budget_note.empty() &&
+                                patch.frame_rate && std::find(patch.frame_rate->supported_rates.begin(),
+                                    patch.frame_rate->supported_rates.end(), 120) != patch.frame_rate->supported_rates.end(),
+                                "GPU-work resolution defaults require a note and a declared 120 mode.");
+                    }
                     require(site.swapchain_textures && site.pool_width && site.pool_height &&
                             site.minimum_render_width && site.target_rate,
                             "Compatibility resolution parameters must be nonzero.");
@@ -340,9 +361,16 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                             "Compatibility calls must be a nonempty bounded array.");
                     std::set<std::uint64_t> offsets;
                     for (id item in calls) {
-                        auto call = object(item, {"offset", "expected_instruction", "note"}, {"frame_rate", "nvn_driver_only"});
+                        auto call = object(item, {"offset", "expected_instruction", "note"}, {"frame_rate", "nvn_driver_only", "phases"});
                         CallPatch site{hex(call[@"offset"]), static_cast<std::uint32_t>(hex(call[@"expected_instruction"], 8))};
                         site.note = note_text(call[@"note"]);
+                        if (id phases = call[@"phases"]) {
+                            auto fields = object(phases, {"original_callee", "counter", "phase_count"});
+                            site.phases = PhaseCallPatch{hex(fields[@"original_callee"]),
+                                hex(fields[@"counter"]), layout_count(fields[@"phase_count"], 65535)};
+                            require(site.phases->phase_count != 0 && site.phases->counter % 4 == 0,
+                                    "Compatibility phase counter must be aligned and its period positive.");
+                        }
                         if (id rate = call[@"frame_rate"]) {
                             site.frame_rate = frame_rate_value(rate, true);
                             require(patch.frame_rate && std::find(patch.frame_rate->supported_rates.begin(),
@@ -402,6 +430,10 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                         }
                     }
                 }
+                for (const auto& call : patch.calls) if (call.phases)
+                    require(patch.layout.variant == titles::FrameRateVariant::IntervalRatio60 &&
+                            patch.layout.frame_step != 0,
+                            "Compatibility phase calls require a published frame step.");
                 require(match_patch(result, patch.identity) == nullptr, "Duplicate compatibility title/build identity.");
                 result.push_back(std::move(patch));
             }
@@ -434,7 +466,15 @@ std::variant<std::vector<WordPatch>, std::string> select_patch_words(
                 return "The selected title mode has overlapping instruction words.";
             result.push_back(word);
         }
-    if (rate != patch.frame_rate->default_rate && std::none_of(result.begin(), result.end(),
+    // The measured-period module already scales its common interval hooks
+    // across admitted rates; it needs no duplicate words for each frequency.
+    const bool measured_interval = patch.module == "frame-rate" &&
+        patch.layout.variant == titles::FrameRateVariant::IntervalRatio60 && patch.layout.frame_step &&
+        std::any_of(patch.calls.begin(), patch.calls.end(), [=](const auto& call) {
+            return !call.frame_rate && !call.phases && !call.gpu_budget &&
+                (nvn_driver_enabled || !call.nvn_driver_only);
+        });
+    if (!measured_interval && rate != patch.frame_rate->default_rate && std::none_of(result.begin(), result.end(),
             [rate](const auto& word) { return word.frame_rate == rate; }) &&
         std::none_of(patch.calls.begin(), patch.calls.end(), [=](const auto& call) {
             return call.frame_rate == rate && (nvn_driver_enabled || !call.nvn_driver_only);
@@ -457,9 +497,74 @@ std::variant<std::vector<CallPatch>, std::string> select_patch_calls(
             result.push_back(call);
     return result;
 }
+struct GpuBudgetContext {
+    std::mutex mutex;
+    titles::title_01007ef00011e000::GpuBudgetState state;
+};
+
+void initialize_gpu_budget(InstalledPatch& patch) {
+    if (std::any_of(patch.description.calls.begin(), patch.description.calls.end(),
+                    [](const auto& call) { return call.gpu_budget.has_value(); }))
+        patch.gpu_budget = std::make_shared<GpuBudgetContext>();
+}
+
+execution::CallHookPatchResult make_patch_hook(const CallPatch& site, std::uint32_t actual,
+    std::uint64_t address, std::uint64_t trampoline, execution::CallHookCodeRegion gate) {
+    if (!site.gpu_budget) return execution::make_call_hook_patch(actual, address, trampoline, gate);
+    // Only the declared 32-bit MOVZ, LSL #16 load-scale form is intercepted.
+    // A branch (not BL) preserves the instruction site's live link register.
+    const auto reg = actual & 31;
+    if ((actual & 0xffe00000u) != 0x52a00000u || reg == 18 || reg >= 30)
+        return {.error = execution::CallHookPatchError::unsupported_site};
+    const auto emitted = execution::make_gate_site_patch(actual, address, trampoline,
+        {gate.address, gate.size}, {.move_wide = true});
+    if (!emitted.ok()) return {.error = execution::CallHookPatchError::invalid_layout};
+    const auto& patch = *emitted.patch;
+    return {.patch = execution::CallHookPatch{address, trampoline, actual, patch.replacement_instruction,
+        patch.trampoline, {patch.dispatch_site.return_address, address + 4, address + 4}}};
+}
+
 execution::GateStatus handle_patch(const InstalledPatch& patch, execution::GateCall& call,
-                                    const horizon::GuestBuffers& memory) noexcept {
+                                    const horizon::GuestBuffers& memory,
+                                    std::uint64_t call_return_address, PatchFeedback feedback) noexcept {
     if (patch.description.module == "frame-rate") {
+        {
+            const CallPatch* site = nullptr;
+            for (const auto& candidate : patch.description.calls)
+                if (call_return_address >= patch.module_base &&
+                    call_return_address - patch.module_base >= 4 &&
+                    call_return_address - patch.module_base - 4 == candidate.offset)
+                    site = &candidate;
+            if (!site) {
+                call.set_failure_message("Compatibility call site has no retained description.");
+                return execution::GateStatus::failed;
+            }
+            if (site->gpu_budget) {
+                if (!patch.gpu_budget) {
+                    call.set_failure_message("Compatibility GPU budget has no initialized state.");
+                    return execution::GateStatus::failed;
+                }
+                const auto gpu_ns = feedback.gpu_work_ns ? feedback.gpu_work_ns(feedback.context) : 0;
+                std::lock_guard lock(patch.gpu_budget->mutex);
+                const auto scale = titles::title_01007ef00011e000::gpu_budget_scale(
+                    patch.gpu_budget->state, gpu_ns, static_cast<std::int64_t>(call.x(0)),
+                    site->gpu_budget->target_rate);
+                if (scale && call.set_x(site->expected_instruction & 31, std::bit_cast<std::uint32_t>(*scale)))
+                    return execution::GateStatus::resume;
+                call.set_failure_message("Compatibility GPU budget state is invalid.");
+                return execution::GateStatus::failed;
+            }
+            if (site->phases) {
+                const auto& phases = *site->phases;
+                titles::FramePhaseDispatch due;
+                if (titles::advance_frame_phases({patch.description.layout.frame_step,
+                        phases.counter, phases.phase_count}, patch.module_base, call.x(0), memory, due) &&
+                    call.set_x(1, due.first) && call.set_x(2, due.count))
+                    return execution::GateStatus::resume;
+                call.set_failure_message("Compatibility phase handler could not access valid scheduler state.");
+                return execution::GateStatus::failed;
+            }
+        }
         std::uint32_t maximum_rate = 0;
         const bool updated = titles::update_frame_rate(
             patch.description.layout, patch.module_base,
@@ -543,6 +648,17 @@ std::string validate_patch(const PatchDescription& patch, const loader::NsoModul
         return "Compatibility frame step overlaps the framework pointer.";
     std::set<std::uint64_t> seen;
     for (const auto& call : patch.calls) {
+        if (call.gpu_budget && (call.phases || call.gpu_budget->target_rate != 120 ||
+            (call.expected_instruction & 0xffe00000u) != 0x52a00000u ||
+            (call.expected_instruction & 31) == 18 || (call.expected_instruction & 31) >= 30))
+            return "Compatibility GPU budget instruction is invalid.";
+        if (call.phases &&
+            (!call.phases->phase_count || call.phases->phase_count > 65535 ||
+             call.phases->counter % 4 || !patch.layout.frame_step ||
+             patch.layout.variant != titles::FrameRateVariant::IntervalRatio60))
+            return "Compatibility phase call layout is invalid.";
+        if (!executable(call_callee(patch, call)))
+            return "Compatibility call callee is outside executable text.";
         if (call.frame_rate != 0 && (!patch.frame_rate ||
             std::find(patch.frame_rate->supported_rates.begin(), patch.frame_rate->supported_rates.end(),
                       call.frame_rate) == patch.frame_rate->supported_rates.end()))
@@ -554,7 +670,8 @@ std::string validate_patch(const PatchDescription& patch, const loader::NsoModul
         if (word != call.expected_instruction) return "Compatibility call instruction preimage mismatch.";
         const auto instruction = aarch64::decode(word);
         const auto target = aarch64::referenced_address(instruction, call.offset);
-        if (instruction.opcode != aarch64::Opcode::bl || !target || *target != patch.original_callee)
+        if (!call.gpu_budget &&
+            (instruction.opcode != aarch64::Opcode::bl || !target || *target != call_callee(patch, call)))
             return "Compatibility instruction is not a BL to the declared original callee.";
     }
     return {};

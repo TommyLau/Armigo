@@ -25,13 +25,16 @@ struct ServiceRegistryDependencies;
 
 // Lane F owns the process facade; lane I uses it from a worker while AppKit
 // pumps on the main thread. Reuse ModuleSet, ProcessRecord, HandleTable, IPC,
-// shared arbitration and service objects. Firmware 20.5.0 is the sole baseline.
+// shared arbitration and service objects. Validated metadata selects the baseline.
 // The launch flows from collected inputs through preparation to real
 // presentation, and an evidence gap stops the run. No SDK host overrides,
 // guest fork path, fake shader/presentation success
 // or hidden private input dependencies. Unsupported dependencies fail explicitly.
 struct RuntimeDependencies {
     ProcessMemoryOptions memory_options;
+    // Shells opt into platform defaults after metadata validation. Explicit
+    // dependency budgets remain unchanged when this is false.
+    bool use_platform_memory_budget = false;
     // Identity supplied by the installed build, not untrusted artifact input.
     PreparationOptions preparation_options;
     std::shared_ptr<GuestClock> clock;

@@ -60,6 +60,19 @@ void reads_build_identity() {
     if (result.ok()) ARMIGO_CHECK(result.image->build_id == identity);
 }
 
+void reads_execute_only_module() {
+    auto file = build_nso(default_spec(false, true));
+    put_u32(file, kFieldFlags, get_u32(file, kFieldFlags) | 0x40);
+    const auto result = read_nso_module(file);
+    ARMIGO_CHECK(result.ok());
+    if (result.ok()) {
+        ARMIGO_CHECK(result.image->segment(NsoSegmentKind::text).permission == SegmentPermission::execute);
+        ARMIGO_CHECK(result.image->segment(NsoSegmentKind::rodata).permission == SegmentPermission::read);
+        ARMIGO_CHECK(result.image->segment(NsoSegmentKind::data).permission ==
+                     (SegmentPermission::read | SegmentPermission::write));
+    }
+}
+
 void reads_uncompressed_module() {
     const FixtureSpec spec = default_spec(false, false);
     const auto result = read_nso_module(build_nso(spec));
@@ -174,7 +187,7 @@ void header_rejections() {
     put_u32(version, kFieldVersion, 1);
     ARMIGO_CHECK(error_of(version) == NsoError::unsupported_version);
 
-    for (std::uint32_t bit = 6; bit < 32; ++bit) {
+    for (std::uint32_t bit = 8; bit < 32; ++bit) {
         auto flags = valid;
         put_u32(flags, kFieldFlags, get_u32(valid, kFieldFlags) | (1u << bit));
         const auto result = read_nso_module(flags);
@@ -396,6 +409,7 @@ void mutation_sweep() {
 int main() {
     reads_build_identity();
     reads_uncompressed_module();
+    reads_execute_only_module();
     reads_compressed_module_with_hashes();
     mixed_flags();
     hash_policies();

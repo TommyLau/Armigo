@@ -62,7 +62,7 @@ enum class Opcode : std::uint8_t {
     ldr_literal_d,  // opc=01 V=1
     ldr_literal_q,  // opc=10 V=1
 
-    // Unconditional branch (register), base forms only.
+    // Unconditional branch (register), base forms.
     br,             // 1101011 0000 11111 000000 Rn 00000
     blr,            // 1101011 0001 11111 000000 Rn 00000
     ret,            // 1101011 0010 11111 000000 Rn 00000
@@ -81,7 +81,16 @@ enum class Opcode : std::uint8_t {
     // System instruction with a single general-register operand:
     // 1101010100 0 0 1 op1 CRn CRm op2 Rt.
     cache_maintenance,  // DC/IC operations that name an address
+    retab,             // authenticated return: implicit X30 target and SP modifier
 };
+
+// Bounded Armv8.3 pointer-authentication admission. Unsupported is a recognized
+// family whose behavior has not been admitted, never a native-safe instruction.
+enum class PointerAuthentication : std::uint8_t {
+    none, unsupported, retab, pacibsp, autibsp, autiasp, xpaclri,
+    pacia, pacib, autib, autia1716, autib1716, xpaci, pacga,
+};
+PointerAuthentication pointer_authentication(std::uint32_t word) noexcept;
 
 // Cache-maintenance operations identified by their CRn:CRm:op2 encoding. These
 // name a virtual address in Rt and have no effect on the host's own caches, so
@@ -146,7 +155,8 @@ struct Instruction {
     Opcode opcode = Opcode::unclassified;
 
     // Rt/Rd (bits 4..0) for branches, address generation, literal loads, MRS
-    // and MSR; Rn (bits 9..5) for BR/BLR/RET. Unused for PRFM and exceptions.
+    // and MSR; Rn (bits 9..5) for BR/BLR/RET; implicit X30 for RETAB.
+    // Unused for PRFM and exceptions.
     std::uint8_t reg = 0;
     // 64-bit general register operand: CBZ/CBNZ sf, TBZ/TBNZ b5, ADR/ADRP,
     // LDR (literal) X and LDRSW, MRS/MSR.

@@ -17,6 +17,7 @@ on the single replay queue. Multi-window attribution needs a separate identity.
 
 import argparse
 import collections
+import sys
 
 
 def read_trace(path):
@@ -28,6 +29,8 @@ def read_trace(path):
             if len(parts) != 4:
                 continue
             time_ns, name, key, value = int(parts[0]), parts[1], int(parts[2]), int(parts[3])
+            if name in {"timeline_overflow", "timeline_incomplete", "timeline_symbols_dropped", "timeline_unquiesced"}:
+                raise ValueError(f"incomplete trace: {name} reports {key} records or active attempts")
             if name == "timeline_start":
                 continue
             first = time_ns if first is None else min(first, time_ns)
@@ -99,7 +102,11 @@ def main():
     parser.add_argument("--presentations", action="store_true",
                         help="group guest submissions by successful single-queue presentations")
     args = parser.parse_args()
-    events, first = read_trace(args.trace)
+    try:
+        events, first = read_trace(args.trace)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 1
     submits = sorted(events["submit"])
     if not submits:
         print("no submit events in the trace")

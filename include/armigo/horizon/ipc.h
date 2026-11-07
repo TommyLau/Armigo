@@ -23,6 +23,7 @@
 namespace armigo::horizon {
 
 inline constexpr std::size_t ipc_message_capacity = 256;
+inline constexpr std::uint32_t session_closed_result = 0xf601;
 using IpcMessage = std::array<std::byte, ipc_message_capacity>;
 
 // Pending, unsupported and cancelled are host dispatcher states, never guest
@@ -134,6 +135,10 @@ struct GuestMemoryMapper {
 class ClientSession : public KernelObject {
 public:
     virtual ~ClientSession() = default;
+    // Retain the existing close acknowledgement for legacy contracts. Opted-in
+    // sessions release server state and reject subsequent requests; the client
+    // handle remains owned by its caller until CloseHandle.
+    virtual IpcReply close_server() { return {.disposition = IpcDisposition::handled}; }
     // Called before dispatch with the runtime's current mapping capability. The
     // default keeps it absent, so a service that needs it reports the gap.
     virtual void set_memory_mapper(GuestMemoryMapper) noexcept {}
@@ -176,6 +181,8 @@ class ForwardingSession : public ClientSession {
 public:
     explicit ForwardingSession(std::shared_ptr<ClientSession> session)
         : inner(std::move(session)) {}
+
+    IpcReply close_server() override { return inner->close_server(); }
 
     void set_memory_mapper(GuestMemoryMapper mapper) noexcept override {
         inner->set_memory_mapper(mapper);

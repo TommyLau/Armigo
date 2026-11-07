@@ -48,6 +48,23 @@ std::array<float, 2> stronger(const std::array<float, 2>& a, const std::array<fl
     return a[0] * a[0] + a[1] * a[1] >= b[0] * b[0] + b[1] * b[1] ? a : b;
 }
 
+// Controller sticks are reported the way the console reports a Pro
+// Controller's: the deflection is clamped to the unit circle, so a diagonal is
+// no faster than a straight push, and a 12% radial dead zone keeps a resting
+// stick centred. Past the dead zone the rest of the range is rescaled, so the
+// output starts from zero at its edge and reaches full scale at full
+// deflection. Keyboard sticks are exact directions and are not shaped.
+constexpr float stick_dead_zone = 3932.0f / 32767.0f;
+
+std::array<float, 2> controller_stick(const std::array<float, 2>& raw) {
+    const float x = std::isfinite(raw[0]) ? raw[0] : 0.0f;
+    const float y = std::isfinite(raw[1]) ? raw[1] : 0.0f;
+    const float magnitude = std::hypot(x, y);
+    if (magnitude <= stick_dead_zone) return {};
+    const float scaled = std::min(1.0f, (magnitude - stick_dead_zone) / (1.0f - stick_dead_zone));
+    return {x / magnitude * scaled, y / magnitude * scaled};
+}
+
 std::int32_t axis(float value) {
     return static_cast<std::int32_t>(std::lround(std::clamp(value, -1.0f, 1.0f) * 32767.0f));
 }
@@ -80,8 +97,13 @@ services::hid::HostFullKeyInput full_key_input(const platform::HostInputSnapshot
     if (left_trigger > 0.5f) input.buttons |= npad_zl;
     if (right_trigger > 0.5f) input.buttons |= npad_zr;
     const std::array<float, 2> idle{};
-    const auto left = stronger(usable(pad) ? pad.left_stick : idle, usable(keys) ? keys.left_stick : idle);
-    const auto right = stronger(usable(pad) ? pad.right_stick : idle, usable(keys) ? keys.right_stick : idle);
+    const auto shaped = [](const std::array<float, 2>& stick, bool exact) {
+        return exact ? stick : controller_stick(stick);
+    };
+    const auto left = stronger(usable(pad) ? shaped(pad.left_stick, pad.exact_left_stick) : idle,
+                               usable(keys) ? keys.left_stick : idle);
+    const auto right = stronger(usable(pad) ? shaped(pad.right_stick, pad.exact_right_stick) : idle,
+                                usable(keys) ? keys.right_stick : idle);
     input.left_x = axis(left[0]);
     input.left_y = axis(left[1]);
     input.right_x = axis(right[0]);
@@ -138,7 +160,9 @@ void MouseCamera::apply(services::hid::HostFullKeyInput& input) {
     decay_locked(now_ns());
     if (buttons_ & 1) input.buttons |= npad_y;
     if (buttons_ & 2) input.buttons |= npad_zr;
-    if (std::hypot(double(input.right_x), double(input.right_y)) >= pad_deadzone) return;
+    // A controller stick past its dead zone, or a keyboard stick, supplies the
+    // right stick; the camera only fills a centred one.
+    if (input.right_x || input.right_y) return;
     input.right_x = std::int32_t(std::lround(x_));
     input.right_y = std::int32_t(std::lround(y_));
     const std::array<float, 2> stick{float(x_ / stick_max), float(y_ / stick_max)};

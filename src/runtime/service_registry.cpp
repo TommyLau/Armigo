@@ -684,12 +684,23 @@ public:
     }
 
     horizon::SessionConnection connect_named_port(std::string_view port) override {
+        if (profile_.process.platform == GuestPlatform::switch2 && port != "sm:") {
+            if (stopped_.load(std::memory_order_acquire))
+                return {horizon::IpcDisposition::cancelled, 0, {}};
+            latch(make_failure(LaunchStage::services, LaunchError::unsupported,
+                               "service_registry.switch2_named_port",
+                               "Switch 2 named port " + std::string(port) +
+                               " requires a verified system-code contract."));
+            return {horizon::IpcDisposition::unsupported, 0, {}};
+        }
         if (port != "sm:")
             return {horizon::IpcDisposition::handled, port_not_found, {}};
         if (stopped_.load(std::memory_order_acquire))
             return {horizon::IpcDisposition::cancelled, 0, {}};
         try {
             const auto weak = weak_from_this();
+            // The selected 23.0.1 reference and Switch 2 client use this same
+            // ordinary-process TIPC subset. Service admission remains separate.
             auto session = std::make_shared<services::sm::ServiceManagerSession>(
                 services::sm::ProcessConfig{process_id_, true,
                     profile_.permissions.service_access_control},
@@ -699,7 +710,7 @@ public:
                         return services::sm::LookupResult{
                             services::sm::LookupKind::unsupported, 0, 0};
                     return registry->connect_service(process_id, name);
-                });
+                }, profile_.process.platform == GuestPlatform::switch2);
             counters_->named_ports.fetch_add(1, std::memory_order_relaxed);
             return {horizon::IpcDisposition::handled, 0, std::move(session)};
         } catch (const std::bad_alloc&) {
@@ -1003,8 +1014,35 @@ private:
 
         std::shared_ptr<horizon::ClientSession> session;
         try {
+            // Services admitted for Switch 2 so far. Each serves the title with
+            // its existing session; contract differences are handled inside it.
+            // Graphics services (nvdrv, vi) and ro, whose Switch 2 NRR layout
+            // differs, stay outside until their contracts are admitted.
+            static const std::array switch2_services{
+                service_name("lm"), service_name("appletOE"), service_name("aoc:u"), service_name("ectx:aw"),
+                service_name("pctl"), service_name("prepo:u"), service_name("time:u"), service_name("acc:u0"),
+                service_name("fsp-srv"), service_name("set"), service_name("pl:u"), service_name("pl:s"),
+                service_name("apm"), service_name("hid"), service_name("nifm:u"), service_name("mm:u"),
+                service_name("bsd:u"), service_name("audout:u"), service_name("audren:u"), service_name("nfp:user"),
+            };
+            if (profile_.process.platform == GuestPlatform::switch2 &&
+                std::find(switch2_services.begin(), switch2_services.end(), name) == switch2_services.end()) {
+                std::string printable;
+                for (const auto byte : name) {
+                    const auto c = static_cast<char>(byte);
+                    if (c == '\0') break;
+                    printable += c >= 0x20 && c < 0x7f ? c : '?';
+                }
+                latch(make_failure(LaunchStage::services, LaunchError::unsupported,
+                    "service_registry.switch2_service",
+                    "Switch 2 service \"" + printable + "\" requires a verified service contract."));
+                return {services::sm::LookupKind::unsupported, 0, 0};
+            }
             if (name == service_name("lm"))
-                session = std::make_shared<services::lm::LogManagerSession>(process_id_);
+                session = std::make_shared<services::lm::LogManagerSession>(process_id_,
+                    profile_.process.platform == GuestPlatform::switch2
+                        ? services::lm::LogManagerContract::switch2_23_0_1
+                        : services::lm::LogManagerContract::horizon_20_5_0);
             else if (name == service_name("acc:u0"))
                 session = std::make_shared<services::acc::AccountSession>(process_id_);
             else if (name == service_name("aoc:u"))
@@ -1058,7 +1096,34 @@ private:
                     process_id_, memory_->process(), *handles,
                     services::am::GameplayRecordingPolicy::Unavailable,
                     std::shared_ptr<services::am::ApplicationRunningState>{},
-                    operation_mode_);
+                    operation_mode_, profile_.process.platform == GuestPlatform::switch2
+                        ? services::am::AppletContract::switch2_23_0_1
+                        : services::am::AppletContract::horizon_20_5_0);
+                if (profile_.process.platform == GuestPlatform::switch2) {
+                    // The graphics system session's driver session shares the
+                    // process's nvdrv client state. A weak reference keeps the
+                    // handle table from owning the base driver.
+                    services::gsv::GraphicsSystemDependencies graphics;
+                    graphics.open_driver = [driver = std::weak_ptr<services::nvdrv::DriverSession>(driver_)]()
+                        -> std::shared_ptr<horizon::ClientSession> {
+                        const auto base = driver.lock();
+                        if (!base) return nullptr;
+                        auto session = std::make_shared<services::nvdrv::DriverSession>(*base);
+                        session->refuse_gpu_devices("Switch 2 NVN boundary: the title's own NVN driver opens a GPU "
+                                                    "device, which Armigo's NVN 231.40 driver replaces; that driver "
+                                                    "is not implemented yet");
+                        return session;
+                    };
+                    graphics.wait_refresh = [vsync = std::weak_ptr<services::vi::VsyncSource>(vsync_)](
+                        std::uint64_t sequence, std::stop_token stop) -> std::optional<std::uint64_t> {
+                        const auto source = vsync.lock();
+                        if (!source) return std::nullopt;
+                        const auto target = std::max(sequence, source->sequence()) + 1;
+                        if (!source->wait_sequence(target, stop)) return std::nullopt;
+                        return target;
+                    };
+                    applet->set_graphics_system_dependencies(std::move(graphics));
+                }
                 if (startup_user_) applet->preselect_user(services::acc::AccountSession::local_user_id());
                 applet->grant_foreground();
                 session = std::move(applet);

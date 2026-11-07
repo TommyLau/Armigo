@@ -1,13 +1,13 @@
 # Armigo
 
 Armigo turns your own Nintendo Switch game files into a standalone player app
-for Apple Silicon Macs and for iPhone and iPad. It is a native compatibility
+for macOS and iOS. It is a native compatibility
 runtime: a thin Horizon (firmware 20.5.0) layer that runs the game's own code
 and SDK unchanged, with graphics on Metal 4.
 
 You give Armigo a game you own, its updates and add-on content, your console's
 keys and firmware. It writes one app for that game: double-click it on a Mac,
-or sign and install the `.ipa` on an iPhone or iPad. Armigo ships no games, no
+or sign and install the `.ipa` on iOS. Armigo ships no games, no
 keys and no firmware, and it signs nothing.
 
 ## Status
@@ -17,8 +17,8 @@ the game builds listed in that folder's `profile.json`:
 
 | Title ID | Title | State |
 | --- | --- | --- |
-| `01007EF00011E000` | The Legend of Zelda: Breath of the Wild | Playable on macOS and iPadOS |
-| `01004B10157F2000` | Persona 5 Royal | In progress: packs for macOS and iOS; holds 30 fps on Apple Silicon Macs, with an optional 60 fps mode; iOS performance not yet measured |
+| `01007EF00011E000` | The Legend of Zelda: Breath of the Wild | Playable on macOS and iOS: 60 fps, with an experimental 120 fps mode on 120 Hz displays |
+| `01004B10157F2000` | Persona 5 Royal | Playable on macOS: 30 fps by default, with 60 and 120 fps modes (120 on 120 Hz displays); packs for iOS, iOS performance not yet measured |
 
 Other titles are not supported. Tears of the Kingdom and Unicorn Overlord are
 planned, not supported.
@@ -29,8 +29,7 @@ planned, not supported.
 - Xcode 26 or later with its Metal toolchain installed, and the iOS SDK if
   you pack for iOS.
 - CMake 3.25 or later and Ninja (`brew install cmake ninja`).
-- For iOS: an iPhone or iPad with iOS/iPadOS 26 or later, and your own way to
-  sign apps.
+- For iOS: a device with iOS 26 or later, and your own way to sign apps.
 
 ## Build
 
@@ -69,7 +68,7 @@ the Settings app):
 | --- | --- |
 | Console Mode | Docked (default), Handheld |
 | Resolution | Auto (default: native on macOS, 1080p on iOS), 720p, 900p, 1080p, 1440p, 4K (macOS), Native |
-| Frame Rate | Auto (default: the title's own rate, 60 for Breath of the Wild and 30 for Persona 5 Royal), 30, 60 |
+| Frame Rate | Auto (default: the title's own rate, 60 for Breath of the Wild and 30 for Persona 5 Royal), 30, 60, 120 (on 120 Hz displays; experimental for Breath of the Wild) |
 | V-Sync | On (default), Off (macOS) |
 | Performance Overlay | Off (default), On |
 

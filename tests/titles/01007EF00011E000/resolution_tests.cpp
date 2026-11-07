@@ -15,6 +15,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
+#include <limits>
 #include <map>
 
 namespace {
@@ -174,6 +176,7 @@ void check_settings() {
     sites.target_rate = 60;
     unsetenv("ARMIGO_COMPAT_RESOLUTION_WIDTH");
     unsetenv("ARMIGO_COMPAT_RESOLUTION_RATE");
+    unsetenv("ARMIGO_COMPAT_RESOLUTION_GPU_BUSY");
     auto settings = title::resolution_settings(sites);
     CHECK(std::holds_alternative<title::ResolutionSettings>(settings) &&
           std::get<title::ResolutionSettings>(settings).maximum_width == 0);
@@ -190,6 +193,131 @@ void check_settings() {
     unsetenv("ARMIGO_COMPAT_RESOLUTION_WIDTH");
     unsetenv("ARMIGO_COMPAT_RESOLUTION_RATE");
 }
+void check_gpu_budget_selection() {
+    Fixture fixture;
+    fixture.sites.gpu_budget_note = "Synthetic opt-in GPU budget.";
+    setenv("ARMIGO_COMPAT_RESOLUTION_WIDTH", "1600", 1);
+    setenv("ARMIGO_COMPAT_RESOLUTION_RATE", "120", 1);
+    setenv("ARMIGO_COMPAT_FRAME_RATE", "120", 1);
+    setenv("ARMIGO_COMPAT_RESOLUTION_GPU_BUSY", "1", 1);
+    const auto selected = title::resolution_settings(fixture.sites);
+    CHECK(std::holds_alternative<title::ResolutionSettings>(selected));
+    if (const auto* settings = std::get_if<title::ResolutionSettings>(&selected)) {
+        CHECK(settings->gpu_budget);
+        const auto planned = title::resolution_words(fixture.sites, *settings, fixture.image);
+        CHECK(std::holds_alternative<title::ResolutionPlan>(planned));
+        if (const auto* plan = std::get_if<title::ResolutionPlan>(&planned)) {
+            CHECK(plan->gpu_budget_hook && plan->gpu_budget_hook->gpu_budget);
+            CHECK(plan->gpu_budget_hook->offset == fixture.sites.load_scale);
+            CHECK(plan->gpu_budget_hook->expected_instruction == fixture.words.at(fixture.sites.load_scale));
+            CHECK(!by_offset(plan->words).contains(fixture.sites.load_scale));
+        }
+    }
+    setenv("ARMIGO_COMPAT_FRAME_RATE", "60", 1);
+    CHECK(std::holds_alternative<std::string>(title::resolution_settings(fixture.sites)));
+    setenv("ARMIGO_COMPAT_FRAME_RATE", "120", 1);
+    setenv("ARMIGO_COMPAT_RESOLUTION_RATE", "60", 1);
+    CHECK(std::holds_alternative<std::string>(title::resolution_settings(fixture.sites)));
+    setenv("ARMIGO_COMPAT_RESOLUTION_GPU_BUSY", "0", 1);
+    CHECK(!std::get<title::ResolutionSettings>(title::resolution_settings(fixture.sites)).gpu_budget);
+    setenv("ARMIGO_COMPAT_RESOLUTION_GPU_BUSY", "2", 1);
+    CHECK(std::holds_alternative<std::string>(title::resolution_settings(fixture.sites)));
+    unsetenv("ARMIGO_COMPAT_RESOLUTION_GPU_BUSY");
+    unsetenv("ARMIGO_COMPAT_FRAME_RATE");
+    unsetenv("ARMIGO_COMPAT_RESOLUTION_WIDTH");
+    unsetenv("ARMIGO_COMPAT_RESOLUTION_RATE");
+}
+void check_declared_gpu_budget() {
+    Fixture fixture;
+    fixture.sites.gpu_budget_note = "Synthetic declared GPU budget.";
+    fixture.sites.gpu_budget_rate = 120;
+    unsetenv("ARMIGO_COMPAT_RESOLUTION_GPU_BUSY");
+    setenv("ARMIGO_COMPAT_RESOLUTION_WIDTH", "1600", 1);
+    for (const char* mode : {"0", "30", "60", "120"}) {
+        setenv("ARMIGO_COMPAT_FRAME_RATE", mode, 1);
+        for (const char* budget : {"30", "60", "120"}) {
+            setenv("ARMIGO_COMPAT_RESOLUTION_RATE", budget, 1);
+            const auto settings = std::get<title::ResolutionSettings>(title::resolution_settings(fixture.sites));
+            CHECK(settings.gpu_budget == (std::string_view(mode) == "120" && std::string_view(budget) == "120"));
+            const auto plan = std::get<title::ResolutionPlan>(title::resolution_words(fixture.sites, settings, fixture.image));
+            if (!settings.gpu_budget) {
+                const auto legacy = std::get<title::ResolutionPlan>(title::resolution_words(
+                    fixture.sites, {settings.maximum_width, settings.target_rate, false}, fixture.image));
+                CHECK(!plan.gpu_budget_hook && by_offset(plan.words) == by_offset(legacy.words));
+            } else CHECK(plan.gpu_budget_hook.has_value());
+        }
+    }
+    setenv("ARMIGO_COMPAT_RESOLUTION_GPU_BUSY", "0", 1);
+    CHECK(!std::get<title::ResolutionSettings>(title::resolution_settings(fixture.sites)).gpu_budget);
+    for (const char* key : {"ARMIGO_COMPAT_RESOLUTION_GPU_BUSY", "ARMIGO_COMPAT_FRAME_RATE",
+                           "ARMIGO_COMPAT_RESOLUTION_WIDTH", "ARMIGO_COMPAT_RESOLUTION_RATE"}) unsetenv(key);
+    CHECK(!std::get<title::ResolutionSettings>(title::resolution_settings(fixture.sites)).gpu_budget);
+}
+void check_missing_gpu_feedback() {
+    // Both stale low and high estimates must stop changing resolution.
+    for (std::uint64_t initial_ns : {4'000'000ull, 10'000'000ull}) {
+        title::GpuBudgetState state;
+        CHECK(title::gpu_budget_scale(state, initial_ns, 192000, 120));
+        for (unsigned i = 0; i < title::GpuBudgetState::missing_feedback_limit; ++i)
+            CHECK(title::gpu_budget_scale(state, 0, 192000, 120));
+        const auto qualifying = state.qualifying_frames;
+        const auto smoothed = state.smoothed_ms;
+        for (unsigned i = 0; i < 120; ++i) {
+            const std::int64_t span = 96000 * (1 + i % 4);
+            const auto scale = title::gpu_budget_scale(state, 0, span, 120);
+            // Hold the internal resolution, not the old multiplier: a changing
+            // elapsed span must still produce the neutral native load.
+            CHECK(scale && std::abs(float(span / 19200000.0) * *scale * 100 - 162.5f) < 0.0001f);
+            CHECK(state.qualifying_frames == qualifying && state.smoothed_ms == smoothed);
+            CHECK(state.missing_feedback_calls == title::GpuBudgetState::missing_feedback_limit);
+        }
+        const auto fresh = title::gpu_budget_scale(state, 20'000'000, 192000, 120);
+        CHECK(fresh && *fresh > 162.5f);
+        CHECK(state.missing_feedback_calls == 0 && state.smoothed_ms > smoothed);
+    }
+}
+void check_gpu_budget_feedback() {
+    // A ten-millisecond span makes the final native load equal to the scale:
+    // span / 19.2 MHz * scale * 100. This checks the controller's load rather
+    // than coupling the assertions to the helper's intermediate arithmetic.
+    constexpr std::int64_t span = 192000;
+    title::GpuBudgetState state;
+    CHECK(title::gpu_budget_scale(state, 0, span, 120) == 240.0f);
+    CHECK(state.smoothed_ms == 0 && state.qualifying_frames == 1);
+    state = {};
+    for (unsigned frame = 1; frame <= 24; ++frame) {
+        const auto scale = title::gpu_budget_scale(state, 4000000, span, 120);
+        CHECK(scale && *scale == (frame % 12 == 0 ? 100.0f : 162.5f));
+    }
+    state = {};
+    CHECK(title::gpu_budget_scale(state, 5000000, span, 120) == 162.5f);
+    CHECK(state.qualifying_frames == 0);
+    CHECK(title::gpu_budget_scale(state, 0, span, 120) == 162.5f);
+    CHECK(state.smoothed_ms == 5.0);
+    const auto smoothed = title::gpu_budget_scale(state, 13000000, span, 120);
+    CHECK(state.smoothed_ms == 6.0);
+    CHECK(smoothed && std::abs(*smoothed - float(162.5 * 6.0 / 5.5)) < 0.0001f);
+    state = {};
+    CHECK(title::gpu_budget_scale(state, 100000000, span, 120) == 999.0f);
+    // The span conversion cancels elapsed time only at this controller. No
+    // GPU counter storage is supplied to, or changed by, this helper.
+    for (std::int64_t ticks : {96000, 192000, 384000}) {
+        state = {};
+        const auto scale = title::gpu_budget_scale(state, 5000000, ticks, 120);
+        CHECK(scale && std::abs(float(ticks / 19200000.0) * *scale * 100 - 162.5f) < 0.0001f);
+    }
+    state = {};
+    CHECK(title::gpu_budget_scale(state, 4000000, 0, 120) == 240.0f);
+    CHECK(state.smoothed_ms == 4.0 && state.qualifying_frames == 1);
+    CHECK(title::gpu_budget_scale(state, 0, -1, 120) == 240.0f);
+    CHECK(!title::gpu_budget_scale(state, 0, span, 0));
+    CHECK(!title::gpu_budget_scale(state, 0, span, 241));
+    for (double value : {-1.0, std::numeric_limits<double>::infinity(),
+                          std::numeric_limits<double>::quiet_NaN()}) {
+        state.smoothed_ms = value;
+        CHECK(!title::gpu_budget_scale(state, 5000000, span, 120));
+    }
+}
 } // namespace
 
 int main() {
@@ -198,6 +326,10 @@ int main() {
     check_floor_keeps_game_floor();
     check_rejections();
     check_settings();
+    check_gpu_budget_feedback();
+    check_missing_gpu_feedback();
+    check_gpu_budget_selection();
+    check_declared_gpu_budget();
     if (failures) {
         std::fprintf(stderr, "%u resolution checks failed\n", failures);
         return 1;

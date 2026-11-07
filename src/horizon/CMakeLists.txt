@@ -11,6 +11,7 @@
 set(ARMIGO_HORIZON_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 
 add_library(armigo_horizon STATIC handle_table.cpp startup_queries.cpp ipc.cpp event.cpp
+    system_resource_pool.cpp memory_interval_map.cpp
     arbitration.cpp process_wide_key.cpp shared_memory.cpp stack_alias.cpp thread_lifecycle.cpp)
 target_include_directories(armigo_horizon PUBLIC "${ARMIGO_HORIZON_SOURCE_ROOT}/include")
 target_compile_features(armigo_horizon PUBLIC cxx_std_20)
@@ -18,6 +19,18 @@ find_package(Threads REQUIRED)
 target_link_libraries(armigo_horizon PUBLIC Threads::Threads)
 
 if(BUILD_TESTING)
+    add_executable(armigo_private_process_resource_tests
+        "${ARMIGO_HORIZON_SOURCE_ROOT}/tests/horizon/private_process_resources_tests.cpp")
+    target_link_libraries(armigo_private_process_resource_tests PRIVATE armigo_horizon)
+    add_test(NAME horizon.private_process_resources COMMAND armigo_private_process_resource_tests)
+    add_executable(armigo_memory_interval_map_tests
+        "${ARMIGO_HORIZON_SOURCE_ROOT}/tests/horizon/memory_interval_map_tests.cpp")
+    target_link_libraries(armigo_memory_interval_map_tests PRIVATE armigo_horizon)
+    add_test(NAME horizon.memory_interval_map COMMAND armigo_memory_interval_map_tests)
+    add_executable(armigo_system_resource_pool_tests
+        "${ARMIGO_HORIZON_SOURCE_ROOT}/tests/horizon/system_resource_pool_tests.cpp")
+    target_link_libraries(armigo_system_resource_pool_tests PRIVATE armigo_horizon)
+    add_test(NAME horizon.system_resource_pool COMMAND armigo_system_resource_pool_tests)
     add_executable(armigo_stack_alias_tests
         "${ARMIGO_HORIZON_SOURCE_ROOT}/tests/horizon/stack_alias_tests.cpp")
     target_link_libraries(armigo_stack_alias_tests PRIVATE armigo_horizon)

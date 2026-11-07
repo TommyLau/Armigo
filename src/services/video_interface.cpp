@@ -417,6 +417,7 @@ public:
         nvn::timeline_event("pres_present", item.frame, std::uint64_t(item.interval));
         try {
             const auto completed = queue->presenter(presentation);
+            if (completed.completed) nvn::timeline_event("pres_complete", item.frame, std::uint64_t(item.interval));
             if (!completed.completed && !completed.diagnostic.empty())
                 note_failure(completed.diagnostic);
         } catch (...) {

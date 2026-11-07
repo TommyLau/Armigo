@@ -39,6 +39,7 @@ using namespace armigo;
 using namespace armigo::runtime;
 
 constexpr std::uint64_t mib = 1024 * 1024;
+bool private_mode = false;
 constexpr auto rw = memory::Permission::read | memory::Permission::write;
 
 std::atomic_uint failures{0};
@@ -84,6 +85,11 @@ LaunchProfile synthetic_profile() {
     profile.process.base_alias_size = 2 * mib;
     profile.process.stack_size = 2 * mib;
     profile.permissions.handle_table_capacity = 64;
+    if (private_mode) {
+        profile.process.platform = GuestPlatform::switch2;
+        profile.process.baseline = horizon::Baseline::horizon_23_0_1;
+        profile.process.private_system_resource_bytes = 65536;
+    }
     return profile;
 }
 
@@ -308,14 +314,15 @@ struct BlockingPublication {
     std::barrier<> gate{2};
     std::promise<void> entered;
     std::atomic_bool native_applied{false};
+    bool accept = true;
 
     static bool apply(void* context) noexcept {
         auto& self = *static_cast<BlockingPublication*>(context);
         self.entered.set_value();
         self.gate.arrive_and_wait();
         self.gate.arrive_and_wait();
-        self.native_applied.store(true, std::memory_order_release);
-        return true;
+        self.native_applied.store(self.accept, std::memory_order_release);
+        return self.accept;
     }
 };
 
@@ -401,13 +408,63 @@ void test_process_record_atomic_publication() {
     }
 }
 
+void test_private_publication_observer() {
+    using namespace std::chrono_literals;
+    for (bool accept : {false, true}) {
+        auto configuration = record_configuration();
+        configuration.platform = GuestPlatform::switch2;
+        configuration.baseline = horizon::Baseline::horizon_23_0_1;
+        configuration.private_system_resource_bytes = 65536;
+        horizon::MemoryAccounting baseline{};
+        baseline.resource_limit_bytes = mib; baseline.resource_limit_used = 65536;
+        auto built = horizon::ProcessRecord::create(configuration, baseline);
+        CHECK(built.ok()); if (!built.ok()) return;
+        auto record = std::move(built.process);
+        const horizon::MemoryMapUpdate update{{configuration.heap_address, native_page_size()},
+            horizon::MemoryBlock{{}, horizon::MemoryType::normal, 0, 3}};
+        auto changed = baseline;
+        changed.committed_heap = native_page_size(); changed.resource_limit_used += native_page_size();
+        BlockingPublication callback; callback.accept = accept;
+        auto entered = callback.entered.get_future();
+        horizon::ProcessStateError committed{};
+        std::thread committer([&] {
+            committed = record->commit_memory_updates(std::span(&update, 1), changed,
+                BlockingPublication::apply, &callback);
+        });
+        if (entered.wait_for(2s) != std::future_status::ready) std::_Exit(1);
+        callback.gate.arrive_and_wait();
+        std::promise<std::pair<horizon::MemoryInfo, std::uint64_t>> observed;
+        auto future = observed.get_future();
+        std::latch started{1};
+        std::thread observer([&] {
+            started.count_down();
+            observed.set_value({record->query_memory(configuration.heap_address), record->used_memory()});
+        });
+        started.wait();
+        CHECK(future.wait_for(25ms) == std::future_status::timeout);
+        CHECK(record->used_system_resource() == 4096);
+        callback.gate.arrive_and_wait();
+        if (future.wait_for(2s) != std::future_status::ready) std::_Exit(1);
+        committer.join(); observer.join();
+        const auto result = future.get();
+        CHECK(committed == (accept ? horizon::ProcessStateError::none : horizon::ProcessStateError::backend_failure));
+        CHECK(result.first.type == (accept ? horizon::MemoryType::normal : horizon::MemoryType::free));
+        CHECK(result.second == (accept ? native_page_size() : 0));
+        CHECK(record->total_memory() == mib - 65536);
+    }
+}
+
 } // namespace
 
 int main() {
-    test_pin_and_protect_race();
-    test_pin_and_heap_resize_race();
-    test_service_mapper_lifetime();
+    for (bool mode : {false, true}) {
+        private_mode = mode;
+        test_pin_and_protect_race();
+        test_pin_and_heap_resize_race();
+        test_service_mapper_lifetime();
+    }
     test_process_record_atomic_publication<horizon::ProcessRecord>();
+    test_private_publication_observer();
     if (failures.load(std::memory_order_relaxed) != 0) return 1;
     std::puts("Guest memory pin, mutation, and mapper concurrency checks passed.");
     return 0;

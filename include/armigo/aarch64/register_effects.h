@@ -138,6 +138,10 @@ enum class Operation : std::uint8_t {
     fp_conditional_select,
     // Scalar floating-point immediate (FMOV immediate).
     fp_immediate,
+
+    // Observed pointer authentication; hints retain their implicit operands.
+    pacibsp, autibsp, autiasp, xpaclri, pacia, pacib, autib,
+    autia1716, autib1716, xpaci, pacga,
 };
 
 enum class RegisterFile : std::uint8_t {

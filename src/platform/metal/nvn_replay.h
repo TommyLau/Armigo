@@ -59,6 +59,11 @@ struct UploadFence {
 class ReplayResources {
 public:
     virtual ~ReplayResources() = default;
+    // For this provider's entire lifetime, every successfully resolved buffer
+    // byte has CPU address equal to its NVN address, including overlapping
+    // registrations. Unclassified or remapped providers must return false.
+    [[nodiscard]] virtual bool buffer_addresses_are_cpu() const { return false; }
+
     // Resource coherence may request completion while replay resolves a binding.
     virtual void set_completion_hook(std::function<bool()> hook) { (void)hook; }
     // Describes the most recent failed texture lookup on this thread, for

@@ -696,6 +696,7 @@ int pack_game(const pack::Command& command) {
             spec.default_frame_rate = description->frame_rate->default_rate;
             spec.display_refresh_rate = description->frame_rate->display_refresh_rate;
             spec.supported_frame_rates = description->frame_rate->supported_rates;
+            spec.experimental_frame_rates = description->frame_rate->experimental_rates;
         }
         auto assembled = pack::assemble_application(spec);
         if (auto* failure = std::get_if<std::string>(&assembled)) {

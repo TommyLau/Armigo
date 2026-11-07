@@ -14,8 +14,10 @@
 #include "nvn_draw_state.h"
 #include "nvn_color_aliases.h"
 #include "nvn_submission_segments.h"
+#include "nvn_gpu_frame_work.h"
 #include "nvn_encode_ring.h"
 #include "nvn_attachment_actions.h"
+#include "nvn_write_ranges.h"
 #include "nvn/flat_map.h"
 #include <armigo/memory/write_tracker.h>
 #include <armigo/platform/presentation_thread.h>
@@ -583,6 +585,18 @@ struct ReplayState {
     PolygonStateBits polygon{};
     DepthStencilStateBits depth_stencil{};
     std::array<std::shared_ptr<const ResolvedProgram>, stage_count> stage_programs;
+    // Immutable shader reflection changes only when a stage's program changes.
+    std::uint32_t write_stages = 0;
+    void update_write_stage(std::size_t stage) {
+        const auto& program = stage_programs[stage];
+        const auto* shader = program ? program->stages[stage].get() : nullptr;
+        const bool writes = shader && std::ranges::any_of(shader->storage_buffers, [](const auto& resource) {
+            return resource.access != platform::CompiledShaderResourceAccess::Read;
+        });
+        const auto bit = 1u << stage;
+        write_stages = writes ? write_stages | bit : write_stages & ~bit;
+    }
+
     // Bit s: the program bound to stage s has that stage, but it failed to
     // translate (stage_programs[s] is then empty). Draws and dispatches that
     // would use it are refused rather than run without it.
@@ -629,7 +643,7 @@ struct PredicateJob {
     std::uint64_t visibility;
     std::uint64_t memory[2];
     std::uint32_t begin[2], end[2];
-    std::uint32_t render_if_equal, capacity;
+    std::uint32_t render_if_equal, record_count;
     std::uint64_t arguments;
 };
 static_assert(sizeof(PredicateJob) == 56);
@@ -649,7 +663,7 @@ struct PredicateJob {
     uint begin[2];
     uint end[2];
     uint render_if_equal;
-    uint capacity;
+    uint record_count;
     device uint* arguments;
 };
 static void evaluate(device const PredicateJob& job) {
@@ -665,7 +679,7 @@ static void evaluate(device const PredicateJob& job) {
     }
     const bool equal = value[0] == value[1];
     if ((job.render_if_equal != 0) == equal) return;
-    for (uint record = 0; record < job.capacity; ++record) job.arguments[record * 8 + 1] = 0;
+    for (uint record = 0; record < job.record_count; ++record) job.arguments[record * 8 + 1] = 0;
 }
 kernel void armigo_nvn_render_predicate(device const PredicateJob& job [[buffer(0)]]) { evaluate(job); }
 // The same evaluation as a point draw with rasterization disabled, at the
@@ -945,7 +959,28 @@ private:
 struct UniformUpdate {
     std::uint64_t address, size;
     const std::byte* bytes;
+    std::uintptr_t cpu = 0;
+    std::uint64_t gpu = 0;
 };
+
+// Offsets inside the first range, without overflowing either end address.
+std::pair<std::uint64_t, std::uint64_t> overlap_offsets(
+    std::uint64_t begin, std::uint64_t size, std::uint64_t other, std::uint64_t length) {
+    if (!size || !length) return {};
+    if (other >= begin) {
+        const auto offset = other - begin;
+        return offset < size ? std::pair{offset, offset + std::min(length, size - offset)}
+                             : std::pair<std::uint64_t, std::uint64_t>{};
+    }
+    const auto offset = begin - other;
+    return offset < length ? std::pair<std::uint64_t, std::uint64_t>{0, std::min(size, length - offset)}
+                           : std::pair<std::uint64_t, std::uint64_t>{};
+}
+
+UniformUpdate uniform_slice(const UniformUpdate& source, std::uint64_t offset, std::uint64_t size) {
+    return {source.address + offset, size, source.bytes + offset,
+            source.cpu ? source.cpu + offset : 0, source.gpu ? source.gpu + offset : 0};
+}
 
 class EncodeThread;
 
@@ -978,6 +1013,7 @@ struct PendingSubmission : std::enable_shared_from_this<PendingSubmission> {
     std::vector<UniformUpdate> uniform_updates;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> other_buffer_writes;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> completion_writes;
+    WriteRanges completion_ranges;
     // The span of completion_writes, so a read outside it needs no scan.
     std::uintptr_t completion_low = UINTPTR_MAX, completion_high = 0;
     // Per-submission work counters, printed every 60 frames when requested.
@@ -1136,11 +1172,12 @@ private:
     // with the next submission, so the thread sleeps instead of spinning.
     bool idle_ = true;
     // How long the thread spins for the next record inside a submission. A
-    // frame paced at a long period leaves the thread idle most of the time, and
-    // spinning there only burns CPU; an unpaced or short frame keeps the spin
-    // because a wake-up costs the producer a system call and delays the commit.
+    // frame paced below 120 Hz leaves enough time to sleep between bursts. An
+    // unpaced frame or a frame at 120 Hz or faster keeps the bounded spin so
+    // semaphore wake-ups do not delay its tightly budgeted commits. The thread
+    // still sleeps between submissions after the final commit.
     static constexpr std::uint64_t spin_unpaced_ns = 500'000;
-    static constexpr std::uint64_t spin_paced_min_period_ns = 8'000'000;
+    static constexpr std::uint64_t spin_paced_min_period_ns = 1'000'000'000 / 120 + 1;
     std::uint64_t spin_ns_ = spin_unpaced_ns;
     bool spin_reported_ = false;
     // The last pipeline record named a pipeline that failed to compile.
@@ -1367,6 +1404,8 @@ struct Encoder {
         std::array<std::uint32_t, buffer_slots + 3> window_extents{};
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         bool writes_buffers = false;
+        std::uint32_t uniform_slots = UINT32_MAX;
+        std::size_t uniform_effects = 0, uniform_writes = 0;
         // The words of hardware constant buffers the shader's texture handles
         // and storage descriptors are read from.
         struct ContentRead { std::uint32_t slot, offset, length; };
@@ -1449,7 +1488,26 @@ struct Encoder {
     void invalidate_args(std::size_t stage) {
         if (stage < stage_count) dirty.arguments[stage] = 1;
     }
-    void invalidate_args_all() { dirty.arguments.fill(true); }
+    // A new uniform range changes resource bindings only when the shader
+    // reads a texture handle or storage descriptor from that hardware slot.
+    // Other stages retain their conservative full rebuild, including the
+    // compute driver's uniform descriptor table.
+    void invalidate_uniform_binding(std::size_t stage, std::uint32_t index) {
+        bindings[stage].uniform_slots |= 1u << (index + 3);
+        if (!uniform_rebind_enabled() ||
+            (stage != NVN_SHADER_STAGE_VERTEX && stage != NVN_SHADER_STAGE_FRAGMENT) ||
+            std::ranges::any_of(bindings[stage].content_reads, [index](const auto& read) {
+                return read.slot == index + 3;
+            })) {
+            invalidate_args(stage);
+        } else {
+            dirty.uniforms[stage] = true;
+        }
+    }
+    void invalidate_args_all() {
+        dirty.arguments.fill(true);
+        for (auto& stage : bindings) stage.uniform_slots = UINT32_MAX;
+    }
     // ARMIGO_NVN_UNIFORM_REBIND=0: every update rebinds whole stages, as
     // before uniform-only rebinds. Measurement and bisection only.
     static bool uniform_rebind_enabled() {
@@ -1461,7 +1519,10 @@ struct Encoder {
     }
     void invalidate_uniforms_all() {
         if (!uniform_rebind_enabled()) return invalidate_args_all();
-        for (std::size_t stage = 0; stage < stage_count; ++stage) dirty.uniforms[stage] = true;
+        for (std::size_t stage = 0; stage < stage_count; ++stage) {
+            dirty.uniforms[stage] = true;
+            bindings[stage].uniform_slots = UINT32_MAX;
+        }
     }
     // A CPU copy into upload memory the GPU reads only after this
     // submission's later records: with the encode thread it runs there, in
@@ -1536,6 +1597,13 @@ struct Encoder {
     struct EffectSpan {
         std::size_t counted = 0;
         std::uintptr_t low = UINTPTR_MAX, high = 0;
+        WriteRanges writes;
+        void clear() {
+            counted = 0;
+            low = UINTPTR_MAX;
+            high = 0;
+            writes.clear();
+        }
     } effect_span;
     struct GpuCounter { std::size_t effect; std::uint32_t begin, end; };
     std::vector<GpuCounter> gpu_counters;
@@ -1546,6 +1614,7 @@ struct Encoder {
     struct PredicateBlock {
         std::byte* arguments = nullptr;
         std::uint64_t arguments_gpu = 0;
+        std::uint32_t* record_count = nullptr;
         std::uint32_t used = 0;
         std::int32_t mode = 0;
         std::uint64_t address = 0;
@@ -1577,11 +1646,16 @@ struct Encoder {
     // In-stream uniform updates encoded so far, by aligned guest word: they
     // reach guest memory only when the GPU runs the submission, but handles
     // the shaders read from uniform buffers are resolved while encoding.
+    // Only queried words fully supplied by this submission's captures are
+    // cached. Ordinary backing and prior submissions still require ordering.
     std::unordered_map<std::uint64_t, std::uint32_t> uniform_words;
+    void refresh_uniform_words(std::uint64_t address, std::uint64_t size, const std::byte* bytes);
 
-    Encoder(ReplayImpl& owner, PendingSubmission& submission, const ReplayState& initial)
-        : backend(owner), pending(submission), queue(submission.encode_thread), state(initial) {
+    Encoder(ReplayImpl& owner, PendingSubmission& submission, const ReplayState& initial, bool canonical)
+        : backend(owner), pending(submission), queue(submission.encode_thread), state(initial),
+          cpu_addressed_buffers(canonical) {
         dirty.arguments.fill(true);
+        refresh_attachment_cpu_bounds();
         trace_submission_id = trace_pass_submission();
         if (trace_submission_id) timeline_event("pass_trace_submission", pending.fence, trace_submission_id);
         trace_pass_event("submission", "begin");
@@ -1595,7 +1669,8 @@ struct Encoder {
                                               id<MTL4ArgumentTable> fragment);
     id<MTL4ComputeCommandEncoder> begin_transfer();
     void end_encoder(id encoder, MTLStages after);
-    void encoder_barrier(id encoder, MTLStages after, MTLStages before);
+    void encoder_barrier(id encoder, MTLStages after, MTLStages before,
+                         MTL4VisibilityOptions extra_visibility = MTL4VisibilityOptionNone);
     bool set_render_pipeline(const NativePipeline& pipeline);
     void set_depth_stencil(id<MTLDepthStencilState> depth_state);
     void set_stencil_reference(std::uint32_t front, std::uint32_t back);
@@ -1662,6 +1737,8 @@ struct Encoder {
     struct UniformVersion {
         std::uint64_t begin, end, valid_end, dirty_begin, dirty_end;
         UploadSlice slice;
+        std::uintptr_t source_cpu = 0;
+        std::uint64_t source_gpu = 0;
     };
     // Prior update bytes remain owned until their submission fence retires.
     std::vector<std::shared_ptr<PendingSubmission>> previous_submissions;
@@ -1671,7 +1748,13 @@ struct Encoder {
     std::uint64_t draw_sampler_registrations() const {
         return state.sampler_registrations ? state.sampler_registrations : UINT64_MAX;
     }
-    void order_cpu_read(std::uint64_t address, std::uint64_t size, bool overlay);
+    bool order_cpu_read(std::uint64_t address, std::uint64_t size, bool overlay,
+                        const std::byte* cpu, bool current = true);
+    bool current_buffer_write_overlap(std::uintptr_t cpu, std::uint64_t size);
+    WriteRanges current_cpu_writes;
+    std::size_t cpu_writes_indexed = 0, cpu_writes_completed = 0;
+    std::uint64_t cpu_writes_registration = 0;
+    bool cpu_writes_unknown = false;
     // Preserve command order even when addresses repeat: a later outer update
     // supersedes older inner writes, while a shorter rewrite preserves the tail
     // of an earlier larger update. Address-only replacement loses both rules.
@@ -1679,11 +1762,35 @@ struct Encoder {
     // Moves on every recorded update to invalidate cached constant windows.
     std::uint64_t update_generation = 0;
     void record_uniform_update(std::uint64_t address, std::uint64_t size,
-                               const std::byte* bytes) {
-        ++pending.counters.uniform_updates;
-        ++update_generation;
-        uniform_updates.push_back({address, size, bytes});
-        note_update_pages(address, size);
+                               const std::byte* bytes, const BufferSpan& destination);
+    WriteRanges captured_guest_bytes, captured_cpu_words, captured_gpu_words;
+    void discard_uniform_captures(std::uintptr_t cpu, std::uint64_t gpu, std::uint64_t size);
+    void discard_gpu_uniform_captures(std::uint64_t address, std::uint64_t size);
+    bool uniform_cpu_conflict(std::uintptr_t cpu, std::uint64_t size) const;
+    void rebuild_capture_ranges();
+    bool capture_retirement_needed = false;
+    bool cpu_addressed_buffers = false;
+    std::uintptr_t uniform_cpu_low = UINTPTR_MAX, uniform_cpu_high = 0;
+    bool retire_captures_if_full();
+    bool uniform_capture_alias(std::uint64_t address, std::uint64_t size, const BufferSpan& span) const;
+    bool prepare_graphics_uniform_writes();
+    std::uintptr_t attachment_cpu_low = UINTPTR_MAX, attachment_cpu_high = 0;
+    void refresh_attachment_cpu_bounds() {
+        attachment_cpu_low = UINTPTR_MAX;
+        attachment_cpu_high = 0;
+        const auto include = [&](const TextureState* target) {
+            if (!target || !target->memory || !target->size) return;
+            const auto begin = reinterpret_cast<std::uintptr_t>(target->memory);
+            if (target->size > UINTPTR_MAX - begin) {
+                attachment_cpu_low = 0;
+                attachment_cpu_high = UINTPTR_MAX;
+                return;
+            }
+            attachment_cpu_low = std::min(attachment_cpu_low, begin);
+            attachment_cpu_high = std::max(attachment_cpu_high, begin + std::uintptr_t(target->size));
+        };
+        for (const auto* target : state.targets.color) include(target);
+        include(state.targets.depth);
     }
     // Guest pages any recorded or unretired update writes: an overlay over
     // bytes no update reached has nothing to apply and skips the scan.
@@ -1703,14 +1810,38 @@ struct Encoder {
     // GPU waits of this submission so far; each writes the listed uniform
     // versions back to guest memory and ends them.
     std::uint64_t gpu_synchronizations = 0;
+    // This log only appends during an encoder's lifetime. Keep it for suffix
+    // queries, while the range union answers ordinary full-history overlaps.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> other_buffer_writes;
+    WriteRanges buffer_write_ranges;
+    std::size_t buffer_writes_indexed = 0;
+    bool buffer_writes_overlap(std::uint64_t address, std::uint64_t size, std::size_t first = 0);
+    void update_effect_ranges();
     bool fill_uniform(UniformVersion& version, std::uint64_t end);
-    bool version_uniform(std::uint64_t address, std::uint64_t size, const std::byte* bytes);
+    bool version_uniform(std::uint64_t address, std::uint64_t size, const std::byte* bytes,
+                         const BufferSpan& destination);
     bool flush_uniforms();
-    bool uniform_conflict(std::uint64_t address, std::uint64_t size) const;
+    bool uniform_conflict(std::uint64_t address, std::uint64_t size);
+    struct PhysicalMapping { std::uintptr_t cpu; std::uint64_t gpu, size; };
+    // Sorted disjoint CPU intervals. GPU zero means multiple virtual aliases
+    // have written the interval; every subsequent mapping then needs visibility.
+    std::vector<PhysicalMapping> uniform_native_mappings;
+    static void record_alias_mapping(std::vector<PhysicalMapping>& mappings,
+                                     std::uintptr_t cpu, std::uint64_t address, std::uint64_t size);
+    static bool mapping_alias(const std::vector<PhysicalMapping>& mappings,
+                              std::uintptr_t cpu, std::uint64_t address, std::uint64_t size);
+    // Actual pending copies retain their guest-to-CPU identity independently
+    // of captured overlays. A drain retires both the writes and this index.
+    std::vector<PhysicalMapping> uniform_copy_mappings;
+    std::size_t uniform_copy_count = 0;
+    bool uniform_copy_unknown = false;
+    void record_uniform_copy(std::uint64_t address, std::uint64_t size, const BufferSpan& destination);
+    bool needs_alias_visibility(std::uintptr_t cpu, std::uint64_t gpu, std::uint64_t size) const;
+    bool prepare_uniform_access(std::uint64_t address, std::uint64_t size, std::uint64_t second = 0);
     std::uint64_t uniform_address(const BoundBuffer& binding, std::uint64_t gpu,
                                   std::uint64_t extent);
-    void overlay_uniform(std::uint64_t address, std::byte* bytes, std::size_t size) const;
+    void overlay_uniform(std::uint64_t address, std::byte* bytes, std::size_t size,
+                         std::uint32_t* covered = nullptr, bool current_only = false) const;
     bool enqueue_counter(const ReportCounter& command, const BufferSpan& destination, std::byte* destination_cpu);
     bool order_completion_read(const BufferSpan& span, std::uint64_t size);
     bool order_completion_read(id<MTLBuffer> __unsafe_unretained buffer, std::uint64_t offset,
@@ -1746,7 +1877,7 @@ struct Encoder {
     bool bind_stage(std::size_t stage, const platform::CompiledGraphicsStage& shader,
                     __unsafe_unretained id<MTL4ArgumentTable> table, bool vertex,
                     bool uniforms_only = false);
-    void invalidate_uniforms(std::uint64_t address, std::uint64_t size);
+    void invalidate_uniforms(std::uint64_t address, std::uint64_t size, std::uintptr_t cpu);
     bool bind_draw_support(std::uint32_t base_instance);
     bool bind_vertex_fetch(const platform::CompiledGraphicsStage& vertex);
     UploadSlice upload(std::size_t size, const void* data = nullptr);
@@ -1842,10 +1973,11 @@ void Encoder::end_encoder(id encoder, MTLStages after) {
     [(id<MTL4CommandEncoder>)encoder endEncoding];
 }
 
-void Encoder::encoder_barrier(id encoder, MTLStages after, MTLStages before) {
-    if (queue) queue->put(EncodeOp::encoder_barrier, 0, BarrierRecord{after, before});
+void Encoder::encoder_barrier(id encoder, MTLStages after, MTLStages before,
+                               MTL4VisibilityOptions extra_visibility) {
+    if (queue) queue->put(EncodeOp::encoder_barrier, std::uint32_t(extra_visibility), BarrierRecord{after, before});
     else [(id<MTL4CommandEncoder>)encoder barrierAfterEncoderStages:after beforeEncoderStages:before
-                                                   visibilityOptions:MTL4VisibilityOptionDevice];
+                                                   visibilityOptions:MTL4VisibilityOptionDevice | extra_visibility];
 }
 
 bool Encoder::set_render_pipeline(const NativePipeline& pipeline) {
@@ -2945,7 +3077,7 @@ public:
         if (stopping_) return;
         scheduling_period_ns_ = period_ns;
         preserve_encode_spin_ = preserve_encode_spin;
-        queued_.push_back({0, {}, period_ns, preserve_encode_spin, true});
+        queued_.push_back({0, {}, period_ns, preserve_encode_spin, true, next_fence_ - 1});
         queued_ready_.notify_one();
     }
 
@@ -3001,6 +3133,10 @@ public:
                 queued_.pop_front();
             }
             if (item.frame_boundary) {
+                if (gpu_frame_work_enabled_.load(std::memory_order_acquire)) {
+                    std::lock_guard timing_lock(fence_mutex_);
+                    gpu_frame_work_.frame_boundary(item.frame_end_fence);
+                }
                 periodic_graphics_tick(item.scheduling_period_ns, ReplayThread::worker, scheduling_);
                 continue;
             }
@@ -3134,6 +3270,7 @@ public:
     void retire_finished() {
         while (finished_.contains(completed_fence_ + 1)) {
             const auto fence = completed_fence_ + 1;
+            std::optional<std::uint64_t> frame_work;
             if (const auto it = inflight_.find(fence); it != inflight_.end()) {
                 if (it->second->execution_error) execution_error_ = it->second->execution_error;
                 else apply_effects_locked(*it->second);
@@ -3143,8 +3280,13 @@ public:
                 retired_log_.push_back({it->second, fence, lookups.lookups - reported_lookups_.lookups,
                                         lookups.misses - reported_lookups_.misses});
                 reported_lookups_ = lookups;
+                if (!it->second->execution_error && it->second->segments.submitted &&
+                    it->second->timed_segments == it->second->segments.submitted && it->second->gpu_first_ns)
+                    frame_work = it->second->gpu_interval_ns;
                 inflight_.erase(it);
             }
+            if (gpu_frame_work_enabled_.load(std::memory_order_relaxed))
+                gpu_frame_work_.retire(fence, frame_work);
             finished_.erase(fence);
             completed_fence_ = fence;
             published_completed_fence_.store(fence, std::memory_order_release);
@@ -3246,7 +3388,7 @@ public:
 
         std::vector<std::shared_ptr<PendingSubmission>> released_submissions;
         resources_->begin_walk();
-        Encoder encoder(*this, *pending, state_);
+        Encoder encoder(*this, *pending, state_, resources_->buffer_addresses_are_cpu());
         encoder.retired_fence = completed_fence();
         // Releasing a retired submission frees its command buffers, allocators
         // and resources, which takes longer than the rest of the preamble. The
@@ -3303,6 +3445,7 @@ public:
         for (const auto& [begin, end] : pending->completion_writes) {
             pending->completion_low = std::min(pending->completion_low, begin);
             pending->completion_high = std::max(pending->completion_high, end);
+            pending->completion_ranges.add(begin, end - begin);
         }
         previous_submissions_.push_back(pending);
         for (auto* sync : pending->fenced_syncs) {
@@ -3334,6 +3477,17 @@ public:
     // that sees a fence also sees its effects.
     std::uint64_t completed_fence() const override {
         return published_completed_fence_.load(std::memory_order_acquire);
+    }
+
+    std::uint64_t gpu_frame_work_ns() const noexcept override {
+        std::lock_guard lock(fence_mutex_);
+        if (!gpu_frame_work_enabled_.load(std::memory_order_relaxed)) {
+            // A completed submission is not necessarily a frame boundary.
+            // The collector discards the first partial frame after this reset.
+            gpu_frame_work_.reset(completed_fence_);
+            gpu_frame_work_enabled_.store(true, std::memory_order_release);
+        }
+        return gpu_frame_work_.latest().value_or(0);
     }
 
     bool wait_fence(std::uint64_t fence, std::uint64_t timeout_ns) override {
@@ -3481,13 +3635,24 @@ public:
         return empty_sampler_;
     }
 
-    id<MTL4CounterHeap> counter_heap(std::uint64_t fence) {
-        auto& heap = submission_storage_[(fence - 1) % submission_slots].timestamp;
+    static constexpr std::size_t timestamp_heap_capacity = 1024;
+    // Six in-flight slots retain at most 24 heaps, below Metal 4's per-process
+    // limit of 32. Additional reports fail explicitly instead of losing work.
+    static constexpr std::size_t timestamp_heap_limit = 4;
+    static_assert(submission_slots * timestamp_heap_limit <= 24);
+
+    id<MTL4CounterHeap> counter_heap(std::uint64_t fence, std::size_t timestamp) {
+        const auto page = timestamp / timestamp_heap_capacity;
+        if (page >= timestamp_heap_limit) return nil;
+        // A slot keeps its pages until the previous fence retires. Allocate
+        // additional pages only for submissions that need them, then reuse them.
+        auto& heap = submission_storage_[(fence - 1) % submission_slots].timestamps[page];
         if (!heap) {
             auto* descriptor = [MTL4CounterHeapDescriptor new];
             descriptor.type = MTL4CounterHeapTypeTimestamp;
-            descriptor.count = 1024;
-            heap = [device_ newCounterHeapWithDescriptor:descriptor error:nil];
+            descriptor.count = timestamp_heap_capacity;
+            NSError* error = nil;
+            heap = [device_ newCounterHeapWithDescriptor:descriptor error:&error];
         }
         return heap;
     }
@@ -3925,6 +4090,8 @@ private:
     // Neither mutex is held while encoding or waiting for a GPU segment.
     mutable std::mutex mutex_;
     mutable std::mutex fence_mutex_;
+    mutable std::atomic<bool> gpu_frame_work_enabled_{false};
+    mutable GpuFrameWork gpu_frame_work_;
     std::condition_variable completion_;
     std::vector<RetiredLog> retired_log_;
     ReplayState state_{};
@@ -3954,7 +4121,7 @@ private:
     struct SubmissionSlot {
         id<MTL4CommandAllocator> allocator = nil;
         id<MTLBuffer> visibility = nil;
-        id<MTL4CounterHeap> timestamp = nil;
+        std::array<id<MTL4CounterHeap>, timestamp_heap_limit> timestamps{};
     };
     std::array<SubmissionSlot, submission_slots> submission_storage_;
     // Allocations the last submission made resident: the next one's set starts that large.
@@ -3975,6 +4142,7 @@ private:
         std::uint64_t scheduling_period_ns = 0;
         bool preserve_encode_spin = false;
         bool frame_boundary = false;
+        std::uint64_t frame_end_fence = 0;
     };
     // The queue mutex keeps both hint fields coherent when a submission captures them.
     std::uint64_t scheduling_period_ns_ = 0;
@@ -4074,8 +4242,10 @@ void EncodeThread::run() {
 
 bool EncodeThread::exec(const EncodeRing::Header& header, const void* payload) {
     const auto argument = header.argument;
-    const auto render = (id<MTL4RenderCommandEncoder>)encoder_;
-    const auto compute = (id<MTL4ComputeCommandEncoder>)encoder_;
+    // encoder_ owns the active encoder until end_encoder. These aliases are
+    // used only during this record and never outlive or replace that owner.
+    __unsafe_unretained id<MTL4RenderCommandEncoder> render = (id<MTL4RenderCommandEncoder>)encoder_;
+    __unsafe_unretained id<MTL4ComputeCommandEncoder> compute = (id<MTL4ComputeCommandEncoder>)encoder_;
     const auto table = [&] { return (__bridge id<MTL4ArgumentTable>)record_value<TableRecord>(payload).table; };
     const auto report = [&](const char* detail) {
         if (owner_) backend_.report_encode_error(*owner_, detail);
@@ -4193,7 +4363,7 @@ bool EncodeThread::exec(const EncodeRing::Header& header, const void* payload) {
         const auto record = record_value<BarrierRecord>(payload);
         [(id<MTL4CommandEncoder>)encoder_ barrierAfterEncoderStages:record.after
                                                 beforeEncoderStages:record.before
-                                                  visibilityOptions:MTL4VisibilityOptionDevice];
+                                                  visibilityOptions:MTL4VisibilityOptionDevice | MTL4VisibilityOptions(argument)];
         break;
     }
     case EncodeOp::render_pipeline: {
@@ -5107,6 +5277,7 @@ void Encoder::note_writes() {
 void Encoder::note_shader_writes(std::size_t stage) {
     other_buffer_writes.insert(other_buffer_writes.end(), bindings[stage].writes.begin(), bindings[stage].writes.end());
     pending.buffer_writes.insert(pending.buffer_writes.end(), bindings[stage].writes.begin(), bindings[stage].writes.end());
+    for (const auto& [address, size] : bindings[stage].writes) discard_gpu_uniform_captures(address, size);
 }
 
 bool Encoder::order_buffer_writes() {
@@ -5173,12 +5344,18 @@ bool Encoder::synchronize_gpu_commit() {
     // Applying cleared pending.effects: the reports are in memory now, and
     // later effects reuse the indices that gpu_counters names.
     gpu_counters.clear();
-    effect_span = {};
+    effect_span.clear();
     if (state.samples_active && counter_begin != visibility_cursor) {
         backend.accumulate_samples(pending.visibility, counter_begin, visibility_cursor);
         counter_begin = visibility_cursor;
     }
     buffer_write_order.clear();
+    cpu_writes_completed = cpu_writes_indexed = other_buffer_writes.size();
+    current_cpu_writes.clear();
+    cpu_writes_unknown = false;
+    uniform_copy_mappings.clear();
+    uniform_copy_count = 0;
+    uniform_copy_unknown = false;
     return restart_segment();
 }
 
@@ -5210,7 +5387,7 @@ void Encoder::drain_failed_prefix() {
     pending.effects.clear();
     pending.committed_effects = 0;
     gpu_counters.clear();
-    effect_span = {};
+    effect_span.clear();
     failed = true;
     error = original;
 }
@@ -5220,7 +5397,10 @@ bool Encoder::sync_draw_resources() {
     const auto writes = memory::WriteTracker::now();
     if (registration != dirty.registration) ++pending.counters.syncs_registration;
     else if (writes != dirty.cpu_writes) ++pending.counters.syncs_writes;
-    return dirty.sync_resources(registration, writes);
+    const bool changed = dirty.sync_resources(registration, writes);
+    if (changed)
+        for (auto& stage : bindings) stage.uniform_slots = UINT32_MAX;
+    return changed;
 }
 
 bool Encoder::report_destination_isolated(std::uint64_t address, std::uint64_t size) {
@@ -5244,11 +5424,10 @@ bool Encoder::report_destination_isolated(std::uint64_t address, std::uint64_t s
                                        state.targets.depth->size)) return false;
     for (const auto& clear : deferred_clears)
         if (overlaps(clear.backing_begin, clear.backing_size)) return false;
-    for (auto word = address & ~std::uint64_t{3}; word < end;) {
-        if (uniform_words.contains(word)) return false;
-        if (word > UINT64_MAX - 4) break;
-        word += 4;
-    }
+    const auto first_word = address & ~std::uint64_t{3};
+    const auto last_word = (end - 1) & ~std::uint64_t{3};
+    if (last_word > UINT64_MAX - 4 ||
+        captured_guest_bytes.may_intersect(first_word, last_word + 4 - first_word)) return false;
     // A negative result for the whole page is reusable until registrations
     // change. Unknown or boundary-spanning storage keeps the ordered path.
     const auto page = address >> 12;
@@ -5318,6 +5497,26 @@ BufferAddress Encoder::buffer_address(std::uint64_t address, std::uint64_t size)
     return range;
 }
 
+void Encoder::update_effect_ranges() {
+    if (pending.effects.size() < effect_span.counted) effect_span.clear();
+    for (; effect_span.counted < pending.effects.size(); ++effect_span.counted) {
+        const auto& effect = pending.effects[effect_span.counted];
+        std::uintptr_t low = 0, high = 0;
+        if (effect.kind == CompletionEffect::Kind::report) {
+            low = reinterpret_cast<std::uintptr_t>(effect.destination_cpu);
+            high = low + sizeof(NVNcounterData);
+        } else if (effect.kind == CompletionEffect::Kind::signal) {
+            low = reinterpret_cast<std::uintptr_t>(effect.event);
+            high = low + sizeof(std::uint32_t);
+        } else {
+            continue;
+        }
+        effect_span.low = std::min(effect_span.low, low);
+        effect_span.high = std::max(effect_span.high, high);
+        effect_span.writes.add(low, high - low);
+    }
+}
+
 bool Encoder::order_completion_read(const BufferSpan& span, std::uint64_t size) {
     auto* contents = static_cast<std::byte*>(span.buffer.contents);
     return order_completion_read(span.buffer, span.offset, contents ? contents + span.offset : nullptr,
@@ -5335,28 +5534,13 @@ bool Encoder::order_completion_read(id<MTLBuffer> __unsafe_unretained buffer, st
         if (wait_tag) timeline_event(wait_tag, pending.fence, timeline_now_ns() - start);
         return result;
     };
-    // Every binding reads through here: a read outside the spans the
-    // completion effects write returns without scanning them.
-    if (pending.effects.size() < effect_span.counted) effect_span = {};
-    for (; effect_span.counted < pending.effects.size(); ++effect_span.counted) {
-        const auto& effect = pending.effects[effect_span.counted];
-        std::uintptr_t low = 0, high = 0;
-        if (effect.kind == CompletionEffect::Kind::report) {
-            low = reinterpret_cast<std::uintptr_t>(effect.destination_cpu);
-            high = low + sizeof(NVNcounterData);
-        } else if (effect.kind == CompletionEffect::Kind::signal) {
-            low = reinterpret_cast<std::uintptr_t>(effect.event);
-            high = low + sizeof(std::uint32_t);
-        } else {
-            continue;
-        }
-        effect_span.low = std::min(effect_span.low, low);
-        effect_span.high = std::max(effect_span.high, high);
-    }
-    const bool outside_pending = cpu && (begin + size <= effect_span.low || effect_span.high <= begin);
+    update_effect_ranges();
+    const bool outside_pending = cpu && (begin + size <= effect_span.low || effect_span.high <= begin ||
+        !effect_span.writes.may_intersect(begin, size));
     for (const auto& previous : previous_submissions) {
         if (previous->fence <= retired_fence) continue;
-        if (cpu && (begin + size <= previous->completion_low || previous->completion_high <= begin)) continue;
+        if (cpu && (begin + size <= previous->completion_low || previous->completion_high <= begin ||
+                    !previous->completion_ranges.may_intersect(begin, size))) continue;
         for (const auto& [write_begin, write_end] : previous->completion_writes)
             if (begin < write_end && write_begin < begin + size) {
                 if (ordered) *ordered = true;
@@ -5390,6 +5574,7 @@ bool Encoder::order_completion_read(id<MTLBuffer> __unsafe_unretained buffer, st
 bool Encoder::enqueue_counter(const ReportCounter& command, const BufferSpan& destination,
                               std::byte* destination_cpu) {
     if (!flush_uniforms()) return false;
+    discard_uniform_captures(reinterpret_cast<std::uintptr_t>(destination_cpu), 0, sizeof(NVNcounterData));
     CompletionEffect effect{};
     effect.kind = CompletionEffect::Kind::report;
     effect.destination = destination;
@@ -5409,12 +5594,12 @@ bool Encoder::enqueue_counter(const ReportCounter& command, const BufferSpan& de
         close_render(PassBreak::counter);
         close_transfer();
     }
-    if (pending.timestamp_count >= 1024)
-        return fail(ReplayErrorCode::allocation, "submission timestamp storage is exhausted");
-    effect.timestamp = backend.counter_heap(pending.fence);
-    effect.timestamp_index = pending.timestamp_count++;
+    if (pending.timestamp_count >= ReplayImpl::timestamp_heap_capacity * ReplayImpl::timestamp_heap_limit)
+        return fail(ReplayErrorCode::allocation, "submission timestamp limit of 4096 reports is exhausted");
+    effect.timestamp = backend.counter_heap(pending.fence, pending.timestamp_count);
     if (!effect.timestamp)
         return fail(ReplayErrorCode::allocation, "GPU counter heap creation failed");
+    effect.timestamp_index = pending.timestamp_count++ % ReplayImpl::timestamp_heap_capacity;
     [backend.device() sampleTimestamps:&effect.cpu_before gpuTimestamp:&effect.gpu_before];
     if (in_pass) write_render_timestamp(effect.timestamp, effect.timestamp_index);
     else write_timestamp(effect.timestamp, effect.timestamp_index);
@@ -5477,7 +5662,6 @@ bool Encoder::gpu_predicate(const RenderEnableConditional& command, bool& handle
     PredicateJob job{};
     job.visibility = pending.visibility.gpuAddress;
     job.render_if_equal = command.mode == NVN_CONDITIONAL_RENDER_MODE_RENDER_IF_EQUAL;
-    job.capacity = predicate_capacity;
     for (std::size_t index = 0; index != 2; ++index) {
         const auto address = command.address + index * sizeof(NVNcounterData);
         // The raw lookup: Encoder::buffer_at would wait for this submission's
@@ -5487,19 +5671,22 @@ bool Encoder::gpu_predicate(const RenderEnableConditional& command, bool& handle
         const auto* cpu = static_cast<const std::byte*>(span.buffer.contents) + span.offset;
         // The latest pending effect that writes the counter decides its value.
         std::optional<std::size_t> writer;
-        for (std::size_t effect = pending.effects.size(); effect-- != 0;) {
-            const auto& candidate = pending.effects[effect];
-            bool writes = false;
-            if (candidate.kind == CompletionEffect::Kind::report)
-                writes = candidate.destination.buffer == span.buffer &&
-                    span.offset < candidate.destination.offset + sizeof(NVNcounterData) &&
-                    candidate.destination.offset < span.offset + sizeof(std::uint64_t);
-            else if (candidate.kind == CompletionEffect::Kind::signal) {
-                const auto event = reinterpret_cast<std::uintptr_t>(candidate.event);
-                const auto begin = reinterpret_cast<std::uintptr_t>(cpu);
-                writes = begin < event + sizeof(std::uint32_t) && event < begin + sizeof(std::uint64_t);
+        update_effect_ranges();
+        if (effect_span.writes.may_intersect(reinterpret_cast<std::uintptr_t>(cpu), sizeof(std::uint64_t))) {
+            for (std::size_t effect = pending.effects.size(); effect-- != 0;) {
+                const auto& candidate = pending.effects[effect];
+                bool writes = false;
+                if (candidate.kind == CompletionEffect::Kind::report)
+                    writes = candidate.destination.buffer == span.buffer &&
+                        span.offset < candidate.destination.offset + sizeof(NVNcounterData) &&
+                        candidate.destination.offset < span.offset + sizeof(std::uint64_t);
+                else if (candidate.kind == CompletionEffect::Kind::signal) {
+                    const auto event = reinterpret_cast<std::uintptr_t>(candidate.event);
+                    const auto begin = reinterpret_cast<std::uintptr_t>(cpu);
+                    writes = begin < event + sizeof(std::uint32_t) && event < begin + sizeof(std::uint64_t);
+                }
+                if (writes) { writer = effect; break; }
             }
-            if (writes) { writer = effect; break; }
         }
         if (writer) {
             const auto found = std::find_if(gpu_counters.rbegin(), gpu_counters.rend(),
@@ -5561,6 +5748,7 @@ bool Encoder::gpu_predicate(const RenderEnableConditional& command, bool& handle
     // block's new pass, or for a kernel before intervening transfer work.
     predicate.job = slice.gpu;
     predicate.arguments = slice.cpu + 64;
+    predicate.record_count = reinterpret_cast<std::uint32_t*>(slice.cpu + offsetof(PredicateJob, record_count));
     predicate.arguments_gpu = slice.gpu + 64;
     predicate.used = 0;
     predicate.mode = command.mode;
@@ -5653,6 +5841,10 @@ std::uint64_t Encoder::predicate_arguments(const void* record, std::size_t size)
     }
     const auto offset = std::size_t(predicate.used++) * predicate_record;
     std::memcpy(predicate.arguments + offset, record, size);
+    // Publish the extent after the payload. Both reach the GPU only when the
+    // segment commits: automatic cuts reject open predicates, and a drain or
+    // submission end seals the block before committing its argument storage.
+    *predicate.record_count = predicate.used;
     return predicate.arguments_gpu + offset;
 }
 
@@ -5774,8 +5966,11 @@ bool Encoder::copy_block_aliases(bool to_alias) {
 
 void Encoder::note_texture_write(const TextureState& texture) {
     pending.texture_writes.push_back(texture);
-    if (texture.memory && texture.size && backend.resources().texture_is_in_place(texture))
-        other_buffer_writes.emplace_back(reinterpret_cast<std::uint64_t>(texture.memory), texture.size);
+    if (texture.memory && texture.size && backend.resources().texture_is_in_place(texture)) {
+        const auto cpu = reinterpret_cast<std::uintptr_t>(texture.memory);
+        other_buffer_writes.emplace_back(cpu, texture.size);
+        discard_uniform_captures(cpu, 0, texture.size);
+    }
 }
 
 bool Encoder::open_transfer_with(std::span<const GuestAccess> accesses, bool declared) {
@@ -6402,11 +6597,37 @@ std::array<std::byte, 0xa00> Encoder::driver_constants(std::size_t stage, std::u
     return bytes;
 }
 
-void Encoder::order_cpu_read(std::uint64_t address, std::uint64_t size, bool overlay) {
+bool Encoder::current_buffer_write_overlap(std::uintptr_t cpu, std::uint64_t size) {
+    if (!size || cpu_writes_completed == other_buffer_writes.size()) return false;
+    if (cpu_addressed_buffers && cpu) return buffer_writes_overlap(cpu, size, cpu_writes_completed);
+    const auto registration = backend.resources().registration_generation();
+    if (registration != cpu_writes_registration) {
+        cpu_writes_registration = registration;
+        cpu_writes_indexed = cpu_writes_completed;
+        current_cpu_writes.clear();
+        cpu_writes_unknown = false;
+    }
+    while (cpu_writes_indexed < other_buffer_writes.size()) {
+        const auto [address, length] = other_buffer_writes[cpu_writes_indexed++];
+        if (!length) continue;
+        const auto synchronizations = gpu_synchronizations;
+        const auto range = backend.resources().buffer_address(address, length);
+        if (failed) return true;
+        if (gpu_synchronizations != synchronizations)
+            return current_buffer_write_overlap(cpu, size);
+        if (!range.buffer) continue;  // Unbacked shader stores target private scratch.
+        if (range.cpu) current_cpu_writes.add(reinterpret_cast<std::uintptr_t>(range.cpu), length);
+        else cpu_writes_unknown = true;
+    }
+    return !cpu || cpu_writes_unknown || current_cpu_writes.may_intersect(cpu, size);
+}
+
+bool Encoder::order_cpu_read(std::uint64_t address, std::uint64_t size, bool overlay,
+                             const std::byte* cpu, bool current) {
     for (const auto& previous : previous_submissions) {
         if (previous->fence <= retired_fence) continue;
-        // Uniform updates have captured CPU bytes, so an overlay can consume
-        // them without waiting. Other GPU writes require actual completion.
+        // Captured uniform bytes can be overlaid without waiting; ordinary
+        // GPU writers must finish before their backing is read on the CPU.
         const auto& writes = overlay ? previous->other_buffer_writes : previous->buffer_writes;
         for (const auto& [begin, length] : writes)
             if (address < begin + length && begin < address + size) {
@@ -6415,9 +6636,190 @@ void Encoder::order_cpu_read(std::uint64_t address, std::uint64_t size, bool ove
                 break;
             }
     }
+    if (current) {
+        if (!order_completion_read(nil, 0, cpu, size)) return false;
+        const auto pointer = reinterpret_cast<std::uintptr_t>(cpu);
+        const bool version_alias = !cpu_addressed_buffers && pointer && std::ranges::any_of(uniform_versions, [&](const auto& version) {
+            if (!version.source_cpu) return false;
+            const auto [first, last] = overlap_offsets(version.source_cpu, version.end - version.begin, pointer, size);
+            return first != last && version.begin + first != address + (version.source_cpu + first - pointer);
+        });
+        if (version_alias && !flush_uniforms()) return false;
+        const bool copied_alias = !cpu_addressed_buffers &&
+            (uniform_copy_unknown || mapping_alias(uniform_copy_mappings, pointer, address, size));
+        const bool written = copied_alias || current_buffer_write_overlap(pointer, size);
+        if (failed || (written && !synchronize_gpu())) return false;
+    }
+    return !failed;
 }
 
-void Encoder::overlay_uniform(std::uint64_t address, std::byte* bytes, std::size_t size) const {
+void Encoder::record_uniform_update(std::uint64_t address, std::uint64_t size,
+                                    const std::byte* bytes, const BufferSpan& destination) {
+    ++pending.counters.uniform_updates;
+    ++update_generation;
+    const auto* contents = cpu_addressed_buffers ? reinterpret_cast<const std::byte*>(address) :
+        static_cast<const std::byte*>(destination.buffer.contents);
+    const auto cpu = cpu_addressed_buffers ? address :
+        contents ? reinterpret_cast<std::uintptr_t>(contents + destination.offset) : 0;
+    const auto gpu = cpu_addressed_buffers ? 0 : destination.buffer.gpuAddress + destination.offset;
+    // Keep the latest disjoint pieces. An outer rewrite must not discard an
+    // older tail, and normalization bounds fragmentation by captured bytes.
+    if (!uniform_updates.empty() && captured_guest_bytes.may_intersect(address, size)) {
+        // Captures are disjoint in guest address space. An exact replacement
+        // changes no range or backing index and needs no vector allocation.
+        for (auto& old : uniform_updates)
+            if (old.address == address && old.size == size && old.cpu == cpu && old.gpu == gpu) {
+                old.bytes = bytes;
+                return;
+            }
+        std::vector<UniformUpdate> kept;
+        kept.reserve(uniform_updates.size() + 1);
+        for (const auto& old : uniform_updates) {
+            const auto [first, last] = overlap_offsets(old.address, old.size, address, size);
+            if (first == last) kept.push_back(old);
+            else {
+                if (first) kept.push_back(uniform_slice(old, 0, first));
+                if (last < old.size) kept.push_back(uniform_slice(old, last, old.size - last));
+            }
+        }
+        uniform_updates = std::move(kept);
+    }
+    uniform_updates.push_back({address, size, bytes, cpu, gpu});
+    capture_retirement_needed |= uniform_updates.size() >= 4096;
+    captured_guest_bytes.add(address, size);
+    const auto prefix = address & 3;
+    const auto covered = (prefix + size + 3) & ~std::uint64_t{3};
+    if (cpu) captured_cpu_words.add(cpu - prefix, covered);
+    if (gpu) captured_gpu_words.add(gpu - prefix, covered);
+    note_update_pages(address, size);
+}
+
+void Encoder::refresh_uniform_words(std::uint64_t address, std::uint64_t size, const std::byte* bytes) {
+    const auto first = address & ~std::uint64_t{3};
+    const auto last = (address + size - 1) & ~std::uint64_t{3};
+    const auto words = (last - first) / 4 + 1;
+    const auto refresh = [&](auto found) {
+        const auto word = found->first;
+        const auto [begin, end] = overlap_offsets(word, 4, address, size);
+        if (begin != end) {
+            if (begin || end != 4) return uniform_words.erase(found);
+            std::memcpy(&found->second, bytes + word - address, 4);
+        }
+        return ++found;
+    };
+    // Update only existing cache entries, with work bounded by the smaller
+    // of the touched words and the populated cache. Unqueried data costs none.
+    if (words < uniform_words.size()) {
+        for (std::uint64_t index = 0; index < words; ++index)
+            if (const auto found = uniform_words.find(first + index * 4); found != uniform_words.end())
+                refresh(found);
+    } else {
+        for (auto found = uniform_words.begin(); found != uniform_words.end();) found = refresh(found);
+    }
+}
+
+void Encoder::discard_uniform_captures(std::uintptr_t cpu, std::uint64_t gpu, std::uint64_t size) {
+    if (!size || uniform_updates.empty() || capture_retirement_needed) return;
+    if ((!cpu || !captured_cpu_words.may_intersect(cpu, size)) &&
+        (!gpu || !captured_gpu_words.may_intersect(gpu, size))) return;
+    const auto overlap = [&](const UniformUpdate& update, bool words) {
+        const auto prefix = words ? update.address & 3 : 0;
+        const auto length = words ? (prefix + update.size + 3) & ~std::uint64_t{3} : update.size;
+        if (cpu && update.cpu) {
+            const auto hit = overlap_offsets(update.cpu - prefix, length, cpu, size);
+            if (hit.first != hit.second) return hit;
+        }
+        if (gpu && update.gpu) return overlap_offsets(update.gpu - prefix, length, gpu, size);
+        return std::pair<std::uint64_t, std::uint64_t>{};
+    };
+    bool changed = false;
+    for (const auto& update : uniform_updates) {
+        const auto [first, last] = overlap(update, true);
+        if (first == last) continue;
+        changed = true;
+        const auto base = update.address & ~std::uint64_t{3};
+        for (auto word = (base + first) & ~std::uint64_t{3}; word < base + last; word += 4)
+            uniform_words.erase(word);
+    }
+    if (!changed) return;
+    std::vector<UniformUpdate> kept;
+    kept.reserve(uniform_updates.size() + 1);
+    for (const auto& update : uniform_updates) {
+        const auto [first, last] = overlap(update, false);
+        if (first == last) kept.push_back(update);
+        else {
+            if (first) kept.push_back(uniform_slice(update, 0, first));
+            if (last < update.size) kept.push_back(uniform_slice(update, last, update.size - last));
+        }
+    }
+    uniform_updates = std::move(kept);
+    ++update_generation;
+    rebuild_capture_ranges();
+    capture_retirement_needed |= uniform_updates.size() >= 4096;
+}
+
+bool Encoder::retire_captures_if_full() {
+    if (!capture_retirement_needed && uniform_updates.size() < 4096 && uniform_copy_count < 4096) return true;
+    // Retire only at a command boundary: the previous writer has been fully
+    // emitted. Completion makes every retained byte available in its backing.
+    if (!synchronize_gpu()) return false;
+    uniform_updates.clear();
+    uniform_words.clear();
+    update_pages = {};
+    rebuild_capture_ranges();
+    capture_retirement_needed = false;
+    ++update_generation;
+    invalidate_args_all();
+    return true;
+}
+
+void Encoder::rebuild_capture_ranges() {
+    captured_guest_bytes.clear();
+    captured_cpu_words.clear();
+    captured_gpu_words.clear();
+    for (const auto& update : uniform_updates) {
+        captured_guest_bytes.add(update.address, update.size);
+        const auto prefix = update.address & 3;
+        const auto size = (prefix + update.size + 3) & ~std::uint64_t{3};
+        if (update.cpu) captured_cpu_words.add(update.cpu - prefix, size);
+        if (update.gpu) captured_gpu_words.add(update.gpu - prefix, size);
+    }
+}
+
+bool Encoder::uniform_capture_alias(std::uint64_t address, std::uint64_t size,
+                                    const BufferSpan& span) const {
+    if (cpu_addressed_buffers) return false;
+    const auto cpu = span.buffer.contents
+        ? reinterpret_cast<std::uintptr_t>(span.buffer.contents) + span.offset : 0;
+    const auto gpu = span.buffer.gpuAddress + span.offset;
+    if ((!cpu || !captured_cpu_words.may_intersect(cpu, size)) &&
+        !captured_gpu_words.may_intersect(gpu, size)) return false;
+    for (const auto& update : uniform_updates) {
+        const auto prefix = update.address & 3;
+        const auto length = (prefix + update.size + 3) & ~std::uint64_t{3};
+        const auto different = [&](std::uint64_t old, std::uint64_t next) {
+            if (!old || !next) return false;
+            const auto [first, last] = overlap_offsets(old - prefix, length, next, size);
+            return first != last && update.address - prefix + first != address + (old - prefix + first - next);
+        };
+        if (different(update.cpu, cpu) || different(update.gpu, gpu)) return true;
+    }
+    return false;
+}
+
+void Encoder::discard_gpu_uniform_captures(std::uint64_t address, std::uint64_t size) {
+    if (!size || uniform_updates.empty()) return;
+    if (cpu_addressed_buffers && !captured_cpu_words.may_intersect(address, size)) return;
+    const auto range = backend.resources().buffer_address(address, size);
+    if (failed) return;
+    // Unbacked writable bindings use private scratch; they do not overwrite
+    // any guest capture. Their absence is not a missing-resource error.
+    if (!range.buffer) return;
+    discard_uniform_captures(reinterpret_cast<std::uintptr_t>(range.cpu), range.gpu, size);
+}
+
+void Encoder::overlay_uniform(std::uint64_t address, std::byte* bytes, std::size_t size,
+                               std::uint32_t* covered, bool current_only) const {
     // Updates are appended in command order and one window is updated at one
     // offset about two hundred times a frame: the range is compared before any
     // address arithmetic and a scan stops at the first update past the range
@@ -6443,10 +6845,14 @@ void Encoder::overlay_uniform(std::uint64_t address, std::byte* bytes, std::size
             const auto end = std::min(address + size, update.address + update.size);
             pending.counters.overlay_bytes += end - begin;
             std::memcpy(bytes + begin - address, update.bytes + begin - update.address, end - begin);
+            if (covered)
+                for (auto byte = begin - address; byte < std::min<std::uint64_t>(end - address, 32); ++byte)
+                    *covered |= 1u << byte;
         }
     };
-    for (const auto& previous : previous_submissions)
-        if (previous->fence > retired_fence) apply(previous->uniform_updates);
+    if (!current_only)
+        for (const auto& previous : previous_submissions)
+            if (previous->fence > retired_fence) apply(previous->uniform_updates);
     apply(uniform_updates);
 }
 
@@ -6464,7 +6870,11 @@ bool Encoder::fill_uniform(UniformVersion& version, std::uint64_t end) {
     if (listed && gpu_synchronizations != synchronizations) return !failed;
     if (!source.buffer.contents)
         return fail(ReplayErrorCode::missing_resource, "uniform version source is unavailable");
-    order_cpu_read(address, end - address, true);
+    // A live version is flushed before a later overlapping writer. Reading
+    // its base must not wait for a writer that has not yet been emitted.
+    if (!order_cpu_read(address, end - address, true,
+            static_cast<const std::byte*>(source.buffer.contents) + source.offset, false)) return false;
+    if (listed && gpu_synchronizations != synchronizations) return !failed;
     auto* bytes = version.slice.cpu + address - version.begin;
     ++pending.counters.fill_calls;
     pending.counters.fill_bytes += end - address;
@@ -6476,13 +6886,167 @@ bool Encoder::fill_uniform(UniformVersion& version, std::uint64_t end) {
     return true;
 }
 
-bool Encoder::uniform_conflict(std::uint64_t address, std::uint64_t size) const {
-    return std::any_of(uniform_versions.begin(), uniform_versions.end(), [&](const auto& version) {
-        return address && size && address < version.end && version.begin < address + size;
+bool Encoder::uniform_cpu_conflict(std::uintptr_t cpu, std::uint64_t size) const {
+    if (!cpu || !size || uniform_versions.empty() || cpu >= uniform_cpu_high ||
+        (cpu < uniform_cpu_low && size <= uniform_cpu_low - cpu)) return false;
+    return std::ranges::any_of(uniform_versions, [&](const auto& version) {
+        const auto hit = overlap_offsets(version.source_cpu, version.end - version.begin, cpu, size);
+        return version.source_cpu && hit.first != hit.second;
     });
 }
 
-bool Encoder::version_uniform(std::uint64_t address, std::uint64_t size, const std::byte* bytes) {
+bool Encoder::uniform_conflict(std::uint64_t address, std::uint64_t size) {
+    if (!address || !size || uniform_versions.empty()) return false;
+    if (std::ranges::any_of(uniform_versions, [&](const auto& version) {
+            const auto hit = overlap_offsets(version.begin, version.end - version.begin, address, size);
+            return hit.first != hit.second;
+        })) return true;
+    if (cpu_addressed_buffers) return false;
+    const auto synchronizations = gpu_synchronizations;
+    const auto range = backend.resources().buffer_address(address, size);
+    if (failed) return true;
+    if (gpu_synchronizations != synchronizations) return !uniform_versions.empty();
+    if (!range.buffer) return true;
+    return uniform_cpu_conflict(reinterpret_cast<std::uintptr_t>(range.cpu), size) ||
+        std::ranges::any_of(uniform_versions, [&](const auto& version) {
+            const auto hit = overlap_offsets(version.source_gpu, version.end - version.begin, range.gpu, size);
+            return version.source_gpu && range.gpu && hit.first != hit.second;
+        });
+}
+
+// Different GPU addresses over the same CPU bytes require alias cache
+// visibility, not just execution order or ordinary device visibility.
+void Encoder::record_alias_mapping(std::vector<PhysicalMapping>& mappings,
+                                   std::uintptr_t cpu, std::uint64_t gpu, std::uint64_t size) {
+    if (!cpu || !gpu || !size) return;
+    const auto end = cpu + size;
+    if (mappings.empty() || mappings.back().cpu + mappings.back().size <= cpu) {
+        if (!mappings.empty() && mappings.back().cpu + mappings.back().size == cpu &&
+            mappings.back().gpu && mappings.back().gpu + mappings.back().size == gpu)
+            mappings.back().size += size;
+        else mappings.push_back({cpu, gpu, size});
+        return;
+    }
+    const auto first = std::lower_bound(mappings.begin(), mappings.end(), cpu,
+        [](const auto& mapping, auto begin) { return mapping.cpu + mapping.size <= begin; });
+    if (first != mappings.end() && first->cpu <= cpu &&
+        end <= first->cpu + first->size && (!first->gpu || first->gpu + cpu - first->cpu == gpu)) return;
+    std::vector<PhysicalMapping> next;
+    next.reserve(mappings.size() + 2);
+    const auto append = [&](std::uintptr_t begin, std::uint64_t limit, std::uint64_t native) {
+        if (begin >= limit) return;
+        if (!next.empty()) {
+            auto& prior = next.back();
+            if (prior.cpu + prior.size == begin &&
+                ((!prior.gpu && !native) || (prior.gpu && native && prior.gpu + prior.size == native))) {
+                prior.size += limit - begin;
+                return;
+            }
+        }
+        next.push_back({begin, native, limit - begin});
+    };
+    auto cursor = cpu;
+    for (const auto& old : mappings) {
+        const auto old_end = old.cpu + old.size;
+        if (old_end <= cpu) { append(old.cpu, old_end, old.gpu); continue; }
+        if (old.cpu >= end) {
+            append(cursor, end, gpu + cursor - cpu); cursor = end;
+            append(old.cpu, old_end, old.gpu); continue;
+        }
+        append(old.cpu, std::min<std::uint64_t>(cpu, old_end), old.gpu);
+        append(cursor, std::min<std::uint64_t>(old.cpu, end), gpu + cursor - cpu);
+        const auto begin = std::max<std::uint64_t>(cpu, old.cpu);
+        const auto limit = std::min<std::uint64_t>(end, old_end);
+        const auto native = gpu + begin - cpu;
+        append(begin, limit, old.gpu && old.gpu + begin - old.cpu == native ? native : 0);
+        cursor = limit;
+        append(limit, old_end, old.gpu ? old.gpu + limit - old.cpu : 0);
+    }
+    append(cursor, end, gpu + cursor - cpu);
+    // Each insertion adds at most two endpoints; callers bound their histories.
+    mappings = std::move(next);
+}
+
+bool Encoder::mapping_alias(const std::vector<PhysicalMapping>& mappings,
+                            std::uintptr_t cpu, std::uint64_t gpu, std::uint64_t size) {
+    if (!cpu || !gpu || !size) return false;
+    auto mapping = std::lower_bound(mappings.begin(), mappings.end(), cpu,
+        [](const auto& entry, auto begin) { return entry.cpu + entry.size <= begin; });
+    for (; mapping != mappings.end() && mapping->cpu < cpu + size; ++mapping) {
+        const auto first = std::max<std::uint64_t>(cpu, mapping->cpu);
+        if (!mapping->gpu || mapping->gpu + first - mapping->cpu != gpu + first - cpu) return true;
+    }
+    return false;
+}
+
+bool Encoder::needs_alias_visibility(std::uintptr_t cpu, std::uint64_t gpu, std::uint64_t size) const {
+    return mapping_alias(uniform_native_mappings, cpu, gpu, size);
+}
+
+void Encoder::record_uniform_copy(std::uint64_t address, std::uint64_t size, const BufferSpan& destination) {
+    const auto* contents = static_cast<const std::byte*>(destination.buffer.contents);
+    // Keep every actual copy's native mapping, including fallback copies.
+    // The disjoint index has at most two endpoints per resident destination
+    // allocation; repeated updates to one allocation do not grow it.
+    record_alias_mapping(uniform_native_mappings, reinterpret_cast<std::uintptr_t>(contents),
+                         destination.buffer.gpuAddress, destination.buffer.length);
+    if (cpu_addressed_buffers) return;
+    ++uniform_copy_count;
+    capture_retirement_needed |= uniform_copy_count >= 4096;
+    if (contents) record_alias_mapping(uniform_copy_mappings,
+        reinterpret_cast<std::uintptr_t>(contents + destination.offset), address, size);
+    else uniform_copy_unknown = true;
+}
+
+bool Encoder::prepare_uniform_access(std::uint64_t address, std::uint64_t size, std::uint64_t second) {
+    const bool first_conflict = uniform_conflict(address, size);
+    const bool second_conflict = second && uniform_conflict(second, size);
+    if (failed || ((first_conflict || second_conflict) && !flush_uniforms())) return false;
+    if (uniform_native_mappings.empty() || !size) return true;
+    const auto aliased = [&](std::uint64_t begin) {
+        if (!begin) return false;
+        if (cpu_addressed_buffers) {
+            const auto low = uniform_native_mappings.front().cpu;
+            const auto& last = uniform_native_mappings.back();
+            const auto high = last.cpu + last.size;
+            if (begin >= high || (begin < low && size <= low - begin)) return false;
+        }
+        const auto range = backend.resources().buffer_address(begin, size);
+        return needs_alias_visibility(reinterpret_cast<std::uintptr_t>(range.cpu), range.gpu, size);
+    };
+    const bool alias = aliased(address) || (second && aliased(second));
+    if (failed) return false;
+    if (!alias) return true;
+    if (render) {
+        encoder_barrier(render, MTLStageVertex, MTLStageVertex | MTLStageFragment,
+                        MTL4VisibilityOptionResourceAlias);
+    } else {
+        if (!transfer && !open_transfer()) return false;
+        encoder_barrier(transfer, MTLStageBlit | MTLStageDispatch, MTLStageBlit | MTLStageDispatch,
+                        MTL4VisibilityOptionResourceAlias);
+    }
+    return !failed;
+}
+
+bool Encoder::prepare_graphics_uniform_writes() {
+    if (uniform_versions.empty()) return true;
+    constexpr auto graphics_writers = (1u << NVN_SHADER_STAGE_VERTEX) | (1u << NVN_SHADER_STAGE_FRAGMENT);
+    if (state.write_stages & graphics_writers) return flush_uniforms();
+    // Target snapshots change only at a target bind. Reject disjoint CPU
+    // bounds before inspecting each attachment on every draw.
+    if (uniform_cpu_high <= attachment_cpu_low || attachment_cpu_high <= uniform_cpu_low) return true;
+    const auto overlaps = [&](const TextureState* target) {
+        return target && target->memory && uniform_cpu_conflict(
+            reinterpret_cast<std::uintptr_t>(target->memory), target->size) &&
+            backend.resources().texture_is_in_place(*target);
+    };
+    for (const auto* target : state.targets.color)
+        if (overlaps(target)) return flush_uniforms();
+    return !overlaps(state.targets.depth) || flush_uniforms();
+}
+
+bool Encoder::version_uniform(std::uint64_t address, std::uint64_t size, const std::byte* bytes,
+                               const BufferSpan& destination) {
     std::uint64_t begin = 0, end = 0;
     for (const auto& stage : state.uniform) {
         for (const auto& binding : stage)
@@ -6494,7 +7058,17 @@ bool Encoder::version_uniform(std::uint64_t address, std::uint64_t size, const s
             }
         if (end) break;
     }
-    if (!end || end - begin > 64 * 1024 || uniform_updates.size() >= 4096) return false;
+    if (!end || end - begin > 64 * 1024 || pending.counters.uniform_updates >= 4096) return false;
+    const auto* contents = cpu_addressed_buffers ? reinterpret_cast<const std::byte*>(address) :
+        static_cast<const std::byte*>(destination.buffer.contents);
+    const auto delta = address - begin;
+    if (!contents || delta > destination.offset) return false;
+    const auto source_cpu = cpu_addressed_buffers ? std::uintptr_t(begin) :
+        reinterpret_cast<std::uintptr_t>(contents + destination.offset - delta);
+    const auto source_gpu = cpu_addressed_buffers ? 0 : destination.buffer.gpuAddress + destination.offset - delta;
+    if (!cpu_addressed_buffers && (uniform_copy_unknown ||
+        mapping_alias(uniform_copy_mappings, source_cpu, begin, end - begin) ||
+        current_buffer_write_overlap(source_cpu, end - begin))) return false;
     const auto overlaps = [&](std::uint64_t address, std::uint64_t size) {
         return address && size && address < end && begin < address + size;
     };
@@ -6518,12 +7092,14 @@ bool Encoder::version_uniform(std::uint64_t address, std::uint64_t size, const s
     if (!version) {
         if (uniform_versions.size() >= 64) return false;
         ++pending.counters.version_creations;
-        uniform_versions.push_back({begin, end, begin, address, address + size, {}});
+        uniform_versions.push_back({begin, end, begin, address, address + size, {}, source_cpu, source_gpu});
+        uniform_cpu_low = std::min(uniform_cpu_low, source_cpu);
+        uniform_cpu_high = std::max(uniform_cpu_high, source_cpu + std::uintptr_t(end - begin));
         version = &uniform_versions.back();
     }
     version->dirty_begin = std::min(version->dirty_begin, address);
     version->dirty_end = std::max(version->dirty_end, address + size);
-    record_uniform_update(address, size, bytes);
+    record_uniform_update(address, size, bytes, destination);
     // One upload slice carries the whole window for the submission's lifetime
     // and is written in place. Reallocating a slice per extension copied the
     // window prefix again each time: the game updates one 64 KB window about
@@ -6576,8 +7152,11 @@ std::uint64_t Encoder::uniform_address(const BoundBuffer& binding, std::uint64_t
 }
 
 bool Encoder::flush_uniforms() {
+    if (failed) return false;
     auto versions = std::move(uniform_versions);
     uniform_versions.clear();
+    uniform_cpu_low = UINTPTR_MAX;
+    uniform_cpu_high = 0;
     for (auto& version : versions) {
         if (!fill_uniform(version, version.dirty_end)) return false;
         const auto size = version.dirty_end - version.dirty_begin;
@@ -6588,9 +7167,16 @@ bool Encoder::flush_uniforms() {
         const GuestAccess writeback{version.dirty_begin, version.dirty_begin + size, true};
         if (!open_transfer_with({&writeback, 1}, true)) return false;
         make_resident(pending, destination.buffer);
+        const auto cpu = reinterpret_cast<std::uintptr_t>(destination.buffer.contents);
+        const auto gpu = destination.buffer.gpuAddress;
+        if (needs_alias_visibility(cpu ? cpu + destination.offset : 0,
+                                   gpu + destination.offset, size))
+            encoder_barrier(transfer, MTLStageBlit | MTLStageDispatch, MTLStageBlit | MTLStageDispatch,
+                            MTL4VisibilityOptionResourceAlias);
         copy_buffer_range(version.slice.buffer, version.slice.offset + version.dirty_begin - version.begin,
                           destination.buffer, destination.offset, size);
         pending.buffer_writes.emplace_back(version.dirty_begin, size);
+        record_uniform_copy(version.dirty_begin, size, destination);
         buffer_write_order.write();
         ++backend.mutable_statistics().copies;
     }
@@ -6613,9 +7199,10 @@ UploadSlice Encoder::upload(std::size_t size, const void* data) {
 // their uniform buffers; the rest of a stage's bindings need resolving again
 // only when the update lands on a word the stage's shader reads a texture
 // handle or storage descriptor from. Other stages rebind in full.
-void Encoder::invalidate_uniforms(std::uint64_t address, std::uint64_t size) {
+void Encoder::invalidate_uniforms(std::uint64_t address, std::uint64_t size, std::uintptr_t cpu) {
     if (!uniform_rebind_enabled()) return invalidate_args_all();
     for (std::size_t stage = 0; stage < stage_count; ++stage) {
+        bindings[stage].uniform_slots = UINT32_MAX;
         if (stage != NVN_SHADER_STAGE_VERTEX && stage != NVN_SHADER_STAGE_FRAGMENT) {
             dirty.arguments[stage] = true;
             continue;
@@ -6625,6 +7212,12 @@ void Encoder::invalidate_uniforms(std::uint64_t address, std::uint64_t size) {
             const auto bound = hardware_buffer(stage, read.slot);
             const auto begin = bound.address + read.offset;
             contents = bound.address && address < begin + read.length && begin < address + size;
+            if (!contents && !cpu_addressed_buffers && cpu && bound.address) {
+                const auto range = backend.resources().buffer_address(begin, read.length);
+                const auto [first, last] = overlap_offsets(cpu, size,
+                    reinterpret_cast<std::uintptr_t>(range.cpu), range.cpu ? read.length : 0);
+                contents = first != last;
+            }
             if (contents) break;
         }
         if (contents) dirty.arguments[stage] = true;
@@ -6632,10 +7225,36 @@ void Encoder::invalidate_uniforms(std::uint64_t address, std::uint64_t size) {
     }
 }
 
+bool Encoder::buffer_writes_overlap(std::uint64_t address, std::uint64_t size, std::size_t first) {
+    if (buffer_writes_indexed > other_buffer_writes.size()) {
+        buffer_writes_indexed = 0;
+        buffer_write_ranges.clear();
+    }
+    while (buffer_writes_indexed < other_buffer_writes.size()) {
+        const auto& range = other_buffer_writes[buffer_writes_indexed++];
+        buffer_write_ranges.add(range.first, range.second);
+    }
+    if (const auto overlap = buffer_write_ranges.intersection(address, size)) {
+        if (!*overlap || first == 0) return *overlap;
+    }
+    // A full-history hit may belong before a cached window's snapshot. Keep
+    // its precise suffix check, and the legacy rules for ambiguous ranges.
+    return std::any_of(other_buffer_writes.begin() + std::ptrdiff_t(first),
+                       other_buffer_writes.end(), [&](const auto& range) {
+        return address < range.first + range.second && range.first < address + size;
+    });
+}
+
 bool Encoder::bind_stage(std::size_t stage_index,
                          const platform::CompiledGraphicsStage& shader,
                          __unsafe_unretained id<MTL4ArgumentTable> table, bool vertex,
                          bool uniforms_only) {
+    // New writes can affect descriptor-only slots absent from constant-buffer
+    // reflection. Rebuild the whole stage to order those resource reads too.
+    if (uniforms_only && stage_index < stage_count &&
+        (bindings[stage_index].uniform_effects != pending.effects.size() ||
+         bindings[stage_index].uniform_writes != other_buffer_writes.size()))
+        uniforms_only = false;
     ++backend.mutable_statistics().stage_binds;
     ++pending.counters.stage_binds;
     if (uniforms_only) {
@@ -6648,6 +7267,16 @@ bool Encoder::bind_stage(std::size_t stage_index,
         sync_draw_resources())
         for (auto& bound : bindings) bound.windows.fill({});
     auto& stage = bindings[stage_index];
+    // An unchanged write history allows a uniform-only rebind to retain the
+    // other constant addresses.
+    const auto uniform_slots = uniforms_only ? stage.uniform_slots : UINT32_MAX;
+    const auto uniform_synchronizations = gpu_synchronizations;
+    const auto uniform_version_count = uniform_versions.size();
+    const auto finish_uniforms = [&] {
+        stage.uniform_slots = 0;
+        stage.uniform_effects = pending.effects.size();
+        stage.uniform_writes = other_buffer_writes.size();
+    };
     if (stage.shader != &shader) {
         stage.window_extents.fill(0);
         for (const auto& window : shader.constant_buffer_windows)
@@ -6684,6 +7313,10 @@ bool Encoder::bind_stage(std::size_t stage_index,
     const auto bind_buffer = [&](const BoundBuffer& binding, std::uint32_t index,
                                  std::uint64_t minimum, bool uniform = false,
                                  bool writable = false) -> bool {
+        if (!uniform) {
+            if (!prepare_uniform_access(binding.address, binding.size)) return false;
+            if (stage_index != NVN_SHADER_STAGE_COMPUTE && !close_transfer()) return false;
+        }
         if (index >= 31)
             return fail(ReplayErrorCode::unsupported,
                         "shader buffer index exceeds the Metal argument-table limit");
@@ -6741,6 +7374,7 @@ bool Encoder::bind_stage(std::size_t stage_index,
     for (const auto& binding : shader.constant_buffers) {
         if (binding.guest_binding >= buffer_slots + 3)
             return fail(ReplayErrorCode::unsupported, "constant buffer slot exceeds the replay limit");
+        if (!(uniform_slots & (1u << binding.guest_binding))) continue;
         if (binding.guest_binding == 0 || binding.guest_binding == 2) {
             if (!bind_driver(binding.guest_binding, binding.metal_buffer_index)) return false;
             continue;
@@ -6757,6 +7391,7 @@ bool Encoder::bind_stage(std::size_t stage_index,
             !binding.window_bytes)
             return fail(ReplayErrorCode::unsupported,
                         "constant-buffer window reflection is invalid");
+        if (!(uniform_slots & (1u << binding.guest_binding))) continue;
         const auto source_binding = hardware_buffer(stage_index, binding.guest_binding);
         // A guest buffer that covers the whole window binds in place, and the
         // GPU reads the bytes at execution as the hardware does. Shaders read
@@ -6768,11 +7403,7 @@ bool Encoder::bind_stage(std::size_t stage_index,
         if (binding.guest_binding != 0 && binding.guest_binding != 2 &&
             source_binding.address && source_binding.size >= binding.window_bytes) {
             const std::uint64_t extent = binding.window_bytes;
-            const bool gpu_written = std::any_of(other_buffer_writes.begin(), other_buffer_writes.end(),
-                [&](const auto& range) {
-                    return source_binding.address < range.first + range.second &&
-                        range.first < source_binding.address + extent;
-                });
+            const bool gpu_written = buffer_writes_overlap(source_binding.address, extent);
             if (!gpu_written) {
                 const auto span = buffer_address(source_binding.address, extent);
                 if (span.buffer && span.offset <= span.length &&
@@ -6788,10 +7419,7 @@ bool Encoder::bind_stage(std::size_t stage_index,
         auto &cached = bindings[stage_index].windows[binding.guest_binding];
         const auto written_since = [&](const WindowUpload& snapshot) {
             const auto end = snapshot.source + std::min<std::uint64_t>(snapshot.source_size, snapshot.bytes);
-            return std::any_of(other_buffer_writes.begin() + std::ptrdiff_t(snapshot.writes),
-                               other_buffer_writes.end(), [&](const auto& range) {
-                return snapshot.source < range.first + range.second && range.first < end;
-            });
+            return buffer_writes_overlap(snapshot.source, end - snapshot.source, snapshot.writes);
         };
         if (cached.gpu && cached.bytes == binding.window_bytes &&
             cached.source == source_binding.address && cached.source_size == source_binding.size &&
@@ -6823,11 +7451,7 @@ bool Encoder::bind_stage(std::size_t stage_index,
                 copied > source.buffer.length - source.offset)
                 return fail(ReplayErrorCode::missing_resource,
                             "constant-buffer zero window source is unavailable");
-            const bool gpu_written = std::any_of(other_buffer_writes.begin(), other_buffer_writes.end(),
-                [&](const auto& range) {
-                    return source_binding.address < range.first + range.second &&
-                        range.first < source_binding.address + copied;
-                });
+            const bool gpu_written = buffer_writes_overlap(source_binding.address, copied);
             if (gpu_written) {
                 if (!flush_uniforms() || !open_transfer()) return false;
                 make_resident(pending, source.buffer);
@@ -6837,7 +7461,8 @@ bool Encoder::bind_stage(std::size_t stage_index,
                 // Only the GPU copy reads the source after encoding.
                 [pending.retained addObject:source.buffer];
             } else {
-                order_cpu_read(source_binding.address, copied, true);
+                if (!order_cpu_read(source_binding.address, copied, true,
+                        static_cast<const std::byte*>(source.buffer.contents) + source.offset)) return false;
                 std::memcpy(window.cpu,
                             static_cast<const std::byte*>(source.buffer.contents) + source.offset, filled);
                 overlay_uniform(source_binding.address, window.cpu, filled);
@@ -6850,7 +7475,15 @@ bool Encoder::bind_stage(std::size_t stage_index,
 
     // A uniform-only rebind ends here: the rest resolves from bindings an
     // in-stream update does not touch (invalidate_uniforms checks that).
-    if (uniforms_only) return true;
+    if (uniforms_only) {
+        // Resolving the changed slot can drain and flush versions used by
+        // earlier slots. Revisit all addresses after that transition.
+        if (gpu_synchronizations != uniform_synchronizations ||
+            uniform_versions.size() != uniform_version_count)
+            return bind_stage(stage_index, shader, table, vertex, false);
+        finish_uniforms();
+        return true;
+    }
     bindings[stage_index].writes.clear();
     const bool compute = stage_index == NVN_SHADER_STAGE_COMPUTE;
     if (compute) {
@@ -6899,7 +7532,8 @@ bool Encoder::bind_stage(std::size_t stage_index,
                     descriptor.offset <= descriptor.buffer.length &&
                     descriptor_size <= descriptor.buffer.length - descriptor.offset) {
                     const auto address = descriptor_buffer.address + reflected.descriptor_byte_offset;
-                    order_cpu_read(address, descriptor_size, true);
+                    if (!order_cpu_read(address, descriptor_size, true,
+                            static_cast<const std::byte*>(descriptor.buffer.contents) + descriptor.offset)) return false;
                     std::array<std::byte, descriptor_size> descriptor_bytes{};
                     std::memcpy(descriptor_bytes.data(),
                         static_cast<const std::byte*>(descriptor.buffer.contents) + descriptor.offset,
@@ -6980,15 +7614,32 @@ bool Encoder::bind_stage(std::size_t stage_index,
         if ((address & 3) == 0)
             if (const auto found = uniform_words.find(address); found != uniform_words.end())
                 return found->second;
+        std::uint32_t handle = 0, covered = 0;
+        if (!uniform_updates.empty() && captured_guest_bytes.may_intersect(address, sizeof handle)) {
+            // A complete current capture supersedes earlier writes without a
+            // backing read. Partial captures and prior submissions cannot be
+            // cached: their remaining bytes still need normal read ordering.
+            overlay_uniform(address, reinterpret_cast<std::byte*>(&handle), sizeof handle, &covered, true);
+            if (covered == 0xf) {
+                if (!(address & 3)) uniform_words.emplace(address, handle);
+                return handle;
+            }
+            handle = covered = 0;
+        }
         const auto span = buffer_at(address, sizeof(std::uint32_t));
-        std::uint32_t handle = 0;
-        order_cpu_read(address, sizeof handle, true);
-        if (span.buffer.contents && span.offset <= span.buffer.length &&
-            sizeof handle <= span.buffer.length - span.offset)
-            std::memcpy(&handle, static_cast<const std::byte*>(span.buffer.contents) +
-                                   span.offset, sizeof handle);
-        // Every recorded update also lands in the word map above, so a word that
-        // is not there cannot be changed by one; no overlay scan is needed.
+        const auto* contents = static_cast<const std::byte*>(span.buffer.contents);
+        if (contents && span.offset <= span.buffer.length && sizeof handle <= span.buffer.length - span.offset) {
+            if (!order_cpu_read(address, sizeof handle, true, contents + span.offset)) return 0;
+            std::memcpy(&handle, contents + span.offset, sizeof handle);
+            covered = 0xf;
+        }
+        // A later writer may invalidate one cached word while leaving earlier
+        // captured bytes in the rest of it. Apply only those surviving bytes.
+        overlay_uniform(address, reinterpret_cast<std::byte*>(&handle), sizeof handle, &covered);
+        if (covered != 0xf) {
+            fail(ReplayErrorCode::missing_resource, "texture handle backing is not CPU-visible");
+            return 0;
+        }
         return handle;
     };
 
@@ -7050,6 +7701,7 @@ bool Encoder::bind_stage(std::size_t stage_index,
                             "resolved shader resource array contract is invalid");
             for (std::uint32_t element = 0; element != resource.array_length; ++element) {
                 const auto handle = read_handle(resource, element);
+                if (failed) return false;
                 if (resource.kind == platform::CompiledShaderResourceKind::Sampler) {
                     id<MTLSamplerState> sampler = handle
                         ? backend.resources().sampler_for_id(
@@ -7133,6 +7785,7 @@ bool Encoder::bind_stage(std::size_t stage_index,
                           arguments.gpu);
     }
     static_cast<void>(vertex);
+    finish_uniforms();
     return true;
 }
 
@@ -7349,6 +8002,7 @@ void Encoder::predict_pipelines() {
                         if (!(std::uint32_t(command.stages) & bit)) continue;
                         shadow.stage_programs[stage_index] =
                             program && program->stages[stage_index] ? program : nullptr;
+                        shadow.update_write_stage(stage_index);
                         const bool unusable = translating || (program && (program->failed_stages & bit));
                         shadow.failed_stages = unusable ? shadow.failed_stages | bit : shadow.failed_stages & ~bit;
                     }
@@ -7442,7 +8096,7 @@ bool Encoder::draw(const Draw& command) {
              ->stages[NVN_SHADER_STAGE_VERTEX]->fixed_point_size))
         return fail(ReplayErrorCode::unsupported,
                     "point size requires a compatible vertex shader artifact");
-    if (!order_buffer_writes()) return false;
+    if (!prepare_graphics_uniform_writes() || !order_buffer_writes()) return false;
     if (!open_render(command.primitive)) return false;
     if (!bind_draw_support(static_cast<std::uint32_t>(command.base_instance))) return false;
     encode_draw(*primitive, command.first, command.count, command.instances, command.base_instance);
@@ -7469,7 +8123,7 @@ bool Encoder::draw_indexed(const DrawIndexed& command) {
         command.index_type == NVN_INDEX_TYPE_UNSIGNED_INT ? 4 : 0;
     if (!element_size)
         return fail(ReplayErrorCode::invalid_command, "indexed draw has an invalid index type");
-    if (!order_buffer_writes()) return false;
+    if (!prepare_graphics_uniform_writes() || !order_buffer_writes()) return false;
     const auto bytes = std::uint64_t(command.count) * element_size;
     state.index_buffer = {command.index_buffer, bytes};
     const auto source = buffer_address(command.index_buffer, bytes);
@@ -7496,7 +8150,7 @@ bool Encoder::draw_indexed(const DrawIndexed& command) {
                     range.first < command.index_buffer + bytes;
             });
         if (written && !synchronize_gpu()) return false;
-        order_cpu_read(command.index_buffer, bytes, false);
+        if (!order_cpu_read(command.index_buffer, bytes, false, source.cpu)) return false;
         const auto* input = source.cpu;
         std::vector<std::uint32_t> indices(command.count);
         std::vector<std::pair<std::size_t, std::size_t>> segments;
@@ -7685,9 +8339,7 @@ bool Encoder::dispatch_indirect(const DispatchIndirect& command) {
 }
 
 bool Encoder::copy_buffer(const CopyBuffer& command) {
-    if ((uniform_conflict(command.source, command.size) ||
-         uniform_conflict(command.destination, command.size)) && !flush_uniforms()) return false;
-    other_buffer_writes.emplace_back(command.destination, command.size);
+    if (!prepare_uniform_access(command.source, command.size, command.destination)) return false;
     if (!command.size) return true;
     if (command.flags != NVN_COPY_FLAGS_NONE)
         return fail(ReplayErrorCode::unsupported,
@@ -7716,6 +8368,8 @@ bool Encoder::copy_buffer(const CopyBuffer& command) {
                           command.size);
     }
     pending.buffer_writes.emplace_back(command.destination, command.size);
+    other_buffer_writes.emplace_back(command.destination, command.size);
+    discard_gpu_uniform_captures(command.destination, command.size);
     buffer_write_order.write();
     note_writes();
     ++backend.mutable_statistics().copies;
@@ -7788,6 +8442,7 @@ bool Encoder::copy_buffer_texture(const CopyBufferToTexture& command, bool uploa
     else {
         pending.buffer_writes.emplace_back(command.source, size);
         other_buffer_writes.emplace_back(command.source, size);
+        discard_gpu_uniform_captures(command.source, size);
         buffer_write_order.write();
     }
     note_writes();
@@ -7832,6 +8487,9 @@ bool Encoder::copy_texture_to_texture(const CopyTextureToTexture& command) {
             destination.height)
         return fail(ReplayErrorCode::invalid_command,
                     "texture copy exceeds a source or destination extent");
+    if (command.destination->memory && backend.resources().texture_is_in_place(*command.destination) &&
+        uniform_cpu_conflict(reinterpret_cast<std::uintptr_t>(command.destination->memory),
+                             command.destination->size) && !flush_uniforms()) return false;
     if (!open_transfer()) return false;
     make_resident(pending, source);
     make_resident(pending, destination);
@@ -7980,6 +8638,9 @@ bool Encoder::encode_clear_plan(const TextureState& texture_state,
         (!color_mask || color_mask == 0xf) && (!stencil || stencil_mask == 0xff);
     plan.fold_layers_into_load = plan.fold_into_load && descriptor.layers > 1;
 
+    if (texture_state.memory && backend.resources().texture_is_in_place(texture_state) &&
+        uniform_cpu_conflict(reinterpret_cast<std::uintptr_t>(texture_state.memory),
+                             texture_state.size) && !flush_uniforms()) return false;
     if (render || !plan.fold_into_load) close_render(PassBreak::clear);
     close_transfer();
     if (plan.fold_into_load) {
@@ -8157,6 +8818,7 @@ bool Encoder::visit(const CommandRecordView& record) {
 
 bool Encoder::visit_command(const CommandRecordView& record) {
     if (failed) return false;
+    if (capture_retirement_needed && !retire_captures_if_full()) return false;
     current_op_ = record.op;
     if (trace_submission_id) {
         switch (record.op) {
@@ -8197,6 +8859,11 @@ bool Encoder::visit_command(const CommandRecordView& record) {
                 command.location != NVN_EVENT_SIGNAL_LOCATION_BOTTOM)
                 return fail(ReplayErrorCode::invalid_command,
                             "event signal location is invalid");
+            const auto cpu = reinterpret_cast<std::uintptr_t>(command.value);
+            if (uniform_cpu_conflict(cpu, sizeof(std::uint32_t)) && !flush_uniforms()) return false;
+            discard_uniform_captures(cpu, 0, sizeof(std::uint32_t));
+            ++update_generation;
+            invalidate_args_all();
             CompletionEffect effect{};
             effect.kind = CompletionEffect::Kind::signal;
             effect.event = command.value;
@@ -8292,7 +8959,7 @@ bool Encoder::visit_command(const CommandRecordView& record) {
             if (!destination.buffer || !destination.buffer.contents)
                 return fail(ReplayErrorCode::missing_resource,
                             "reported value destination is not CPU-visible");
-            if (uniform_conflict(command.address, sizeof command.value) && !flush_uniforms()) return false;
+            if (!prepare_uniform_access(command.address, sizeof command.value)) return false;
             const auto source = upload(sizeof command.value, &command.value);
             if (!source || !open_transfer()) return false;
             make_resident(pending, destination.buffer);
@@ -8300,6 +8967,7 @@ bool Encoder::visit_command(const CommandRecordView& record) {
                               sizeof command.value);
             other_buffer_writes.emplace_back(command.address, sizeof command.value);
             pending.buffer_writes.emplace_back(command.address, sizeof command.value);
+            discard_gpu_uniform_captures(command.address, sizeof command.value);
             buffer_write_order.write();
             note_writes();
             return true;
@@ -8317,58 +8985,41 @@ bool Encoder::visit_command(const CommandRecordView& record) {
             if (!destination.buffer)
                 return fail(ReplayErrorCode::missing_resource,
                             "uniform update destination is unavailable");
+            const bool alias = uniform_capture_alias(command.destination, command.size, destination);
+            if (alias) {
+                if (!prepare_uniform_access(command.destination, command.size)) return false;
+                const auto cpu = destination.buffer.contents
+                    ? reinterpret_cast<std::uintptr_t>(destination.buffer.contents) + destination.offset : 0;
+                discard_uniform_captures(cpu, destination.buffer.gpuAddress + destination.offset, command.size);
+            }
             const auto* update_bytes = static_cast<const std::byte*>(record.payload) + header;
-            if (!version_uniform(command.destination, command.size, update_bytes)) {
+            if (alias || !version_uniform(command.destination, command.size, update_bytes, destination)) {
                 if (failed || !flush_uniforms()) return false;
-                record_uniform_update(command.destination, command.size, update_bytes);
+                // A canonical NVN address may still resolve through a distinct
+                // native GPU allocation. Preserve visibility before its copy.
+                if (!alias && !prepare_uniform_access(command.destination, command.size)) return false;
+                record_uniform_update(command.destination, command.size, update_bytes, destination);
                 const auto source = upload(command.size, update_bytes);
                 if (!source || !open_transfer()) return false;
                 make_resident(pending, destination.buffer);
                 copy_buffer_range(source.buffer, source.offset, destination.buffer, destination.offset,
                                   command.size);
                 pending.buffer_writes.emplace_back(command.destination, command.size);
+                record_uniform_copy(command.destination, command.size, destination);
                 buffer_write_order.write();
                 note_writes();
                 ++backend.mutable_statistics().copies;
             }
-            {
-                const auto* bytes = static_cast<const std::byte*>(record.payload) + header;
-                const auto* contents = static_cast<const std::byte*>(destination.buffer.contents);
-                const std::int64_t base = std::int64_t(destination.offset) - std::int64_t(command.destination);
-                const std::uint64_t end = command.destination + command.size;
-                for (std::uint64_t word = command.destination & ~std::uint64_t{3}; word < end; word += 4) {
-                    std::uint32_t value = 0;
-                    auto* value_bytes = reinterpret_cast<std::byte*>(&value);
-                    if (word >= command.destination && word + 4 <= end) {
-                        std::memcpy(&value, bytes + word - command.destination, 4);
-                        uniform_words[word] = value;
-                        continue;
-                    }
-                    if (const auto found = uniform_words.find(word); found != uniform_words.end()) {
-                        value = found->second;
-                    } else if (contents) {
-                        order_cpu_read(word, 4, true);
-                        for (unsigned byte = 0; byte < 4; ++byte) {
-                            const std::int64_t at = base + std::int64_t(word + byte);
-                            if (at >= 0 && std::uint64_t(at) < destination.buffer.length)
-                                value_bytes[byte] = contents[at];
-                        }
-                    }
-
-                    for (unsigned byte = 0; byte < 4; ++byte)
-                        if (word + byte >= command.destination && word + byte < end)
-                            value_bytes[byte] = bytes[word + byte - command.destination];
-                    uniform_words[word] = value;
-                }
-            }
-            invalidate_uniforms(command.destination, command.size);
+            if (!uniform_words.empty()) refresh_uniform_words(command.destination, command.size, update_bytes);
+            invalidate_uniforms(command.destination, command.size, cpu_addressed_buffers ? command.destination :
+                destination.buffer.contents ? reinterpret_cast<std::uintptr_t>(destination.buffer.contents) + destination.offset : 0);
+            if (failed) return false;
             ++pending.counters.uniform_invalidations;
             return true;
         }
         case Op::clear_buffer: {
             const auto command = payload<ClearBuffer>(record);
-            if (uniform_conflict(command.address, command.size) && !flush_uniforms()) return false;
-            other_buffer_writes.emplace_back(command.address, command.size);
+            if (!prepare_uniform_access(command.address, command.size)) return false;
             if (!command.size) return true;
             if (command.size > 64 * 1024 * 1024)
                 return fail(ReplayErrorCode::allocation,
@@ -8386,6 +9037,8 @@ bool Encoder::visit_command(const CommandRecordView& record) {
             copy_buffer_range(source.buffer, source.offset, destination.buffer, destination.offset,
                               command.size);
             pending.buffer_writes.emplace_back(command.address, command.size);
+            other_buffer_writes.emplace_back(command.address, command.size);
+            discard_gpu_uniform_captures(command.address, command.size);
             buffer_write_order.write();
             note_writes();
             ++backend.mutable_statistics().clears;
@@ -8417,6 +9070,7 @@ bool Encoder::visit_command(const CommandRecordView& record) {
                 state.depth_owner = std::make_shared<const TextureState>(*state.targets.depth);
                 state.targets.depth = state.depth_owner.get();
             }
+            refresh_attachment_cpu_bounds();
             return true;
         case Op::clear_color: return clear_bound_color(payload<ClearColor>(record));
         case Op::clear_color_integer: {
@@ -8539,6 +9193,7 @@ bool Encoder::visit_command(const CommandRecordView& record) {
                 if (state.stage_programs[stage_index].get() != next) {
                     state.stage_programs[stage_index] = program && program->stages[stage_index]
                         ? program : nullptr;
+                    state.update_write_stage(stage_index);
                     changed = true;
                 }
                 const auto failed = program ? program->failed_stages & bit : 0u;
@@ -8638,8 +9293,7 @@ bool Encoder::visit_command(const CommandRecordView& record) {
                 return fail(ReplayErrorCode::invalid_command,
                             "vertex buffer range is invalid");
             for (std::int32_t index = 0; index < command.count; ++index)
-                if (uniform_conflict(command.ranges[index].address, command.ranges[index].size) &&
-                    !flush_uniforms()) return false;
+                if (!prepare_uniform_access(command.ranges[index].address, command.ranges[index].size)) return false;
             if (replace_state(state.vertex_buffers.data() + command.first, command.ranges,
                               command.count * sizeof(NVNbufferRange))) dirty.vertices = true;
             return true;
@@ -8652,7 +9306,7 @@ bool Encoder::visit_command(const CommandRecordView& record) {
                 return fail(ReplayErrorCode::invalid_command,
                             "shader buffer binding range is invalid");
             if (record.op == Op::bind_storage_buffer) {
-                if (uniform_conflict(command.address, command.size) && !flush_uniforms()) return false;
+                if (!prepare_uniform_access(command.address, command.size)) return false;
             } else {
                 for (const auto& version : uniform_versions)
                     if (command.address < version.end && version.begin < command.address + command.size &&
@@ -8666,7 +9320,10 @@ bool Encoder::visit_command(const CommandRecordView& record) {
                 : state.storage[command.stage][command.index];
             if (target.address != command.address || target.size != command.size) {
                 target = {command.address, command.size};
-                invalidate_args(std::size_t(command.stage));
+                if (record.op == Op::bind_uniform_buffer)
+                    invalidate_uniform_binding(std::size_t(command.stage), std::uint32_t(command.index));
+                else
+                    invalidate_args(std::size_t(command.stage));
                 if (record.op == Op::bind_storage_buffer || command.stage == NVN_SHADER_STAGE_COMPUTE) {
                     ++bindings[command.stage].driver_generation[0];
                     bindings[command.stage].windows[0] = {};
@@ -8824,6 +9481,9 @@ bool Encoder::visit_command(const CommandRecordView& record) {
                 ? command.source_view.format : command.source->description.format);
             if (!format || graphics::texture_format_info(*format).depth)
                 return fail(ReplayErrorCode::unsupported, "depth downsample requires an explicit resolve filter");
+            if (command.destination->memory && backend.resources().texture_is_in_place(*command.destination) &&
+                uniform_cpu_conflict(reinterpret_cast<std::uintptr_t>(command.destination->memory),
+                                     command.destination->size) && !flush_uniforms()) return false;
             barrier(PassBreak::downsample);
             auto* pass = [MTL4RenderPassDescriptor new];
             pass.colorAttachments[0].texture = source;
@@ -9008,6 +9668,7 @@ bool Encoder::visit_command(const CommandRecordView& record) {
 }
 
 bool Encoder::finish() {
+    if (capture_retirement_needed && !retire_captures_if_full()) return false;
     if (predicate_open()) {
         predicate.arguments = nullptr;
         predicate.job = 0;
@@ -9047,6 +9708,8 @@ namespace {
 class ResourceLookup final : public ReplayResources {
 public:
     explicit ResourceLookup(Resources& resources) : resources_(resources) {}
+    // Resources registers only shared, zero-copy pools at their CPU addresses.
+    bool buffer_addresses_are_cpu() const override { return true; }
     void set_completion_hook(std::function<bool()> hook) override {
         resources_.set_completion_hook(std::move(hook));
     }

@@ -98,6 +98,34 @@ so instrumented present periods include that overhead. Logging errors latch the
 first structured failure, which runtime polling sees even if the native
 presentation callback has already returned.
 
+For native pacing checks, `ARMIGO_NVN_TIMELINE=FILE` together with
+`ARMIGO_NVN_TIMELINE_PRESENT_ONLY=1` retains the clock header and only the
+`pres_*` and `present_*` events. These include queued presents, GPU-fence
+readiness, native slot waits, entry into the host consumer, and successful
+consumer completion (`pres_complete`). Combine this with
+`ARMIGO_FRAME_STATS=0` to avoid the full GPU timeline and per-frame
+diagnostic output. It still has measurement overhead; compare with an untraced
+control. The filtered trace cannot supply GPU segment timings or a CPU/GPU
+breakdown, and neither its consumer entry nor completion proves physical
+scanout. Omitting the filter, or setting it to `0`, preserves the full timeline.
+
+Timeline callers append binary records to a preallocated ring. A background
+writer formats the existing TSV records, and normal process exit drains them.
+`ARMIGO_NVN_TIMELINE_CAPACITY` selects 2–16777216 records (default 1048576).
+A full ring drops new records without waiting. `timeline_overflow`,
+`timeline_incomplete`, and `timeline_symbols_dropped` footer records report
+loss; their key is the dropped count. `timeline_unquiesced` reports the number
+of admitted attempts still active when shutdown closed admission; those
+attempts may publish or report a loss after the footer snapshot. Reject traces containing these records
+for pacing admission or complete gap attribution. Event names use fixed symbol
+storage: at most 512 distinct names, each up to 63 bytes. Output errors are
+reported on stderr. Forced termination can lose the undrained tail.
+
+Use present-only tracing and `ARMIGO_FRAME_STATS=0` for pacing admission;
+full traces are attribution runs and must be labeled as traced. Compare traced
+and untraced controls on the same build and workload before attributing a
+performance difference to the graphics pipeline.
+
 For admission, record input/build/configuration/cache identity, scratch saves,
 unchanged 30 A/A controls and separate fixed 30/60/120 controls. Compare semantic
 landmarks in elapsed wall time and integrated capped simulation time; a present

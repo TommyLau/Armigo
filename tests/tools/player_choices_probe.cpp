@@ -19,6 +19,11 @@ int main(int argc, char* argv[]) {
         if (std::string_view(argv[index]) == "-expect_default" &&
             choices.default_frame_rate != std::strtoul(argv[index + 1], nullptr, 10)) return 1;
     }
+    for (int index = 1; index + 1 < argc; ++index) {
+        if (std::string_view(argv[index]) == "-expect_experimental" &&
+            choices.experimental_frame_rates != std::vector<std::uint32_t>{static_cast<std::uint32_t>(
+                std::strtoul(argv[index + 1], nullptr, 10))}) return 1;
+    }
     armigo::platform::DisplayCapabilities display;
     display.current = {1920, 1080, 60, false};
     for (int index = 1; index + 1 < argc; ++index)

@@ -9,6 +9,7 @@
 // ============================================================================
 
 #include <armigo/runtime/kernel_queries.h>
+#include <armigo/common/diagnostics.h>
 #include <cxxabi.h>
 #include <algorithm>
 #include <string>
@@ -106,6 +107,28 @@ execution::GateStatus StartupSupervisor::dispatch(std::uint16_t immediate,
                           " Result 0x%x (module %u, description %u).", result, result & 0x1ffu,
                           (result >> 9) & 0x1fffu);
         }
+        // ARMIGO_TRACE_SUPERVISOR=1 also prints the guest's return chain: x30 and
+        // the return addresses of up to 16 AAPCS64 frame records from x29.
+        static const bool trace = std::getenv("ARMIGO_TRACE_SUPERVISOR") != nullptr;
+        if (trace && self.caller_.read_memory) {
+            char chain[512];
+            auto used = std::snprintf(chain, sizeof chain, "break x30=%llx frames",
+                                      static_cast<unsigned long long>(call.x(30)));
+            auto frame = call.x(29);
+            for (unsigned depth = 0; depth != 16 && frame && !(frame & 15) && used > 0 &&
+                                     static_cast<std::size_t>(used) < sizeof chain; ++depth) {
+                std::array<std::byte, 16> record{};
+                if (!self.caller_.read_memory(self.caller_.memory_context, frame, record)) break;
+                std::uint64_t next = 0, link = 0;
+                std::memcpy(&next, record.data(), sizeof next);
+                std::memcpy(&link, record.data() + 8, sizeof link);
+                used += std::snprintf(chain + used, sizeof chain - static_cast<std::size_t>(used), " %llx",
+                                      static_cast<unsigned long long>(link));
+                if (next <= frame) break;
+                frame = next;
+            }
+            diag::opt_in("%s\n", chain);
+        }
         call.set_failure_message(self.break_message_);
         return execution::GateStatus::failed;
     }
@@ -179,6 +202,14 @@ execution::GateStatus StartupSupervisor::dispatch(std::uint16_t immediate,
     if (self.memory_) {
         auto result = self.memory_->dispatch(immediate, registers);
         if (auto* failure = std::get_if<LaunchFailure>(&result)) {
+            // Private interval capacity is a recoverable kernel resource error.
+            // The memory transaction has not changed native mappings or accounting.
+            if (failure->stage == LaunchStage::memory && failure->code == LaunchError::resource_limit &&
+                failure->guest_result == 0xce01) {
+                for (unsigned i = 0; i < registers.size(); ++i) call.set_x(i, 0);
+                call.set_x(0, *failure->guest_result);
+                return execution::GateStatus::resume;
+            }
             self.memory_failure_ = std::move(*failure);
             call.set_failure_message(self.memory_failure_->detail.c_str());
             return execution::GateStatus::failed;
@@ -214,6 +245,14 @@ execution::GateStatus StartupSupervisor::dispatch(std::uint16_t immediate,
                 }() + (self.queries_->unsupported_detail()
                            ? std::string(": ") + self.queries_->unsupported_detail()
                            : std::string("."));
+            if (immediate == 0x29) {
+                char query[160];
+                std::snprintf(query, sizeof query, " GetInfo type=%#llx handle=%#llx sub-id=%#llx.",
+                    static_cast<unsigned long long>(call.x(1)),
+                    static_cast<unsigned long long>(call.x(2)),
+                    static_cast<unsigned long long>(call.x(3)));
+                self.ipc_failure_detail_ += query;
+            }
             if (immediate == 0x21) {
                 if (const auto object = self.ipc_->handles().lookup(static_cast<horizon::Handle>(call.x(0)))) {
                     int status = 0;

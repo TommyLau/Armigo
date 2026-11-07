@@ -183,6 +183,7 @@ inline constexpr std::uint64_t kProgramIdMax = 0x0200000000000FFF;
 inline constexpr std::uint64_t kProgramId = 0x0200000000000A42;
 
 struct Parts {
+    bool switch2 = false;
     std::uint8_t meta_flags = 0x07; // 64-bit process, address space type 3 (39-bit)
     std::uint8_t main_priority = 44;
     std::uint8_t main_core = 1;
@@ -271,11 +272,12 @@ inline NpdmImage build_npdm(const Parts& parts) {
     aci0.resize(aci0_kac_offset);
     aci0.insert(aci0.end(), aci0_kac.begin(), aci0_kac.end());
 
-    Bytes acid = raw_bytes(0x240);
-    put_u32(acid, 0x200, 0x44494341u); // "ACID"
-    put_u32(acid, 0x20C, parts.acid_flags);
-    put_u64(acid, 0x210, parts.program_id_min);
-    put_u64(acid, 0x218, parts.program_id_max);
+    const std::uint32_t body = parts.switch2 ? 0x300 : 0x200;
+    Bytes acid = raw_bytes(body + 0x40);
+    put_u32(acid, body + 0x00, 0x44494341u); // "ACID"
+    put_u32(acid, body + 0x0C, parts.acid_flags);
+    put_u64(acid, body + 0x10, parts.program_id_min);
+    put_u64(acid, body + 0x18, parts.program_id_max);
     Bytes acid_fs = acid_fs_access_block(parts.fs_version, parts.acid_fs_permissions);
     Bytes acid_sac;
     for (const ServiceEntry& entry : parts.acid_services) {
@@ -287,22 +289,22 @@ inline NpdmImage build_npdm(const Parts& parts) {
         Bytes word_bytes = capability_words({word});
         acid_kac.insert(acid_kac.end(), word_bytes.begin(), word_bytes.end());
     }
-    const std::uint32_t acid_fs_offset = 0x240;
+    const std::uint32_t acid_fs_offset = body + 0x40;
     const std::uint32_t acid_sac_offset = acid_fs_offset + static_cast<std::uint32_t>(acid_fs.size());
     const std::uint32_t acid_kac_offset =
         (acid_sac_offset + static_cast<std::uint32_t>(acid_sac.size()) + 3) & ~3u;
-    put_u32(acid, 0x220, acid_fs_offset);
-    put_u32(acid, 0x224, static_cast<std::uint32_t>(acid_fs.size()));
-    put_u32(acid, 0x228, acid_sac_offset);
-    put_u32(acid, 0x22C, static_cast<std::uint32_t>(acid_sac.size()));
-    put_u32(acid, 0x230, acid_kac_offset);
-    put_u32(acid, 0x234, static_cast<std::uint32_t>(acid_kac.size()));
+    put_u32(acid, body + 0x20, acid_fs_offset);
+    put_u32(acid, body + 0x24, static_cast<std::uint32_t>(acid_fs.size()));
+    put_u32(acid, body + 0x28, acid_sac_offset);
+    put_u32(acid, body + 0x2C, static_cast<std::uint32_t>(acid_sac.size()));
+    put_u32(acid, body + 0x30, acid_kac_offset);
+    put_u32(acid, body + 0x34, static_cast<std::uint32_t>(acid_kac.size()));
     acid.insert(acid.end(), acid_fs.begin(), acid_fs.end());
     acid.insert(acid.end(), acid_sac.begin(), acid_sac.end());
     acid.resize(acid_kac_offset);
     acid.insert(acid.end(), acid_kac.begin(), acid_kac.end());
 
-    put_u32(acid, 0x204, static_cast<std::uint32_t>(acid.size()) - 0x100);
+    put_u32(acid, body + 0x04, static_cast<std::uint32_t>(acid.size()) - (parts.switch2 ? 0x180 : 0x100));
 
     const std::uint32_t aci0_offset = 0x80;
     const std::uint32_t acid_offset =

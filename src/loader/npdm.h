@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <armigo/common/guest_platform.h>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -45,6 +46,7 @@ struct NpdmSection {
 // bytes. Interpretation of the subsections is the caller's responsibility.
 struct ParsedNpdm {
     std::span<const std::byte> image;
+    GuestPlatform platform = GuestPlatform::switch1;
 
     // Fixed META header fields.
     std::uint8_t meta_flags = 0;

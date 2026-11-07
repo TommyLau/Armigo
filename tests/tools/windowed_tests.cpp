@@ -391,6 +391,11 @@ int main() {
         {120, nullptr, 60, 24, true, 30, 24, 1},
         {120, nullptr, 120, 24, true, 60, 24, 1, false, false, 60},
         {120, "120", 60, 24, true, 120, 24, 0},
+        {120, nullptr, 60, 60, false, 60, 60, 1, false, false, 60},
+        {120, nullptr, 120, 60, false, 120, 120, 0, false, false, 60},
+        {0, nullptr, 120, 60, false, 0, 60, 0, false, false, 60},
+        {30, "120", 60, 60, true, 120, 60, 0, false, false, 60},
+        {120, "60", 120, 120, true, 60, 120, 0, false, false, 60},
     };
     for (const auto& test : rate_cases) {
         for (const char* key : {"ARMIGO_COMPAT_FRAME_RATE", "ARMIGO_VI_REFRESH_HZ",

@@ -244,6 +244,10 @@ public:
                                           const horizon::GuestBuffers& buffers) override;
     // The runtime's guest-memory capability, supplied before dispatch.
     void set_memory_mapper(horizon::GuestMemoryMapper mapper) noexcept override;
+    // Opening a GPU device (a path ending in "-gpu") stops with `reason`. The
+    // Switch 2 driver session uses this where the title's own NVN driver
+    // reaches the GPU, which Armigo's NVN driver replaces.
+    void refuse_gpu_devices(const char* reason) noexcept;
     // Shared by clones, including an optional retained callback context owner.
     void set_render_backend(graphics::RenderCallbacks rendering);
     // Enable pipelined submission with an independently retained memory capability.
@@ -277,6 +281,7 @@ public:
 
 private:
     horizon::IpcReply unsupported(const char* detail);
+    const char* refused_gpu_devices_ = nullptr;
     horizon::IpcReply open_device(const horizon::IpcMessage& message, std::size_t cmif,
                                  const horizon::GuestBuffers& buffers);
     horizon::IpcReply query_event(const horizon::IpcMessage& message, std::size_t cmif);

@@ -36,6 +36,7 @@ struct WordRole {
     bool system = false;
     // Branch or exception class word this decoder does not identify.
     bool unknown_control = false;
+    bool unsupported_authentication = false;
     bool exclusive_load = false;
     bool exclusive_store = false;
     bool clear_exclusive = false;

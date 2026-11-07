@@ -52,6 +52,7 @@ struct NativeLoading {
     std::vector<compat::WordPatch> launch_words;
     std::optional<std::size_t> launch_module;
     std::optional<std::size_t> nvn_module;
+    std::optional<compat::CallPatch> gpu_budget_hook;
     EmbeddedNativeArtifacts* capture = nullptr;
     const EmbeddedNativeArtifacts* artifacts = nullptr;
 };
@@ -71,6 +72,17 @@ std::array<std::byte, 32> code_settings_digest(const NativeLoading& loading) {
     number(loading.compatibility_patch ? loading.compatibility_patch->description.calls.size() : 0);
     if (loading.compatibility_patch) for (const auto& call : loading.compatibility_patch->description.calls) {
         number(call.offset); number(call.expected_instruction);
+        if (call.phases) {
+            number(0x7068617365); // Phase-call metadata extends only the selected mode's identity.
+            number(call.phases->original_callee);
+            number(call.phases->counter);
+            number(call.phases->phase_count);
+            number(loading.compatibility_patch->description.layout.frame_step);
+        }
+        if (call.gpu_budget) {
+            number(0x6770756275646765); // GPU budget instruction metadata.
+            number(call.gpu_budget->target_rate);
+        }
     }
     // Launch-time sites are code; the words they apply are not.
     if (!loading.launch_words.empty()) {
@@ -353,7 +365,7 @@ bool prepare_native_module(const ModulePreparationView& view, void* raw) noexcep
                     return false;
                 }
                 const auto stub_offset = gate_offset + hook_gate.size() + i * 16;
-                const auto hook = execution::make_call_hook_patch(actual, view.base_address + site.offset,
+                const auto hook = compat::make_patch_hook(site, actual, view.base_address + site.offset,
                     view.base_address + view.appended_code_offset + stub_offset,
                     {gate_address, hook_gate.size()});
                 if (!hook.ok()) {
@@ -398,7 +410,7 @@ std::string installed_embedded_preparation_identity() {
     const auto gate = execution::make_embedded_gate_code(0x8000, 0x4008);
     const auto digest = gate ? loader::detail::sha256(*gate) : std::nullopt;
     if (!digest) throw std::runtime_error("Embedded gate identity could not be computed.");
-    std::string result = "armigo-native-embedded-v1-r2-";
+    std::string result = "armigo-native-embedded-v1-r3-";
     constexpr char hex[] = "0123456789abcdef";
     for (const auto byte : *digest) {
         const auto value = std::to_integer<unsigned>(byte);
@@ -565,6 +577,11 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
                     if (const auto* failure = std::get_if<std::string>(&planned))
                         return fail(LaunchError::artifact_mismatch, "compatibility-resolution", *failure);
                     const auto& resolution = std::get<title::ResolutionPlan>(planned);
+                    loading.gpu_budget_hook = resolution.gpu_budget_hook;
+                    if (loading.gpu_budget_hook && (patch->module != "frame-rate" ||
+                        native_options.embedded_preparation || native_options.artifacts))
+                        return fail(LaunchError::unsupported, "compatibility-resolution",
+                                    "GPU-work feedback requires load-time preparation and the title frame-rate module.");
                     if (!resolution.words.empty())
                         armigo::diag::write(armigo::diag::Level::info,  "compat_resolution width=%u height=%u render_target_pool=%llu "
                                      "graphics_heap=%llu process_heap=%llu root_heap=%llu floor=%.4f load_scale=%.1f\n",
@@ -630,6 +647,10 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
                     loading.compatibility_module = *main;
                     loading.compatibility_patch =
                         std::make_shared<compat::InstalledPatch>(compat::InstalledPatch{*patch, 0});
+                    if (loading.gpu_budget_hook)
+                        loading.compatibility_patch->description.calls.push_back(*loading.gpu_budget_hook);
+                    if (auto error = compat::validate_patch(loading.compatibility_patch->description, source); !error.empty())
+                        return fail(LaunchError::artifact_mismatch, "compatibility-preflight", std::move(error));
                     loading.hook_gate = gate;
                 }
             }
@@ -664,6 +685,8 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
                 return fail(LaunchError::invalid_input, "compatibility-frame-rate", *failure);
         }
         if (loading.compatibility_patch) {
+            if (loading.gpu_budget_hook && !loading.nvn_module)
+                return fail(LaunchError::unsupported, "compatibility-resolution", "GPU-work feedback requires the NVN driver.");
             auto& description = loading.compatibility_patch->description;
             auto selected = compat::select_patch_calls(description, requested_title_rate, loading.nvn_module.has_value());
             if (const auto* failure = std::get_if<std::string>(&selected))
@@ -674,6 +697,7 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
                 loading.compatibility_module.reset();
             } else {
                 compat::set_present_link(description.present_link);
+                compat::initialize_gpu_budget(*loading.compatibility_patch);
             }
         }
         if (!loading.nvn_module)
@@ -692,7 +716,8 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
             for (std::size_t j = 0; j < hooks.size(); ++j) {
                 const auto& description = loading.compatibility_patch->description;
                 if (hooks[j].call_return_offset != description.calls[j].offset + 4 ||
-                    hooks[j].target.module_index != i || hooks[j].target.image_offset != description.original_callee)
+                    hooks[j].target.module_index != i ||
+                    hooks[j].target.image_offset != compat::call_callee(description, description.calls[j]))
                     return fail(LaunchError::artifact_mismatch, "load-native", "Embedded hook target differs from title settings.");
             }
         }

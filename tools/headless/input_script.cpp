@@ -143,13 +143,15 @@ platform::HostInputSnapshot ScriptInputOverlay::merge(platform::HostInputSnapsho
     pad.buttons |= controller_.buttons;
     pad.left_trigger = std::max(pad.left_trigger, controller_.left_trigger);
     pad.right_trigger = std::max(pad.right_trigger, controller_.right_trigger);
-    const auto stronger = [](auto& host_stick, const auto& script_stick) {
+    const auto stronger = [](auto& host_stick, const auto& script_stick, bool& exact) {
         if (script_stick[0] * script_stick[0] + script_stick[1] * script_stick[1] >
-            host_stick[0] * host_stick[0] + host_stick[1] * host_stick[1])
+            host_stick[0] * host_stick[0] + host_stick[1] * host_stick[1]) {
             host_stick = script_stick;
+            exact = true;
+        }
     };
-    stronger(pad.left_stick, controller_.left_stick);
-    stronger(pad.right_stick, controller_.right_stick);
+    stronger(pad.left_stick, controller_.left_stick, pad.exact_left_stick);
+    stronger(pad.right_stick, controller_.right_stick, pad.exact_right_stick);
     return host;
 }
 
@@ -214,6 +216,7 @@ std::variant<InputScript, std::string> parse_input_script(std::istream& source) 
     });
     platform::HostInputSnapshot state;
     state.controller.connected = state.controller.supported = true;
+    state.controller.exact_left_stick = state.controller.exact_right_stick = true;
     script.states.push_back({0, state});
     for (const auto& event : events) {
         apply(state.controller, event);

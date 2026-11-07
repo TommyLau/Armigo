@@ -644,6 +644,8 @@ void loads_and_executes_prepared_multimodule_code() {
 struct CompatibilityMemory {
     std::array<std::byte, 32> object{};
     std::int64_t period = 320000;
+    float frame_step = 0.5f;
+    std::uint64_t gpu_work = 0;
     const compat::InstalledPatch* installed = nullptr;
     unsigned callbacks = 0;
     std::thread::id thread = std::this_thread::get_id();
@@ -656,6 +658,9 @@ struct CompatibilityMemory {
             return true;
         }
         const auto framework = reinterpret_cast<std::uintptr_t>(&self.period);
+        if (address == self.installed->module_base + test::data_offset + 8 && bytes.size() == 4) {
+            std::memcpy(bytes.data(), &self.frame_step, 4); return true;
+        }
         if (address == self.installed->module_base + test::data_offset && bytes.size() == 8) {
             std::memcpy(bytes.data(), &framework, 8); return true;
         }
@@ -666,19 +671,156 @@ struct CompatibilityMemory {
     }
     static bool write(void* raw, std::uint64_t address, std::span<const std::byte> bytes) noexcept {
         auto& self = *static_cast<CompatibilityMemory*>(raw);
+        if (address == self.installed->module_base + test::data_offset + 8 && bytes.size() == 4) {
+            std::memcpy(&self.frame_step, bytes.data(), 4); return true;
+        }
         const auto object = reinterpret_cast<std::uintptr_t>(self.object.data());
         if (address < object || address - object > self.object.size() ||
             bytes.size() > self.object.size() - (address - object)) return false;
         std::memcpy(self.object.data() + address - object, bytes.data(), bytes.size());
         return true;
     }
-    static GateStatus handle(const CallHookSite&, GateCall& call, GuestThreadContext&, void* raw) {
+    static GateStatus handle(const CallHookSite& site, GateCall& call, GuestThreadContext&, void* raw) {
         auto& self = *static_cast<CompatibilityMemory*>(raw);
         CHECK(self.thread == std::this_thread::get_id());
         ++self.callbacks;
-        return compat::handle_patch(*self.installed, call, {read, write, &self});
+        return compat::handle_patch(*self.installed, call, {read, write, &self}, site.call_return_address,
+            {[](void* context) noexcept { return static_cast<CompatibilityMemory*>(context)->gpu_work; }, &self});
     }
 };
+
+void gpu_budget_instruction_preserves_leaf_state() {
+    test::ModuleSpec module;
+    module.name = "main";
+    module.symbols = {{"_start", 0x100, 0x38, true}, {"unused_callee", 0x200, 4, true}};
+    const std::array<std::uint32_t, 14> code{
+        0xaa1e03e9, // MOV X9,X30: the instruction hook must retain live LR.
+        0x910003ea, // MOV X10,SP.
+        0xeb00001f, // CMP X0,X0: the hook must retain NZCV.
+        0x52a83e08, // MOVZ W8,#0x41f0,LSL#16: synthetic scale 30.0.
+        0xb9000028, // STR W8,[X1].
+        0x540000c1, // B.NE failure.
+        0xeb1e013f, // CMP X9,X30.
+        0x54000081, // B.NE failure.
+        0x910003e0, // MOV X0,SP.
+        0xcb0a0000, // SUB X0,X0,X10: return the stack displacement.
+        0xd65f03c0, // RET.
+        0xaa0903fe, // failure: restore LR before returning a failure result.
+        0xd2800020, // MOV X0,#1.
+        0xd65f03c0,
+    };
+    for (std::size_t i = 0; i < code.size(); ++i) test::put_word(module, 0x100 + i * 4, code[i]);
+    test::put_word(module, 0x200, aarch64::encode_ret().word);
+    loader::ExeFsDirectoryInput input;
+    input.modules.push_back({"main", test::build_module(std::move(module))});
+    auto profile = synthetic_profile(); profile.title_id = 0x123;
+    const auto artifacts = prepare_modules(input, preparation_options());
+    CHECK(value(artifacts)); if (!value(artifacts)) return;
+    const auto plan = plan_launch(input, profile, *value(artifacts));
+    CHECK(value(plan)); if (!value(plan)) return;
+    const auto image = loader::read_nso_module(input.modules[0].bytes);
+    CHECK(image.ok()); if (!image.ok()) return;
+    compat::PatchDescription patch;
+    patch.identity = {profile.title_id, image.image->build_id};
+    patch.module = "frame-rate";
+    patch.original_callee = 0x200;
+    patch.layout.framework_pointer = test::data_offset;
+    patch.calls = {{0x10c, code[3], "Synthetic GPU budget constant."}};
+    patch.calls[0].gpu_budget = compat::GpuBudgetInstruction{120};
+    auto key = std::make_shared<platform::ThreadSlotKey>();
+    auto loaded = load_prepared_launch(input, *value(artifacts), profile, *value(plan), key, {}, std::span(&patch, 1));
+    CHECK(value(loaded)); if (!value(loaded)) return;
+    auto& launch = *value(loaded);
+    CompatibilityMemory memory;
+    memory.installed = launch.compatibility_patch.get();
+    memory.gpu_work = 5000000;
+    GuestThreadContext context;
+    GuestDispatchScope dispatch(launch.sites, context, {}, GateFailurePolicy::trap,
+        launch.call_hooks, {CompatibilityMemory::handle, &memory});
+    platform::ThreadSlotBinding binding(*key, context.bound_register_cell());
+    CHECK(dispatch.setup_error() == GuestDispatchFailureKind::none && binding.native_access());
+    if (dispatch.setup_error() != GuestDispatchFailureKind::none || !binding.native_access()) return;
+    float scale = 0;
+    const auto result = reinterpret_cast<std::uint64_t (*)(std::int64_t, float*)>(launch.entry_address)(192000, &scale);
+    CHECK(result == 0 && scale == 162.5f && memory.callbacks == 1 && dispatch.failure_count() == 0);
+}
+
+void mixed_interval_and_phase_hooks() {
+    test::ModuleSpec module;
+    module.name = "main";
+    module.symbols = {{"_start", 0x100, 16, true}, {"phase", 0x300, 16, true},
+                      {"interval_callee", 0x200, 4, true}, {"phase_callee", 0x240, 12, true}};
+    for (auto start : {0x100u, 0x300u}) {
+        test::put_word(module, start, 0xf81f0ffeu); // STR X30,[SP,#-16]!
+        test::put_word(module, start + 4, aarch64::encode_bl(start + 4, start == 0x100 ? 0x200 : 0x240).word);
+        test::put_word(module, start + 8, 0xf84107feu); // LDR X30,[SP],#16
+        test::put_word(module, start + 12, aarch64::encode_ret().word);
+    }
+    test::put_word(module, 0x200, aarch64::encode_ret().word);
+    test::put_word(module, 0x240, 0xb9001401u); // STR W1,[X0,#20]
+    test::put_word(module, 0x244, 0xb9001802u); // STR W2,[X0,#24]
+    test::put_word(module, 0x248, aarch64::encode_ret().word);
+    loader::ExeFsDirectoryInput input;
+    input.modules.push_back({"main", test::build_module(std::move(module))});
+    auto profile = synthetic_profile(); profile.title_id = 0x123;
+    const auto artifacts = prepare_modules(input, preparation_options());
+    CHECK(value(artifacts)); if (!value(artifacts)) return;
+    const auto plan = plan_launch(input, profile, *value(artifacts));
+    CHECK(value(plan)); if (!value(plan)) return;
+    const auto image = loader::read_nso_module(input.modules[0].bytes);
+    CHECK(image.ok()); if (!image.ok()) return;
+    compat::PatchDescription patch;
+    patch.identity = {profile.title_id, image.image->build_id};
+    patch.module = "frame-rate";
+    patch.original_callee = 0x200;
+    patch.layout = {test::data_offset, 0, 0, 4, 8, 12, test::data_offset + 8};
+    patch.calls = {{0x104, aarch64::encode_bl(0x104, 0x200).word},
+                   {0x304, aarch64::encode_bl(0x304, 0x240).word}};
+    patch.calls[1].phases = compat::PhaseCallPatch{0x240, 28, 10};
+    auto key = std::make_shared<platform::ThreadSlotKey>();
+    auto loaded = load_prepared_launch(input, *value(artifacts), profile, *value(plan), key, {}, std::span(&patch, 1));
+    CHECK(value(loaded)); if (!value(loaded)) return;
+    auto& launch = *value(loaded);
+    CHECK(launch.call_hooks && launch.call_hooks->sites().size() == 2);
+    CompatibilityMemory memory;
+    memory.installed = launch.compatibility_patch.get();
+    memory.period = 160000;
+    const std::uint32_t base = 2;
+    std::memcpy(memory.object.data() + 12, &base, 4);
+    GuestThreadContext context;
+    GuestDispatchScope dispatch(launch.sites, context, {}, GateFailurePolicy::trap,
+        launch.call_hooks, {CompatibilityMemory::handle, &memory});
+    platform::ThreadSlotBinding binding(*key, context.bound_register_cell());
+    CHECK(dispatch.setup_error() == GuestDispatchFailureKind::none && binding.native_access());
+    if (dispatch.setup_error() != GuestDispatchFailureKind::none || !binding.native_access()) return;
+    const auto phase = launch.modules->entry_address(0, "phase");
+    CHECK(phase); if (!phase) return;
+    using Entry = void (*)(void*, std::uint32_t);
+    reinterpret_cast<Entry>(launch.entry_address)(memory.object.data(), 1);
+    unsigned emitted = 0;
+    for (unsigned frame = 0; frame < 40; ++frame) {
+        reinterpret_cast<Entry>(*phase)(memory.object.data(), 99);
+        std::uint32_t first = 0, count = 0;
+        std::memcpy(&first, memory.object.data() + 20, 4);
+        std::memcpy(&count, memory.object.data() + 24, 4);
+        CHECK(count == (frame % 4 == 3 ? 1u : 0u));
+        if (count) CHECK(first == emitted++);
+    }
+    CHECK(emitted == 10 && memory.callbacks == 41 && dispatch.failure_count() == 0);
+    const float before_wrap = 9.75f;
+    std::memcpy(memory.object.data() + 28, &before_wrap, 4);
+    memory.period = 960000;
+    reinterpret_cast<Entry>(launch.entry_address)(memory.object.data(), 1);
+    reinterpret_cast<Entry>(*phase)(memory.object.data(), 99);
+    std::uint32_t first = 0, count = 0;
+    float after_wrap = 0;
+    std::memcpy(&first, memory.object.data() + 20, 4);
+    std::memcpy(&count, memory.object.data() + 24, 4);
+    std::memcpy(&after_wrap, memory.object.data() + 28, 4);
+    CHECK(first == 9 && count == 2 && after_wrap == 1.25f);
+    CHECK(graphics::presentation_scheduling_period(std::chrono::nanoseconds::zero()) ==
+          std::chrono::nanoseconds(3'333'333));
+}
 
 void rejects_unsupported_and_filtered_prepared_rates() {
     test::ModuleSpec module;
@@ -940,6 +1082,8 @@ void fractional_hook_uses_declared_register(titles::FrameRateVariant variant, un
 } // namespace
 
 int main() {
+    gpu_budget_instruction_preserves_leaf_state();
+    mixed_interval_and_phase_hooks();
     fractional_hook_uses_declared_register(titles::FrameRateVariant::FractionalCounter30, 22, 3.5f);
     fractional_hook_uses_declared_register(titles::FrameRateVariant::FractionalCountdown30, 25, 2.5f);
     loads_identity_selected_call_hooks();

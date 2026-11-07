@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include <armigo/common/guest_platform.h>
+
 #include <armigo/horizon/arbitration.h>
 #include <armigo/horizon/event.h>
 #include <armigo/horizon/handle_table.h>
@@ -33,8 +35,11 @@ namespace armigo::horizon {
 inline constexpr Handle current_process_handle = 0xffff8001u;
 inline constexpr Handle current_thread_handle = 0xffff8000u;
 inline constexpr std::uint64_t guest_page_size = 4096;
+// Owner-approved, unverified Switch 2 allocation granule. Query 33 and physical
+// map/unmap checks share this value; a console capture may establish 64 KiB.
+inline constexpr std::uint64_t switch2_physical_mapping_granule = guest_page_size;
 
-enum class Baseline { horizon_20_5_0 };
+enum class Baseline { horizon_20_5_0, horizon_23_0_1 };
 
 struct AddressRange {
     std::uint64_t address = 0;
@@ -64,15 +69,26 @@ struct MemoryBlock {
     std::uint8_t merge_disable = 0;
 };
 
+// Range edits carry only the changed metadata; private processes stage them in
+// their shared interval authority before applying native mapping changes.
+struct MemoryMapUpdate {
+    AddressRange range;
+    std::optional<MemoryBlock> replacement;
+    std::uint8_t set_merge = 0;
+    std::uint8_t clear_merge = 0;
+};
+
 // A public MemoryInfo value, not the host layout of the wire structure.
 // encode_memory_info writes its exact forty-byte little-endian representation.
 using MemoryInfo = MemoryBlock;
 std::array<std::byte, 40> encode_memory_info(const MemoryInfo& info) noexcept;
 
-// The first supported process profile is 64-bit, 39-bit address space, with
-// no private system-resource allocation. Placements and resource budgets are
-// supplied by the runtime, never selected by a game name.
+// Supported process profiles use 64-bit, 39-bit address space. The Switch 1
+// profile has no private system resource; the selected 23.0.1 reference also
+// admits an application-owned resource pool. Placement and resource budgets
+// are supplied by the runtime, never selected by a game name.
 struct ProcessConfiguration {
+    GuestPlatform platform = GuestPlatform::switch1;
     Baseline baseline = Baseline::horizon_20_5_0;
     unsigned address_bits = 39;
     std::uint64_t heap_address = 0;
@@ -90,6 +106,8 @@ struct ProcessConfiguration {
     std::uint64_t stack_size = std::uint64_t{2} << 30;
     AddressRange allocation_region{std::uint64_t{128} << 20,
                                    (std::uint64_t{1} << 39) - (std::uint64_t{128} << 20)};
+    // Actual native reservation; empty means remote-region queries are unsupported.
+    AddressRange remote_region{};
 };
 
 struct MemoryAccounting {
@@ -113,6 +131,7 @@ enum class ProcessStateError {
 };
 
 class ProcessRecord;
+class MemoryIntervalMap;
 struct ProcessBuild {
     ProcessStateError error = ProcessStateError::none;
     std::shared_ptr<ProcessRecord> process;
@@ -124,9 +143,16 @@ struct ProcessBuild {
 // backing and must register the live guest stack before executing the SDK.
 class ProcessRecord final : public KernelObject {
 public:
+    ~ProcessRecord() override;
     static constexpr std::uint64_t query_end = std::uint64_t{1} << 39;
     static constexpr std::uint64_t aslr_start = 128ull * 1024 * 1024;
     static constexpr std::uint64_t heap_capacity = 8ull * 1024 * 1024 * 1024;
+    // Unverified Switch 2 application-pool assumption from practical startup
+    // evidence; replace with owner-console GetInfo 16/21/22 evidence when available.
+    static constexpr std::uint64_t switch2_application_capacity = 9809ull * 1024 * 1024;
+    static constexpr std::uint64_t application_capacity(GuestPlatform platform) noexcept {
+        return platform == GuestPlatform::switch2 ? switch2_application_capacity : heap_capacity;
+    }
     static constexpr std::uint64_t base_alias_capacity = 64ull * 1024 * 1024 * 1024;
     static constexpr std::uint64_t stack_capacity = 2ull * 1024 * 1024 * 1024;
 
@@ -134,19 +160,24 @@ public:
                                const MemoryAccounting& accounting,
                                std::span<const MemoryBlock> blocks = {});
     ProcessStateError set_accounting(const MemoryAccounting& accounting);
+    // Legacy metadata replacement only; private profiles require bounded edits.
     ProcessStateError replace_memory_map(std::span<const MemoryBlock> blocks);
     // Prepares and validates both query views before calling apply under the
     // record lock. apply must not reenter this record and must restore partial
     // native work before returning false. Success publishes without allocation.
     ProcessStateError commit_memory_state(std::span<const MemoryBlock> blocks,
         const MemoryAccounting& accounting, bool (*apply)(void*) noexcept, void* context);
-    // Copy of the current map, for a caller that has to split a block's metadata.
+    // Explicit diagnostic snapshot; private mutation must use bounded updates.
     std::vector<MemoryBlock> memory_map() const;
 
     MemoryInfo query_memory(std::uint64_t address) const;
     bool writable(std::uint64_t address, std::size_t size) const;
     std::uint64_t used_memory() const;
     std::uint64_t total_memory() const;
+    std::uint64_t used_system_resource() const;
+    std::shared_ptr<MemoryIntervalMap> memory_intervals() const noexcept { return private_memory_; }
+    ProcessStateError commit_memory_updates(std::span<const MemoryMapUpdate> updates,
+        const MemoryAccounting& accounting, bool (*apply)(void*) noexcept, void* context);
     const ProcessConfiguration& configuration() const noexcept { return configuration_; }
     std::uint64_t alias_extra_size() const noexcept;
     AddressRange heap_region() const noexcept;
@@ -173,12 +204,13 @@ public:
     }
 
 private:
-    explicit ProcessRecord(const ProcessConfiguration& configuration)
-        : configuration_(configuration) {}
+    explicit ProcessRecord(const ProcessConfiguration& configuration);
+    ProcessStateError initialize_memory_map(std::span<const MemoryBlock> blocks);
     const ProcessConfiguration configuration_;
     mutable std::mutex mutex_;
     MemoryAccounting accounting_;
     std::vector<MemoryBlock> blocks_;
+    std::shared_ptr<MemoryIntervalMap> private_memory_;
     std::atomic<std::uint64_t> user_exception_context_{0};
     std::atomic<std::uint64_t> scheduled_count_{0};
 };
@@ -201,6 +233,10 @@ public:
     const std::shared_ptr<ProcessRecord>& process() const noexcept { return process_; }
     std::uint64_t id() const noexcept { return id_; }
     std::uint32_t priority() const noexcept { return priority_.load(std::memory_order_relaxed); }
+    // The handle the creating process received for this thread; zero until the
+    // runtime inserts it. A Switch 2 thread finds it in its thread-local region.
+    Handle creation_handle() const noexcept { return creation_handle_.load(std::memory_order_acquire); }
+    void set_creation_handle(Handle handle) noexcept { creation_handle_.store(handle, std::memory_order_release); }
     bool set_priority(std::uint32_t priority) noexcept;
     // Atomically publish/query the runtime's ideal, affinity and virtual binding.
     ThreadSchedulingState scheduling_state() const noexcept;
@@ -271,6 +307,7 @@ private:
     void* guest_wait_context_ = nullptr;
     std::shared_ptr<ProcessRecord> process_;
     std::uint64_t id_;
+    std::atomic<Handle> creation_handle_{0};
     std::atomic<std::uint32_t> priority_;
     mutable std::mutex scheduling_mutex_;
     std::int32_t ideal_core_ = -1;

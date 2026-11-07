@@ -25,6 +25,12 @@ target_link_libraries(armigo_metal_nvn_resources PUBLIC armigo_nvn armigo_metal_
     "-framework Metal" "-framework Foundation")
 
 if(BUILD_TESTING)
+    add_executable(armigo_nvn_timeline_tests "${PROJECT_SOURCE_DIR}/tests/nvn/timeline_tests.cpp" timeline.cpp)
+    target_include_directories(armigo_nvn_timeline_tests PRIVATE "${PROJECT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_compile_features(armigo_nvn_timeline_tests PRIVATE cxx_std_20)
+    target_link_libraries(armigo_nvn_timeline_tests PRIVATE Threads::Threads)
+    add_test(NAME nvn.timeline COMMAND armigo_nvn_timeline_tests)
+    set_tests_properties(nvn.timeline PROPERTIES TIMEOUT 30)
     foreach(test_name IN ITEMS abi counting null_device)
         add_executable(armigo_nvn_${test_name}_tests "${PROJECT_SOURCE_DIR}/tests/nvn/${test_name}_tests.cpp")
         target_include_directories(armigo_nvn_${test_name}_tests PRIVATE "${PROJECT_SOURCE_DIR}/src/nvn")
@@ -161,6 +167,12 @@ if(BUILD_TESTING)
     add_test(NAME nvn.metal_replay_finalized_queries_worker COMMAND armigo_metal_nvn_replay_tests)
     set_tests_properties(nvn.metal_replay_finalized_queries_worker PROPERTIES
         ENVIRONMENT "ARMIGO_NVN_BATCH_FINALIZED_QUERIES=1;ARMIGO_NVN_CONDITIONAL_CONTRACT_TESTS=1;ARMIGO_NVN_ENCODE_THREAD=0;MTL_DEBUG_LAYER=1")
+    add_test(NAME nvn.metal_unused_colors COMMAND armigo_metal_nvn_replay_tests)
+    set_tests_properties(nvn.metal_unused_colors PROPERTIES ENVIRONMENT
+        "ARMIGO_NVN_UNUSED_COLOR_CONTRACT_TESTS=1;ARMIGO_NVN_OMIT_UNUSED_COLORS=0;ARMIGO_NVN_ENCODE_THREAD=1;MTL_DEBUG_LAYER=1")
+    add_test(NAME nvn.metal_unused_colors_worker COMMAND armigo_metal_nvn_replay_tests)
+    set_tests_properties(nvn.metal_unused_colors_worker PROPERTIES ENVIRONMENT
+        "ARMIGO_NVN_UNUSED_COLOR_CONTRACT_TESTS=1;ARMIGO_NVN_OMIT_UNUSED_COLORS=0;ARMIGO_NVN_ENCODE_THREAD=0;MTL_DEBUG_LAYER=1")
     # Conditional-render predicates as the compute kernel before each block's pass.
     add_test(NAME nvn.metal_replay_predicate_kernel COMMAND armigo_metal_nvn_replay_tests)
     set_tests_properties(nvn.metal_replay_predicate_kernel PROPERTIES
@@ -179,6 +191,12 @@ if(BUILD_TESTING)
     target_include_directories(armigo_metal_nvn_encode_ring_tests PRIVATE
         "${PROJECT_SOURCE_DIR}/src/platform/metal")
     add_test(NAME nvn.metal_encode_ring COMMAND armigo_metal_nvn_encode_ring_tests)
+    add_executable(armigo_metal_nvn_write_ranges_tests
+        "${PROJECT_SOURCE_DIR}/tests/metal/nvn_write_ranges_tests.cpp")
+    target_include_directories(armigo_metal_nvn_write_ranges_tests PRIVATE
+        "${PROJECT_SOURCE_DIR}/src/platform/metal")
+    target_compile_features(armigo_metal_nvn_write_ranges_tests PRIVATE cxx_std_20)
+    add_test(NAME nvn.metal_write_ranges COMMAND armigo_metal_nvn_write_ranges_tests)
     add_executable(armigo_metal_pso_manifest_tests
         "${PROJECT_SOURCE_DIR}/tests/metal/pso_manifest_tests.cpp"
         "${PROJECT_SOURCE_DIR}/src/platform/metal/pso_manifest.cpp")

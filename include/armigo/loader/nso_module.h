@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <span>
 #include <vector>
 
@@ -112,6 +113,7 @@ struct ModuleHeaderInfo {
 
 /// A fully materialized, unrelocated module image.
 struct NsoModuleImage {
+    bool zbic_compression = false;
     /// Exact 32-byte module build ID from the NSO header.
     std::array<std::byte, 32> build_id{};
     /// Image bytes. The size is a multiple of the guest page size; bytes not
@@ -184,6 +186,8 @@ enum class NsoError : std::uint8_t {
     /// LZ4 decoding failed; `lz4` holds the decoder error and `detail` the
     /// position within the compressed segment.
     decompression_failed,
+    /// ZBIC decoding failed; decoder_detail describes the format or build limitation.
+    zbic_decompression_failed,
     /// A decompressed segment does not match its stored SHA-256 hash.
     hash_mismatch,
     /// A rodata-relative extent lies outside the rodata segment. `detail`
@@ -207,6 +211,7 @@ struct NsoReadError {
     std::optional<NsoSegmentKind> segment;
     Lz4Error lz4 = Lz4Error::success;
     std::uint64_t detail = 0;
+    std::string decoder_detail;
 };
 
 /// Outcome of `read_nso_module`: an image on success, an error otherwise.

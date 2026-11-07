@@ -386,7 +386,8 @@ int main() {
     check(focus.apply(input, true).buttons == 0, "held merged controls stay released on refocus");
     overlay.publish({});
     input = runtime::full_key_input(overlay.merge(physical));
-    check((input.buttons & 7) == 6 && input.left_x == 8192,
+    // The physical stick is shaped again: 0.25 past a 12% dead zone, rescaled.
+    check((input.buttons & 7) == 6 && input.left_x >= 4830 && input.left_x <= 4850,
           "script release leaves physical controls intact");
     (void)focus.apply(runtime::full_key_input(overlay.merge({})), true);
     overlay.publish(scripted);

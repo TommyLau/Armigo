@@ -10,6 +10,7 @@
 
 #include <armigo/common/diagnostics.h>
 #include <armigo/services/applet.h>
+#include <armigo/services/graphics_system.h>
 
 #include <armigo/horizon/startup_queries.h>
 #include <armigo/services/settings.h>
@@ -67,13 +68,36 @@ bool ApplicationRunningState::notify() {
 AppletServiceSession::AppletServiceSession(std::uint64_t process_id,
     std::shared_ptr<horizon::ProcessRecord> process, horizon::HandleTable& handles,
     GameplayRecordingPolicy recording_policy, std::shared_ptr<ApplicationRunningState> running_state,
-    OperationMode operation_mode)
-    : process_id_(process_id), operation_mode_(operation_mode), recording_policy_(recording_policy),
+    OperationMode operation_mode, AppletContract contract)
+    : process_id_(process_id), contract_(contract), operation_mode_(operation_mode), recording_policy_(recording_policy),
       // The default disabled state is an explicit Armigo host launch policy for
       // headless starts, not a recovered firmware initial flag.
       running_state_(running_state ? std::move(running_state)
                                    : std::make_shared<ApplicationRunningState>()),
       process_(std::move(process)), handles_(&handles) {}
+
+horizon::IpcReply AppletServiceSession::close_server() {
+    const std::lock_guard lock(mutex_);
+    if (contract_ == AppletContract::horizon_20_5_0) return ClientSession::close_server();
+    if (contract_ != AppletContract::switch2_23_0_1) return {};
+    if (closed_) return {.disposition = horizon::IpcDisposition::handled,
+                         .transport_result = horizon::session_closed_result};
+    closed_ = true;
+    domain_ = false;
+    application_proxy_configuration_.reset();
+    std::vector<DomainObject>{}.swap(objects_);
+    launch_parameters_ = {};
+    suspended_tick_event_.reset();
+    library_applet_launchable_event_.reset();
+    gpu_error_event_.reset();
+    common_state_event_.reset();
+    display_resolution_event_.reset();
+    application_state_event_.reset();
+    process_.reset();
+    keyboard_input_ = {};
+    diagnostic_ = "Applet server session is closed";
+    return {.disposition = horizon::IpcDisposition::handled};
+}
 
 horizon::IpcReply AppletServiceSession::request(const horizon::IpcMessage& message,
                                                std::uint64_t sender_pid) {
@@ -139,6 +163,10 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
     }
     const auto& message = *source;
     const std::lock_guard lock(mutex_);
+    if (closed_) return {.disposition = horizon::IpcDisposition::handled,
+                         .transport_result = horizon::session_closed_result};
+    if (contract_ != AppletContract::horizon_20_5_0 && contract_ != AppletContract::switch2_23_0_1)
+        return {};
     diagnostic_ = "Applet service request is not implemented";
     if (sender_pid != process_id_) {
         diagnostic_ = "Applet service session belongs to a different process";
@@ -148,6 +176,10 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
     const auto words = read(message, 4);
     if ((type == 4 || type == 6) && domain_ && source == &request && words >= 6 && words < 12 &&
         (read(message, 16) & 0xff) == 2) {
+        if (contract_ == AppletContract::switch2_23_0_1) {
+            diagnostic_ = "Switch 2 applet domain close requires a verified contract";
+            return {};
+        }
         // A domain close releases one object; its reply has no CMIF payload.
         // Ids stay assigned, so the slot is only marked closed.
         const auto id = read(message, 20);
@@ -173,6 +205,73 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
             id < 2 || id - 2 >= objects_.size() || read(message, 32) != 0x49434653 ||
             objects_.size() >= std::numeric_limits<std::uint32_t>::max() - 1)
             return {};
+        // Switch 2 provisional handlers: zero replies adopted from practical
+        // reference evidence ahead of firmware verification. Each succeeds with
+        // zeroed output of the listed size and warns once per session. The
+        // table below lists them all.
+        struct Provisional {
+            ObjectKind kind; std::uint32_t command; std::uint32_t output_bytes; std::uint32_t token; const char* name;
+            // The first output word; the rest of the output is zero.
+            std::uint32_t first_word = 0;
+        };
+        static constexpr Provisional switch2_provisional[] = {
+            {ObjectKind::application_functions, 320, 2, 0x21f9610e, "ApplicationFunctions 320"},
+            {ObjectKind::application_functions, 321, 1, 0x21f9610e, "ApplicationFunctions 321"},
+            {ObjectKind::application_functions, 330, 1, 0x21f9610e, "ApplicationFunctions 330"},
+            // GetCurrentGraphicsScale: scale 10, the first of the accepted 10, 20 and 30.
+            {ObjectKind::graphics_scale, 10, 12, 0, "GraphicsScale 10", 10},
+        };
+        static_assert(std::size(switch2_provisional) <= 64);
+        if (contract_ == AppletContract::switch2_23_0_1) {
+            for (std::size_t index = 0; index != std::size(switch2_provisional); ++index) {
+                const auto& entry = switch2_provisional[index];
+                if (entry.kind != objects_[id - 2].kind || entry.command != read(message, 40)) continue;
+                if (in_objects || copied_handle || buffered) return {};
+                if (!(provisional_warned_ & (std::uint64_t{1} << index))) {
+                    provisional_warned_ |= std::uint64_t{1} << index;
+                    armigo::diag::write(armigo::diag::Level::warning,
+                        "Armigo am: provisional Switch 2 handler %s answers with an unverified reply\n", entry.name);
+                }
+                const auto output_words = (entry.output_bytes + 3) / 4;
+                horizon::IpcReply reply{horizon::IpcDisposition::handled};
+                reply.size = 56 + 4 * output_words;
+                write(reply.bytes, 4, 12 + output_words);
+                write(reply.bytes, 32, 0x4f434653);
+                write(reply.bytes, 44, entry.token);
+                if (output_words) write(reply.bytes, 48, entry.first_word);
+                diagnostic_ = nullptr;
+                return reply;
+            }
+        }
+        // Switch 2 child commands admitted so far; each shares the handler below
+        // with the 20.5.0 contract.
+        struct Admitted { ObjectKind kind; std::uint32_t command; };
+        static constexpr Admitted switch2_admitted[] = {
+            {ObjectKind::window_controller, 1}, {ObjectKind::window_controller, 10},
+            {ObjectKind::common_state, 0}, {ObjectKind::common_state, 1}, {ObjectKind::common_state, 5},
+            {ObjectKind::common_state, 6}, {ObjectKind::common_state, 9}, {ObjectKind::common_state, 50},
+            {ObjectKind::common_state, 66}, {ObjectKind::common_state, 67}, {ObjectKind::common_state, 900},
+            {ObjectKind::self_controller, 1}, {ObjectKind::self_controller, 2}, {ObjectKind::self_controller, 9},
+            {ObjectKind::self_controller, 10}, {ObjectKind::self_controller, 11}, {ObjectKind::self_controller, 12},
+            {ObjectKind::self_controller, 13}, {ObjectKind::self_controller, 14}, {ObjectKind::self_controller, 16},
+            {ObjectKind::self_controller, 62}, {ObjectKind::self_controller, 63}, {ObjectKind::self_controller, 91},
+            {ObjectKind::self_controller, 2000}, {ObjectKind::self_controller, 2400},
+            {ObjectKind::application_functions, 1}, {ObjectKind::application_functions, 20},
+            {ObjectKind::application_functions, 21}, {ObjectKind::application_functions, 22},
+            {ObjectKind::application_functions, 40}, {ObjectKind::application_functions, 67},
+            {ObjectKind::application_functions, 130}, {ObjectKind::application_functions, 210},
+            {ObjectKind::storage, 0}, {ObjectKind::storage_accessor, 0}, {ObjectKind::storage_accessor, 10},
+            {ObjectKind::storage_accessor, 11},
+            {ObjectKind::graphics_scale, 1050},
+        };
+        if (contract_ == AppletContract::switch2_23_0_1 &&
+            objects_[id - 2].kind != ObjectKind::application_proxy &&
+            std::none_of(std::begin(switch2_admitted), std::end(switch2_admitted), [&](const Admitted& entry) {
+                return entry.kind == objects_[id - 2].kind && entry.command == read(message, 40);
+            })) {
+            diagnostic_ = "Switch 2 applet child command requires a verified contract";
+            return {};
+        }
         if (in_objects && (objects_[id - 2].kind != ObjectKind::library_applet || read(message, 40) != 100))
             return {};
         // Only a storage read or write takes a buffer, and only a transfer
@@ -183,6 +282,56 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
             (objects_[id - 2].kind != ObjectKind::storage_accessor ||
              (read(message, 40) != 10 && read(message, 40) != 11)))
             return {};
+        if (contract_ == AppletContract::switch2_23_0_1 &&
+            objects_[id - 2].kind == ObjectKind::self_controller && read(message, 40) == 2000) {
+            // GetGraphicsSystemSession: one copied handle to a new graphics
+            // system session, which the SDK then speaks TIPC on.
+            std::shared_ptr<gsv::GraphicsSystemSession> session;
+            try {
+                session = std::make_shared<gsv::GraphicsSystemSession>(process_id_, *handles_,
+                                                                     graphics_system_dependencies_);
+            } catch (const std::bad_alloc&) {
+                return {};
+            }
+            const auto handle = handles_->insert(session);
+            if (!handle) return {};
+            horizon::IpcReply reply{horizon::IpcDisposition::handled};
+            reply.size = 64;
+            write(reply.bytes, 4, 0x8000000c);
+            write(reply.bytes, 8, 2);
+            write(reply.bytes, 12, *handle);
+            write(reply.bytes, 32, 0x4f434653);
+            write(reply.bytes, 44, 0x56efeaa1);
+            diagnostic_ = nullptr;
+            return reply;
+        }
+        if (contract_ == AppletContract::switch2_23_0_1 &&
+            objects_[id - 2].kind == ObjectKind::self_controller && read(message, 40) == 2400) {
+            // The Switch 2 AM program takes one boolean byte, keeps it in the
+            // controller and the applet's display state, and replies without
+            // output. The display update it then triggers is not modeled.
+            if (words < 13 || size < 17) return {};
+            self_controller_2400_ = (read(message, 48) & 1) != 0;
+            horizon::IpcReply reply{horizon::IpcDisposition::handled};
+            reply.size = 56;
+            write(reply.bytes, 4, 12);
+            write(reply.bytes, 32, 0x4f434653);
+            write(reply.bytes, 44, 0x56efeaa1);
+            diagnostic_ = nullptr;
+            return reply;
+        }
+        if (objects_[id - 2].kind == ObjectKind::graphics_scale && read(message, 40) == 1050) {
+            // SetGraphicsScaleChangedNotificationEnabled takes one boolean byte. The
+            // graphics scale never changes on this host, so the flag is only kept.
+            if (words < 13 || size < 17) return {};
+            graphics_scale_notifications_ = (read(message, 48) & 1) != 0;
+            horizon::IpcReply reply{horizon::IpcDisposition::handled};
+            reply.size = 56;
+            write(reply.bytes, 4, 12);
+            write(reply.bytes, 32, 0x4f434653);
+            diagnostic_ = nullptr;
+            return reply;
+        }
         if (objects_[id - 2].kind == ObjectKind::window_controller && read(message, 40) == 1) {
             // The host application instance uses its process identity for the
             // lifetime of the launch, independently of handles and title IDs.
@@ -197,11 +346,15 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
             return reply;
         }
         if (objects_[id - 2].kind == ObjectKind::window_controller && read(message, 40) == 10) {
-            if (!focused_) {
-                diagnostic_ = "Foreground ownership has not been granted by launch policy";
-                return {};
+            if (contract_ == AppletContract::horizon_20_5_0) {
+                if (!focused_) {
+                    diagnostic_ = "Foreground ownership has not been granted by launch policy";
+                    return {};
+                }
+                foreground_rights_acquired_ = true;
             }
-            foreground_rights_acquired_ = true;
+            // The selected Switch 2 firmware method returns zero without
+            // changing state. Foreground selection remains host launch policy.
             horizon::IpcReply reply{horizon::IpcDisposition::handled};
             reply.size = 56;
             write(reply.bytes, 4, 12);
@@ -232,15 +385,24 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
         }
         if (objects_[id - 2].kind == ObjectKind::common_state && read(message, 40) == 66) {
             // Command66 takes one inline enum below two and produces no output.
+            // The Switch 2 AM program reads its low byte, adds the GPU-only mode
+            // 2, and answers a larger mode with 0x3f480 without changing state.
             if (words < 13 || size < 20) return {};
-            const auto value = read(message, 48);
-            if (value >= 2) return {};
-            common_state_command66_ = value;
-            common_state_boost_active_ = true;
+            const bool switch2 = contract_ == AppletContract::switch2_23_0_1;
+            const auto value = switch2 ? read(message, 48) & 0xff : read(message, 48);
+            std::uint32_t result = 0;
+            if (value >= (switch2 ? 3u : 2u)) {
+                if (!switch2) return {};
+                result = 0x3f480;
+            } else {
+                common_state_command66_ = value;
+                common_state_boost_active_ = true;
+            }
             horizon::IpcReply reply{horizon::IpcDisposition::handled};
             reply.size = 56;
             write(reply.bytes, 4, 12);
             write(reply.bytes, 32, 0x4f434653);
+            write(reply.bytes, 40, result);
             write(reply.bytes, 44, 0x32f27d77);
             diagnostic_ = nullptr;
             return reply;
@@ -888,6 +1050,14 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
         case 4: child_kind = ObjectKind::display_controller; break;
         case 11: child_kind = ObjectKind::library_creator; break;
         case 20: child_kind = ObjectKind::application_functions; break;
+        case 40:
+            if (contract_ != AppletContract::switch2_23_0_1) return {};
+            child_kind = ObjectKind::application_status;
+            break;
+        case 60:
+            if (contract_ != AppletContract::switch2_23_0_1) return {};
+            child_kind = ObjectKind::graphics_scale;
+            break;
         case 1000: child_kind = ObjectKind::debug_functions; break;
         default: return {};
         }
@@ -909,16 +1079,22 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
         return reply;
     }
     if (type == 4 || type == 6) {
+        const auto command = read(message, 56);
+        const bool extended_proxy = contract_ == AppletContract::switch2_23_0_1 && command == 10;
         const auto raw_words = words & 0x3ffu;
         if (!domain_ || !process_ || (words & ~0x3ffu) != 0x80000000u ||
-            raw_words < 14 || raw_words > (message.size() - 24) / 4 || read(message, 8) != 3)
+            raw_words < (extended_proxy ? 16u : 14u) || raw_words > (message.size() - 24) / 4 || read(message, 8) != 3)
             return {};
         const auto domain_header = read(message, 32);
         const auto data_size = domain_header >> 16;
-        if ((domain_header & 0xffff) != 1 || data_size < 24 ||
+        if ((domain_header & 0xffff) != 1 || data_size < (extended_proxy ? 32u : 24u) ||
             data_size > 24 + raw_words * 4 - 48 || read(message, 36) != 1 ||
-            read(message, 48) != 0x49434653 || read(message, 56) != 0)
+            read(message, 48) != 0x49434653 || (command != 0 && !extended_proxy))
             return {};
+        if (extended_proxy && read(message, 72) != 0) {
+            diagnostic_ = "Switch 2 application proxy configuration is not implemented";
+            return {};
+        }
         const auto copied_handle = read(message, 20);
         auto object = copied_handle == horizon::current_process_handle
             ? std::static_pointer_cast<horizon::KernelObject>(process_)
@@ -933,6 +1109,14 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
             return {};
         } catch (const std::length_error&) {
             return {};
+        }
+        if (extended_proxy) {
+            // Practical reference evidence admits the registered host application
+            // through the same factory. Switch 2 launch-policy effects remain
+            // unverified against console; retain the extra configuration word.
+            application_proxy_configuration_ = read(message, 72);
+            armigo::diag::opt_in("Switch 2 application proxy configuration=%u\n",
+                *application_proxy_configuration_);
         }
         horizon::IpcReply reply{horizon::IpcDisposition::handled};
         reply.size = 60;
@@ -1045,12 +1229,22 @@ std::uint32_t AppletServiceSession::terminate_result() const {
     return terminate_result_;
 }
 
+void AppletServiceSession::set_graphics_system_dependencies(gsv::GraphicsSystemDependencies dependencies) {
+    const std::lock_guard lock(mutex_);
+    graphics_system_dependencies_ = std::move(dependencies);
+}
+
 void AppletServiceSession::grant_foreground() {
     const std::lock_guard lock(mutex_);
     if (focused_) return;
     focused_ = true;
     focus_notification_pending_ = true;
     if (common_state_event_ && focus_notifications_enabled_) common_state_event_->signal();
+}
+
+std::optional<std::uint32_t> AppletServiceSession::application_proxy_configuration() const {
+    const std::lock_guard lock(mutex_);
+    return application_proxy_configuration_;
 }
 
 std::size_t AppletServiceSession::domain_object_count() const {

@@ -68,6 +68,7 @@ struct RunnerArguments {
     // exclusive with --exefs/--romfs; headless only in this increment. The
     // extraction runs before launch and only succeeds with all container
     // signatures verified.
+    std::optional<std::filesystem::path> nup_file;
     std::optional<std::filesystem::path> container_file;
     std::optional<std::filesystem::path> keys_file;
     // Optional update container layered over --container: the update's

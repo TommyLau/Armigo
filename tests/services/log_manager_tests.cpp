@@ -18,6 +18,7 @@
 namespace {
 using namespace armigo::horizon;
 using armigo::services::lm::LogManagerSession;
+using armigo::services::lm::LogManagerContract;
 unsigned failures = 0;
 #define CHECK(condition) do { if (!(condition)) { ++failures; \
     std::fprintf(stderr, "FAIL %d: %s\n", __LINE__, #condition); } } while (false)
@@ -64,9 +65,9 @@ IpcMessage open_logger(std::uint32_t root) {
 IpcMessage log_request(std::uint32_t logger, std::uint32_t data_size = 16) {
     IpcMessage message;
     message.fill(std::byte{0xa5});
-    put(message, 0, 6);              // HIPC type6 request, length halfword 0.
-    put(message, 2, 0x11, 2);        // The wire length halfword is not the type.
-    put(message, 4, 12);             // Twelve raw words, no descriptors.
+    put(message, 0, 6);              // Context-bearing request.
+    put(message, 2, 0x11, 2);        // Legacy admitted X/A descriptor shape.
+    put(message, 4, 12);             // Twelve raw words, no PID special header.
     put(message, 8, 0x00bc1000);     // Input buffer extent and address.
     put(message, 12, 0x08b625f8);
     put(message, 32, 1 | (data_size << 16)); // Domain type1, zero objects.
@@ -81,12 +82,15 @@ IpcMessage log_request(std::uint32_t logger, std::uint32_t data_size = 16) {
 
 struct Fixture {
     HandleTable handles{8};
-    std::shared_ptr<LogManagerSession> session = std::make_shared<LogManagerSession>(71);
+    std::shared_ptr<LogManagerSession> session;
     IpcDispatcher dispatcher{handles, nullptr};
     Handle handle = handles.insert(session).value();
     IpcMessage message{};
     QueryRegisters registers{};
     IpcCallContext caller{71, message, nullptr, nullptr};
+
+    explicit Fixture(LogManagerContract contract = LogManagerContract::horizon_20_5_0)
+        : session(std::make_shared<LogManagerSession>(71, contract)) {}
 
     IpcDisposition send() {
         registers.fill(0x123456789abcdef0);
@@ -219,6 +223,130 @@ void test_logger_log_command() {
     f.expect_unsupported();
 }
 
+IpcMessage switch2_log_request(std::uint32_t logger, std::uint64_t address,
+                               std::uint32_t size, bool alias) {
+    IpcMessage request{};
+    put(request, 0, 6u | (1u << 16) | (1u << 20)); // One X and one A descriptor.
+    put(request, 4, 12);
+    if (alias) {
+        put(request, 16, size);
+        put(request, 20, address);
+        put(request, 24, ((address >> 32) & 15) << 28 | ((address >> 36) & 7) << 2);
+    } else {
+        put(request, 8, std::uint64_t{size} << 16 | ((address >> 32) & 15) << 12 |
+                        ((address >> 36) & 7) << 6);
+        put(request, 12, address);
+    }
+    put(request, 32, 0x00100001);
+    put(request, 36, logger);
+    put(request, 48, 0x49434653);
+    put(request, 52, 1);
+    return request;
+}
+
+void test_switch2_logger_contract() {
+    Fixture f(LogManagerContract::switch2_23_0_1);
+    f.message = control(3);
+    CHECK(f.send() == IpcDisposition::handled);
+    check_control_reply(f.message, 0x400, 2);
+    const auto root = f.convert();
+    f.message = open_logger(root);
+    CHECK(f.send() == IpcDisposition::handled && get(f.message, 44) == 0xe1d7f748);
+    const auto logger = static_cast<std::uint32_t>(get(f.message, 48));
+    struct Source {
+        std::uint64_t address = 0x50001000;
+        std::vector<std::byte> bytes;
+        unsigned reads = 0;
+    } source;
+    f.caller.memory_context = &source;
+    f.caller.read_memory = [](void* context, std::uint64_t address,
+                              std::span<std::byte> output) noexcept {
+        auto& source = *static_cast<Source*>(context);
+        if (address != source.address || output.size() != source.bytes.size()) return false;
+        ++source.reads;
+        std::copy(source.bytes.begin(), source.bytes.end(), output.begin());
+        return true;
+    };
+    for (bool alias : {false, true}) {
+        source.bytes.assign(alias ? 0x800 : 0x80, std::byte{0x5a});
+        const auto original = source.bytes;
+        const auto reads = source.reads;
+        f.message = switch2_log_request(logger, source.address, source.bytes.size(), alias);
+        const auto before = f.message;
+        CHECK(f.send() == IpcDisposition::handled);
+        IpcMessage expected{};
+        put(expected, 4, 12);
+        put(expected, 32, 0x4f434653);
+        put(expected, 44, 0x3e81dad2);
+        CHECK(std::equal(expected.begin(), expected.begin() + 56, f.message.begin()));
+        CHECK(std::equal(before.begin() + 56, before.end(), f.message.begin() + 56));
+        CHECK(source.reads == reads + 1 && source.bytes == original);
+        CHECK(f.session->domain_object_count() == 2 && f.handles.size() == 1);
+        f.message = switch2_log_request(logger, source.address + 16, source.bytes.size(), alias);
+        f.expect_unsupported();
+    }
+    f.message = switch2_log_request(logger, 0, 0, false);
+    const auto reads = source.reads;
+    CHECK(f.send() == IpcDisposition::handled && get(f.message, 44) == 0x3e81dad2);
+    CHECK(source.reads == reads);
+    f.message = switch2_log_request(logger, source.address, 0x10001, true);
+    f.expect_unsupported();
+    f.message = switch2_log_request(logger, source.address, 0x401, false);
+    f.expect_unsupported();
+    f.message = switch2_log_request(logger, source.address, 0x80, false);
+    put(f.message, 16, 0x80); put(f.message, 20, source.address); // Two active buffers.
+    f.expect_unsupported();
+    f.message = switch2_log_request(logger, source.address, 0x80, false);
+    put(f.message, 0, 6); // Descriptor counts are not a message-length field.
+    f.expect_unsupported();
+    f.message = switch2_log_request(logger, source.address, 0x80, false);
+    put(f.message, 8, get(f.message, 8) | (1u << 9)); // A wider address must not wrap.
+    f.expect_unsupported();
+    f.message = switch2_log_request(logger, source.address, 0x80, true);
+    put(f.message, 24, get(f.message, 24) | (1u << 5));
+    f.expect_unsupported();
+}
+
+void test_switch2_control_counts_and_close() {
+    for (unsigned command : {0u, 3u}) {
+        Fixture f(LogManagerContract::switch2_23_0_1);
+        f.message = control(command);
+        put(f.message, 0, 7u | (2u << 16));
+        f.expect_unsupported();
+        CHECK(f.session->domain_object_count() == 0);
+    }
+    Fixture f(LogManagerContract::switch2_23_0_1);
+    const auto root = f.convert();
+    f.message = open_logger(root);
+    CHECK(f.send() == IpcDisposition::handled);
+    const auto logger = static_cast<std::uint32_t>(get(f.message, 48));
+    CHECK(f.session->logger_process_id(logger) == 71);
+    f.message = {}; put(f.message, 0, 2);
+    const auto close_message = f.message;
+    CHECK(f.send() == IpcDisposition::handled && f.registers[0] == 0);
+    CHECK(f.message == close_message && f.handles.lookup(f.handle) == f.session);
+    CHECK(f.session->domain_object_count() == 0 && !f.session->logger_process_id(logger));
+    for (auto request : {control(0), open_logger(root), switch2_log_request(logger, 0, 0, false)}) {
+        f.message = request;
+        CHECK(f.send() == IpcDisposition::handled && f.registers[0] == 0xf601);
+        CHECK(f.message == request && f.session->domain_object_count() == 0);
+    }
+    f.message = close_message;
+    CHECK(f.send() == IpcDisposition::handled && f.registers[0] == 0xf601);
+    CHECK(f.handles.close(f.handle));
+    f.message = control(3);
+    CHECK(f.send() == IpcDisposition::handled && f.registers[0] == 0xe401);
+
+    // This targeted Switch 2 fix preserves the existing legacy close contract.
+    Fixture legacy;
+    const auto legacy_root = legacy.convert();
+    legacy.message = close_message;
+    CHECK(legacy.send() == IpcDisposition::handled && legacy.registers[0] == 0);
+    CHECK(legacy.session->domain_object_count() == 1);
+    legacy.message = open_logger(legacy_root);
+    CHECK(legacy.send() == IpcDisposition::handled);
+}
+
 void test_context_wire_types() {
     Fixture f;
     f.message = control(3);
@@ -341,6 +469,8 @@ void test_serialized_object_creation() {
 int main() {
     test_startup();
     test_logger_log_command();
+    test_switch2_logger_contract();
+    test_switch2_control_counts_and_close();
     test_context_wire_types();
     test_unsupported_is_not_a_reply();
     test_serialized_object_creation();

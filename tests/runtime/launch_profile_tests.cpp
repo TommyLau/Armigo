@@ -74,10 +74,34 @@ fixture::NpdmImage build(fixture::Parts parts) {
     return fixture::build_npdm(parts);
 }
 
+void test_switch2_platform_from_metadata() {
+    fixture::Parts parts;
+    parts.switch2 = true;
+    parts.aci0_capabilities[0] = fixture::cap_core_priority(59, 28, 0, 5);
+    parts.acid_capabilities[0] = fixture::cap_core_priority(59, 28, 0, 5);
+    const auto input = fixture::build_npdm(parts);
+    const auto profile = expect_success(input.bytes);
+    ARMIGO_CHECK(profile.process.platform == armigo::GuestPlatform::switch2);
+    ARMIGO_CHECK(profile.process.baseline == armigo::horizon::Baseline::horizon_23_0_1);
+    ARMIGO_CHECK(profile.title_id == fixture::kProgramId);
+    ARMIGO_CHECK(profile.permissions.handle_table_capacity == 512);
+    ARMIGO_CHECK(profile.main_thread.priority == parts.main_priority);
+    ARMIGO_CHECK(profile.process.allowed_core_mask == 0x3f);
+    parts.switch2 = false;
+    expect_failure(fixture::build_npdm(parts).bytes, LaunchError::unsupported);
+    parts.switch2 = true;
+    parts.aci0_capabilities[0] = fixture::cap_core_priority(59, 28, 0, 6);
+    parts.acid_capabilities[0] = fixture::cap_core_priority(59, 28, 0, 6);
+    expect_failure(fixture::build_npdm(parts).bytes, LaunchError::unsupported);
+    auto authenticated = armigo::runtime::derive_launch_profile(input.bytes, NpdmTrustPolicy::require_authenticated);
+    ARMIGO_CHECK(std::holds_alternative<LaunchFailure>(authenticated));
+}
+
 void test_two_profiles_admit_with_different_settings() {
     const LaunchProfile a = expect_success(fixture::profile_image_a().bytes);
     const LaunchProfile b = expect_success(fixture::profile_image_b().bytes);
 
+    ARMIGO_CHECK(a.process.platform == armigo::GuestPlatform::switch1);
     ARMIGO_CHECK(a.origin == armigo::runtime::ProfileOrigin::npdm);
     ARMIGO_CHECK(b.origin == armigo::runtime::ProfileOrigin::npdm);
     ARMIGO_CHECK(a.permissions.intended_kernel_version == fixture::cap_kernel_version(20, 5));
@@ -677,6 +701,7 @@ void test_fs_version_short_circuit_and_header_bounds() {
 
 int main() {
     test_two_profiles_admit_with_different_settings();
+    test_switch2_platform_from_metadata();
     test_authenticated_policy_is_unsupported();
     test_structural_failures_surface_through_the_profile();
     test_acid_flag_admission();

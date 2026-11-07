@@ -274,14 +274,19 @@ IpcDisposition IpcDispatcher::send(QueryRegisters& registers,
     // HIPC Close (type 2) tears down the server side of the session. The client still owns
     // its handle and closes it with svcCloseHandle itself, so this dispatcher must not drop
     // the entry here: a second close would then fail with an invalid-handle result the guest
-    // never asked for. No service sees the message, but the kernel validates the handle first.
+    // never asked for. Validate the handle first, then invoke the endpoint's
+    // close hook without sending the payload through its request dispatcher.
     constexpr std::uint16_t close_request = 2;
     if ((read_word(request, 0) & 0xffffu) == close_request) {
-        if (!handles_->lookup_as<ClientSession>(static_cast<Handle>(registers[0]))) {
+        const auto session = handles_->lookup_as<ClientSession>(static_cast<Handle>(registers[0]));
+        if (!session) {
             finish(registers, invalid_handle);
             return IpcDisposition::handled;
         }
-        finish(registers, 0);
+        const auto reply = session->close_server();
+        if (reply.disposition != IpcDisposition::handled) return reply.disposition;
+        if (reply.size || reply.transferred_count) return IpcDisposition::invalid_backend;
+        finish(registers, reply.transport_result);
         return IpcDisposition::handled;
     }
     const auto session = handles_->lookup_as<ClientSession>(static_cast<Handle>(registers[0]));

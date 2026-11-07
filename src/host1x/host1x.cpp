@@ -17,6 +17,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <iterator>
 
 namespace armigo::host1x {
 namespace {
@@ -70,13 +71,22 @@ std::int64_t FrameQueue::find_decoder(std::uint64_t luma_offset) {
     return -1;
 }
 
-std::shared_ptr<const DecodedFrame> FrameQueue::take(std::int64_t fd) {
+std::shared_ptr<const DecodedFrame> FrameQueue::take(std::int64_t fd, std::uint64_t luma_offset) {
     const std::lock_guard lock(mutex_);
     if (fd < 0) return nullptr;
     const auto found = devices_.find(static_cast<std::uint32_t>(fd));
     if (found == devices_.end() || found->second.empty()) return nullptr;
-    auto frame = std::move(found->second.front().second);
-    found->second.pop_front();
+    auto& frames = found->second;
+    const auto named = std::find_if(frames.rbegin(), frames.rend(),
+                                    [&](const auto& entry) { return entry.first == luma_offset; });
+    if (named == frames.rend()) {
+        auto frame = std::move(frames.front().second);
+        frames.pop_front();
+        return frame;
+    }
+    const auto last = std::prev(named.base());
+    auto frame = std::move(last->second);
+    frames.erase(frames.begin(), std::next(last));
     return frame;
 }
 

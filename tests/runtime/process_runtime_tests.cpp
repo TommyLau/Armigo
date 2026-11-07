@@ -20,6 +20,25 @@
 #include <sstream>
 
 namespace {
+void test_explicit_and_platform_memory_budgets() {
+    for (bool platform_default : {false, true}) {
+        Fixture fixture;
+        auto deps = dependencies();
+        const auto explicit_budget = deps.memory_options.resource_limit_bytes;
+        deps.use_platform_memory_budget = platform_default;
+        if (platform_default) deps.memory_options.resource_limit_bytes = 0;
+        std::uint64_t observed = 0;
+        deps.create_services = [&observed](ServiceRegistryDependencies setup)
+            -> LaunchResult<std::shared_ptr<ServiceRegistry>> {
+            observed = setup.memory->process()->total_memory();
+            return create_service_registry(std::move(setup));
+        };
+        const auto made = ProcessRuntime::create(fixture.description, std::move(deps));
+        CHECK(value(made) != nullptr);
+        CHECK(observed == (platform_default ? std::uint64_t{4} << 30 : explicit_budget));
+    }
+}
+
 void test_title_rate_clock_warning_for_both_runners() {
     Fixture fixture;
     const std::uint64_t title = 0xffff000000000000ull |
@@ -791,6 +810,7 @@ void test_capture_policy_selects_readback_frames() {
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--construction-drain-failure")
         return construction_drain_failure_child();
+    test_explicit_and_platform_memory_budgets();
     test_title_rate_clock_warning_for_both_runners();
     test_capture_policy_selects_readback_frames();
     test_construction_drain_failure_returns_without_abort(argv[0]);

@@ -35,6 +35,8 @@ const char* permission_text(SegmentPermission permission) {
         return "rw-";
     case 5:
         return "r-x";
+    case 4:
+        return "--x";
     default:
         return "???";
     }
@@ -75,6 +77,7 @@ int inspect(const char* path, const NsoReadOptions& options, bool image_digest) 
         if (error.lz4 != Lz4Error::success) {
             std::printf(" [%s]", to_string(error.lz4));
         }
+        if (!error.decoder_detail.empty()) std::printf(" [%s]", error.decoder_detail.c_str());
         std::printf(" [detail 0x%llx]\n", static_cast<unsigned long long>(error.detail));
         return 1;
     }
@@ -90,7 +93,7 @@ int inspect(const char* path, const NsoReadOptions& options, bool image_digest) 
                     static_cast<unsigned long long>(segment.content_size),
                     static_cast<unsigned long long>(segment.mapped_size),
                     permission_text(segment.permission),
-                    segment.compressed ? "lz4" : "raw",
+                    segment.compressed ? (image.zbic_compression ? "zbic" : "lz4") : "raw",
                     static_cast<unsigned long long>(segment.file_size),
                     segment.hash == HashCheck::verified ? "verified" : "not-checked");
     }

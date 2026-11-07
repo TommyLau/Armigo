@@ -14,6 +14,7 @@
 #include <armigo/horizon/event.h>
 #include <armigo/services/operation_mode.h>
 #include <armigo/services/software_keyboard.h>
+#include <armigo/services/graphics_system.h>
 
 #include <array>
 #include <atomic>
@@ -27,6 +28,8 @@ class TransferMemoryRecord;
 }
 
 namespace armigo::services::am {
+
+enum class AppletContract { horizon_20_5_0, switch2_23_0_1 };
 
 // Portable launch policy, separate from application metadata and permissions.
 enum class GameplayRecordingPolicy : std::uint8_t { Unavailable };
@@ -71,7 +74,9 @@ public:
                          horizon::HandleTable& handles,
                          GameplayRecordingPolicy recording_policy = GameplayRecordingPolicy::Unavailable,
                          std::shared_ptr<ApplicationRunningState> running_state = {},
-                         OperationMode operation_mode = OperationMode::Console);
+                         OperationMode operation_mode = OperationMode::Console,
+                         AppletContract contract = AppletContract::horizon_20_5_0);
+    horizon::IpcReply close_server() override;
     horizon::IpcReply request(const horizon::IpcMessage&, std::uint64_t sender_pid) override;
     horizon::IpcReply request_with_buffers(const horizon::IpcMessage&, std::uint64_t sender_pid,
                                            const horizon::GuestBuffers& buffers) override;
@@ -84,8 +89,12 @@ public:
     // headless_keyboard_input. It runs with the session's request lock held, on
     // the guest thread that starts the applet.
     void set_keyboard_input(KeyboardInput input);
+    // Switch 2: what the graphics system session needs from the launch.
+    // Without it, its driver and display refresh requests stay unsupported.
+    void set_graphics_system_dependencies(gsv::GraphicsSystemDependencies dependencies);
     const char* diagnostic() const;
     std::size_t domain_object_count() const;
+    std::optional<std::uint32_t> application_proxy_configuration() const;
     bool exit_to_library_on_next_program_enabled() const;
     // Host launch policy grants foreground ownership once the application is
     // ready to run. The transition produces a readable focus notification.
@@ -119,6 +128,8 @@ public:
 
 private:
     const std::uint64_t process_id_;
+    const AppletContract contract_;
+    bool closed_ = false;
     const OperationMode operation_mode_;
     const GameplayRecordingPolicy recording_policy_;
     // Shared by every session the host associates with one launch. A null
@@ -127,7 +138,7 @@ private:
     std::shared_ptr<horizon::ProcessRecord> process_;
     horizon::HandleTable* handles_;
     enum class ObjectKind {
-        application_proxy, application_functions, common_state, self_controller,
+        application_proxy, application_functions, common_state, self_controller, graphics_scale, application_status,
         window_controller, audio_controller, display_controller, library_creator, debug_functions,
         storage, storage_accessor, library_applet, closed, transfer_storage,
     };
@@ -169,6 +180,14 @@ private:
                              const horizon::GuestBuffers* buffers);
     std::vector<DomainObject> objects_;
     bool domain_ = false;
+    std::optional<std::uint32_t> application_proxy_configuration_;
+    // Switch 2 provisional handlers that already logged their one-time warning.
+    std::uint64_t provisional_warned_ = 0;
+    // Switch 2 GraphicsScale command1050: whether scale-change notifications are wanted.
+    bool graphics_scale_notifications_ = false;
+    gsv::GraphicsSystemDependencies graphics_system_dependencies_;
+    // Switch 2 SelfController command2400: the boolean the application last set.
+    bool self_controller_2400_ = false;
     bool exit_to_library_on_next_program_ = false;
     std::uint32_t terminate_result_ = 0;
     std::optional<std::uint32_t> common_state_command66_;

@@ -211,11 +211,13 @@ private:
             const auto& slot = config.slots[i];
             if (!slot.enable) continue;
             const auto luma = address(surfaces + i * 8 * 3);
-            // A closed decoder channel is replaced by the next one that has
-            // this surface's pictures (a new movie opens a new channel).
+            // The channel holding this surface's picture supplies it, so a new
+            // movie's channel takes over even while an older channel stays
+            // open. A picture shown again from an earlier surface is not
+            // queued under this one; the bound channel then supplies its next.
             if (decoder_ >= 0 && !hub_.frames().is_open(decoder_)) decoder_ = -1;
-            if (decoder_ < 0) decoder_ = hub_.frames().find_decoder(luma);
-            const auto frame = hub_.frames().take(decoder_);
+            if (const auto named = hub_.frames().find_decoder(luma); named >= 0) decoder_ = named;
+            const auto frame = hub_.frames().take(decoder_, luma);
             if (tracing())
                 armigo::diag::opt_in(
                              "host1x %.3f compositor slot %zu luma 0x%llx frame %s mean luma %u format %u "

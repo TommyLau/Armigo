@@ -498,7 +498,10 @@ void test_embedded_native_launch() {
     test::put_word(main, 0x300, 0xd2800020); // MOV X0,#1
     const auto call = aarch64::encode_bl(0x400, 0x500).word;
     test::put_word(main, 0x400, call);
+    const auto phase_call = aarch64::encode_bl(0x404, 0x504).word;
+    test::put_word(main, 0x404, phase_call);
     test::put_word(main, 0x500, aarch64::encode_ret().word);
+    test::put_word(main, 0x504, aarch64::encode_ret().word);
     // Resolution sites at the console's 1600x900; the function at 0x600
     // returns the swapchain size, width | height << 32.
     main.symbols.push_back({"resolution_probe", 0x600, 0x14, true});
@@ -833,6 +836,40 @@ void test_embedded_native_launch() {
             {true, nullptr, &files->artifacts(), files->backings()})));
     }
     auto high_only = rate_patch;
+    auto phase_patch = patch;
+    phase_patch.layout.frame_step = 0x8018;
+    phase_patch.frame_rate = compat::FrameRateSettings{30, 60, {30, 120}};
+    phase_patch.calls.push_back({0x404, phase_call, "Synthetic selected phase call.", 120});
+    phase_patch.calls.back().phases = compat::PhaseCallPatch{0x504, 0, 10};
+    for (const bool active : {false, true}) {
+        setenv("ARMIGO_COMPAT_FRAME_RATE", "30", 1);
+        // Capture uses the profile default (30 or 60), so use a synthetic
+        // unconditional phase call to test active embedded routing. Numeric
+        // mode selection is covered independently above and in compat tests.
+        phase_patch.calls.back().frame_rate = active ? 0 : 120;
+        EmbeddedNativeArtifacts phase_capture;
+        auto phase_launch = load_native_launch(input, profile, std::make_shared<platform::ThreadSlotKey>(),
+            std::span(&phase_patch, 1), {true, &phase_capture});
+        CHECK(std::holds_alternative<PreparedLaunch>(phase_launch));
+        if (!std::holds_alternative<PreparedLaunch>(phase_launch)) continue;
+        CHECK(phase_capture.modules[1].hooks.size() == (active ? 2u : 1u));
+        if (active && phase_capture.modules[1].hooks.size() == 2)
+            CHECK(phase_capture.modules[1].hooks[1].target.image_offset == 0x504);
+        const auto directory = cleanup.path / (active ? "phase-active" : "phase-inactive");
+        CHECK(std::holds_alternative<std::monostate>(write_embedded_modules(directory, phase_capture)));
+        auto opened = open_embedded_modules(directory);
+        CHECK(std::holds_alternative<EmbeddedNativeFiles>(opened));
+        if (const auto* files = std::get_if<EmbeddedNativeFiles>(&opened)) {
+            CHECK(std::holds_alternative<PreparedLaunch>(load_native_launch(input, profile,
+                std::make_shared<platform::ThreadSlotKey>(), std::span(&phase_patch, 1),
+                {true, nullptr, &files->artifacts(), files->backings()})));
+            auto changed_phase = phase_patch;
+            changed_phase.calls.back().phases->phase_count = 11;
+            auto changed = load_native_launch(input, profile, std::make_shared<platform::ThreadSlotKey>(),
+                std::span(&changed_phase, 1), {true, nullptr, &files->artifacts(), files->backings()});
+            CHECK(std::holds_alternative<LaunchFailure>(changed) == active);
+        }
+    }
     high_only.words.erase(high_only.words.begin());
     high_only.frame_rate->supported_rates = {30, 120};
     setenv("ARMIGO_COMPAT_FRAME_RATE", "60", 1);

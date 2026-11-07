@@ -14,7 +14,7 @@ add_library(armigo_compat STATIC
     patches.mm title_settings.mm)
 target_include_directories(armigo_compat PUBLIC "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(armigo_compat PUBLIC armigo_horizon armigo_loader armigo_aarch64
-    armigo_execution "${ARMIGO_FOUNDATION_FRAMEWORK}")
+    armigo_execution armigo_execution_call_hook armigo_execution_gate_patch "${ARMIGO_FOUNDATION_FRAMEWORK}")
 target_link_libraries(armigo_runtime PUBLIC armigo_compat)
 
 if(BUILD_TESTING)

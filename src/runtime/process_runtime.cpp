@@ -12,8 +12,11 @@
 #include <armigo/runtime/process_runtime.h>
 #include <armigo/runtime/kernel_queries.h>
 #include <armigo/romfs/romfs_virtual.h>
+#include <armigo/romfs/nup_storage.h>
 #include <armigo/runtime/addon_content.h>
 #include <armigo/compat/title_settings.h>
+#include <armigo/execution/guest_fault.h>
+#include <armigo/memory/write_tracker.h>
 #include <armigo/services/file_system.h>
 #include "service_registry.h"
 #ifdef ARMIGO_RUNTIME_TESTING
@@ -504,9 +507,23 @@ struct NativeProcessRuntime::ThreadBinding {
             if (const auto cmif = horizon::locate_cmif(message))
                 std::memcpy(&command, message.data() + *cmif + 8, sizeof command);
             const auto object = self.runtime.handles_->lookup(static_cast<horizon::Handle>(arguments[0]));
-            armigo::diag::opt_in( "ipc handle=%llx command=%u object=%s words=",
+            // The return addresses of the first frame records name the caller.
+            std::array<std::uint64_t, 8> callers{};
+            for (std::uint64_t frame = call.x(29), depth = 0; depth != callers.size() && frame && !(frame & 15); ++depth) {
+                std::array<std::byte, 16> pair{};
+                if (!self.memory->ipc_buffers().read_memory(frame, pair)) break;
+                std::uint64_t next = 0;
+                std::memcpy(&next, pair.data(), sizeof next);
+                std::memcpy(&callers[depth], pair.data() + 8, sizeof callers[depth]);
+                if (next <= frame) break;
+                frame = next;
+            }
+            armigo::diag::opt_in( "ipc handle=%llx command=%u object=%s from=",
                          static_cast<unsigned long long>(arguments[0]), command,
                          object ? typeid(*object).name() : "-");
+            for (std::size_t index = 0; index != callers.size(); ++index)
+                armigo::diag::opt_in(index ? ",%llx" : "%llx", static_cast<unsigned long long>(callers[index]));
+            armigo::diag::opt_in(" words=");
             for (std::size_t offset = 0; offset < 64; offset += 4) {
                 std::uint32_t word;
                 std::memcpy(&word, message.data() + offset, sizeof word);
@@ -596,6 +613,12 @@ LaunchResult<ThreadServiceBinding> NativeProcessRuntime::bind(
     // Firmware supplies a cleared thread-local region. The SDK owns its TLS
     // allocation and all private pointers it later installs in that region.
     const bool original = launch_.plan.entry_abi == LaunchEntryAbi::original_process;
+    // The Switch 2 kernel publishes the thread's own handle at offset 0x110, where
+    // its SDK reads the current thread's lock owner tag.
+    if (profile_.process.platform == GuestPlatform::switch2) {
+        const std::uint32_t handle = binding->record->creation_handle();
+        std::memcpy(reinterpret_cast<void*>(range.address + 0x110), &handle, sizeof handle);
+    }
     // The guest reads the cache geometry of its own processor (64-byte data
     // and instruction lines) and maintains caches on addresses it maps.
     context.set_cache_type(guest_cache_type);
@@ -1074,15 +1097,36 @@ LaunchResult<std::unique_ptr<ProcessRuntime>> ProcessRuntime::create(
             dependencies.presenter->mode() != description.presentation.mode)
             return fail(LaunchStage::inputs, LaunchError::invalid_input, "runtime-dependencies",
                         "A presenter matching the selected mode and one shared clock are required.");
-        if (!dependencies.memory_options.resource_limit_bytes)
+        if (!dependencies.memory_options.resource_limit_bytes && !dependencies.use_platform_memory_budget)
             return fail(LaunchStage::memory, LaunchError::invalid_input, "runtime-budget",
-                        "An explicit positive process memory budget is required.");
+                        "A positive process memory budget or platform-default selection is required.");
         auto input_limits = description.input_limits;
         input_limits.collect_all_subsdk = description.synthetic_profile.has_value();
-        auto collected = loader::read_exefs_directory(description.exefs_directory, input_limits);
-        if (const auto* failed = std::get_if<loader::ExeFsDirectoryFailure>(&collected))
-            return fail(LaunchStage::inputs, LaunchError::invalid_input, "collect-exefs", failed->detail);
-        auto input = std::get<loader::ExeFsDirectoryInput>(std::move(collected));
+        std::shared_ptr<loader::NupArchive> archive;
+        std::shared_ptr<loader::NupSelection> nup_selection;
+        loader::ExeFsDirectoryInput input;
+        if (!description.nup_file.empty()) {
+            if (!description.exefs_directory.empty() || !description.romfs_directory.empty())
+                return fail(LaunchStage::inputs, LaunchError::invalid_input, "nup-input",
+                            "NUP and extracted directory inputs are mutually exclusive.");
+            auto opened = loader::NupArchive::open(description.nup_file);
+            if (auto error = std::get_if<loader::NupFailure>(&opened))
+                return fail(LaunchStage::inputs, LaunchError::invalid_input, error->operation, error->detail);
+            archive = std::get<std::shared_ptr<loader::NupArchive>>(std::move(opened));
+            auto selected = archive->select(description.container_title_id.value_or(0));
+            if (auto error = std::get_if<loader::NupFailure>(&selected))
+                return fail(LaunchStage::inputs, LaunchError::invalid_input, error->operation, error->detail);
+            nup_selection = std::make_shared<loader::NupSelection>(std::get<loader::NupSelection>(std::move(selected)));
+            auto collected = archive->read_exefs(*nup_selection, input_limits);
+            if (auto error = std::get_if<loader::NupFailure>(&collected))
+                return fail(LaunchStage::inputs, LaunchError::invalid_input, error->operation, error->detail);
+            input = std::get<loader::ExeFsDirectoryInput>(std::move(collected));
+        } else {
+            auto collected = loader::read_exefs_directory(description.exefs_directory, input_limits);
+            if (const auto* failed = std::get_if<loader::ExeFsDirectoryFailure>(&collected))
+                return fail(LaunchStage::inputs, LaunchError::invalid_input, "collect-exefs", failed->detail);
+            input = std::get<loader::ExeFsDirectoryInput>(std::move(collected));
+        }
         if (description.npdm_file) {
             auto detached = read_metadata(*description.npdm_file, description.input_limits.max_file_bytes);
             if (const auto* failed = std::get_if<LaunchFailure>(&detached)) return *failed;
@@ -1107,19 +1151,45 @@ LaunchResult<std::unique_ptr<ProcessRuntime>> ProcessRuntime::create(
             auto derived = derive_launch_profile(*input.process_metadata, description.npdm_trust);
             if (const auto* failed = std::get_if<LaunchFailure>(&derived)) return *failed;
             profile = std::get<LaunchProfile>(std::move(derived));
+        }
+        if (dependencies.use_platform_memory_budget)
+            dependencies.memory_options.resource_limit_bytes =
+                profile.process.platform == GuestPlatform::switch2
+                    ? horizon::ProcessRecord::switch2_application_capacity : std::uint64_t{4} << 30;
+        if (profile.origin != ProfileOrigin::synthetic_test) {
             // Native reservations must fit alongside the host's own mappings.
-            // Bound their advertised extents by the explicit host memory budget;
+            // Physical quota and compact VA windows are independent. Keep the
+            // existing Switch 2 window limit until a larger request is admitted;
             // the NPDM main-stack allocation itself remains unchanged.
             const auto page = platform::native_page_size();
             if (!page)
                 return fail(LaunchStage::memory, LaunchError::host_failure,
                             "runtime-reservations", "The native page size is unavailable.");
-            const auto extent = std::max(page,
-                dependencies.memory_options.resource_limit_bytes & ~(page - 1));
-            profile.process.heap_size = std::min(profile.process.heap_size, extent);
-            profile.process.base_alias_size = std::min(profile.process.base_alias_size, extent);
+            const auto window_limit = profile.process.platform == GuestPlatform::switch2
+                ? std::min(dependencies.memory_options.resource_limit_bytes, std::uint64_t{4} << 30)
+                : dependencies.memory_options.resource_limit_bytes;
+            const auto extent = std::max(page, window_limit & ~(page - 1));
+            // A Switch 2 title sizes its heap from the application quota, so its
+            // heap window keeps the profile's heap region up to that quota.
+            const auto heap_limit = profile.process.platform == GuestPlatform::switch2
+                ? dependencies.memory_options.resource_limit_bytes : window_limit;
+            profile.process.heap_size = std::min(profile.process.heap_size,
+                                                 std::max(page, heap_limit & ~(page - 1)));
+            // A Switch 2 process needs one contiguous host arena (1 GiB mappable,
+            // alias, stack and heap) plus its 8 GiB remote window below the
+            // 39-bit limit. The host leaves about 40 GiB free there, split by two
+            // large system reservations into at most three gaps, so the largest
+            // gap always holds 13 GiB and the remaining pieces then hold 8 GiB.
+            // A 2 GiB alias window keeps the arena at 13 GiB; the title maps only
+            // a few pages there so far and reserves its large ranges remotely.
+            const auto alias_limit = profile.process.platform == GuestPlatform::switch2
+                ? std::min(extent, std::uint64_t{2} << 30) : extent;
+            profile.process.base_alias_size = std::min(profile.process.base_alias_size, alias_limit);
             profile.process.stack_size = std::min(profile.process.stack_size, extent);
         }
+        if (nup_selection && nup_selection->title_id != profile.title_id)
+            return fail(LaunchStage::inputs, LaunchError::invalid_input, "nup-title",
+                        "The selected NUP title differs from the admitted process metadata.");
         arc4random_buf(profile.process.entropy.data(), sizeof(profile.process.entropy));
         auto preparation_options = dependencies.preparation_options;
         if (preparation_options.mode == PreparationMode::automatic) {
@@ -1152,12 +1222,22 @@ LaunchResult<std::unique_ptr<ProcessRuntime>> ProcessRuntime::create(
                             "The title's save directory " + saves.string() + " could not be created.");
             services::fs::set_host_save_directory(saves);
         }
+        // A guest fault ends its thread with a report instead of the process.
+        // The write tracker handles its own faults first and chains to this
+        // handler, so this one goes in before graphics installs the tracker.
+        if (!execution::guest_fault_handler_installed() && memory::WriteTracker::installed())
+            armigo::diag::write(armigo::diag::Level::warning,
+                "Armigo runtime: the write tracker was installed first; guest faults end the process unreported\n");
+        else
+            execution::install_guest_fault_handler();
         // The shader package and the RomFS index do not depend on the guest
         // image, so they open while it loads.
         auto shader_package = start_shader_package_open(description.shader_package_directory);
-        auto romfs_opening = std::async(std::launch::async, [&description] {
+        auto romfs_opening = std::async(std::launch::async, [&description, archive, nup_selection] {
             std::string error;
-            auto storage = romfs::DirectoryStorage::open(description.romfs_directory, error);
+            std::shared_ptr<romfs::Storage> storage;
+            if (archive) storage = romfs::NupStorage::open(archive, *nup_selection, error);
+            else storage = romfs::DirectoryStorage::open(description.romfs_directory, error);
             return std::pair{std::move(storage), std::move(error)};
         });
         auto addon_opening = std::async(std::launch::async, [&description, title = profile.title_id] {

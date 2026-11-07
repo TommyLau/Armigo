@@ -30,9 +30,10 @@ struct CallHookCodeRegion {
     std::uint64_t size = 0;
 };
 
-// One direct guest call redirected through a host callback. return_address is
-// the gate call's stub-local identity. call_return_address and target_address
-// retain the architectural values of the original BL.
+// One guest operation redirected through a host callback. return_address is
+// the gate call's stub-local identity. For a direct call, call_return_address
+// and target_address retain the original BL values. An instruction callback
+// uses its continuation for both and preserves the live guest link register.
 struct CallHookSite {
     std::uint64_t return_address = 0;
     std::uint64_t call_return_address = 0;
@@ -86,9 +87,9 @@ private:
 };
 
 // The callback runs synchronously on the guest's host thread before the original
-// callee. GateCall::x(30) is the gate identity and GateCall::sp() is the guest
+// callee or instruction continuation. GateCall::x(30) is the gate identity and GateCall::sp() is the guest
 // stack pointer minus CallHookPatch::stack_adjustment. The site's
-// call_return_address is the original guest x30 value that the callee receives.
+// call_return_address is the original call's return or the instruction's continuation.
 // A callback must not change x30 or sp. Other accepted GateCall changes are
 // applied before control transfers to the original callee.
 using CallHookHandler = GateStatus (*)(const CallHookSite& site, GateCall& call,

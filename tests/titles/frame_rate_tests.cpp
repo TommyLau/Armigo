@@ -288,6 +288,100 @@ void test_counter_state_and_failures() {
     CHECK(!update_frame_rate(selected, module_base, UINT64_MAX, 0, fixture.buffers));
 }
 
+void test_phase_schedule() {
+    using namespace armigo::titles;
+    constexpr FramePhaseLayout phases{0x300, 0x40, 10};
+    for (unsigned rate : {30u, 60u, 120u}) {
+        Fixture fixture;
+        fixture.memory.store(vfr_object + phases.counter, 0.0f);
+        fixture.memory.store(module_base + phases.frame_step, 60.0f / rate);
+        std::vector<unsigned> observed;
+        for (unsigned frame = 0; frame < rate; ++frame) {
+            FramePhaseDispatch due;
+            CHECK(advance_frame_phases(phases, module_base, vfr_object, fixture.buffers, due));
+            for (unsigned i = 0; i < due.count; ++i)
+                observed.push_back((due.first + i) % phases.phase_count);
+        }
+        CHECK(observed.size() == 30);
+        for (unsigned i = 0; i < observed.size(); ++i) CHECK(observed[i] == i % 10);
+        for (unsigned phase : {0u, 7u, 8u, 9u})
+            CHECK(std::count(observed.begin(), observed.end(), phase) == 3);
+        CHECK(fixture.memory.load<float>(vfr_object + phases.counter) == 0.0f);
+    }
+    Fixture fixture;
+    fixture.memory.store(vfr_object + phases.counter, 6.75f);
+    // Delivered cadence changes without resetting the schedule. A slow frame
+    // may cross two phases, including the last and first phase of a cycle.
+    const std::array<float, 6> steps{3.0f, 0.5f, 1.0f, 2.0f, 3.0f, 0.5f};
+    const std::array<FramePhaseDispatch, 6> expected{{{6, 2}, {8, 0}, {8, 1}, {9, 1}, {0, 1}, {1, 0}}};
+    for (std::size_t i = 0; i < steps.size(); ++i) {
+        fixture.memory.store(module_base + phases.frame_step, steps[i]);
+        FramePhaseDispatch due;
+        CHECK(advance_frame_phases(phases, module_base, vfr_object, fixture.buffers, due));
+        CHECK(due == expected[i]);
+    }
+    fixture.memory.store(vfr_object + phases.counter, 9.75f);
+    fixture.memory.store(module_base + phases.frame_step, 3.0f);
+    FramePhaseDispatch due;
+    CHECK(advance_frame_phases(phases, module_base, vfr_object, fixture.buffers, due));
+    CHECK((due == FramePhaseDispatch{9, 2}));
+    CHECK(fixture.memory.load<float>(vfr_object + phases.counter) == 1.25f);
+    // A one-phase schedule still emits both crossings, not a deduplicated mask.
+    auto single = phases; single.phase_count = 1;
+    fixture.memory.store(vfr_object + phases.counter, 0.75f);
+    CHECK(advance_frame_phases(single, module_base, vfr_object, fixture.buffers, due));
+    CHECK((due == FramePhaseDispatch{0, 2}));
+    fixture.memory.store(vfr_object + phases.counter, 0.0f);
+    unsigned emitted = 0;
+    for (unsigned frame = 0; frame < 80; ++frame) {
+        constexpr std::array<float, 5> jitter{0.25f, 1.25f, 0.5f, 3.0f, 2.0f};
+        fixture.memory.store(module_base + phases.frame_step, jitter[frame % jitter.size()]);
+        CHECK(advance_frame_phases(phases, module_base, vfr_object, fixture.buffers, due));
+        for (unsigned i = 0; i < due.count; ++i)
+            CHECK((due.first + i) % 10 == emitted++ % 10);
+    }
+    CHECK(emitted == 56);
+    CHECK(fixture.memory.load<float>(vfr_object + phases.counter) == 6.0f);
+}
+
+void test_phase_failures() {
+    using namespace armigo::titles;
+    constexpr FramePhaseLayout phases{0x300, 0x40, 10};
+    Fixture fixture;
+    fixture.memory.store(vfr_object + phases.counter, 9.75f);
+    fixture.memory.store(module_base + phases.frame_step, 0.0f);
+    FramePhaseDispatch due{99, 99};
+    CHECK(advance_frame_phases(phases, module_base, vfr_object, fixture.buffers, due));
+    CHECK(due.count == 0 && fixture.memory.load<float>(vfr_object + phases.counter) == 9.75f);
+    for (float step : {-1.0f, 3.1f, std::numeric_limits<float>::infinity(),
+                       std::numeric_limits<float>::quiet_NaN()}) {
+        fixture.memory.store(module_base + phases.frame_step, step);
+        CHECK(!advance_frame_phases(phases, module_base, vfr_object, fixture.buffers, due));
+        CHECK(due.count == 0);
+    }
+    fixture.memory.store(module_base + phases.frame_step, 0.5f);
+    for (float counter : {-1.0f, 10.0f, std::numeric_limits<float>::infinity(),
+                          std::numeric_limits<float>::quiet_NaN()}) {
+        fixture.memory.store(vfr_object + phases.counter, counter);
+        CHECK(!advance_frame_phases(phases, module_base, vfr_object, fixture.buffers, due));
+    }
+    fixture.memory.store(vfr_object + phases.counter, 9.75f);
+    fixture.memory.failed_write = vfr_object + phases.counter;
+    CHECK(!advance_frame_phases(phases, module_base, vfr_object, fixture.buffers, due));
+    CHECK(due.count == 0 && fixture.memory.load<float>(vfr_object + phases.counter) == 9.75f);
+    fixture.memory.failed_write = UINT64_MAX;
+    for (auto address : {module_base + phases.frame_step, vfr_object + phases.counter}) {
+        fixture.memory.failed_read = address;
+        CHECK(!advance_frame_phases(phases, module_base, vfr_object, fixture.buffers, due));
+        CHECK(due.count == 0);
+    }
+    fixture.memory.failed_read = UINT64_MAX;
+    CHECK(!advance_frame_phases(phases, UINT64_MAX, vfr_object, fixture.buffers, due));
+    CHECK(!advance_frame_phases(phases, module_base, UINT64_MAX, fixture.buffers, due));
+    auto invalid = phases; invalid.phase_count = 0;
+    CHECK(!advance_frame_phases(invalid, module_base, vfr_object, fixture.buffers, due));
+}
+
 } // namespace
 
 int main() {
@@ -295,6 +389,8 @@ int main() {
     test_fractional_countdown_contract();
     test_fractional_repeat_contract();
     test_counter_state_and_failures();
+    test_phase_schedule();
+    test_phase_failures();
     if (failures) return 1;
     std::puts("Shared frame-rate layout checks passed");
     return 0;

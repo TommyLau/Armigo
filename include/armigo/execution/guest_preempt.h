@@ -27,6 +27,7 @@
 
 #include <armigo/execution/gate_frame_layout.h>
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -34,6 +35,21 @@
 #include <span>
 
 namespace armigo::execution {
+
+// A native fault that ended a guest invocation (guest_fault.h): the signal,
+// the faulting address and syndrome, and the guest registers at the fault.
+struct GuestFault {
+    int signal = 0;
+    int code = 0;                // siginfo si_code
+    std::uint64_t address = 0;   // data address, or the instruction for SIGILL/SIGTRAP
+    std::uint32_t syndrome = 0;  // ESR_EL1 as reported to the thread
+    std::uint64_t pc = 0;
+    std::uint64_t sp = 0;
+    std::uint64_t pstate = 0;
+    std::array<std::uint64_t, 31> x{};  // x0-x30; x29 is fp and x30 is lr
+    std::uint64_t fpcr = 0;
+    std::uint64_t fpsr = 0;
+};
 
 // One per guest host-thread, owned by the runtime for the thread's lifetime.
 struct GuestPreemptSlot {
@@ -47,6 +63,10 @@ struct GuestPreemptSlot {
     std::atomic<std::uint64_t> stack_high{0};
     // Gate frame handed to the exit routine, which reads only FPCR and FPSR.
     alignas(16) std::byte frame[ARMIGO_GATE_FRAME_SIZE]{};
+    // Written by the guest fault handler on the bound thread itself before it
+    // ends the innermost invocation; nonzero signal marks `fault` as set.
+    std::atomic<int> fault_signal{0};
+    GuestFault fault;
 };
 
 // Binds the calling host thread to a slot until destroyed.
@@ -109,6 +129,8 @@ struct PreemptPublication {
 PreemptPublication publish_invocation(void* record, std::uint64_t stack_low,
                                       std::uint64_t stack_high) noexcept;
 void restore_invocation(const PreemptPublication& previous) noexcept;
+// Slot bound to the calling thread, or null.
+GuestPreemptSlot* bound_slot() noexcept;
 }  // namespace detail
 
 }  // namespace armigo::execution

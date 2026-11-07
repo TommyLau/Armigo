@@ -331,6 +331,7 @@ runtime::LaunchDescription build_launch_description(
     const RunnerArguments& arguments, const platform::PresenterOptions& presentation) {
     runtime::LaunchDescription description;
 
+    description.nup_file = arguments.nup_file.value_or(std::filesystem::path{});
     description.exefs_directory = arguments.exefs_directory;
     description.romfs_directory = arguments.romfs_directory;
     description.addon_directories = arguments.addon_directories;
@@ -341,7 +342,7 @@ runtime::LaunchDescription build_launch_description(
     if (arguments.embedded_directory) description.embedded_directory = *arguments.embedded_directory;
     description.shader_package_directory = arguments.shader_package_directory;
     description.operation_mode = arguments.operation_mode;
-    // Owner policy: user-supplied extracted ExeFS/RomFS is admitted after full
+    // Owner policy: user-supplied extracted directories or raw NUP files receive
     // structural and capability validation; the NPDM signature is not
     // verified (that belongs to container packaging) and reports say so.
     description.npdm_trust = runtime::NpdmTrustPolicy::structurally_validated_extracted_input;
@@ -434,7 +435,10 @@ ParsedRunArguments parse_runner_arguments(platform::PresentationMode mode,
             return parsed;
         }
         bool argument_error = false;
-        if (flag == "--exefs") {
+        if (flag == "--nup") {
+            argument_error = !consume_value(arguments, value);
+            if (!argument_error) options.nup_file = value;
+        } else if (flag == "--exefs") {
             argument_error = !consume_value(arguments, value);
             if (!argument_error) options.exefs_directory = value;
         } else if (flag == "--romfs") {
@@ -566,7 +570,7 @@ ParsedRunArguments parse_runner_arguments(platform::PresentationMode mode,
 
     // A packed app carries its game under Armigo/ in its resources. Given no
     // input, it runs that game with its add-on content and its shader package.
-    if (!options.container_file && options.exefs_directory.empty() && options.romfs_directory.empty()) {
+    if (!options.nup_file && !options.container_file && options.exefs_directory.empty() && options.romfs_directory.empty()) {
         if (const auto packed = compat::packed_resources(); !packed.empty()) {
             options.exefs_directory = packed / "game" / "exefs";
             options.romfs_directory = packed / "game" / "romfs";
@@ -581,7 +585,18 @@ ParsedRunArguments parse_runner_arguments(platform::PresentationMode mode,
         }
     }
 
-    if (options.container_file) {
+    if (options.nup_file) {
+        if (options.mode != platform::PresentationMode::headless || options.container_file ||
+            options.keys_file || options.title_keys_file || options.update_container_file ||
+            options.cache_directory || !options.exefs_directory.empty() || !options.romfs_directory.empty()) {
+            parsed.error = "--nup requires headless mode and excludes container, key, cache and directory inputs.";
+            return parsed;
+        }
+        if (!path_is_regular_file(*options.nup_file)) {
+            parsed.error = "--nup is not a readable file.";
+            return parsed;
+        }
+    } else if (options.container_file) {
         if (options.mode != platform::PresentationMode::headless) {
             parsed.error = "--container is only supported by the headless shell.";
             return parsed;
@@ -721,6 +736,7 @@ ParsedRunArguments parse_runner_arguments(platform::PresentationMode mode,
 std::string runner_run_usage() {
     return "Options:\n"
            "  --exefs DIR --romfs DIR\n"
+           "  --nup FILE            Read a raw NUP package lazily; no keys or extraction.\n"
            "                         Launch extracted directories (default input mode).\n"
            "  --container FILE --keys FILE [--update FILE] [--title-keys FILE]\n"
            "                         [--cache DIR]\n"
@@ -781,7 +797,7 @@ ShellEnvironment default_shell_environment() {
     };
     environment.create_runtime =
         [](const runtime::LaunchDescription& description, runtime::RuntimeDependencies&& dependencies) {
-            dependencies.memory_options.resource_limit_bytes = std::uint64_t{4} << 30;
+            dependencies.use_platform_memory_budget = true;
             dependencies.preparation_options = {
                 runtime::installed_preparation_identity(), runtime::default_prepared_artifact_limit};
             return runtime::ProcessRuntime::create(description, std::move(dependencies));

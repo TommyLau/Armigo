@@ -43,6 +43,7 @@ struct BundleSpec {
     std::uint32_t default_frame_rate = 0;
     std::uint32_t display_refresh_rate = 0;
     std::vector<std::uint32_t> supported_frame_rates;
+    std::vector<std::uint32_t> experimental_frame_rates;
 };
 
 [[nodiscard]] std::string info_plist(const BundleSpec& spec);

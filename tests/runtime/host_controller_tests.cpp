@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <span>
+#include <limits>
 
 namespace {
 
@@ -60,6 +61,61 @@ void test_sticks() {
     CHECK(input.left_x == 0 && input.left_y == 32767);
     CHECK(input.right_x == -32767 && input.right_y == 0);
     CHECK(input.buttons == ((1u << 17) | (1u << 20)));
+}
+
+// Controller sticks: a 12% radial dead zone keeps a resting stick centred,
+// the range past it is rescaled from zero, and a diagonal is clamped to the
+// unit circle. Keyboard diagonals are unchanged.
+void test_controller_stick_shaping() {
+    auto snapshot = connected();
+    snapshot.controller.left_stick = {0.1f, 0.05f};   // inside the dead zone
+    auto input = armigo::runtime::full_key_input(snapshot);
+    CHECK(input.left_x == 0 && input.left_y == 0 && (input.buttons & 0xf0000u) == 0);
+    snapshot.controller.left_stick = {0.13f, 0.0f};   // just past it: small, from zero
+    input = armigo::runtime::full_key_input(snapshot);
+    CHECK(input.left_x > 0 && input.left_x < 1000 && input.left_y == 0);
+    snapshot.controller.left_stick = {0.56f, 0.0f};   // halfway through the live range
+    input = armigo::runtime::full_key_input(snapshot);
+    CHECK(input.left_x > 16000 && input.left_x < 16800);
+    snapshot.controller.left_stick = {1.0f, 0.0f};
+    input = armigo::runtime::full_key_input(snapshot);
+    CHECK(input.left_x == 32767);
+    snapshot.controller.left_stick = {1.0f, 1.0f};    // a corner: clamped to the circle
+    input = armigo::runtime::full_key_input(snapshot);
+    const double length = std::hypot(double(input.left_x), double(input.left_y));
+    CHECK(length > 32700 && length <= 32768 && input.left_x == input.left_y);
+    snapshot.controller.left_stick = {std::numeric_limits<float>::quiet_NaN(), 0.5f};
+    input = armigo::runtime::full_key_input(snapshot);
+    CHECK(input.left_x == 0 && input.left_y > 0);
+    // An input script's stick is exact.
+    snapshot.controller.left_stick = {-0.5f, 1.0f};
+    snapshot.controller.exact_left_stick = true;
+    input = armigo::runtime::full_key_input(snapshot);
+    CHECK(input.left_x == -16384 && input.left_y == 32767);
+    snapshot.controller.exact_left_stick = false;
+    // The keyboard's diagonal is not shaped.
+    using armigo::platform::HostKey;
+    using armigo::platform::keyboard_input;
+    const HostKey diagonal[] = {HostKey::W, HostKey::D};
+    auto keys = connected();
+    keys.keyboard = keyboard_input(std::span<const HostKey>(diagonal, 2));
+    const auto from_keys = armigo::runtime::full_key_input(keys);
+    const auto expected = armigo::runtime::full_key_input([&] {
+        auto only = connected();
+        only.keyboard = keys.keyboard;
+        return only;
+    }());
+    CHECK(from_keys.left_x == expected.left_x && from_keys.left_y == expected.left_y && from_keys.left_x > 0);
+    // A controller stick just past the dead zone still takes the right stick
+    // from the mouse camera.
+    armigo::runtime::MouseCamera camera;
+    camera.moved(8, 0);
+    snapshot = connected();
+    snapshot.controller.right_stick = {0.0f, 0.13f};
+    input = armigo::runtime::full_key_input(snapshot);
+    const auto held = input;
+    camera.apply(input);
+    CHECK(held.right_y > 0 && input.right_x == held.right_x && input.right_y == held.right_y);
 }
 
 // I/J/K/L and a controller share the right stick: the further deflection
@@ -202,6 +258,7 @@ int main() {
     test_buttons_by_position();
     test_triggers();
     test_sticks();
+    test_controller_stick_shaping();
     test_keyboard_right_stick_mouse_and_face();
     test_unusable_devices();
     test_focus();

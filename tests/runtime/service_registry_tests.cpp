@@ -12,7 +12,9 @@
 
 #include <armigo/horizon/startup_queries.h>
 #include <armigo/runtime/presentation_clock.h>
+#include <armigo/services/applet.h>
 #include <armigo/services/nvdrv.h>
+#include <armigo/services/log_manager.h>
 #include <armigo/services/service_manager_session.h>
 #include <armigo/services/video_interface.h>
 #include <armigo/services/vi_producer.h>
@@ -1261,6 +1263,135 @@ void test_presentation_observer_preserves_authority_lifetime() {
 
 } // namespace
 
+void test_switch2_service_boundary() {
+    Fixture fixture;
+    auto admitted = profile(service_acl("nvdrv"));
+    admitted.process.platform = armigo::GuestPlatform::switch2;
+    admitted.process.baseline = armigo::horizon::Baseline::horizon_23_0_1;
+    auto registry = fixture.create(std::move(admitted));
+    CHECK(registry != nullptr);
+    if (!registry) return;
+    const auto connection = registry->connect_named_port("sm:");
+    CHECK(connection.disposition == horizon::IpcDisposition::handled && connection.result == 0);
+    const auto sm = std::dynamic_pointer_cast<services::sm::ServiceManagerSession>(connection.session);
+    CHECK(sm != nullptr);
+    if (!sm) { registry->request_stop(); return; }
+    const auto handles_before = fixture.handles->size();
+    auto reply = lookup(sm, "nvdrv");
+    CHECK(reply.disposition == horizon::IpcDisposition::handled && read_u32(reply.bytes, 16) == 0x415);
+    CHECK(!registry->failure());
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        reply = sm->request(register_client(), 71);
+        CHECK(reply.disposition == horizon::IpcDisposition::handled && read_u32(reply.bytes, 8) == 0);
+    }
+    reply = lookup(sm, "denied");
+    CHECK(reply.disposition == horizon::IpcDisposition::handled && read_u32(reply.bytes, 16) == 0x1015);
+    CHECK(!registry->failure());
+    reply = lookup(sm, "");
+    CHECK(reply.disposition == horizon::IpcDisposition::handled && read_u32(reply.bytes, 16) == 0xc15);
+    CHECK(!registry->failure());
+    reply = lookup(sm, "nvdrv");
+    CHECK(reply.disposition == horizon::IpcDisposition::unsupported);
+    CHECK(fixture.handles->size() == handles_before);
+    const auto failed = registry->failure();
+    CHECK(failed && failed->operation == "service_registry.switch2_service" &&
+          failed->detail.find("nvdrv") != std::string::npos);
+    CHECK(sm->close_server().transport_result == 0);
+    const auto closed = sm->request(register_client(), 71);
+    CHECK(closed.disposition == horizon::IpcDisposition::handled && closed.transport_result == 0xf601);
+    registry->request_stop();
+    CHECK(registry->connect_named_port("sm:").disposition == horizon::IpcDisposition::cancelled);
+
+    Fixture other_fixture;
+    auto other_profile = profile();
+    other_profile.process.platform = armigo::GuestPlatform::switch2;
+    other_profile.process.baseline = armigo::horizon::Baseline::horizon_23_0_1;
+    const auto other = other_fixture.create(std::move(other_profile));
+    CHECK(other != nullptr);
+    if (other) {
+        CHECK(other->connect_named_port("other").disposition == horizon::IpcDisposition::unsupported);
+        const auto unknown = other->failure();
+        CHECK(unknown && unknown->operation == "service_registry.switch2_named_port");
+        other->request_stop();
+    }
+}
+
+void test_switch2_applet_admission() {
+    Fixture fixture;
+    auto admitted = profile(service_acl("appletOE"));
+    admitted.process.platform = armigo::GuestPlatform::switch2;
+    admitted.process.baseline = horizon::Baseline::horizon_23_0_1;
+    auto registry = fixture.create(std::move(admitted));
+    CHECK(registry != nullptr);
+    if (!registry) return;
+    const auto connection = registry->connect_named_port("sm:");
+    const auto sm = std::dynamic_pointer_cast<services::sm::ServiceManagerSession>(connection.session);
+    CHECK(sm != nullptr);
+    if (!sm) { registry->request_stop(); return; }
+    CHECK(sm->request(register_client(), 71).disposition == horizon::IpcDisposition::handled);
+    const auto result = lookup(sm, "appletOE");
+    CHECK(result.disposition == horizon::IpcDisposition::handled && read_u32(result.bytes, 16) == 0);
+    const auto applet = fixture.handles->lookup_as<services::am::AppletServiceSession>(read_u32(result.bytes, 12));
+    CHECK(applet != nullptr);
+    if (applet) {
+        horizon::IpcMessage request{};
+        write(request, 0, 7, 4); write(request, 4, 8, 4);
+        write(request, 16, 0x49434653, 4); write(request, 24, 3, 4);
+        const auto reply = applet->request(request, 71);
+        CHECK(reply.disposition == horizon::IpcDisposition::handled && reply.size == 44);
+        CHECK(read_u32(reply.bytes, 28) == 0xec6be3ff && read_u32(reply.bytes, 32) == 0);
+        CHECK(applet->close_server().transport_result == 0);
+        CHECK(applet->request(request, 71).transport_result == 0xf601);
+    }
+    CHECK(!registry->failure());
+    registry->request_stop();
+}
+
+void test_switch2_log_manager_admission() {
+    Fixture fixture;
+    auto admitted = profile(service_acl("lm"));
+    admitted.process.platform = armigo::GuestPlatform::switch2;
+    admitted.process.baseline = armigo::horizon::Baseline::horizon_23_0_1;
+    const auto registry = fixture.create(std::move(admitted));
+    CHECK(registry != nullptr);
+    if (!registry) return;
+    const auto sm = connect_sm(registry);
+    const auto before = fixture.handles->size();
+    auto reply = lookup(sm, "lm");
+    CHECK(reply.disposition == horizon::IpcDisposition::handled && read_u32(reply.bytes, 16) == 0);
+    const auto lm = fixture.handles->lookup_as<services::lm::LogManagerSession>(read_u32(reply.bytes, 12));
+    CHECK(lm && fixture.handles->size() == before + 1);
+    if (!lm) { registry->request_stop(); return; }
+    horizon::IpcMessage request{};
+    write(request, 0, 5, 4); write(request, 4, 8, 4); write(request, 16, sfci, 4);
+    write(request, 24, 3, 4);
+    reply = lm->request(request, 71);
+    CHECK(reply.disposition == horizon::IpcDisposition::handled && read_u32(reply.bytes, 32) == 0x400);
+    write(request, 24, 0, 4);
+    reply = lm->request(request, 71);
+    CHECK(reply.disposition == horizon::IpcDisposition::handled);
+    const auto root = read_u32(reply.bytes, 32);
+    request = {};
+    write(request, 0, 6, 4); write(request, 4, 0x8000000e, 4); write(request, 8, 1, 4);
+    write(request, 32, 0x00180001, 4); write(request, 36, root, 4);
+    write(request, 48, sfci, 4); write(request, 52, 1, 4);
+    reply = lm->request(request, 71);
+    CHECK(reply.disposition == horizon::IpcDisposition::handled);
+    const auto logger = read_u32(reply.bytes, 48);
+    CHECK(lm->logger_process_id(logger) == 71);
+    request = {};
+    write(request, 0, 0x00110006, 4); write(request, 4, 12, 4);
+    write(request, 32, 0x00100001, 4); write(request, 36, logger, 4);
+    write(request, 48, sfci, 4);
+    reply = lm->request(request, 71);
+    CHECK(reply.disposition == horizon::IpcDisposition::handled && reply.size == 56 &&
+          read_u32(reply.bytes, 4) == 12 && read_u32(reply.bytes, 44) == 0x3e81dad2);
+    CHECK(!registry->failure() && fixture.handles->size() == before + 1);
+    CHECK(lm->close_server().transport_result == 0 && lm->domain_object_count() == 0);
+    CHECK(lm->request(request, 71).transport_result == 0xf601);
+    registry->request_stop();
+}
+
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--legacy-memory-release") {
         test_registry_legacy_memory_release();
@@ -1270,6 +1401,9 @@ int main(int argc, char** argv) {
         test_registry_gpu_memory_release();
         return failures == 0 ? 0 : 1;
     }
+    test_switch2_service_boundary();
+    test_switch2_applet_admission();
+    test_switch2_log_manager_admission();
     test_presentation_observer_preserves_authority_lifetime();
     test_registry_presentation_counts_follow_vi_release();
     test_registry_counts_native_window_presents();

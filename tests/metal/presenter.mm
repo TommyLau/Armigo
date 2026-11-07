@@ -182,6 +182,8 @@ void test_cancellation_retains_resources_until_drain(Presenter& presenter) {
     });
     const graphics::Rgba8Image image = gradient_image(8, 8);
     const PresentResult result = presenter.present(make_frame(image, 9), far_deadline(), stop.get_token());
+    // The stop request can wake present before the helper stores its flag.
+    canceller.join();
     CHECK(has_error(result, PresentationError::cancelled));
     CHECK(cancelled.load());
     CHECK(presenter_test_inflight_count(presenter) == 1);
@@ -190,7 +192,6 @@ void test_cancellation_retains_resources_until_drain(Presenter& presenter) {
     CHECK(std::holds_alternative<std::monostate>(drained));
     CHECK(presenter_test_inflight_count(presenter) == 0);
     presenter_test_set_feedback_delay_ns(0);
-    canceller.join();
 }
 
 void test_presenter_stays_usable_after_drain(Presenter& presenter) {

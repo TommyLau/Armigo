@@ -190,13 +190,25 @@ std::variant<NpdmParseFailure, ParsedNpdm> parse_npdm(std::span<const std::byte>
     parsed.acid = NpdmSection{acid_offset, acid_size};
 
     // ACID validation precedes ACI0 validation in the firmware loader.
+    std::size_t acid_body_shift = 0;
+    std::uint32_t acid_header_size = kNpdmAcidSize;
+    std::uint32_t signature_size = 0x100;
     if (!reader.read_u32(acid_offset + kAcidOffsetMagic, magic) || magic != kAcidMagic) {
-        return NpdmParseFailure{"npdm.acid_magic", "the ACID section does not carry the ACID magic"};
+        // The second platform has a 0x300-byte signature/key area. Subsection
+        // offsets still refer to the original ACID section, not the body.
+        if (acid_size < 0x340 ||
+            !reader.read_u32(std::size_t{acid_offset} + 0x300, magic) || magic != kAcidMagic)
+            return NpdmParseFailure{"npdm.acid_magic", "the ACID section does not carry the ACID magic"};
+        parsed.platform = GuestPlatform::switch2;
+        acid_body_shift = 0x100;
+        acid_header_size = 0x340;
+        signature_size = 0x180;
     }
+    const auto acid_fields = std::size_t{acid_offset} + acid_body_shift;
     std::uint8_t acid_major = 0;
     std::uint8_t acid_minor = 0;
-    if (!reader.read_u8(acid_offset + kAcidOffsetVersionMajor, acid_major) ||
-        !reader.read_u8(acid_offset + kAcidOffsetVersionMinor, acid_minor)) {
+    if (!reader.read_u8(acid_fields + kAcidOffsetVersionMajor, acid_major) ||
+        !reader.read_u8(acid_fields + kAcidOffsetVersionMinor, acid_minor)) {
         return NpdmParseFailure{"npdm.acid_header", "the ACID header is truncated"};
     }
     if (!((acid_major == 0 && acid_minor == 0) || acid_major > 19 ||
@@ -204,23 +216,23 @@ std::variant<NpdmParseFailure, ParsedNpdm> parse_npdm(std::span<const std::byte>
         return NpdmParseFailure{"npdm.acid_version",
                                 "the ACID version is not admitted by this baseline"};
     }
-    if (!reader.read_u32(acid_offset + kAcidOffsetFlags, parsed.acid_flags) ||
-        !reader.read_u64(acid_offset + kAcidOffsetProgramIdMin, parsed.acid_program_id_min) ||
-        !reader.read_u64(acid_offset + kAcidOffsetProgramIdMax, parsed.acid_program_id_max)) {
+    if (!reader.read_u32(acid_fields + kAcidOffsetFlags, parsed.acid_flags) ||
+        !reader.read_u64(acid_fields + kAcidOffsetProgramIdMin, parsed.acid_program_id_min) ||
+        !reader.read_u64(acid_fields + kAcidOffsetProgramIdMax, parsed.acid_program_id_max)) {
         return NpdmParseFailure{"npdm.acid_header", "the ACID header is truncated"};
     }
-    if (!read_subsection(reader, acid_offset + kAcidOffsetFsAccessControl, parsed.acid,
-                         kNpdmAcidSize, false, parsed.acid_fs_access_control) ||
-        !read_subsection(reader, acid_offset + kAcidOffsetServiceAccessControl, parsed.acid,
-                         kNpdmAcidSize, false, parsed.acid_service_access_control) ||
-        !read_subsection(reader, acid_offset + kAcidOffsetKernelAccessControl, parsed.acid,
-                         kNpdmAcidSize, true, parsed.acid_kernel_access_control)) {
+    if (!read_subsection(reader, acid_fields + kAcidOffsetFsAccessControl, parsed.acid,
+                         acid_header_size, false, parsed.acid_fs_access_control) ||
+        !read_subsection(reader, acid_fields + kAcidOffsetServiceAccessControl, parsed.acid,
+                         acid_header_size, false, parsed.acid_service_access_control) ||
+        !read_subsection(reader, acid_fields + kAcidOffsetKernelAccessControl, parsed.acid,
+                         acid_header_size, true, parsed.acid_kernel_access_control)) {
         return NpdmParseFailure{"npdm.acid_sections",
                                 "an ACID subsection has invalid bounds or alignment"};
     }
     std::uint32_t signed_size = 0;
-    if (!reader.read_u32(acid_offset + kAcidOffsetSignedSize, signed_size) ||
-        std::uint64_t{signed_size} + 0x100 != acid_size) {
+    if (!reader.read_u32(acid_fields + kAcidOffsetSignedSize, signed_size) ||
+        std::uint64_t{signed_size} + signature_size != acid_size) {
         return NpdmParseFailure{"npdm.acid_size",
                                 "the ACID signed size disagrees with its section size"};
     }

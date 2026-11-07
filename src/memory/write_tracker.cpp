@@ -489,8 +489,11 @@ bool guest_write_fault(void* context) noexcept {
 void chain_previous(int sig, siginfo_t* info, void* context) noexcept {
     const struct sigaction& previous =
         sig == SIGBUS ? g_previous_bus : g_previous_segv;
-    if (previous.sa_flags & SA_SIGINFO) {
-        if (previous.sa_sigaction) previous.sa_sigaction(sig, info, context);
+    // The disposition comes first: a default action inherited across exec
+    // still reports SA_SIGINFO, and returning would repeat the fault forever.
+    if ((previous.sa_flags & SA_SIGINFO) && previous.sa_handler != SIG_DFL &&
+        previous.sa_handler != SIG_IGN) {
+        previous.sa_sigaction(sig, info, context);
         return;
     }
     if (previous.sa_handler == SIG_DFL) {

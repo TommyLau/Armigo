@@ -68,6 +68,7 @@ struct Fixture {
     std::shared_ptr<SyntheticClient> client = std::make_shared<SyntheticClient>();
     bool available = false;
     unsigned connections = 0;
+    std::weak_ptr<int> server_lifetime;
     std::shared_ptr<ServiceManagerSession> sm;
     IpcDispatcher dispatcher;
     IpcMessage message{};
@@ -75,12 +76,16 @@ struct Fixture {
     IpcCallContext context;
     Handle sm_handle = 0;
 
-    Fixture() : dispatcher(handles, connect_port, this), context{71, message, read_byte, nullptr} {
+    explicit Fixture(bool close_on_hipc = false)
+        : dispatcher(handles, connect_port, this), context{71, message, read_byte, nullptr} {
         ProcessConfig process{71, true, {std::byte{3}, std::byte{'u'}, std::byte{'n'},
             std::byte{'i'}, std::byte{'t'}, std::byte{3}, std::byte{'w'}, std::byte{'a'},
             std::byte{'i'}, std::byte{'t'}}};
+        auto lifetime = std::make_shared<int>(7);
+        server_lifetime = lifetime;
         sm = std::make_shared<ServiceManagerSession>(std::move(process),
-            [this](std::uint64_t pid, const ServiceName& name) {
+            [this, lifetime](std::uint64_t pid, const ServiceName& name) {
+                CHECK(*lifetime == 7);
                 ++connections;
                 CHECK(pid == 71);
                 if (name == service_name("wait") && !available)
@@ -88,7 +93,7 @@ struct Fixture {
                 const auto handle = handles.insert(client);
                 CHECK(handle.has_value());
                 return LookupResult{LookupKind::connected, handle.value_or(0), 0};
-            });
+            }, close_on_hipc);
         registers.fill(0x1234);
         registers[1] = 0x2000;
         CHECK(dispatcher.dispatch(0x1f, registers, context) == IpcDisposition::handled);
@@ -189,12 +194,60 @@ void test_explicit_unsupported() {
     f.message = lookup("unit");
     CHECK(f.send(f.sm_handle) == IpcDisposition::unsupported && f.connections == 0);
 }
+void test_remote_close_lifecycle() {
+    Fixture f(true);
+    f.register_client();
+    f.message = lookup("unit");
+    CHECK(f.send(f.sm_handle) == IpcDisposition::handled);
+    const auto client = static_cast<Handle>(get(f.message, 12, 4));
+    CHECK(f.handles.lookup(client) == f.client && !f.server_lifetime.expired());
+    f.message = {}; put(f.message, 0, 2, 4);
+    const auto close_message = f.message;
+    CHECK(f.send(f.sm_handle) == IpcDisposition::handled && f.registers[0] == 0);
+    CHECK(f.message == close_message && f.handles.lookup(f.sm_handle) == f.sm);
+    CHECK(f.server_lifetime.expired());
+    const auto connections = f.connections;
+    f.message = lookup("unit");
+    const auto request = f.message;
+    CHECK(f.send(f.sm_handle) == IpcDisposition::handled && f.registers[0] == 0xf601);
+    CHECK(f.message == request && f.connections == connections);
+    f.message = {}; put(f.message, 0, 0x8000000000000010ULL, 8); put(f.message, 8, 1, 4);
+    const auto registration = f.message;
+    CHECK(f.send(f.sm_handle) == IpcDisposition::handled && f.registers[0] == 0xf601);
+    CHECK(f.message == registration);
+    // Services already handed to the caller are independent of the SM session.
+    f.message.fill(std::byte{0xa5});
+    CHECK(f.send(client) == IpcDisposition::handled && f.registers[0] == 0);
+    CHECK(f.handles.close(f.sm_handle));
+    f.message = lookup("unit");
+    CHECK(f.send(f.sm_handle) == IpcDisposition::handled && f.registers[0] == 0xe401);
+
+    Fixture pending(true);
+    pending.register_client();
+    pending.message = lookup("wait");
+    CHECK(pending.send(pending.sm_handle) == IpcDisposition::pending);
+    pending.message = close_message;
+    CHECK(pending.send(pending.sm_handle) == IpcDisposition::handled && pending.registers[0] == 0);
+    pending.available = true;
+    const auto retry = pending.sm->service_registered(service_name("wait"));
+    CHECK(retry.disposition == IpcDisposition::handled && retry.transport_result == 0xf601);
+    CHECK(pending.connections == 1 && pending.server_lifetime.expired());
+
+    Fixture legacy;
+    legacy.register_client();
+    legacy.message = close_message;
+    CHECK(legacy.send(legacy.sm_handle) == IpcDisposition::handled && legacy.registers[0] == 0);
+    CHECK(!legacy.server_lifetime.expired());
+    legacy.message = lookup("unit");
+    CHECK(legacy.send(legacy.sm_handle) == IpcDisposition::handled && get(legacy.message, 16, 4) == 0);
+}
 }  // namespace
 
 int main() {
     test_real_session_publication();
     test_deferred_notification();
     test_explicit_unsupported();
+    test_remote_close_lifecycle();
     if (failures) return 1;
     std::puts("service-manager session checks passed");
     return 0;

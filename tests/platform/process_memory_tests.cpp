@@ -312,6 +312,40 @@ bool decommit_regrow_and_failure_rollback(std::uint64_t page) {
 #endif
 }
 
+bool large_aligned_reservation(std::uint64_t page) {
+    constexpr std::uint64_t alignment = 0x10000;
+    constexpr std::uint64_t bytes = 8ull << 30;
+    auto region = require_region(ProcessMemoryRegion::reserve_low_aligned(bytes, alignment),
+                                 "Bounded large reservation failed.");
+    if (!region.valid()) return false;
+    if (!check(region.address() >= (128ull << 20) && region.address() % alignment == 0 &&
+               region.size() == bytes && region.address() + region.size() <= (1ull << 39),
+               "Bounded reservation geometry is invalid.")) return false;
+    const auto collision = ProcessMemoryRegion::reserve(page, region.address());
+    if (!check(std::holds_alternative<ProcessMemoryError>(collision),
+               "Bounded reservation did not own its native range.")) return false;
+    auto neighbor = require_region(ProcessMemoryRegion::reserve_low_aligned(page, alignment),
+                                   "Second bounded reservation failed.");
+    if (!check(neighbor.valid() && (neighbor.address() + page <= region.address() ||
+               neighbor.address() >= region.address() + bytes),
+               "Bounded reservation overlaps a live owner.")) return false;
+    for (const auto invalid : {std::uint64_t{0}, page / 2, page + 1})
+        if (!check(std::holds_alternative<ProcessMemoryError>(
+                       ProcessMemoryRegion::reserve_low_aligned(page, invalid)),
+                   "Invalid reservation alignment was admitted.")) return false;
+    for (const auto invalid : {std::uint64_t{0}, page + 1, (std::uint64_t{1} << 39) + page, UINT64_MAX})
+        if (!check(std::holds_alternative<ProcessMemoryError>(
+                       ProcessMemoryRegion::reserve_low_aligned(invalid, alignment)),
+                   "Invalid reservation size was admitted.")) return false;
+#if defined(__APPLE__)
+    return check(has_protection(region.address(), VM_PROT_NONE) &&
+                 has_protection(region.address() + bytes - page, VM_PROT_NONE),
+                 "Bounded reservation must stay inaccessible without physical commitment.");
+#else
+    return true;
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -320,7 +354,8 @@ int main() {
                "Native page size is unavailable or invalid.")) {
         return 1;
     }
-    if (!reservation_does_not_clobber(page) ||
+    if (!large_aligned_reservation(page) ||
+        !reservation_does_not_clobber(page) ||
         !commit_protect_and_geometry(page) ||
         !protect_middle_page(page) ||
         !alias_coherence_and_protection(page) ||

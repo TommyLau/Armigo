@@ -15,6 +15,7 @@
 #include "entry_table.h"
 #include "nvn_replay.h"
 #include "nvn_submission_segments.h"
+#include "nvn_gpu_frame_work.h"
 
 #include <array>
 #include <atomic>
@@ -26,6 +27,7 @@
 #include <cstring>
 #include <limits>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -78,6 +80,87 @@ void test_segment_lifecycle() {
   CHECK(policy.admit(16, 15));
   policy.draws = 0;
   CHECK(!policy.admit(100, 0));
+}
+
+void test_completed_frame_work() {
+  replay::GpuFrameWork work;
+  work.frame_boundary(2);
+  work.retire(1, 4);
+  CHECK(!work.latest());
+  work.retire(2, 6);
+  CHECK(work.latest() == 10);
+  // A marker can follow feedback; the next frame includes both submissions.
+  work.retire(3, 7);
+  work.retire(4, 11);
+  work.frame_boundary(4);
+  CHECK(work.latest() == 18);
+  for (unsigned i = 0; i < 15; ++i) work.frame_boundary(4);
+  CHECK(work.latest() == 18);
+  work.frame_boundary(4);
+  CHECK(!work.latest());
+
+  work.reset();
+  work.frame_boundary(1);
+  work.frame_boundary(3);
+  work.retire(1, 5);
+  CHECK(work.latest() == 5);
+  work.retire(2, 7);
+  CHECK(work.latest() == 5);
+  work.retire(3, 11);
+  CHECK(work.latest() == 18);
+
+  work.reset();
+  work.frame_boundary(2);
+  work.retire(1, 4);
+  work.retire(2, std::nullopt);
+  CHECK(!work.latest());
+  work.frame_boundary(3);
+  work.retire(3, 9);
+  CHECK(work.latest() == 9);
+  work.retire(4, 0);
+  work.frame_boundary(4);
+  CHECK(work.latest().has_value() && *work.latest() == 0);
+
+  work.reset();
+  for (unsigned i = 0; i < 65; ++i) work.frame_boundary(1);
+  work.retire(1, 7);
+  CHECK(!work.latest());
+  work.frame_boundary(2);
+  work.retire(2, 9);
+  CHECK(work.latest() == 9);
+
+  work.reset(42);
+  work.frame_boundary(42);
+  CHECK(!work.latest());
+  work.retire(43, 8);
+  work.frame_boundary(43);
+  CHECK(work.latest() == 8);
+
+  // Collection enabled after earlier work in this frame retired. Whether
+  // its marker precedes or follows the remaining retirement, discard that
+  // partial frame and publish only the next fully observed frame.
+  for (bool marker_first : {false, true}) {
+    work.reset(42);
+    if (marker_first) work.frame_boundary(43);
+    work.retire(43, 3);
+    if (!marker_first) work.frame_boundary(43);
+    CHECK(!work.latest());
+    work.frame_boundary(45);
+    work.retire(44, 4);
+    CHECK(!work.latest());
+    work.retire(45, 6);
+    CHECK(work.latest() == 10);
+  }
+
+  work.reset();
+  work.frame_boundary(1);
+  work.frame_boundary(2);
+  work.retire(3, 10); // Missing retirement prefixes cannot become a zero-cost frame.
+  work.frame_boundary(3);
+  CHECK(!work.latest());
+  work.retire(4, 9);
+  work.frame_boundary(4);
+  CHECK(work.latest() == 9);
 }
 
 class SharedResources final : public replay::ReplayResources {
@@ -234,6 +317,92 @@ void test_six_inflight_submissions(id<MTLDevice> device,
     previous_timestamp = report.timestamp;
     recorder.release(handles[i]);
   }
+  recorder.finalize();
+}
+
+// A submission can report more timestamps than one heap holds. Keep every
+// result distinct while six slots are in flight, then reuse the oldest slot.
+void test_timestamp_reports_across_heap_pages(id<MTLDevice> device,
+                                             id<MTL4CommandQueue> queue) {
+  constexpr std::size_t reports = 2049;
+  constexpr std::size_t submissions = 7;
+  SharedResources resources(device,
+                            reports * submissions * sizeof(NVNcounterData));
+  std::memset(resources.memory.contents, 0, resources.memory.length);
+  auto backend = replay::create_replay_backend(device, queue, resources);
+  id<MTLSharedEvent> gate = [device newSharedEvent];
+  [queue waitForEvent:gate value:1];
+  std::array<Recorder, submissions> recorders;
+  std::array<NVNcommandHandle, submissions> handles{};
+  std::uint64_t last = 0;
+  for (std::size_t submission = 0; submission != submissions; ++submission) {
+    auto& recorder = recorders[submission];
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    for (std::size_t report = 0; report != reports; ++report) {
+      const auto offset = (submission * reports + report) * sizeof(NVNcounterData);
+      load<Entry::nvnCommandBufferReportCounter>()(
+          &recorder.commands, NVN_COUNTER_TYPE_TIMESTAMP,
+          SharedResources::base + offset);
+    }
+    handles[submission] = recorder.finish();
+    last = backend->submit({&handles[submission], 1});
+    CHECK(last != 0);
+  }
+  CHECK(eventually([&] { return backend->statistics().submissions == 6; }));
+  CHECK(backend->completed_fence() == 0);
+  CHECK(read_at<NVNcounterData>(resources, 0).timestamp == 0);
+  gate.signaledValue = 1;
+  CHECK(backend->wait_fence(last, 10'000'000'000ull));
+  CHECK(!backend->last_error());
+  std::uint64_t previous = 0;
+  bool ordered = true;
+  for (std::size_t index = 0; index != reports * submissions; ++index) {
+    const auto value = read_at<NVNcounterData>(resources,
+                                             index * sizeof(NVNcounterData));
+    ordered = ordered && value.counter == 0 && value.timestamp != 0 &&
+              value.timestamp >= previous;
+    previous = value.timestamp;
+  }
+  CHECK(ordered);
+  CHECK(backend->statistics().counter_timestamp_fallbacks == 0);
+  for (std::size_t index = 0; index != submissions; ++index) {
+    recorders[index].release(handles[index]);
+    recorders[index].finalize();
+  }
+}
+
+// Exceeding the bounded storage must report an allocation failure, preserve
+// the submitted prefix, and leave the rejected report and following work alone.
+void test_timestamp_report_limit(id<MTLDevice> device,
+                                 id<MTL4CommandQueue> queue) {
+  constexpr std::size_t limit = 4096;
+  SharedResources resources(device, 64);
+  std::memset(resources.memory.contents, 0, resources.memory.length);
+  auto backend = replay::create_replay_backend(device, queue, resources);
+  Recorder recorder;
+  load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+  load<Entry::nvnCommandBufferReportCounter>()(
+      &recorder.commands, NVN_COUNTER_TYPE_TIMESTAMP, SharedResources::base);
+  const auto prefix = recorder.finish();
+  load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+  load<Entry::nvnCommandBufferReportCounter>()(
+      &recorder.commands, NVN_COUNTER_TYPE_TIMESTAMP, SharedResources::base + 16);
+  load<Entry::nvnCommandBufferReportValue>()(
+      &recorder.commands, 77, SharedResources::base + 32);
+  const auto rejected = recorder.finish();
+  std::vector<NVNcommandHandle> handles(limit, prefix);
+  handles.push_back(rejected);
+  const auto fence = backend->submit(handles);
+  CHECK(fence != 0);
+  CHECK(backend->wait_fence(fence, 10'000'000'000ull));
+  const auto error = backend->last_error();
+  CHECK(error.code == replay::ReplayErrorCode::allocation);
+  CHECK(error.detail.find("4096") != std::string::npos);
+  CHECK(read_at<NVNcounterData>(resources, 0).timestamp != 0);
+  CHECK(read_at<NVNcounterData>(resources, 16).timestamp == 0);
+  CHECK(read_at<std::uint32_t>(resources, 32) == 0);
+  recorder.release(prefix);
+  recorder.release(rejected);
   recorder.finalize();
 }
 
@@ -410,6 +579,10 @@ void test_timestamp_reports_precede_gpu_copies(id<MTLDevice> device,
 
   Recorder recorder;
   load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+  // Put the two copied reports on opposite sides of a heap-page boundary.
+  for (std::size_t index = 0; index != 1023; ++index)
+    load<Entry::nvnCommandBufferReportCounter>()(
+        &recorder.commands, NVN_COUNTER_TYPE_TIMESTAMP, SharedResources::base);
   load<Entry::nvnCommandBufferReportCounter>()(
       &recorder.commands, NVN_COUNTER_TYPE_TIMESTAMP,
       SharedResources::base + first_offset);
@@ -547,10 +720,37 @@ void test_destructor_drains_pending_callbacks(id<MTLDevice> device) {
   recorder.finalize();
 }
 
+void test_gpu_frame_work_feedback(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+  SharedResources resources(device, 2 * 1024 * 1024);
+  auto backend = replay::create_replay_backend(device, queue, resources);
+  CHECK(backend != nullptr);
+  if (!backend) return;
+  CHECK(backend->gpu_frame_work_ns() == 0);
+  Recorder recorder;
+  load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+  load<Entry::nvnCommandBufferClearBuffer>()(
+      &recorder.commands, SharedResources::base, resources.memory.length, 0x4172a39c);
+  const auto handle = recorder.finish();
+  const auto fence = backend->submit({&handle, 1});
+  backend->finish_frame(0);
+  CHECK(fence && backend->wait_fence(fence, 2'000'000'000ull));
+  // The replay worker's frame marker can follow the GPU completion callback.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  std::uint64_t work = 0;
+  while (!(work = backend->gpu_frame_work_ns()) && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  CHECK(work > 0);
+  CHECK(read_at<std::uint32_t>(resources, 0) == 0x4172a39c);
+  CHECK(read_at<std::uint32_t>(resources, resources.memory.length - 4) == 0x4172a39c);
+  recorder.release(handle);
+  recorder.finalize();
+}
+
 } // namespace
 
 int main() {
   test_segment_lifecycle();
+  test_completed_frame_work();
   @autoreleasepool {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     if (!device || ![device supportsFamily:MTLGPUFamilyMetal4] ||
@@ -564,12 +764,15 @@ int main() {
       select_api_version({55, 15});
       register_command_entries();
       test_six_inflight_submissions(device, queue);
+      test_timestamp_reports_across_heap_pages(device, queue);
+      test_timestamp_report_limit(device, queue);
       test_feedback_during_encoder_split(device, queue);
       test_report_value_precedes_gpu_copy(device, queue);
       test_event_orders_gpu_work_in_one_stream(device, queue);
       test_timestamp_reports_precede_gpu_copies(device, queue);
       test_rejected_submit_does_not_leave_fence_gap(device, queue);
       test_destructor_drains_pending_callbacks(device);
+      test_gpu_frame_work_feedback(device, queue);
     }
   }
   std::printf("Metal NVN replay ordering failures: %u\n", failures);

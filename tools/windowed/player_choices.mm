@@ -54,6 +54,13 @@ PlayerChoices read_player_choices() {
                 }
                 if (choices.supported_frame_rates.empty()) choices.supported_frame_rates = {30, 60};
             }
+            id experimental = rate_policy[@"ExperimentalRates"];
+            if ([experimental isKindOfClass:[NSArray class]]) {
+                for (id value in experimental) {
+                    if ([value isEqual:@30] || [value isEqual:@60] || [value isEqual:@120])
+                        choices.experimental_frame_rates.push_back([value unsignedIntValue]);
+                }
+            }
         }
 #endif
         choices.vsync = [defaults boolForKey:@"vsync"];

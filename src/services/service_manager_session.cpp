@@ -15,8 +15,21 @@
 
 namespace armigo::services::sm {
 
-ServiceManagerSession::ServiceManagerSession(ProcessConfig process, ConnectService connect)
-    : process_id_(process.process_id), session_(std::move(process), std::move(connect)) {}
+ServiceManagerSession::ServiceManagerSession(ProcessConfig process, ConnectService connect,
+    bool close_on_hipc)
+    : process_id_(process.process_id), close_on_hipc_(close_on_hipc),
+      session_(std::in_place, std::move(process), std::move(connect)) {}
+
+horizon::IpcReply ServiceManagerSession::close_server() {
+    const std::lock_guard lock(mutex_);
+    if (!close_on_hipc_) return ClientSession::close_server();
+    if (!session_) return {.disposition = horizon::IpcDisposition::handled,
+                           .transport_result = horizon::session_closed_result};
+    session_.reset();
+    pending_name_.reset();
+    diagnostic_ = "Service-manager server session is closed";
+    return {.disposition = horizon::IpcDisposition::handled};
+}
 
 horizon::IpcReply ServiceManagerSession::translate(const DispatchResult& result) {
     horizon::IpcReply reply;
@@ -48,12 +61,14 @@ horizon::IpcReply ServiceManagerSession::translate(const DispatchResult& result)
 horizon::IpcReply ServiceManagerSession::request(const horizon::IpcMessage& message,
                                                 std::uint64_t sender_pid) {
     const std::lock_guard lock(mutex_);
+    if (!session_) return {.disposition = horizon::IpcDisposition::handled,
+                           .transport_result = horizon::session_closed_result};
     if (malformed_) return {};
     if (sender_pid != process_id_) {
         diagnostic_ = "Service-manager session cannot serve a different configured process";
         return {};
     }
-    const auto result = session_.dispatch(message, sender_pid);
+    const auto result = session_->dispatch(message, sender_pid);
     if (result.disposition == Disposition::pending) {
         ServiceName name{};
         std::copy_n(message.begin() + 8, name.size(), name.begin());
@@ -64,12 +79,14 @@ horizon::IpcReply ServiceManagerSession::request(const horizon::IpcMessage& mess
 
 horizon::IpcReply ServiceManagerSession::service_registered(const ServiceName& name) {
     const std::lock_guard lock(mutex_);
+    if (!session_) return {.disposition = horizon::IpcDisposition::handled,
+                           .transport_result = horizon::session_closed_result};
     if (malformed_) return {};
     if (!pending_name_ || *pending_name_ != name) {
         diagnostic_ = "Service registration does not match a pending service-manager request";
         return {};
     }
-    return translate(session_.retry_pending());
+    return translate(session_->retry_pending());
 }
 
 const char* ServiceManagerSession::diagnostic() const {

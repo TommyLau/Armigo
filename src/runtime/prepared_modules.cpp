@@ -185,7 +185,7 @@ std::string installed_preparation_identity() {
     const auto gate = execution::make_local_gate_template();
     const auto digest = loader::detail::sha256(gate.code);
     if (!digest) throw std::runtime_error("Native gate template hashing failed.");
-    std::string identity = "armigo-a64-preparation-v1-r6-";
+    std::string identity = "armigo-a64-preparation-v1-r7-";
     constexpr char hex[] = "0123456789abcdef";
     for (const auto byte : *digest) {
         const auto value = std::to_integer<unsigned>(byte);

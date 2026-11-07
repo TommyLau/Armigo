@@ -11,12 +11,16 @@
 #include "process_memory.h"
 
 #include <limits>
+#include <vector>
+#include <cstdio>
+#include <algorithm>
 #include <utility>
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include "mach_vm.h"
 #include <mach/vm_statistics.h>
+#include <mach-o/dyld.h>
 #endif
 
 namespace armigo::platform {
@@ -235,6 +239,31 @@ std::uint64_t native_page_size() noexcept {
 #endif
 }
 
+std::optional<memory::Permission> process_memory_permissions(
+    std::uint64_t address, std::uint64_t* contiguous_bytes) noexcept {
+    if (contiguous_bytes) *contiguous_bytes = 0;
+#if defined(__APPLE__)
+    mach_vm_address_t start = address;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info{};
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    const auto result = ::mach_vm_region(mach_task_self(), &start, &size, VM_REGION_BASIC_INFO_64,
+        reinterpret_cast<vm_region_info_t>(&info), &count, &object);
+    if (object != MACH_PORT_NULL) ::mach_port_deallocate(mach_task_self(), object);
+    if (result != KERN_SUCCESS || start > address || address - start >= size) return {};
+    if (contiguous_bytes) *contiguous_bytes = size - (address - start);
+    auto permissions = memory::Permission::none;
+    if (info.protection & VM_PROT_READ) permissions = permissions | memory::Permission::read;
+    if (info.protection & VM_PROT_WRITE) permissions = permissions | memory::Permission::write;
+    if (info.protection & VM_PROT_EXECUTE) permissions = permissions | memory::Permission::execute;
+    return permissions;
+#else
+    static_cast<void>(address);
+    return {};
+#endif
+}
+
 ProcessMemoryStatus protect_process_memory(
     std::uint64_t address, std::uint64_t size,
     memory::Permission permission) noexcept {
@@ -246,6 +275,99 @@ ProcessMemoryStatus protect_process_memory(
     return apply_protection(address, size, permission);
 #else
     return {ProcessMemoryError::unsupported};
+#endif
+}
+
+std::string describe_guest_address_space() {
+#if defined(__APPLE__)
+    struct Mapping { std::uint64_t start, end; unsigned tag; };
+    std::vector<Mapping> mappings;
+    mach_vm_address_t address = 0;
+    for (unsigned count = 0; count < (1u << 20); ++count) {
+        mach_vm_size_t size = 0;
+        natural_t depth = 0;
+        vm_region_submap_info_data_64_t info{};
+        mach_msg_type_number_t info_count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        if (::mach_vm_region_recurse(mach_task_self(), &address, &size, &depth,
+                reinterpret_cast<vm_region_recurse_info_t>(&info), &info_count) != KERN_SUCCESS || address >= query_end)
+            break;
+        mappings.push_back({address, std::min<std::uint64_t>(address + size, query_end), info.user_tag});
+        address += size;
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> gaps;
+    std::uint64_t cursor = std::uint64_t{1} << 32;
+    for (const auto& m : mappings) {
+        if (m.start > cursor) gaps.emplace_back(m.start - cursor, cursor);
+        cursor = std::max(cursor, m.end);
+    }
+    if (cursor < query_end) gaps.emplace_back(query_end - cursor, cursor);
+    std::sort(gaps.rbegin(), gaps.rend());
+    char text[96];
+    std::string out = std::to_string(mappings.size()) + " regions below 512 GiB; largest gaps";
+    for (std::size_t i = 0; i < gaps.size() && i < 3; ++i) {
+        std::snprintf(text, sizeof text, " %.2f GiB at %#llx", double(gaps[i].first) / double(1ull << 30),
+                      static_cast<unsigned long long>(gaps[i].second));
+        out += text;
+    }
+    out += "; regions of 1 GiB or more:";
+    unsigned large = 0;
+    for (const auto& m : mappings) {
+        if (m.end - m.start < (1ull << 30) || large++ >= 8) continue;
+        std::snprintf(text, sizeof text, " %.2f GiB at %#llx tag %u", double(m.end - m.start) / double(1ull << 30),
+                      static_cast<unsigned long long>(m.start), m.tag);
+        out += text;
+    }
+    return out;
+#else
+    return "address space summary unavailable";
+#endif
+}
+
+ProcessMemoryResult ProcessMemoryRegion::reserve_low_aligned(
+    std::uint64_t bytes, std::uint64_t alignment) noexcept {
+    const auto page = native_page_size();
+    if (!page) return ProcessMemoryError::unsupported;
+    if (!bytes) return ProcessMemoryError::invalid_size;
+    if (bytes % page) return ProcessMemoryError::unaligned_size;
+    if (alignment < page || (alignment & (alignment - 1))) return ProcessMemoryError::unaligned_address;
+    if (bytes > query_end || alignment > query_end) return ProcessMemoryError::out_of_range;
+#if defined(__APPLE__)
+    // The low-address guard of a native executable need not appear as a VM
+    // region. Start at its actual mapped image rather than treating that gap
+    // as allocatable. This is a host placement policy, not guest geometry.
+    const auto image = reinterpret_cast<std::uintptr_t>(_dyld_get_image_header(0));
+    if (!image) return ProcessMemoryError::system_failure;
+    std::uint64_t cursor = image > (128ull << 20) ? image : (128ull << 20);
+    for (unsigned attempt = 0; attempt < 16384 && cursor < query_end; ++attempt) {
+        const auto candidate = (cursor + alignment - 1) & ~(alignment - 1);
+        if (candidate >= query_end || bytes > query_end - candidate)
+            return ProcessMemoryError::allocation_failed;
+        mach_vm_address_t next = candidate;
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info{};
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        const auto status = ::mach_vm_region(mach_task_self(), &next, &size,
+            VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object);
+        if (object != MACH_PORT_NULL) ::mach_port_deallocate(mach_task_self(), object);
+        if (status != KERN_SUCCESS && status != KERN_INVALID_ADDRESS)
+            return ProcessMemoryError::system_failure;
+        if (status == KERN_INVALID_ADDRESS || (next >= candidate && bytes <= next - candidate)) {
+            auto reserved = reserve(bytes, candidate);
+            if (std::holds_alternative<ProcessMemoryRegion>(reserved)) return reserved;
+            const auto error = std::get<ProcessMemoryError>(reserved);
+            if (error != ProcessMemoryError::address_occupied) return error;
+            // Re-query after a concurrent allocator took the gap. No overwrite
+            // flag is used; the scan budget also bounds repeated contention.
+            continue;
+        }
+        if (!size || next > UINT64_MAX - size || next + size <= cursor)
+            return ProcessMemoryError::system_failure;
+        cursor = next + size;
+    }
+    return ProcessMemoryError::allocation_failed;
+#else
+    return ProcessMemoryError::unsupported;
 #endif
 }
 

@@ -687,9 +687,10 @@ LaunchResult<LaunchProfile> derive_launch_profile(std::span<const std::byte> npd
     if (auto check = decode_kernel_capabilities(request_caps, aci0_capabilities)) {
         return *check;
     }
-    if (aci0_capabilities.max_core >= kGuestCoreCount) {
+    const auto supported_cores = meta.platform == GuestPlatform::switch2 ? 6u : kGuestCoreCount;
+    if (aci0_capabilities.max_core >= supported_cores) {
         return failure(LaunchError::unsupported, "npdm.capability_support",
-                       "the requested virtual cores exceed Armigo's four-core profile");
+                       "the requested virtual cores exceed the selected platform profile");
     }
     if (aci0_capabilities.requests_memory_mapping) {
         return failure(LaunchError::unsupported, "npdm.capability_support",
@@ -765,6 +766,8 @@ LaunchResult<LaunchProfile> derive_launch_profile(std::span<const std::byte> npd
     profile.origin = ProfileOrigin::npdm;
     profile.title_id = meta.aci0_program_id;
     profile.is_64_bit = true;
+    profile.process.platform = meta.platform;
+    if (meta.platform == GuestPlatform::switch2) profile.process.baseline = horizon::Baseline::horizon_23_0_1;
     profile.process.address_bits = 39;
     profile.process.alias_extra_enabled =
         (meta.meta_flags & kMetaFlagAliasRegionExtraSize) != 0;

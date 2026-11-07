@@ -31,6 +31,23 @@ int main() {
             const char* selected_title;
             bool enabled;
         };
+        {
+            armigo::tools::PlayerChoices choices;
+            choices.title_frame_rate = true;
+            choices.default_frame_rate = 60;
+            choices.supported_frame_rates = {30, 60, 120};
+            choices.experimental_frame_rates = {120};
+            choices.frame_rate = 120;
+            armigo::platform::DisplayCapabilities display;
+            display.current = {1920, 1080, 120, false};
+            const auto selection = armigo::tools::select_mac_frame_rate(choices, display);
+            NSPopUpButton* button = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+            armigo::tools::populate_player_frame_rate_menu(button, selection, 120);
+            CHECK([button.selectedItem.title isEqualToString:@"120 fps (Experimental)"]);
+            CHECK(([button.selectedItem.representedObject isEqual:@[@"frame_rate", @120]]));
+            CHECK([[button itemAtIndex:0].title isEqualToString:@"Auto"]);
+            CHECK([[button itemAtIndex:2].title isEqualToString:@"60 fps"]);
+        }
         for (const auto& test : {
             Case{120, "120", false, 60, "120 fps (ARMIGO_COMPAT_FRAME_RATE override)", false},
             Case{30, "120", false, 60, "120 fps (ARMIGO_COMPAT_FRAME_RATE override)", false},

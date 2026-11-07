@@ -196,6 +196,36 @@ Instruction decode_system_instruction(std::uint32_t word) {
 
 } // namespace
 
+PointerAuthentication pointer_authentication(std::uint32_t word) noexcept {
+    using P = PointerAuthentication;
+    switch (word) {
+    case 0xd65f0fff: return P::retab;
+    case 0xd503237f: return P::pacibsp;
+    case 0xd50323ff: return P::autibsp;
+    case 0xd50323bf: return P::autiasp;
+    case 0xd50320ff: return P::xpaclri;
+    case 0xd503219f: return P::autia1716;
+    case 0xd50321df: return P::autib1716;
+    case 0xd503211f: case 0xd503215f: case 0xd503231f: case 0xd503233f:
+    case 0xd503235f: case 0xd503239f: case 0xd50323df: return P::unsupported;
+    default: break;
+    }
+    switch (word & 0xfffffc00u) {
+    case 0xdac10000: return P::pacia;
+    case 0xdac10400: return P::pacib;
+    case 0xdac11400: return P::autib;
+    default: break;
+    }
+    if ((word & 0xffffffe0u) == 0xdac143e0u) return P::xpaci;
+    if ((word & 0xffe0fc00u) == 0x9ac03000u) return P::pacga;
+    // Remaining one-source PAUTH, authenticated register branches/returns,
+    // and authenticated loads retain an explicit unsupported boundary.
+    if ((word & 0xffff0000u) == 0xdac10000u ||
+        (word & 0xfe1ff800u) == 0xd61f0800u ||
+        (word & 0xff200400u) == 0xf8200400u) return P::unsupported;
+    return P::none;
+}
+
 CacheOperation identify_cache_operation(std::uint16_t encoding) noexcept {
     for (const auto& entry : cache_operations) {
         if (entry.encoding == encoding) return entry.operation;
@@ -222,6 +252,10 @@ std::optional<std::uint16_t> encoding_of(SystemRegister reg) noexcept {
 }
 
 Instruction decode(std::uint32_t word) noexcept {
+    if (word == 0xd65f0fffu)
+        return {.word = word, .opcode = Opcode::retab, .reg = link_register,
+                .wide = true, .reads = register_bit(link_register)};
+
     if ((word & 0x7C000000u) == 0x14000000u) {
         return decode_immediate_branch(word, (word >> 31) ? Opcode::bl : Opcode::b);
     }

@@ -122,7 +122,21 @@ void check_folder(const std::filesystem::path& folder) {
         }
         if (*title == 0x01007ef00011e000ull) {
             CHECK(patch.calls.size() == 2);
+            CHECK(patch.frame_rate && patch.frame_rate->default_rate == 60);
+            CHECK(patch.frame_rate->supported_rates == std::vector<std::uint32_t>({30, 60, 120}));
+            CHECK(patch.frame_rate->experimental_rates == std::vector<std::uint32_t>({120}));
+            CHECK(patch.resolution && patch.resolution->gpu_budget_rate == 120);
+            const auto baseline = std::get<std::vector<compat::WordPatch>>(compat::select_patch_words(patch, "60"));
+            CHECK(baseline.size() == 26);
             for (const char* rate : {"", "0", "30", "60", "120"}) {
+                const auto words = compat::select_patch_words(patch, rate);
+                CHECK(std::holds_alternative<std::vector<compat::WordPatch>>(words));
+                if (const auto* selected = std::get_if<std::vector<compat::WordPatch>>(&words))
+                    CHECK(std::equal(selected->begin(), selected->end(), baseline.begin(), baseline.end(),
+                        [](const auto& left, const auto& right) {
+                            return left.offset == right.offset && left.expected_instruction == right.expected_instruction &&
+                                left.replacement_instruction == right.replacement_instruction && !left.frame_rate;
+                        }));
                 const auto calls = compat::select_patch_calls(patch, rate);
                 CHECK(std::holds_alternative<std::vector<compat::CallPatch>>(calls));
                 if (const auto* selected = std::get_if<std::vector<compat::CallPatch>>(&calls))

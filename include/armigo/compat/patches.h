@@ -13,9 +13,11 @@
 #include <armigo/titles/frame_rate.h>
 #include <armigo/loader/nso_module.h>
 #include <armigo/execution/gate.h>
+#include <armigo/execution/call_hook.h>
 #include <array>
 #include <filesystem>
 #include <optional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -33,6 +35,16 @@ struct TitleIdentity {
     std::array<std::byte, 32> main_build_id{};
     bool operator==(const TitleIdentity&) const = default;
 };
+// A phase call shares its parent layout's published frame step. Its native
+// callee consumes x1 = first phase and x2 = number of consecutive phases due.
+struct PhaseCallPatch {
+    std::uint64_t original_callee = 0;
+    std::uint64_t counter = 0;
+    std::uint32_t phase_count = 0;
+};
+struct GpuBudgetInstruction {
+    std::uint32_t target_rate = 0;
+};
 struct CallPatch {
     std::uint64_t offset = 0;
     std::uint32_t expected_instruction = 0;
@@ -41,6 +53,10 @@ struct CallPatch {
     std::string note;
     std::uint32_t frame_rate = 0;
     bool nvn_driver_only = false;
+    std::optional<PhaseCallPatch> phases;
+    // Generated only for an explicitly enabled resolution-feedback site.
+    // This intercepts a MOVZ constant, rather than calling a guest function.
+    std::optional<GpuBudgetInstruction> gpu_budget;
 };
 // One instruction of the main module replaced at load time. The expected word
 // must be present, unchanged by preparation, or the title is not patched.
@@ -64,6 +80,7 @@ struct FrameRateSettings {
     std::uint32_t display_refresh_rate = 60;
     // Explicitly admitted modes, including the default.
     std::vector<std::uint32_t> supported_rates;
+    std::vector<std::uint32_t> experimental_rates;
 };
 // Instruction sites of the internal-resolution patch
 // (titles/01007EF00011E000/resolution.h). Each
@@ -81,6 +98,8 @@ struct ResolutionSites {
     std::uint64_t load_scale = 0;                  // dynamic-resolution load scale (f32 high half)
     std::uint32_t swapchain_textures = 0, pool_width = 0, pool_height = 0, minimum_render_width = 0;
     std::uint32_t maximum_width = 0, target_rate = 60;   // defaults; the environment overrides
+    std::string gpu_budget_note; // Nonempty permits the GPU-work controller.
+    std::uint32_t gpu_budget_rate = 0; // Zero is opt-in only; 120 enables that title mode.
 };
 // Where the packer finds this title's shader stages. Absent profile settings
 // keep the historical choice: BNSH containers and a minus-one-to-one vertex
@@ -128,12 +147,27 @@ struct PatchDescription {
     // when the profile includes it.
     std::string note;
 };
+struct GpuBudgetContext;
 struct InstalledPatch {
     PatchDescription description;
     std::uint64_t module_base = 0;
+    std::shared_ptr<GpuBudgetContext> gpu_budget;
 };
+inline std::uint64_t call_callee(const PatchDescription& patch, const CallPatch& call) noexcept {
+    if (call.gpu_budget) return call.offset + 4;
+    return call.phases ? call.phases->original_callee : patch.original_callee;
+}
+void initialize_gpu_budget(InstalledPatch& patch);
+struct PatchFeedback {
+    std::uint64_t (*gpu_work_ns)(void*) noexcept = nullptr;
+    void* context = nullptr;
+};
+execution::CallHookPatchResult make_patch_hook(const CallPatch& site, std::uint32_t actual,
+    std::uint64_t address, std::uint64_t trampoline, execution::CallHookCodeRegion gate);
 execution::GateStatus handle_patch(const InstalledPatch& patch, execution::GateCall& call,
-                                    const horizon::GuestBuffers& memory) noexcept;
+                                    const horizon::GuestBuffers& memory,
+                                    std::uint64_t call_return_address,
+                                    PatchFeedback feedback = {}) noexcept;
 // Present policy of the patch installed for this process (false unless a
 // title's compatibility description enables it). Read by the display service.
 void set_present_link(bool enabled) noexcept;

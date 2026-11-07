@@ -261,11 +261,13 @@ void test_bundle_and_icon() {
     spec.default_frame_rate = 30;
     spec.display_refresh_rate = 60;
     spec.supported_frame_rates = {30, 60, 120};
+    spec.experimental_frame_rates = {120};
     const auto title_rate_plist = pack::info_plist(spec);
     CHECK(title_rate_plist.find("<key>ArmigoTitleFrameRate</key><dict><key>Default</key><integer>30</integer>") != std::string::npos);
     CHECK(title_rate_plist.find("<key>DisplayRefresh</key><integer>60</integer>") != std::string::npos);
     CHECK(title_rate_plist.find("<key>SupportedRates</key><array><integer>30</integer><integer>60</integer>"
                                "<integer>120</integer></array>") != std::string::npos);
+    CHECK(title_rate_plist.find("<key>ExperimentalRates</key><array><integer>120</integer></array>") != std::string::npos);
     spec.platform = "ios";
     CHECK(pack::info_plist(spec).find("SupportedRates") == std::string::npos);
     CHECK(pack::info_plist(spec).find("ArmigoTitleFrameRate") == std::string::npos);

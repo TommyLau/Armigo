@@ -89,6 +89,12 @@ public:
     // zero period (no known presentation rate) leaves its policy as it was.
     virtual void acquire_tick(std::uint64_t period_ns) { (void)period_ns; }
 
+    // Optional host feedback: the latest completed presented frame's sum of
+    // GPU execution intervals, excluding gaps between command buffers. Zero
+    // means unavailable. Querying enables collection; it never changes GPU
+    // counters, submission order or guest fence completion.
+    [[nodiscard]] virtual std::uint64_t gpu_frame_work_ns() const noexcept { return 0; }
+
     // Replays the recorded commands of the given command handles, in order,
     // and returns the fence value the GPU reaches once they complete.
     virtual std::uint64_t submit(std::span<const NVNcommandHandle> handles) = 0;

@@ -55,6 +55,14 @@ with tempfile.TemporaryDirectory(prefix="armigo-player-choices-") as directory:
     check(high, "120 1 120 120 120", "-frame_rate", "120", "-display_hz", "120",
           clock=120, options="0,30,60,120,")
     check(high, "0 1 60 0 60", "-frame_rate", "0", "-display_hz", "120", options="0,30,60,120,")
+    botw = {"Default": 60, "DisplayRefresh": 60, "SupportedRates": [30, 60, 120], "ExperimentalRates": [120]}
+    for hz in (60, 90, 119.88):
+        check(botw, "60 1 60 60 60", "-frame_rate", "120", "-display_hz", str(hz),
+              "-expect_experimental", "120", fallback=1)
+    for hz in (120, 144, 240):
+        check(botw, "120 1 120 120 120", "-frame_rate", "120", "-display_hz", str(hz),
+              "-expect_experimental", "120", clock=120, options="0,30,60,120,")
+        check(botw, "0 1 60 0 60", "-frame_rate", "0", "-display_hz", str(hz), options="0,30,60,120,")
     check(dict(policy, SupportedRates=[30, 120]), "30 1 60 30 60", "-frame_rate", "120",
           fallback=1, options="0,30,")
     check(None, "60 0 0 unset 60", "-frame_rate", "120", "-display_hz", "120", fallback=1)

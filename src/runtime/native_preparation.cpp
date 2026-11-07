@@ -115,6 +115,8 @@ void sort_unique(std::vector<T>& values) {
 
 WordRole classify_word(std::uint32_t word) noexcept {
     WordRole role;
+    role.unsupported_authentication = aarch64::pointer_authentication(word) ==
+        aarch64::PointerAuthentication::unsupported;
     const auto instruction = aarch64::decode(word);
     const auto effects = aarch64::decode_register_effects(word);
     const bool known = effects.status == aarch64::EffectStatus::decoded ||
@@ -339,13 +341,14 @@ std::optional<JumpTable> find_jump_table(std::uint64_t offset, std::uint64_t tex
 
 enum RoleBit : std::uint8_t {
     role_x18 = 1, role_system = 2, role_unknown_control = 4, role_exclusive_load = 8,
-    role_exclusive_store = 16, role_clear_exclusive = 32,
+    role_exclusive_store = 16, role_clear_exclusive = 32, role_unsupported_authentication = 64,
 };
 
 std::uint8_t role_flags(const WordRole& role) noexcept {
     return static_cast<std::uint8_t>((role.uses_x18 ? role_x18 : 0) | (role.system ? role_system : 0) |
         (role.unknown_control ? role_unknown_control : 0) | (role.exclusive_load ? role_exclusive_load : 0) |
-        (role.exclusive_store ? role_exclusive_store : 0) | (role.clear_exclusive ? role_clear_exclusive : 0));
+        (role.exclusive_store ? role_exclusive_store : 0) | (role.clear_exclusive ? role_clear_exclusive : 0) |
+        (role.unsupported_authentication ? role_unsupported_authentication : 0));
 }
 
 WordRole role_from_flags(std::uint8_t flags) noexcept {
@@ -356,6 +359,7 @@ WordRole role_from_flags(std::uint8_t flags) noexcept {
     role.exclusive_load = flags & role_exclusive_load;
     role.exclusive_store = flags & role_exclusive_store;
     role.clear_exclusive = flags & role_clear_exclusive;
+    role.unsupported_authentication = flags & role_unsupported_authentication;
     return role;
 }
 
@@ -488,12 +492,16 @@ void ModuleCodePreparation::prepare(const ModulePreparationView& view) {
         if (role.exclusive_load) exclusive = true;
         const bool in_window = exclusive;
         if (role.exclusive_store || role.clear_exclusive) exclusive = false;
-        if (!role.uses_x18 && !role.system && !role.unknown_control) return;
+        if (!role.uses_x18 && !role.system && !role.unknown_control && !role.unsupported_authentication) return;
         recent[recent_next++ % recent.size()] = {offset, word};
         const auto stop = [&](const char* reason) {
             std::memcpy(view.image.data() + offset, &terminal, 4);
             stops.push_back({address, word, reason});
         };
+        if (role.unsupported_authentication) {
+            stop("Pointer authentication form unsupported by native preparation.");
+            return;
+        }
         if (role.unknown_control) {
             stop("Control instruction unsupported by native preparation.");
             return;

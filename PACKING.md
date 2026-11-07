@@ -11,7 +11,7 @@
 # Packing your own app
 
 `armigo` turns one game you own into one player app: a macOS `.app`, or an iOS
-and iPadOS `.ipa`. Build Armigo first (see [README.md](README.md)). Packing
+`.ipa`. Build Armigo first (see [README.md](README.md)). Packing
 supports the titles listed in the README's status table.
 
 ```text
@@ -69,15 +69,15 @@ Armigo signs nothing else. It opens on the Mac that packed it; on another Mac,
 macOS may ask you to allow it in System Settings › Privacy & Security the first
 time, or you can sign it with your own identity.
 
-## iOS and iPadOS
+## iOS
 
 ```sh
 build/macos-release/armigo "My Game.xci" --keys prod.keys \
   --firmware Firmware.20.5.0.zip --platform ios --output "$HOME/Games"
 ```
 
-This writes one unsigned `<Name>.ipa` that contains the game. It needs iOS or
-iPadOS 26 or later and runs without JIT. The first iOS pack configures and
+This writes one unsigned `<Name>.ipa` that contains the game. It needs iOS 26 or
+later and runs without JIT. The first iOS pack configures and
 builds the iOS player itself (the `ios-release` preset); `--ios-build DIR`
 uses another build. If a macOS app of the same game is already in the output
 folder, the packer reuses its game files and shaders (`--reuse APP` names one

@@ -334,7 +334,7 @@ ExclusiveWindowProof prove_exclusive_windows(
             if (node.effects.operation == Operation::clrex ||
                 (node.exclusive && !node.load)) continue;
             switch (node.instruction.opcode) {
-            case Opcode::bl: case Opcode::blr: case Opcode::ret:
+            case Opcode::bl: case Opcode::blr: case Opcode::ret: case Opcode::retab:
                 refuse(ExclusiveWindowError::unclosed_exit, site.image_offset);
                 break;
             case Opcode::b: case Opcode::b_cond: case Opcode::bc_cond:
@@ -656,6 +656,8 @@ PreparedImageResult prepare_image(std::uint64_t original_size,
             const auto address = kPlanningBase + site.image_offset;
             auto site_policy = options.scalar_x18_policy;
             site_policy.exclusive_monitor_clear = proof.monitor_clear[index];
+            if (aarch64::pointer_authentication(site.word) == aarch64::PointerAuthentication::unsupported)
+                return fail(PreparedImageError::unsupported_instruction, index);
             if (decoded.opcode == Opcode::brk || decoded.opcode == Opcode::hlt ||
                 decoded.opcode == Opcode::hvc || decoded.opcode == Opcode::smc) {
                 return fail(PreparedImageError::unsupported_instruction, index);

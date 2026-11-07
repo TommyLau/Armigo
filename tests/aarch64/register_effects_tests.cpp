@@ -585,7 +585,9 @@ void one_two_three_source() {
     }
     EXPECT_STATUS(two_source(1, 0, 9, 0x00, 7, 5), unknown);  // SUBP (memory tagging)
     EXPECT_STATUS(two_source(1, 0, 9, 0x04, 7, 5), unknown);  // IRG
-    EXPECT_STATUS(two_source(1, 0, 9, 0x0C, 7, 5), unknown);  // PACGA
+    EXPECT_EFFECTS(two_source(1, 0, 9, 0x0C, 7, 5), Operation::pacga,
+                   Op{0, 5, ZR, 64, W, Role::destination}, Op{5, 7, ZR, 64, R, Role::source},
+                   Op{16, 9, SP, 64, R, Role::source});
     EXPECT_STATUS(two_source(1, 0, 9, 0x18, 7, 5), unknown);  // SMAX (register)
     EXPECT_STATUS(two_source(1, 1, 9, 0x02, 7, 5), unknown);  // S = 1
 
@@ -608,7 +610,8 @@ void one_two_three_source() {
     }
     EXPECT_STATUS(one_source(0, 0, 0, 3, 7, 5), reserved);  // REV with sf = 0, opc = 11
     EXPECT_STATUS(one_source(1, 0, 0, 6, 7, 5), unknown);   // CTZ (CSSC)
-    EXPECT_STATUS(one_source(1, 0, 1, 0, 7, 5), unknown);   // PACIA (pointer authentication)
+    EXPECT_EFFECTS(one_source(1, 0, 1, 0, 7, 5), Operation::pacia,
+                   Op{0, 5, ZR, 64, RW, Role::destination}, Op{5, 7, SP, 64, R, Role::source});
     EXPECT_STATUS(one_source(1, 1, 0, 0, 7, 5), unknown);   // S = 1
 
     // madd/msub: Ra is an accumulator in bits 14..10.

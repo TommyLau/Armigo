@@ -127,11 +127,18 @@ std::string info_plist(const BundleSpec& spec) {
     for (const auto rate : spec.supported_frame_rates)
         supported_rates += "<integer>" + std::to_string(rate) + "</integer>";
     supported_rates += "</array>";
+    std::string experimental_rates;
+    if (!spec.experimental_frame_rates.empty()) {
+        experimental_rates = "<key>ExperimentalRates</key><array>";
+        for (const auto rate : spec.experimental_frame_rates)
+            experimental_rates += "<integer>" + std::to_string(rate) + "</integer>";
+        experimental_rates += "</array>";
+    }
     const auto frame_rate = spec.default_frame_rate && spec.display_refresh_rate
         ? "<key>ArmigoTitleFrameRate</key><dict><key>Default</key><integer>" +
             std::to_string(spec.default_frame_rate) +
             "</integer><key>DisplayRefresh</key><integer>" +
-            std::to_string(spec.display_refresh_rate) + "</integer>" + supported_rates + "</dict>\n"
+            std::to_string(spec.display_refresh_rate) + "</integer>" + supported_rates + experimental_rates + "</dict>\n"
         : std::string{};
     if (spec.platform == "ios") {
         return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"

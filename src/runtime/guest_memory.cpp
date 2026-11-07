@@ -14,6 +14,8 @@
 // registered writable alias when available and publish after the copy.
 
 #include <armigo/runtime/guest_memory.h>
+#include <armigo/common/diagnostics.h>
+#include "memory_map.h"
 #include <armigo/horizon/read_only_shared_memory.h>
 #include <armigo/horizon/shared_memory.h>
 #include <armigo/horizon/stack_alias.h>
@@ -23,6 +25,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -91,6 +94,61 @@ QueryDisposition finish(QueryRegisters& r, std::uint32_t result,
     return QueryDisposition::handled;
 }
 
+// Host rollback storage for copied mappings. Retain original physical backing
+// and actual native protections before any mutation. Writable private aliases
+// restore only bytes the operation may overwrite, preserving neighboring writes.
+class NativePageUndo {
+    struct Saved {
+        std::uint64_t destination;
+        Permission permission;
+        Region backing;
+        std::optional<Region> writable;
+        std::uint64_t byte_offset;
+        std::vector<std::byte> bytes;
+    };
+    std::vector<Saved> pages_;
+public:
+    static std::optional<NativePageUndo> stage(AddressRange pages, AddressRange writes = {}) {
+        NativePageUndo undo;
+        const auto page = platform::native_page_size();
+        undo.pages_.reserve(pages.size / page);
+        for (auto at = pages.address; at < pages.address + pages.size; at += page) {
+            const auto permission = platform::process_memory_permissions(at);
+            if (!permission) return {};
+            auto alias = Region::alias_copy(at, page, Permission::none);
+            auto* backing = std::get_if<Region>(&alias);
+            if (!backing) return {};
+            Saved saved{at, *permission, std::move(*backing), {}, 0, {}};
+            if (writes.size && pm::overlaps({at, page}, writes)) {
+                auto writable = Region::writable_host_alias(at, page);
+                auto* view = std::get_if<Region>(&writable);
+                if (!view) return {};
+                saved.writable.emplace(std::move(*view));
+                const auto first = std::max(at, writes.address);
+                const auto end = std::min(at + page, writes.address + writes.size);
+                saved.byte_offset = first - at;
+                saved.bytes.resize(end - first);
+                std::memcpy(saved.bytes.data(),
+                    reinterpret_cast<const void*>(saved.writable->address() + saved.byte_offset), saved.bytes.size());
+            }
+            undo.pages_.push_back(std::move(saved));
+        }
+        return undo;
+    }
+    NativeStatus restore(Region& owner, bool restore_bytes) noexcept {
+        NativeStatus result;
+        for (const auto& saved : pages_) {
+            if (restore_bytes && saved.writable)
+                std::memcpy(reinterpret_cast<void*>(saved.writable->address() + saved.byte_offset),
+                    saved.bytes.data(), saved.bytes.size());
+            const auto status = owner.alias(saved.destination - owner.address(), platform::native_page_size(),
+                saved.backing.address(), saved.permission);
+            if (!status.ok()) result = status;
+        }
+        return result;
+    }
+};
+
 struct State;
 class Pin final : public PinnedGuestMemory {
 public:
@@ -134,7 +192,46 @@ struct State : std::enable_shared_from_this<State> {
     std::shared_ptr<ModuleSet> modules;
     std::shared_ptr<Region> heap, alias, stack;
     MemoryAccounting accounting;
+    // Legacy processes retain their original vector. Private processes discard
+    // construction scratch and share the ProcessRecord interval authority.
     std::vector<MemoryBlock> blocks;
+    std::shared_ptr<MemoryIntervalMap> intervals;
+    MemoryMapView view(AddressRange range) const {
+        return intervals ? MemoryMapView(intervals->snapshot(range)) :
+            MemoryMapView(std::span<const MemoryBlock>(blocks));
+    }
+    bool covered(AddressRange range, std::uint8_t permissions) const {
+        return intervals ? intervals->covered(range, permissions) : pm::covered(blocks, range, permissions);
+    }
+    bool free(AddressRange range) const {
+        return intervals ? intervals->free(range) : pm::free(blocks, range);
+    }
+    std::optional<MemoryBlock> uniform(AddressRange range) const {
+        return intervals ? intervals->uniform(range) : pm::uniform(blocks, range);
+    }
+    MemoryMapPlan replace(AddressRange range, std::optional<MemoryBlock> replacement,
+        std::uint8_t set_merge = 0, std::uint8_t clear_merge = 0) const {
+        MemoryMapPlan plan;
+        plan.intervals = intervals;
+        if (intervals) plan.updates.push_back({range, replacement, set_merge, clear_merge});
+        else plan.legacy = pm::replace(blocks, range, replacement, set_merge, clear_merge);
+        return plan;
+    }
+    StackAliasUnmapResult unmap_plan(std::span<const StackAliasRecord> records,
+        AddressRange source, AddressRange destination) const {
+        if (!intervals) return plan_stack_alias_unmap(blocks, records,
+            destination.address, source.address, source.size);
+        auto relevant = intervals->snapshot(source);
+        auto target = intervals->snapshot(destination);
+        relevant.insert(relevant.end(), target.begin(), target.end());
+        std::sort(relevant.begin(), relevant.end(), [](const auto& a, const auto& b) {
+            return a.range.address < b.range.address;
+        });
+        relevant.erase(std::unique(relevant.begin(), relevant.end(), [](const auto& a, const auto& b) {
+            return a.range.address == b.range.address;
+        }), relevant.end());
+        return plan_stack_alias_unmap(relevant, records, destination.address, source.address, source.size);
+    }
     std::vector<Allocation> allocations;
     std::vector<SharedMapping> shared;
     std::vector<StackAliasRecord> aliases;
@@ -187,7 +284,7 @@ struct State : std::enable_shared_from_this<State> {
                  memory::has_permission(access, Permission::execute)))
                 return false;
             const AddressRange range{address, size};
-            if (!pm::covered(blocks, range, static_cast<std::uint8_t>(access))) return false;
+            if (!covered(range, static_cast<std::uint8_t>(access))) return false;
             if (prepare_write && memory::has_permission(access, Permission::write))
                 memory::WriteTracker::prepare_host_write(reinterpret_cast<const void*>(address), size);
             body();
@@ -202,13 +299,15 @@ struct State : std::enable_shared_from_this<State> {
             (memory::has_permission(access, Permission::write) &&
              memory::has_permission(access, Permission::execute)))
             return failure(LaunchError::invalid_input, "pin", "Pin access requires readable non-WX memory.");
-        if (!pm::covered(blocks, range, static_cast<std::uint8_t>(access)))
+        if (!covered(range, static_cast<std::uint8_t>(access)))
             return failure(LaunchError::guest_fault, "pin", "The whole range is not mapped with the required permissions.");
         return make_pin(range, access, prepare_write);
     }
     // The free part of the process address space: guest-chosen mappings land
     // here, inside host reservations no other host allocation can take.
     std::shared_ptr<Region> mappable;
+    // Reserved VA only. Remote mapping operations are not admitted by region().
+    std::shared_ptr<Region> remote;
     std::shared_ptr<Region> region(AddressRange range) const {
         for (const auto& r : {heap, alias, stack, mappable})
             if (r && pm::contains(range_of(*r), range)) return r;
@@ -221,13 +320,13 @@ struct State : std::enable_shared_from_this<State> {
     void restored(NativeStatus status) noexcept { if (!status.ok()) poisoned = true; }
 
     template<class Process, class Apply, class Undo>
-    LaunchStatus commit(Process& record, std::vector<MemoryBlock>& next,
+    LaunchStatus commit(Process& record, MemoryMapPlan& next,
         MemoryAccounting updated, const char* operation, Apply&& apply, Undo&& undo) {
         // The integrator-owned ProcessRecord patch makes native publication and
         // both query views one critical section. Keep this capability check so
         // lane C can still be built against the frozen pre-integration headers.
         if constexpr (requires {
-            record.commit_memory_state(next, updated,
+            record.commit_memory_state(next.legacy, updated,
                 static_cast<bool (*)(void*) noexcept>(nullptr), nullptr);
         }) {
             struct Callback {
@@ -239,21 +338,27 @@ struct State : std::enable_shared_from_this<State> {
                     return !self.failed;
                 }
             } callback{&apply};
-            const auto result = record.commit_memory_state(next, updated, Callback::invoke, &callback);
+            const auto result = next.intervals
+                ? record.commit_memory_updates(next.updates, updated, Callback::invoke, &callback)
+                : record.commit_memory_state(next.legacy, updated, Callback::invoke, &callback);
             if (callback.failed) return host_failure(operation);
-            if (result != ProcessStateError::none)
-                return failure(LaunchError::resource_limit, operation, "Memory state admission failed before native publication.");
+            if (result != ProcessStateError::none) {
+                const bool private_metadata = record.configuration().private_system_resource_bytes != 0;
+                return failure(private_metadata && result != ProcessStateError::resource_limit
+                    ? LaunchError::invalid_input : LaunchError::resource_limit, operation,
+                    "Memory state admission failed before native publication.");
+            }
             return std::monostate{};
         }
         // Validate every fallible metadata constraint before touching native pages.
         // The existing ProcessRecord publication API allocates again; retain an
         // undo mapping until that publication has succeeded. This synthetic-only
         // fallback requires serialized direct ProcessRecord observers.
-        const auto checked = ProcessRecord::create(record.configuration(), updated, next);
+        const auto checked = ProcessRecord::create(record.configuration(), updated, next.legacy);
         if (!checked.ok())
             return failure(LaunchError::resource_limit, operation, "Memory metadata or accounting admission failed.");
         if (!apply().ok()) return host_failure(operation);
-        if (record.replace_memory_map(next) != ProcessStateError::none) {
+        if (record.replace_memory_map(next.legacy) != ProcessStateError::none) {
             restored(undo());
             if (poisoned) return failure(LaunchError::host_failure, operation,
                 "Native rollback failed; the backing authority is no longer usable.");
@@ -267,12 +372,12 @@ struct State : std::enable_shared_from_this<State> {
         return std::monostate{};
     }
     template<class Apply, class Undo>
-    LaunchStatus transaction(std::vector<MemoryBlock> next, MemoryAccounting updated,
+    LaunchStatus transaction(MemoryMapPlan next, MemoryAccounting updated,
         const char* operation, Apply&& apply, Undo&& undo) {
         auto result = commit(*process, next, updated, operation,
                              std::forward<Apply>(apply), std::forward<Undo>(undo));
         if (std::holds_alternative<std::monostate>(result)) {
-            blocks.swap(next);
+            if (!intervals) blocks.swap(next.legacy);
             accounting = updated;
         }
         return result;
@@ -469,6 +574,7 @@ public:
     }
 private:
     LaunchResult<QueryDisposition> heap(QueryRegisters& r);
+    LaunchResult<QueryDisposition> physical(QueryRegisters& r, bool unmap);
     LaunchResult<QueryDisposition> protect(QueryRegisters& r);
     LaunchResult<QueryDisposition> attribute(QueryRegisters& r);
     LaunchResult<QueryDisposition> stack(QueryRegisters& r, bool unmap);
@@ -503,7 +609,7 @@ LaunchResult<GuestMemoryPin> NativeGuestMemory::allocate(std::uint64_t bytes,
         if (type == MemoryType::stack) {
             region = s.stack;
             range.address = region->address();
-            for (const auto& b : s.blocks) {
+            for (const auto& b : s.view(range_of(*region))) {
                 if (b.range.address + b.range.size <= range.address) continue;
                 if (b.range.address >= range.address + bytes) break;
                 range.address = b.range.address + b.range.size;
@@ -515,7 +621,7 @@ LaunchResult<GuestMemoryPin> NativeGuestMemory::allocate(std::uint64_t bytes,
             const auto page = platform::native_page_size();
             region = s.mappable;
             range.address = region->address();
-            for (const auto& b : s.blocks) {
+            for (const auto& b : s.view(range_of(*region))) {
                 if (b.range.address + b.range.size <= range.address) continue;
                 if (b.range.address >= range.address + bytes) break;
                 range.address = (b.range.address + b.range.size + page - 1) & ~(page - 1);
@@ -531,7 +637,7 @@ LaunchResult<GuestMemoryPin> NativeGuestMemory::allocate(std::uint64_t bytes,
                 return unsupported("allocate", "Native allocation lies outside the admitted address space.");
         }
         s.allocations.reserve(s.allocations.size() + 1);
-        auto next = pm::replace(s.blocks, range,
+        auto next = s.replace(range,
             MemoryBlock{range, type, 0, static_cast<std::uint8_t>(access)}, pm::merge_disable_mapping);
         auto accounting = s.accounting;
         if (charged) {
@@ -565,10 +671,11 @@ LaunchStatus NativeGuestMemory::release(AddressRange range) {
             return failure(LaunchError::invalid_input, "release", "Retirement requires an exact bootstrap allocation.");
         if (s.pinned(range)) return unsupported("release", "The allocation still has live pins.");
         std::vector<MemoryBlock> retired;
-        retired.reserve(s.blocks.size());
+        const auto current = s.view(range);
+        retired.reserve(current.size());
         auto cursor = range.address;
         const auto end = range.address + range.size;
-        for (const auto& block : s.blocks) {
+        for (const auto& block : current) {
             if (!pm::overlaps(block.range, range)) continue;
             const auto begin = std::max(block.range.address, range.address);
             const auto block_end = std::min(block.range.address + block.range.size, end);
@@ -591,7 +698,7 @@ LaunchStatus NativeGuestMemory::release(AddressRange range) {
                                              accounting.other_accounted_mapping_bytes) -= range.size;
             accounting.resource_limit_used -= range.size;
         }
-        auto next = pm::replace(s.blocks, range, std::nullopt, 0, pm::merge_disable_mapping);
+        auto next = s.replace(range, std::nullopt, 0, pm::merge_disable_mapping);
         const auto region = found->region;
         const auto offset = range.address - region->address();
         auto status = s.transaction(std::move(next), accounting, "release",
@@ -614,11 +721,172 @@ LaunchStatus NativeGuestMemory::release(AddressRange range) {
     }
 }
 
+LaunchResult<QueryDisposition> NativeGuestMemory::physical(QueryRegisters& r, bool unmap) {
+    auto& s = *state_;
+    const auto& config = s.process->configuration();
+    if (config.platform != GuestPlatform::switch2) return QueryDisposition::unsupported_operation;
+    const auto operation = unmap ? "UnmapPhysicalMemory" : "MapPhysicalMemory";
+    const AddressRange range{r[0], r[1]};
+    const auto granule = switch2_physical_mapping_granule;
+    if (range.address % granule) return finish(r, pm::invalid_address);
+    if (!range.size || range.size % granule) return finish(r, pm::invalid_size);
+    if (range.size > std::numeric_limits<std::uint64_t>::max() - range.address)
+        return finish(r, pm::invalid_region);
+    // Switch 2 eligibility from practical reference evidence, unverified against
+    // console. The admitted application profile owns private system resources.
+    if (!config.private_system_resource_bytes) return finish(r, 0xfa01);
+    if (!pm::contains(config.allocation_region, range) ||
+        !pm::contains(s.process->alias_region(), range)) return finish(r, pm::invalid_region);
+
+    std::vector<AddressRange> changed;
+    const auto before = s.view(range);
+    auto cursor = range.address;
+    const auto end = range.address + range.size;
+    for (const auto& block : before) {
+        if (block.type == MemoryType::free || !pm::overlaps(block.range, range)) continue;
+        const auto first = std::max(range.address, block.range.address);
+        const auto last = std::min(end, block.range.address + block.range.size);
+        if (unmap) {
+            if (block.type != MemoryType::normal || block.attributes ||
+                block.ipc_references || block.device_references) return finish(r, pm::invalid_memory);
+            changed.push_back({first, last - first});
+        } else if (cursor < first) changed.push_back({cursor, first - cursor});
+        cursor = last;
+    }
+    if (!unmap && cursor < end) changed.push_back({cursor, end - cursor});
+    if (changed.empty()) return finish(r, 0);
+    std::uint64_t bytes = 0;
+    for (const auto delta : changed) {
+        bytes += delta.size;
+        if (s.pinned(delta)) return unsupported(operation, "Physical mapping conflicts with a retained range.");
+    }
+    auto accounting = s.accounting;
+    if (!unmap && bytes > accounting.resource_limit_bytes - accounting.resource_limit_used)
+        return finish(r, pm::limit_reached);
+    if (unmap) {
+        accounting.other_accounted_mapping_bytes -= bytes;
+        accounting.resource_limit_used -= bytes;
+    } else {
+        accounting.other_accounted_mapping_bytes += bytes;
+        accounting.resource_limit_used += bytes;
+    }
+    MemoryMapPlan next;
+    next.intervals = s.intervals;
+    if (!next.intervals) next.legacy = s.blocks;
+    for (const auto delta : changed) {
+        const auto boundary = delta.address == s.alias->address() ? pm::merge_disable_mapping : 0;
+        next.replace(delta, unmap ? std::nullopt :
+            std::optional<MemoryBlock>{{delta, MemoryType::normal, 0, 3}},
+            unmap ? 0 : boundary, unmap ? pm::merge_disable_mapping : 0);
+    }
+
+    // Split at guest-block edges rounded to host pages. Large uniform interiors
+    // stay single runs; only boundary pages need neighbor permission unions.
+    const auto pages = native_pages(range);
+    const auto page_size = platform::native_page_size();
+    std::vector<std::uint64_t> cuts{pages.address, pages.address + pages.size};
+    const auto cut = [&](std::uint64_t address) {
+        const auto low = address & ~(page_size - 1);
+        for (auto value : {low, low + page_size})
+            if (value > pages.address && value < pages.address + pages.size) cuts.push_back(value);
+    };
+    for (const auto delta : changed) { cut(delta.address); cut(delta.address + delta.size); }
+    const auto old_blocks = s.view(pages);
+    for (const auto& block : old_blocks) {
+        if (block.type == MemoryType::free) continue;
+        cut(block.range.address); cut(block.range.address + block.range.size);
+    }
+    std::sort(cuts.begin(), cuts.end());
+    cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+    struct Change {
+        AddressRange range;
+        bool occupied, retained;
+        Permission original, desired;
+        std::optional<Region> backing;
+    };
+    std::vector<Change> changes;
+    for (std::size_t index = 1; index < cuts.size(); ++index) {
+        const AddressRange piece{cuts[index - 1], cuts[index] - cuts[index - 1]};
+        if (std::none_of(changed.begin(), changed.end(), [&](auto d) { return pm::overlaps(d, piece); })) continue;
+        const bool occupied = !s.free(piece);
+        const auto after = next.view(piece);
+        bool retained = false;
+        std::uint8_t permissions = 0;
+        for (const auto& block : after) {
+            if (block.type != MemoryType::free && pm::overlaps(block.range, piece)) {
+                retained = true;
+                permissions |= block.permissions;
+            }
+        }
+        if ((permissions & 6) == 6)
+            return unsupported(operation, "A native physical page would require write and execute access.");
+        // Native protection runs preserve write-tracker protections on rollback
+        // without one backup allocation per host page.
+        for (auto at = piece.address; at < piece.address + piece.size;) {
+            std::uint64_t available = 0;
+            const auto original = platform::process_memory_permissions(at, &available);
+            if (!original || !available) return host_failure(operation);
+            const AddressRange part{at, std::min(available, piece.address + piece.size - at)};
+            Change change{part, occupied, retained, *original, static_cast<Permission>(permissions), {}};
+            if (occupied) {
+                auto saved = Region::writable_host_alias(part.address, part.size);
+                auto* owner = std::get_if<Region>(&saved);
+                if (!owner) return host_failure(operation);
+                change.backing.emplace(std::move(*owner));
+            }
+            changes.push_back(std::move(change));
+            at += part.size;
+        }
+    }
+    const auto undo_one = [&](const Change& change) {
+        const auto offset = change.range.address - s.alias->address();
+        if (!change.occupied) return s.alias->decommit(offset, change.range.size);
+        if (!change.retained) return s.alias->alias(offset, change.range.size,
+            change.backing->address(), change.original);
+        return s.alias->protect(offset, change.range.size, change.original);
+    };
+    const auto rollback = [&](std::size_t count) {
+        NativeStatus status;
+        while (count) {
+            const auto result = undo_one(changes[--count]);
+            if (!result.ok()) status = result;
+        }
+        s.restored(status);
+        return status;
+    };
+    auto status = s.transaction(std::move(next), accounting, operation, [&] {
+        std::size_t applied = 0;
+        for (const auto& change : changes) {
+            const auto offset = change.range.address - s.alias->address();
+            const auto result = !change.occupied ? s.alias->commit(offset, change.range.size, change.desired) :
+                !change.retained ? s.alias->decommit(offset, change.range.size) :
+                s.alias->protect(offset, change.range.size, change.desired);
+            if (!result.ok()) { rollback(applied); return result; }
+            ++applied;
+        }
+        if (!unmap) for (const auto& change : changes) {
+            if (!change.occupied) continue; // Fresh backing is already zero-filled.
+            for (const auto delta : changed) {
+                if (!pm::overlaps(delta, change.range)) continue;
+                const auto first = std::max(delta.address, change.range.address);
+                const auto last = std::min(delta.address + delta.size, change.range.address + change.range.size);
+                // Only previously free bytes change. Retained neighbors and all
+                // aliases of those neighbors keep their original physical pages.
+                std::memset(reinterpret_cast<void*>(change.backing->address() + first - change.range.address),
+                    0, last - first);
+            }
+        }
+        return NativeStatus{};
+    }, [&] { return rollback(changes.size()); });
+    if (const auto* failed = std::get_if<LaunchFailure>(&status)) return *failed;
+    return finish(r, 0);
+}
+
 LaunchResult<QueryDisposition> NativeGuestMemory::heap(QueryRegisters& r) {
     auto& s = *state_;
     const auto size = r[1], old = s.accounting.committed_heap;
     if (const auto result = pm::validate_heap_size(size)) return finish(r, result, size);
-    const auto maximum_heap = ProcessRecord::heap_capacity -
+    const auto maximum_heap = ProcessRecord::application_capacity(s.process->configuration().platform) -
         s.accounting.code_bytes - s.accounting.initial_stack_bytes;
     if (size > s.heap->size() || size > maximum_heap)
         return finish(r, pm::out_of_memory, size);
@@ -628,13 +896,13 @@ LaunchResult<QueryDisposition> NativeGuestMemory::heap(QueryRegisters& r) {
     const AddressRange delta{s.heap->address() + std::min(size, old),
                              size > old ? size - old : old - size};
     if (size < old) {
-        const auto block = pm::uniform(s.blocks, delta);
+        const auto block = s.uniform(delta);
         if (!block || block->type != MemoryType::normal || block->permissions != 3 ||
             block->attributes || block->ipc_references || block->device_references)
             return finish(r, pm::invalid_memory, size);
     }
     if (s.pinned(delta)) return unsupported("SetHeapSize", "Heap resize conflicts with a retained range.");
-    auto next = pm::replace(s.blocks, delta, size > old ?
+    auto next = s.replace(delta, size > old ?
         std::optional<MemoryBlock>{{delta, MemoryType::normal, 0, 3}} : std::nullopt,
         old == 0 ? pm::merge_disable_mapping : 0, size == 0 ? pm::merge_disable_mapping : 0);
     auto accounting = s.accounting;
@@ -664,7 +932,7 @@ LaunchResult<QueryDisposition> NativeGuestMemory::protect(QueryRegisters& r) {
     if (const auto result = pm::validate_range(range)) return finish(r, result);
     if (permission != 0 && permission != 1 && permission != 3)
         return finish(r, pm::invalid_permission);
-    const auto block = pm::uniform(s.blocks, range);
+    const auto block = s.uniform(range);
     if (!block || (block->type != MemoryType::normal && block->type != MemoryType::code_data) ||
         block->attributes || block->ipc_references || block->device_references)
         return finish(r, pm::invalid_memory);
@@ -672,7 +940,7 @@ LaunchResult<QueryDisposition> NativeGuestMemory::protect(QueryRegisters& r) {
     if (s.pinned(range)) return unsupported("SetMemoryPermission", "Protection conflicts with a retained range.");
     auto changed = *block;
     changed.permissions = static_cast<std::uint8_t>(permission);
-    auto next = pm::replace(s.blocks, range, changed);
+    auto next = s.replace(range, changed);
     // Native pages wholly inside the range take the new permission. A native
     // page the range only partly covers keeps the union of its guest pages'
     // permissions, so a reduction there is enforced only in the guest map.
@@ -693,8 +961,8 @@ LaunchResult<QueryDisposition> NativeGuestMemory::protect(QueryRegisters& r) {
     };
     for (auto at = pages.address; at < pages.address + pages.size; at += page_size) {
         const AddressRange page{at, page_size};
-        const auto to = pm::contains(range, page) ? static_cast<std::uint8_t>(permission) : union_of(next, page);
-        const auto from = pm::contains(range, page) ? block->permissions : union_of(s.blocks, page);
+        const auto to = pm::contains(range, page) ? static_cast<std::uint8_t>(permission) : union_of(next.view(page), page);
+        const auto from = pm::contains(range, page) ? block->permissions : union_of(s.view(page), page);
         if (to == from) continue;
         if ((to & 4) && (to & 2))
             return unsupported("SetMemoryPermission", "A native page would need to be writable and executable.");
@@ -703,9 +971,18 @@ LaunchResult<QueryDisposition> NativeGuestMemory::protect(QueryRegisters& r) {
     auto status = s.transaction(std::move(next), s.accounting,
         "SetMemoryPermission", [&] {
             platform::ProcessMemoryStatus result;
+            std::size_t applied = 0;
             for (const auto& change : changes) {
                 result = platform::protect_process_memory(change.page.address, change.page.size, change.to);
-                if (!result.ok()) return result;
+                if (!result.ok()) {
+                    while (applied) {
+                        const auto& previous = changes[--applied];
+                        s.restored(platform::protect_process_memory(previous.page.address,
+                            previous.page.size, previous.from));
+                    }
+                    return result;
+                }
+                ++applied;
             }
             return result;
         }, [&] {
@@ -732,7 +1009,7 @@ LaunchResult<QueryDisposition> NativeGuestMemory::attribute(QueryRegisters& r) {
     constexpr std::uint32_t uncached = 8, permission_locked = 16;
     if (const auto result = pm::validate_range(range)) return finish(r, result);
     if ((mask & ~(uncached | permission_locked)) || (value & ~mask)) return finish(r, pm::invalid_combination);
-    const auto block = pm::uniform(s.blocks, range);
+    const auto block = s.uniform(range);
     if (!block || (block->type != MemoryType::normal && block->type != MemoryType::code_data) ||
         (block->attributes & ~(uncached | permission_locked)) || block->ipc_references || block->device_references)
         return finish(r, pm::invalid_memory);
@@ -741,7 +1018,7 @@ LaunchResult<QueryDisposition> NativeGuestMemory::attribute(QueryRegisters& r) {
     auto changed = *block;
     changed.attributes = static_cast<std::uint8_t>((block->attributes & ~mask) | value);
     if (changed.attributes == block->attributes) return finish(r, 0);
-    auto status = s.transaction(pm::replace(s.blocks, range, changed), s.accounting, "SetMemoryAttribute",
+    auto status = s.transaction(s.replace(range, changed), s.accounting, "SetMemoryAttribute",
         [] { return platform::ProcessMemoryStatus{}; }, [] { return platform::ProcessMemoryStatus{}; });
     if (const auto* f = std::get_if<LaunchFailure>(&status)) return *f;
     return finish(r, 0);
@@ -765,17 +1042,17 @@ LaunchResult<QueryDisposition> NativeGuestMemory::stack(QueryRegisters& r, bool 
     const bool copied = !native_range(source) || !native_range(destination);
     const auto pages = native_pages(destination);
     if (!unmap) {
-        const auto block = pm::uniform(s.blocks, source);
+        const auto block = s.uniform(source);
         if (!block || (block->type != MemoryType::normal && block->type != MemoryType::code_data) ||
             block->permissions != 3 || block->attributes || block->ipc_references || block->device_references ||
-            !pm::free(s.blocks, destination)) return finish(r, pm::invalid_memory);
+            !s.free(destination)) return finish(r, pm::invalid_memory);
         if (s.pinned(source) || s.pinned(destination))
             return unsupported(operation, "Stack alias conflicts with a retained range.");
         if (s.aliases.size() >= 4096) return unsupported(operation, "Stack alias host limit exceeded.");
         s.aliases.reserve(s.aliases.size() + 1);
         auto locked = *block; locked.permissions = 0; locked.attributes = 1;
-        auto next = pm::replace(s.blocks, source, locked, pm::merge_disable_locked);
-        next = pm::replace(next, destination, MemoryBlock{destination, MemoryType::stack, 0, 3},
+        auto next = s.replace(source, locked, pm::merge_disable_locked);
+        next.replace(destination, MemoryBlock{destination, MemoryType::stack, 0, 3},
                            pm::merge_disable_mapping);
         if (copied) {
             if (!pm::contains(range_of(*s.stack), pages)) return finish(r, pm::invalid_memory);
@@ -784,31 +1061,24 @@ LaunchResult<QueryDisposition> NativeGuestMemory::stack(QueryRegisters& r, bool 
             const auto page = platform::native_page_size();
             std::vector<std::uint64_t> fresh;
             for (auto at = pages.address; at < pages.address + pages.size; at += page)
-                if (!native_page_used(s.blocks, at, destination)) fresh.push_back(at);
+                if (!native_page_used(s.view({at, page}), at, destination)) fresh.push_back(at);
+            auto undo = NativePageUndo::stage(pages, destination);
+            if (!undo) return host_failure(operation);
+            bool copied_bytes = false;
+            const auto restore = [&] { return undo->restore(*s.stack, copied_bytes); };
             auto status = s.transaction(std::move(next), s.accounting, operation, [&] {
-                platform::ProcessMemoryStatus result;
-                for (std::size_t i = 0; i < fresh.size(); ++i) {
-                    result = s.stack->commit(fresh[i] - s.stack->address(), page, rw);
-                    if (!result.ok()) {
-                        while (i--) s.restored(s.stack->decommit(fresh[i] - s.stack->address(), page));
-                        return result;
-                    }
+                NativeStatus result;
+                for (const auto at : fresh) {
+                    result = s.stack->commit(at - s.stack->address(), page, rw);
+                    if (!result.ok()) { s.restored(restore()); return result; }
                 }
-                // A page already in use may hold a read-only copy; the stack
-                // needs it writable.
                 result = s.stack->protect(pages.address - s.stack->address(), pages.size, rw);
-                if (!result.ok()) return result;
+                if (!result.ok()) { s.restored(restore()); return result; }
                 std::memcpy(reinterpret_cast<void*>(destination.address),
                             reinterpret_cast<const void*>(source.address), destination.size);
+                copied_bytes = true;
                 return result;
-            }, [&] {
-                platform::ProcessMemoryStatus result;
-                for (const auto at : fresh) {
-                    const auto undone = s.stack->decommit(at - s.stack->address(), page);
-                    if (!undone.ok()) result = undone;
-                }
-                return result;
-            });
+            }, restore);
             if (const auto* f = std::get_if<LaunchFailure>(&status)) return *f;
             s.aliases.push_back({destination.address, source.address, source.size, block->type});
             return finish(r, 0);
@@ -826,13 +1096,13 @@ LaunchResult<QueryDisposition> NativeGuestMemory::stack(QueryRegisters& r, bool 
         if (const auto* f = std::get_if<LaunchFailure>(&status)) return *f;
         s.aliases.push_back({destination.address, source.address, source.size, block->type});
     } else {
-        const auto source_block = pm::uniform(s.blocks, source);
+        const auto source_block = s.uniform(source);
         if (!source_block ||
             (source_block->type != MemoryType::normal && source_block->type != MemoryType::code_data) ||
             source_block->permissions != 0 || source_block->attributes != 1 ||
             source_block->ipc_references || source_block->device_references)
             return finish(r, pm::invalid_memory);
-        const auto destination_block = pm::uniform(s.blocks, destination);
+        const auto destination_block = s.uniform(destination);
         if (!destination_block || destination_block->type != MemoryType::stack ||
             destination_block->attributes || destination_block->ipc_references ||
             destination_block->device_references)
@@ -850,7 +1120,7 @@ LaunchResult<QueryDisposition> NativeGuestMemory::stack(QueryRegisters& r, bool 
                 return finish(r, pm::invalid_region);
             cursor = std::min(end, alias->destination + alias->size);
         }
-        auto plan = plan_stack_alias_unmap(s.blocks, s.aliases, destination.address, source.address, source.size);
+        auto plan = s.unmap_plan(s.aliases, source, destination);
         if (const auto* error = std::get_if<StackAliasFailure>(&plan)) {
             if (error->code == StackAliasError::AllocationFailure || error->code == StackAliasError::AdmissionLimit)
                 return failure(LaunchError::resource_limit, operation, "Stack alias metadata allocation failed.");
@@ -860,14 +1130,44 @@ LaunchResult<QueryDisposition> NativeGuestMemory::stack(QueryRegisters& r, bool 
             return unsupported(operation, "Stack alias conflicts with a retained range.");
         auto& next = std::get<StackAliasUnmapPlan>(plan);
         // Normalize the pure planner's explicit free destination to our sparse map.
-        auto blocks = pm::replace(next.blocks, destination, std::nullopt);
+        MemoryMapPlan blocks;
+        if (s.intervals) {
+            auto restored_source = *source_block;
+            restored_source.permissions = 3; restored_source.attributes = 0;
+            blocks = s.replace(source, restored_source, 0, pm::merge_disable_locked);
+            blocks.replace(destination, std::nullopt, 0, pm::merge_disable_mapping);
+        } else blocks.legacy = pm::replace(next.blocks, destination, std::nullopt);
         if (copied) {
             const auto page = platform::native_page_size();
             std::vector<std::uint64_t> released;
             for (auto at = pages.address; at < pages.address + pages.size; at += page)
-                if (!native_page_used(s.blocks, at, destination)) released.push_back(at);
-            std::vector<std::byte> original(source.size);
+                if (!native_page_used(s.view({at, page}), at, destination)) released.push_back(at);
+            std::vector<std::byte> original(source.size), stack_bytes(destination.size);
             std::memcpy(original.data(), reinterpret_cast<const void*>(source.address), source.size);
+            std::memcpy(stack_bytes.data(), reinterpret_cast<const void*>(destination.address), destination.size);
+            std::vector<Region> retained;
+            retained.reserve(released.size());
+            for (const auto at : released) {
+                auto backing = Region::alias_copy(at, page, rw);
+                if (auto* region = std::get_if<Region>(&backing)) retained.push_back(std::move(*region));
+                else return host_failure(operation);
+            }
+            std::size_t decommitted = 0;
+            const auto restore = [&] {
+                platform::ProcessMemoryStatus result;
+                while (decommitted) {
+                    const auto index = --decommitted;
+                    const auto restored = s.stack->alias(released[index] - s.stack->address(),
+                        page, retained[index].address(), rw);
+                    if (!restored.ok()) result = restored;
+                }
+                std::memcpy(reinterpret_cast<void*>(source.address), original.data(), source.size);
+                // A failed mapping restoration poisons the owner; do not write
+                // through a destination whose backing could not be recovered.
+                if (result.ok())
+                    std::memcpy(reinterpret_cast<void*>(destination.address), stack_bytes.data(), destination.size);
+                return result;
+            };
             auto status = s.transaction(std::move(blocks), s.accounting, operation, [&] {
                 std::memcpy(reinterpret_cast<void*>(source.address),
                             reinterpret_cast<const void*>(destination.address), destination.size);
@@ -875,15 +1175,14 @@ LaunchResult<QueryDisposition> NativeGuestMemory::stack(QueryRegisters& r, bool 
                 platform::ProcessMemoryStatus result;
                 for (const auto at : released) {
                     result = s.stack->decommit(at - s.stack->address(), page);
-                    if (!result.ok()) break;
+                    if (!result.ok()) {
+                        s.restored(restore());
+                        return result;
+                    }
+                    ++decommitted;
                 }
-                if (!result.ok())
-                    std::memcpy(reinterpret_cast<void*>(source.address), original.data(), source.size);
                 return result;
-            }, [&] {
-                std::memcpy(reinterpret_cast<void*>(source.address), original.data(), source.size);
-                return platform::ProcessMemoryStatus{};
-            });
+            }, restore);
             if (const auto* f = std::get_if<LaunchFailure>(&status)) return *f;
             s.aliases.erase(s.aliases.begin() + static_cast<std::ptrdiff_t>(next.alias_index));
             return finish(r, 0);
@@ -922,7 +1221,7 @@ LaunchResult<QueryDisposition> NativeGuestMemory::shared(QueryRegisters& r, bool
     if (range.size != size) return finish(r, pm::invalid_size);
     if (!unmap && immutable && permission != 1) return finish(r, pm::invalid_permission);
     if (unmap) {
-        const auto block = pm::uniform(s.blocks, range);
+        const auto block = s.uniform(range);
         if (!block || block->type != MemoryType::shared || block->attributes ||
             block->ipc_references || block->device_references)
             return finish(r, pm::invalid_memory);
@@ -938,18 +1237,19 @@ LaunchResult<QueryDisposition> NativeGuestMemory::shared(QueryRegisters& r, bool
             const auto region = found->region;
             std::vector<std::uint64_t> released;
             for (auto at = pages.address; at < pages.address + pages.size; at += page)
-                if (!native_page_used(s.blocks, at, range)) released.push_back(at);
-            auto status = s.transaction(pm::replace(s.blocks, range, std::nullopt, 0, pm::merge_disable_mapping),
-                s.accounting, operation,
-                [&] {
-                    platform::ProcessMemoryStatus result;
+                if (!native_page_used(s.view({at, page}), at, range)) released.push_back(at);
+            auto undo = NativePageUndo::stage(pages);
+            if (!undo) return host_failure(operation);
+            const auto restore = [&] { return undo->restore(*region, false); };
+            auto status = s.transaction(s.replace(range, std::nullopt, 0, pm::merge_disable_mapping),
+                s.accounting, operation, [&] {
+                    NativeStatus result;
                     for (const auto at : released) {
                         result = region->decommit(at - region->address(), page);
-                        if (!result.ok()) return result;
+                        if (!result.ok()) { s.restored(restore()); return result; }
                     }
                     return result;
-                },
-                [&] { return platform::ProcessMemoryStatus{}; });
+                }, restore);
             if (const auto* f = std::get_if<LaunchFailure>(&status)) return *f;
             s.shared.erase(found);
             return finish(r, 0);
@@ -963,7 +1263,7 @@ LaunchResult<QueryDisposition> NativeGuestMemory::shared(QueryRegisters& r, bool
             const auto access = found->access;
             const auto offset = envelope.address - region->address();
             const auto source = reinterpret_cast<std::uint64_t>(mutable_object->data()) - (range.address - envelope.address);
-            auto status = s.transaction(pm::replace(s.blocks, range, std::nullopt, 0, pm::merge_disable_mapping), s.accounting, operation,
+            auto status = s.transaction(s.replace(range, std::nullopt, 0, pm::merge_disable_mapping), s.accounting, operation,
                 [&] { return region->decommit(offset, envelope.size); },
                 [&] { return region->alias(offset, envelope.size, source, access); });
             if (const auto* f = std::get_if<LaunchFailure>(&status)) return *f;
@@ -977,13 +1277,13 @@ LaunchResult<QueryDisposition> NativeGuestMemory::shared(QueryRegisters& r, bool
         auto& backup = std::get<Region>(saved);
         const auto region = found->region;
         const auto offset = range.address - region->address();
-        auto status = s.transaction(pm::replace(s.blocks, range, std::nullopt, 0, pm::merge_disable_mapping), s.accounting, operation,
+        auto status = s.transaction(s.replace(range, std::nullopt, 0, pm::merge_disable_mapping), s.accounting, operation,
             [&] { return region->decommit(offset, range.size); },
             [&] { return region->alias(offset, range.size, backup.address(), found->access); });
         if (const auto* f = std::get_if<LaunchFailure>(&status)) return *f;
         s.shared.erase(found);
     } else {
-        if (!pm::free(s.blocks, range)) return finish(r, pm::invalid_memory);
+        if (!s.free(range)) return finish(r, pm::invalid_memory);
         if (!native_range(range) && immutable) {
             // A read-only object smaller than a native page is a copy; no
             // writer exists, so the copy stays exact. A native page it shares
@@ -998,31 +1298,29 @@ LaunchResult<QueryDisposition> NativeGuestMemory::shared(QueryRegisters& r, bool
             std::vector<std::uint64_t> fresh;
             bool writable = false;
             for (auto at = pages.address; at < pages.address + pages.size; at += page)
-                if (!native_page_used(s.blocks, at, range, &writable)) fresh.push_back(at);
+                if (!native_page_used(s.view({at, page}), at, range, &writable)) fresh.push_back(at);
             const auto offset = pages.address - region->address();
             s.shared.reserve(s.shared.size() + 1);
-            auto status = s.transaction(pm::replace(s.blocks, range,
+            auto undo = NativePageUndo::stage(pages, range);
+            if (!undo) return host_failure(operation);
+            bool copied_bytes = false;
+            const auto restore = [&] { return undo->restore(*region, copied_bytes); };
+            auto status = s.transaction(s.replace(range,
                 MemoryBlock{range, MemoryType::shared, 0, static_cast<std::uint8_t>(Permission::read)},
-                pm::merge_disable_mapping), s.accounting, operation,
-                [&] {
-                    platform::ProcessMemoryStatus result;
+                pm::merge_disable_mapping), s.accounting, operation, [&] {
+                    NativeStatus result;
                     for (const auto at : fresh) {
                         result = region->commit(at - region->address(), page, rw);
-                        if (!result.ok()) return result;
+                        if (!result.ok()) { s.restored(restore()); return result; }
                     }
                     result = region->protect(offset, pages.size, rw);
-                    if (!result.ok()) return result;
+                    if (!result.ok()) { s.restored(restore()); return result; }
                     std::memcpy(reinterpret_cast<void*>(range.address), immutable->bytes().data(), size);
-                    return writable ? result : region->protect(offset, pages.size, Permission::read);
-                },
-                [&] {
-                    platform::ProcessMemoryStatus result;
-                    for (const auto at : fresh) {
-                        const auto undone = region->decommit(at - region->address(), page);
-                        if (!undone.ok()) result = undone;
-                    }
+                    copied_bytes = true;
+                    if (!writable) result = region->protect(offset, pages.size, Permission::read);
+                    if (!result.ok()) s.restored(restore());
                     return result;
-                });
+                }, restore);
             if (const auto* f = std::get_if<LaunchFailure>(&status)) return *f;
             s.shared.push_back({range, object, region, Permission::read});
             return finish(r, 0);
@@ -1041,7 +1339,7 @@ LaunchResult<QueryDisposition> NativeGuestMemory::shared(QueryRegisters& r, bool
             const auto pages = native_pages(range);
             if (s.pinned(pages)) return unsupported(operation, "Shared mapping conflicts with a retained range.");
             for (auto at = pages.address; at < pages.address + pages.size; at += page)
-                if (native_page_used(s.blocks, at, range) || s.envelope_used({at, page}))
+                if (native_page_used(s.view({at, page}), at, range) || s.envelope_used({at, page}))
                     return unsupported(operation, "A sub-page shared mapping shares a native page with another mapping.");
             const auto phase = static_cast<std::size_t>(range.address - pages.address);
             if (!mutable_object->spans(phase, page)) {
@@ -1059,7 +1357,7 @@ LaunchResult<QueryDisposition> NativeGuestMemory::shared(QueryRegisters& r, bool
             const auto access = static_cast<Permission>(permission);
             const auto offset = pages.address - region->address();
             const auto source = reinterpret_cast<std::uint64_t>(mutable_object->data()) - phase;
-            auto status = s.transaction(pm::replace(s.blocks, range,
+            auto status = s.transaction(s.replace(range,
                 MemoryBlock{range, MemoryType::shared, 0, static_cast<std::uint8_t>(access)},
                 pm::merge_disable_mapping), s.accounting, operation,
                 [&] { return region->alias(offset, pages.size, source, access); },
@@ -1102,7 +1400,7 @@ LaunchResult<QueryDisposition> NativeGuestMemory::shared(QueryRegisters& r, bool
             std::memcpy(reinterpret_cast<void*>(immutable_backing->address()), immutable->bytes().data(), size);
         }
         const auto source = mutable_object ? reinterpret_cast<std::uint64_t>(mutable_object->data()) : immutable_backing->address();
-        auto status = s.transaction(pm::replace(s.blocks, range,
+        auto status = s.transaction(s.replace(range,
             MemoryBlock{range, MemoryType::shared, 0, static_cast<std::uint8_t>(access)},
             pm::merge_disable_mapping), s.accounting, operation,
             [&] { return region->alias(offset, size, source, access); },
@@ -1114,26 +1412,36 @@ LaunchResult<QueryDisposition> NativeGuestMemory::shared(QueryRegisters& r, bool
 }
 
 LaunchResult<QueryDisposition> NativeGuestMemory::dispatch(std::uint16_t svc, QueryRegisters& r) {
-    try {
-        std::lock_guard lock(state_->mutex);
-        if (state_->poisoned) return host_failure("memory dispatch");
-        switch (svc) {
-        case 1: return heap(r);
-        case 2: return protect(r);
-        case 4: return stack(r, false);
-        case 5: return stack(r, true);
-        case 0x13: return shared(r, false);
-        case 0x14: return shared(r, true);
-        case 3: return attribute(r);
-        // CreateTransferMemory records the range and permission; the startup
-        // queries own that object. The owner's range is not locked meanwhile.
-        default: return QueryDisposition::unsupported_operation;
+    const auto invoke = [&]() -> LaunchResult<QueryDisposition> {
+        try {
+            std::lock_guard lock(state_->mutex);
+            if (state_->poisoned) return host_failure("memory dispatch");
+            switch (svc) {
+            case 0x2c: return physical(r, false);
+            case 0x2d: return physical(r, true);
+            case 1: return heap(r);
+            case 2: return protect(r);
+            case 4: return stack(r, false);
+            case 5: return stack(r, true);
+            case 0x13: return shared(r, false);
+            case 0x14: return shared(r, true);
+            case 3: return attribute(r);
+            // CreateTransferMemory records the range and permission; the startup
+            // queries own that object. The owner's range is not locked meanwhile.
+            default: return QueryDisposition::unsupported_operation;
+            }
+        } catch (const std::bad_alloc&) {
+            return failure(LaunchError::resource_limit, "memory dispatch", "Transaction allocation failed.");
+        } catch (const std::length_error&) {
+            return failure(LaunchError::resource_limit, "memory dispatch", "Transaction container limit exceeded.");
         }
-    } catch (const std::bad_alloc&) {
-        return failure(LaunchError::resource_limit, "memory dispatch", "Transaction allocation failed.");
-    } catch (const std::length_error&) {
-        return failure(LaunchError::resource_limit, "memory dispatch", "Transaction container limit exceeded.");
-    }
+    };
+    auto result = invoke();
+    if (auto* failed = std::get_if<LaunchFailure>(&result);
+        failed && failed->code == LaunchError::resource_limit &&
+        state_->process->configuration().private_system_resource_bytes != 0)
+        return finish(r, 0xce01);
+    return result;
 }
 } // namespace
 
@@ -1141,12 +1449,20 @@ LaunchResult<std::shared_ptr<GuestMemory>> create_guest_memory(const LaunchProfi
     ProcessMemoryOptions options, std::shared_ptr<ModuleSet> modules,
     std::shared_ptr<HandleTable> handles) {
     try {
-        if (!handles || !options.resource_limit_bytes || options.resource_limit_bytes > ProcessRecord::heap_capacity)
+        if (!handles || !options.resource_limit_bytes ||
+            options.resource_limit_bytes > ProcessRecord::application_capacity(profile.process.platform))
             return failure(LaunchError::invalid_input, "create_guest_memory", "A bounded memory budget and handle table are required.");
-        if (!profile.is_64_bit || profile.process.address_bits != 39 ||
-            profile.process.baseline != Baseline::horizon_20_5_0 ||
-            profile.process.private_system_resource_bytes || !profile.process.allowed_core_mask)
+        const bool extended = profile.process.platform == GuestPlatform::switch2 &&
+                              profile.process.baseline == Baseline::horizon_23_0_1;
+        const bool legacy = profile.process.platform == GuestPlatform::switch1 &&
+                            profile.process.baseline == Baseline::horizon_20_5_0;
+        if (!profile.is_64_bit || profile.process.address_bits != 39 || (!legacy && !extended) ||
+            (profile.process.private_system_resource_bytes && !extended) || !profile.process.allowed_core_mask)
             return unsupported("create_guest_memory", "The process profile is not supported by native memory.");
+        const auto system_bytes = profile.process.private_system_resource_bytes;
+        if (system_bytes > options.resource_limit_bytes)
+            return failure(LaunchError::resource_limit, "create_guest_memory resources",
+                           "Private system resources exceed the process memory budget.");
         if ((!modules || !modules->module_count()) && profile.origin != ProfileOrigin::synthetic_test)
             return failure(LaunchError::invalid_input, "create_guest_memory", "Ordinary processes require retained sealed modules.");
         if (profile.origin != ProfileOrigin::synthetic_test && !atomic_record_publication<ProcessRecord>())
@@ -1157,6 +1473,13 @@ LaunchResult<std::shared_ptr<GuestMemory>> create_guest_memory(const LaunchProfi
         if (config.heap_size > ProcessRecord::heap_capacity || config.base_alias_size > ProcessRecord::base_alias_capacity ||
             config.stack_size > ProcessRecord::stack_capacity || config.alias_extra_enabled)
             return unsupported("create_guest_memory", "The reservation profile is unsupported.");
+        if (config.remote_region.address || config.remote_region.size)
+            return unsupported("create_guest_memory", "Remote geometry must come from native reservation.");
+        // Initial measurement capacity, not a claimed console size. The reference
+        // workload demand exceeds 7 GiB; retain later observed requests before
+        // finalizing this unverified Switch 2 compatibility policy.
+        const std::uint64_t remote_size = extended ? 8ull << 30 : 0;
+        constexpr std::uint64_t remote_alignment = 0x10000;
         const auto reserve = [&](std::uint64_t size, std::uint64_t& address, std::shared_ptr<Region>& owner) {
             auto result = Region::reserve(size, address);
             if (!std::holds_alternative<Region>(result)) return false;
@@ -1167,9 +1490,9 @@ LaunchResult<std::shared_ptr<GuestMemory>> create_guest_memory(const LaunchProfi
         if (profile.origin != ProfileOrigin::synthetic_test) {
             // The guest picks addresses for its own mappings anywhere free in
             // its address space, but host libraries also reserve address space
-            // there. The process address space is therefore one host arena:
-            // free mappable space, then the alias, stack and heap regions. The
-            // modules stay where the host loaded them.
+            // there. The general allocation range is therefore one host arena:
+            // mappable space, then alias, stack and heap. The independent remote
+            // reservation and the host-loaded modules are outside this arena.
             const auto page = platform::native_page_size();
             constexpr std::uint64_t mappable_size = 1ull << 30;
             const auto arena_size = mappable_size + config.base_alias_size + config.stack_size + config.heap_size;
@@ -1177,9 +1500,23 @@ LaunchResult<std::shared_ptr<GuestMemory>> create_guest_memory(const LaunchProfi
             for (int attempt = 0; attempt < 4 && !placed; ++attempt) {
                 std::uint64_t arena = 0;
                 {
-                    auto probe = Region::reserve((arena_size + page - 1) & ~(page - 1));
-                    if (!std::holds_alternative<Region>(probe)) return host_failure("create_guest_memory arena");
+                    const auto reserved_size = (arena_size + page - 1) & ~(page - 1);
+                    auto probe = remote_size ? Region::reserve_low_aligned(reserved_size, remote_alignment)
+                                             : Region::reserve(reserved_size);
+                    if (!std::holds_alternative<Region>(probe)) {
+                        auto error = host_failure("create_guest_memory arena");
+                        error.detail += " Reservation error=" + std::to_string(static_cast<unsigned>(
+                            std::get<platform::ProcessMemoryError>(probe))) + " bytes=" +
+                            std::to_string(reserved_size) + ". " + platform::describe_guest_address_space() + ".";
+                        return error;
+                    }
                     arena = std::get<Region>(probe).address();
+                    // ARMIGO_TRACE_RESERVATION=1 shows the host address space the arena was placed in.
+                    static const bool trace = std::getenv("ARMIGO_TRACE_RESERVATION") != nullptr;
+                    if (trace)
+                        armigo::diag::opt_in("Armigo memory: arena %#llx + %llu bytes; %s\n",
+                            static_cast<unsigned long long>(arena), static_cast<unsigned long long>(reserved_size),
+                            platform::describe_guest_address_space().c_str());
                 }
                 config.allocation_region = {arena, arena_size};
                 auto cursor = arena;
@@ -1201,6 +1538,16 @@ LaunchResult<std::shared_ptr<GuestMemory>> create_guest_memory(const LaunchProfi
             !reserve(config.base_alias_size, config.alias_address, s->alias) ||
             !reserve(config.stack_size, config.stack_address, s->stack))
             return host_failure("create_guest_memory reservations");
+        if (remote_size && !s->remote) {
+            auto reserved = Region::reserve_low_aligned(remote_size, remote_alignment);
+            if (!std::holds_alternative<Region>(reserved)) {
+                auto error = host_failure("create_guest_memory remote region");
+                error.detail += " " + platform::describe_guest_address_space() + ".";
+                return error;
+            }
+            s->remote = std::make_shared<Region>(std::move(std::get<Region>(reserved)));
+            config.remote_region = range_of(*s->remote);
+        }
         s->accounting.resource_limit_bytes = options.resource_limit_bytes;
         if (s->modules) {
             for (std::size_t index = 0; index < s->modules->module_count(); ++index) {
@@ -1210,17 +1557,24 @@ LaunchResult<std::shared_ptr<GuestMemory>> create_guest_memory(const LaunchProfi
                     mapping.mapping_size() > ProcessRecord::query_end - mapping.base_address())
                     return unsupported("create_guest_memory modules", "Module backing is unsealed or outside the process address space.");
                 const auto status = register_module(*s, mapping, s->modules->appended_code(index),
-                    options.resource_limit_bytes, profile.origin != ProfileOrigin::synthetic_test);
+                    options.resource_limit_bytes - system_bytes, profile.origin != ProfileOrigin::synthetic_test);
                 if (const auto* f = std::get_if<LaunchFailure>(&status)) return *f;
             }
         }
-        s->accounting.resource_limit_used = s->accounting.code_bytes;
+        s->accounting.resource_limit_used = s->accounting.code_bytes + system_bytes;
         std::sort(s->blocks.begin(), s->blocks.end(), [](const auto& a, const auto& b) {
             return a.range.address < b.range.address;
         });
         auto built = ProcessRecord::create(config, s->accounting, s->blocks);
-        if (!built.ok()) return failure(LaunchError::invalid_input, "create_guest_memory", "Native reservation metadata was rejected.");
+        if (!built.ok()) {
+            if (system_bytes && built.error == ProcessStateError::resource_limit)
+                return failure(LaunchError::resource_limit, "create_guest_memory resources",
+                    "Private system-resource backing or metadata capacity is unavailable.");
+            return failure(LaunchError::invalid_input, "create_guest_memory", "Native reservation metadata was rejected.");
+        }
         s->process = std::move(built.process);
+        s->intervals = s->process->memory_intervals();
+        if (s->intervals) std::vector<MemoryBlock>{}.swap(s->blocks);
         return std::shared_ptr<GuestMemory>(std::make_shared<NativeGuestMemory>(std::move(s), std::move(handles)));
     } catch (const std::bad_alloc&) {
         return failure(LaunchError::resource_limit, "create_guest_memory", "Native memory owner allocation failed.");

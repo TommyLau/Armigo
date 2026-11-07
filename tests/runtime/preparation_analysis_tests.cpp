@@ -140,6 +140,38 @@ bool coverage() {
     return ok;
 }
 
+bool execute_only_text_admission() {
+    Fixture fixture;
+    fixture.image.segments[0].permission = loader::SegmentPermission::execute;
+    fixture.put(0, a64::encode_ret());
+    const auto result = analyze(fixture);
+    return check(result.ok() && result.modules.size() == 1 && result.modules[0].code.size() == 1,
+                 "Owned instruction bytes must remain analyzable for execute-only guest text.");
+}
+
+bool authenticated_return_provenance() {
+    bool ok = true;
+    for (const auto first : {0xd503237fu, 0xaa0003feu}) { // PACIBSP; MOV LR,X0
+        Fixture fixture;
+        fixture.put(0, first);
+        fixture.put(4, 0xd65f0fffu); // RETAB
+        const auto result = analyze(fixture);
+        ok &= check(!result.ok() && result.modules.empty() && result.roots.empty() &&
+            !result.exclusive_proof_complete && result.return_diagnostics.size() == 1 &&
+            result.return_diagnostics[0].module_index == 0 &&
+            result.return_diagnostics[0].instruction_offset == 0 &&
+            result.return_diagnostics[0].reason == ReturnError::unproven_link_write,
+            "RETAB must not turn signed or arbitrary LR writes into proven return targets.");
+    }
+    Fixture terminal;
+    terminal.put(0, 0xd65f0fffu);
+    terminal.put(4, 0xaa0003feu);
+    const auto result = analyze(terminal);
+    ok &= check(result.ok() && result.modules[0].code.size() == 1,
+        "RETAB ends offline discovery before an unreachable LR write.");
+    return ok;
+}
+
 bool register_addressed_code_reads() {
     bool ok = true;
     for (const bool page_relative : {false, true}) {
@@ -1492,6 +1524,8 @@ bool unwind_roots() {
 
 int main() {
     bool ok = coverage();
+    ok &= execute_only_text_admission();
+    ok &= authenticated_return_provenance();
     ok &= register_addressed_code_reads();
     ok &= address_provenance_escapes();
     ok &= guest_relocation_store();

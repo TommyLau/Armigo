@@ -270,15 +270,9 @@ struct VirtualImage {
     std::vector<VirtualFile> files;
 };
 
-// Builds the table bytes and the file map for `root`. The files are only
-// opened when their data is read; nothing in the data region is copied.
-inline std::optional<VirtualImage> build_virtual(const std::filesystem::path& root,
-                                                 ImageLayout& layout,
-                                                 std::string& error) {
-    detail::Node tree;
-    tree.directory = true;
-    if (!detail::load(root, tree, error)) return std::nullopt;
-
+// Builds table bytes and a file map for an already validated in-memory tree.
+// Payload bytes are supplied by the caller's storage backend.
+inline VirtualImage build_virtual_tree(detail::Node& tree, ImageLayout& layout) {
     std::uint32_t directory_meta_cursor = 0;
     std::uint32_t file_meta_cursor = 0;
     detail::assign(tree, directory_meta_cursor, file_meta_cursor);
@@ -347,6 +341,15 @@ inline std::optional<VirtualImage> build_virtual(const std::filesystem::path& ro
                                           .size = file.size});
     }
     return image;
+}
+
+inline std::optional<VirtualImage> build_virtual(const std::filesystem::path& root,
+                                                 ImageLayout& layout,
+                                                 std::string& error) {
+    detail::Node tree;
+    tree.directory = true;
+    if (!detail::load(root, tree, error)) return std::nullopt;
+    return build_virtual_tree(tree, layout);
 }
 
 // Builds one contiguous image for `root`. The file data is copied into the

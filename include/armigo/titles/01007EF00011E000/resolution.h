@@ -24,6 +24,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -35,10 +36,29 @@ namespace armigo::titles::title_01007ef00011e000 {
 struct ResolutionSettings {
     std::uint32_t maximum_width = 0;   // 0: the game's own sizes
     std::uint32_t target_rate = 60;    // Frame rate the load scale budgets for
+    bool gpu_budget = false;
 };
 
-// Settings from ARMIGO_COMPAT_RESOLUTION_WIDTH and ARMIGO_COMPAT_RESOLUTION_RATE
-// over the description's defaults. Returns an error for malformed values.
+struct GpuBudgetState {
+    static constexpr std::uint32_t missing_feedback_limit = 16;
+    double smoothed_ms = 0;
+    std::uint32_t missing_feedback_calls = 0;
+    std::uint32_t qualifying_frames = 0;
+};
+
+// Host resolution feedback, separate from the game's GPU timestamp counters.
+// gpu_work_ns is the sum of execution intervals of a completed frame; zero
+// means unavailable. span_ticks is the controller's unchanged 19.2 MHz span.
+// The returned float replaces only its load-scale constant. The caller owns
+// and serializes the smoothing state. After bounded missing feedback, return
+// the neutral load for the current span so the game holds its resolution.
+std::optional<float> gpu_budget_scale(GpuBudgetState& state, std::uint64_t gpu_work_ns,
+                                      std::int64_t span_ticks, std::uint32_t target_rate) noexcept;
+
+// Width/rate settings override the description's defaults. GPU-work feedback
+// requires a declared default or ARMIGO_COMPAT_RESOLUTION_GPU_BUSY=1, a title
+// capability, an explicit width, and frame/resolution rates both set to 120.
+// Returns an error for malformed or unsupported settings.
 std::variant<ResolutionSettings, std::string>
 resolution_settings(const compat::ResolutionSites& sites);
 
@@ -47,6 +67,7 @@ struct ResolutionPlan {
     std::uint64_t render_target_pool = 0, graphics_heap = 0, process_heap = 0, root_heap = 0;
     float floor = 0, load_scale = 0;
     std::vector<compat::WordPatch> words;
+    std::optional<compat::CallPatch> gpu_budget_hook;
 };
 
 // The words that apply the settings to the image, each with its original

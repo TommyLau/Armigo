@@ -23,6 +23,34 @@
 namespace armigo::titles::title_01007ef00011e000 {
 using compat::ResolutionSites;
 
+std::optional<float> gpu_budget_scale(GpuBudgetState& state, std::uint64_t gpu_work_ns,
+                                      std::int64_t span_ticks, std::uint32_t target_rate) noexcept {
+    if (!target_rate || target_rate > 240 || !std::isfinite(state.smoothed_ms) || state.smoothed_ms < 0)
+        return {};
+    if (gpu_work_ns) {
+        state.missing_feedback_calls = 0;
+        const double milliseconds = static_cast<double>(gpu_work_ns) / 1e6;
+        state.smoothed_ms = state.smoothed_ms
+            ? state.smoothed_ms + (milliseconds - state.smoothed_ms) / 8.0 : milliseconds;
+    } else if (state.missing_feedback_calls < GpuBudgetState::missing_feedback_limit)
+        ++state.missing_feedback_calls;
+    const bool stale = state.missing_feedback_calls >= GpuBudgetState::missing_feedback_limit;
+    const double budget = 0.66 * 1000.0 / target_rate;
+    float load = 162.5f;
+    // A stale low estimate must not keep raising resolution (nor a stale
+    // high estimate keep lowering it). The neutral load holds the game's
+    // current resolution even when its unchanged elapsed span varies.
+    if (!stale && state.smoothed_ms > budget)
+        load = static_cast<float>(162.5 * state.smoothed_ms / budget);
+    else if (!stale && state.smoothed_ms < 0.85 * budget && ++state.qualifying_frames % 12 == 0)
+        load = 100.0f;
+    load = std::min(load, 999.0f);
+    // The guest ignores a load of 1000 or more. Preserve its existing span
+    // and change only the multiplier it uses for this controller's load.
+    if (span_ticks <= 0 || !state.smoothed_ms) return 2.0f * target_rate;
+    return static_cast<float>(static_cast<double>(load) * 192000.0 / static_cast<double>(span_ticks));
+}
+
 namespace {
 
 // One MOVZ or MOVK: the 16-bit immediate, its halfword position, and whether
@@ -92,6 +120,19 @@ std::variant<ResolutionSettings, std::string> resolution_settings(const Resoluti
         return std::string("Compatibility resolution width must be 0 or 1280..3840.");
     if (!settings.target_rate || settings.target_rate > 240)
         return std::string("Compatibility resolution rate must be 1..240.");
+    const char* mode = std::getenv("ARMIGO_COMPAT_FRAME_RATE");
+    settings.gpu_budget = sites.gpu_budget_rate == 120 && settings.maximum_width &&
+        settings.target_rate == 120 && mode && std::string_view(mode) == "120";
+    if (const auto enabled = environment_number("ARMIGO_COMPAT_RESOLUTION_GPU_BUSY", error)) {
+        if (*enabled > 1) return std::string("Compatibility GPU-work resolution feedback must be 0 or 1.");
+        settings.gpu_budget = *enabled != 0;
+    }
+    if (!error.empty()) return error;
+    if (settings.gpu_budget) {
+        if (sites.gpu_budget_note.empty() || !settings.maximum_width || settings.target_rate != 120 ||
+            !mode || std::string_view(mode) != "120")
+            return std::string("GPU-work resolution feedback requires title support, an explicit width, and 120 frame/resolution rates.");
+    }
     return settings;
 }
 
@@ -99,7 +140,10 @@ std::variant<ResolutionPlan, std::string>
 resolution_words(const ResolutionSites& sites, const ResolutionSettings& settings,
                  const loader::NsoModuleImage& image) {
     ResolutionPlan plan;
-    if (!settings.maximum_width) return plan;
+    if (!settings.maximum_width) {
+        if (settings.gpu_budget) return std::string("GPU-work feedback requires an explicit resolution width.");
+        return plan;
+    }
     const auto& text = image.segment(loader::NsoSegmentKind::text);
     std::string error;
     const auto read = [&](std::uint64_t offset, bool keep, unsigned shift) -> std::optional<Move> {
@@ -200,7 +244,18 @@ resolution_words(const ResolutionSites& sites, const ResolutionSettings& setting
     // stays between about 0.92 and 1.08 of the budget.
     const float budget = 0.66f / float(settings.target_rate);
     plan.load_scale = high_half_float(1.75f / (1.077f * budget));
-    set(sites.load_scale, *scale, std::uint16_t(float_bits(plan.load_scale) >> 16));
+    if (settings.gpu_budget) {
+        const auto reg = scale->word & 31;
+        if (sites.gpu_budget_note.empty() || settings.target_rate != 120 ||
+            (scale->word & 0xffe00000u) != 0x52a00000u || reg == 18 || reg >= 30)
+            return std::string("GPU-work resolution feedback needs a supported 32-bit load-scale constant.");
+        compat::CallPatch hook{sites.load_scale, scale->word, sites.gpu_budget_note};
+        hook.nvn_driver_only = true;
+        hook.gpu_budget = compat::GpuBudgetInstruction{settings.target_rate};
+        plan.gpu_budget_hook = std::move(hook);
+    } else {
+        set(sites.load_scale, *scale, std::uint16_t(float_bits(plan.load_scale) >> 16));
+    }
     return plan;
 }
 

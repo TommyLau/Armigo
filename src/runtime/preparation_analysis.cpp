@@ -245,7 +245,6 @@ private:
             }
             const auto& text = module.image->segment(loader::NsoSegmentKind::text);
             if (text.image_offset % 4 || text.content_size % 4 ||
-                !permission(text, loader::SegmentPermission::read) ||
                 !permission(text, loader::SegmentPermission::execute) ||
                 permission(text, loader::SegmentPermission::write))
                 fail("Preparation requires aligned immutable executable text.");
@@ -443,6 +442,8 @@ private:
             const auto owner = location(address, true);
             const auto word = static_cast<std::uint32_t>(read(
                 modules_[owner.module_index].linked_image, owner.image_offset, 4));
+            if (a64::pointer_authentication(word) == a64::PointerAuthentication::unsupported)
+                fail("Pointer authentication form is unsupported by preparation.");
             const Node node{owner, a64::decode(word), a64::decode_register_effects(word)};
             if (!node.effects.decoded()) fail("A reached instruction has unsupported register effects.");
             if (a64::has(node.effects.memory.attributes, a64::MemoryAttribute::exclusive)) {
@@ -477,7 +478,7 @@ private:
                 indirect_.push_back(address);
                 if (node.instruction.opcode == Opcode::blr) next(true);
                 break;
-            case Opcode::ret:
+            case Opcode::ret: case Opcode::retab:
                 if (node.instruction.reg != 30) refuse_return(node, ReturnError::unsupported_return_register);
                 break;
             case Opcode::brk: case Opcode::hvc: case Opcode::smc: case Opcode::hlt:
@@ -724,7 +725,7 @@ private:
                     break;
                 case Opcode::cbz: case Opcode::cbnz: case Opcode::tbz: case Opcode::tbnz:
                     merge(referenced(node, address), after); merge(address + 4, after); break;
-                case Opcode::ret:
+                case Opcode::ret: case Opcode::retab:
                     if (!after.registers[30].is_link()) refuse_return(node, ReturnError::unproven_return);
                     if (after.registers[30].kind == Kind::call_link) merge(after.registers[30].link, after);
                     break;
@@ -976,7 +977,7 @@ private:
                 merge(resolved_.at(address), after);
                 if (node.instruction.opcode == Opcode::blr) merge(address + 4, after | returned);
                 break;
-            case Opcode::ret:
+            case Opcode::ret: case Opcode::retab:
                 if (before & (Mask{1} << 30))
                     fail("RET X30 uses a constructed module address instead of the callable return contract.");
                 if ((returned | after) != returned) {

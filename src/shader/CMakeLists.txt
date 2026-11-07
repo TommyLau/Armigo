@@ -279,6 +279,8 @@ endif()
 # a shared checkout do not silently become part of the translation chain. The
 # root build file is left out: it declares other targets, and the shader
 # libraries' own sources and build file are listed here.
+include("${ARMIGO_SHADER_REPOSITORY_ROOT}/src/loader/nso_component.cmake")
+armigo_nso_production_files(ARMIGO_NSO_VERSION_FILES)
 set(ARMIGO_SHADER_VERSION_FILES
     "${CMAKE_CURRENT_LIST_FILE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/source_version.h.in"
@@ -292,13 +294,8 @@ set(ARMIGO_SHADER_VERSION_FILES
     "${ARMIGO_SHADER_INCLUDE_DIR}/armigo/shader/package.h"
     "${ARMIGO_SHADER_REPOSITORY_ROOT}/src/shader_input/CMakeLists.txt"
     "${ARMIGO_SHADER_REPOSITORY_ROOT}/src/shader_input/tools/extract.cpp"
-    "${ARMIGO_SHADER_REPOSITORY_ROOT}/src/loader/CMakeLists.txt"
-    "${ARMIGO_SHADER_REPOSITORY_ROOT}/include/armigo/loader/nso_module.h"
-    "${ARMIGO_SHADER_REPOSITORY_ROOT}/include/armigo/loader/lz4_block.h"
-    "${ARMIGO_SHADER_REPOSITORY_ROOT}/src/loader/nso_module.cpp"
-    "${ARMIGO_SHADER_REPOSITORY_ROOT}/src/loader/lz4_block.cpp"
-    "${ARMIGO_SHADER_REPOSITORY_ROOT}/src/loader/sha256.h"
-    "${ARMIGO_SHADER_REPOSITORY_ROOT}/src/loader/sha256_commoncrypto.cpp")
+    "${ARMIGO_SHADER_REPOSITORY_ROOT}/src/loader/nso_component.cmake"
+    ${ARMIGO_NSO_VERSION_FILES})
 foreach(component IN ITEMS shader shader_input shader_pipeline shader_translation)
     get_target_property(component_sources armigo_${component} SOURCES)
     get_target_property(component_directory armigo_${component} SOURCE_DIR)

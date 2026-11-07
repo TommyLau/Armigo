@@ -56,6 +56,27 @@ struct FrameRateLayout {
     std::uint32_t repeat_frames = 0;
 };
 
+// A zero-initialized guest float records progress through a repeating schedule.
+// The timing source is the measured 60 Hz frame step published by this module.
+struct FramePhaseLayout {
+    std::uint64_t frame_step = 0;
+    std::uint64_t counter = 0;
+    std::uint32_t phase_count = 0;
+};
+
+struct FramePhaseDispatch {
+    std::uint32_t first = 0;
+    std::uint32_t count = 0;
+    bool operator==(const FramePhaseDispatch&) const = default;
+};
+
+// Advance in nominal 30 Hz units and return every crossed phase, in order,
+// wrapping at phase_count. The guest remains responsible for executing each
+// phase's work. A failed access never publishes a dispatch; zero step is a no-op.
+bool advance_frame_phases(const FramePhaseLayout& layout, std::uint64_t module_base,
+                          std::uint64_t object, const horizon::GuestBuffers& buffers,
+                          FramePhaseDispatch& dispatch) noexcept;
+
 // IntervalRatio60 publishes the measured whole-frame ratio before the guest's original
 // updateInterval call. False reports an address overflow or guest-memory
 // access failure; an override, a zero interval/base, a null framework, or a

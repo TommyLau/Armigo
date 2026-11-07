@@ -93,6 +93,27 @@ bool mapping_and_execution(std::size_t page) {
                  "Moving ownership changed mapped code behavior.");
 }
 
+bool execute_only_mapping(std::size_t page) {
+    Image image(page);
+    const auto count = reinterpret_cast<std::uintptr_t>(armigo_test_mapping_code_end) -
+                       reinterpret_cast<std::uintptr_t>(armigo_test_mapping_code_begin);
+    std::memcpy(image.data(), armigo_test_mapping_code_begin, count);
+    const std::array regions = {ModuleRegion{0, page, Permission::execute}};
+    auto result = HostModule::create(image, regions);
+    if (!check(result.ok() && result.module->seal().ok(), "Execute-only sealing failed.")) return false;
+    auto& module = *result.module;
+    const auto entry = module.executable_address(0);
+    const auto native = protection(module.base_address());
+    if (native) std::printf("Execute-only request: native protection=%x, declared permission=%u\n",
+                            *native, static_cast<unsigned>(regions[0].permissions));
+    // Darwin may add read permission to an execute-only request. The host
+    // mapping remains nonwritable, and declared guest access stays execute-only.
+    return check(native && (*native == VM_PROT_EXECUTE || *native == (VM_PROT_READ | VM_PROT_EXECUTE)) &&
+                 !module.readable_bytes(0, 4) && entry &&
+                 reinterpret_cast<std::uint64_t(*)()>(*entry)() == 42,
+                 "Execute-only code must execute without exposing a readable view.");
+}
+
 bool shared_pages_and_gaps(std::size_t page) {
     Image image(page * 3);
     const std::array shared = {
@@ -232,6 +253,7 @@ int main() {
         !mapping_and_execution(static_cast<std::size_t>(page)) ||
         !embedded_mapping(static_cast<std::size_t>(page)) ||
         !embedded_linked_text(static_cast<std::size_t>(page)) ||
+        !execute_only_mapping(static_cast<std::size_t>(page)) ||
         !shared_pages_and_gaps(static_cast<std::size_t>(page)) ||
         !minimum_address_mapping(static_cast<std::size_t>(page)) ||
         !invalid_inputs(static_cast<std::size_t>(page))) return 1;

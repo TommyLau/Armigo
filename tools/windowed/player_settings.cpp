@@ -75,6 +75,7 @@ MacFrameRateSelection select_mac_frame_rate(const PlayerChoices& choices,
     const platform::DisplayCapabilities& display) {
     MacFrameRateSelection result;
     result.options.push_back(0);
+    result.experimental_rates = choices.experimental_frame_rates;
     // Use the active mode, not a faster mode the display could switch to.
     // A mode with no fixed refresh is resolved by the platform to its maximum.
     const bool high_refresh = display.available() && std::isfinite(display.current.refresh_hz) &&

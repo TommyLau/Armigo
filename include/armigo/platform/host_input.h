@@ -89,6 +89,10 @@ struct HostInputDeviceState {
     // (up positive). Both components are finite and within [-1, 1].
     std::array<float, 2> left_stick{};
     std::array<float, 2> right_stick{};
+    // Set where an input script supplies the stick: its values are exact HID
+    // coordinates, not a physical stick's, so they are not shaped.
+    bool exact_left_stick = false;
+    bool exact_right_stick = false;
     float left_trigger = 0.0f;   // finite, within [0, 1]
     float right_trigger = 0.0f;  // finite, within [0, 1]
     // Motion sensors, when the device has them, in the device's frame (x

@@ -9,10 +9,14 @@
 // ============================================================================
 
 #include <armigo/horizon/startup_queries.h>
+#include <armigo/common/diagnostics.h>
+#include <atomic>
 
 #include <armigo/horizon/process_wide_key.h>
 #include <armigo/horizon/event.h>
 #include "process_memory.h"
+#include "memory_interval_map.h"
+#include <cstdlib>
 
 #include <algorithm>
 #include <cstdio>
@@ -58,10 +62,15 @@ bool used_bytes(const MemoryAccounting& accounting, std::uint64_t& used) {
 
 bool accounting_valid(const MemoryAccounting& accounting, const ProcessConfiguration& config) {
     std::uint64_t used;
+    const auto reserved = config.private_system_resource_bytes;
+    const auto capacity = ProcessRecord::application_capacity(config.platform);
+    if (reserved && (reserved > capacity ||
+        !used_bytes(accounting, used) || used > capacity - reserved ||
+        reserved > accounting.resource_limit_used || used > accounting.resource_limit_used - reserved)) return false;
     return used_bytes(accounting, used) &&
            accounting.committed_heap <= config.heap_size &&
            accounting.initial_stack_bytes <= config.stack_size &&
-           used <= ProcessRecord::heap_capacity &&
+           used <= capacity &&
            used <= accounting.resource_limit_used &&
            accounting.resource_limit_used <= accounting.resource_limit_bytes;
 }
@@ -112,7 +121,8 @@ void finish(QueryRegisters& registers, std::uint32_t result, std::uint64_t value
     std::fill(registers.begin() + 2, registers.end(), 0);
 }
 
-bool supported_info(std::uint32_t type) {
+bool supported_info(std::uint32_t type, Baseline baseline) {
+    if (type == 17) return baseline == Baseline::horizon_23_0_1;
     switch (type) {
     case 0: case 2: case 3: case 4: case 5: case 8: case 11: case 12: case 13:
     case 14: case 15: case 16: case 20: case 21: case 22: case 28:
@@ -124,8 +134,17 @@ bool supported_info(std::uint32_t type) {
 
 // These are unrecognized by the selected kernel's GetInfo switch. Other
 // recognized types remain unsupported Armigo capabilities, not guest errors.
-bool rejected_info(std::uint32_t type) {
+bool rejected_info(std::uint32_t type, Baseline baseline, GuestPlatform platform) {
+    if (platform == GuestPlatform::switch2 && type >= 29 && type <= 33) return false;
+    if (baseline == Baseline::horizon_23_0_1)
+        return type == 19 || (type >= 29 && type <= 33) || type == 35 || type > 38;
     return type == 19 || (type >= 29 && type <= 33) || type > 34;
+}
+
+std::uint64_t resource_entropy(void*) noexcept {
+    std::uint64_t value;
+    arc4random_buf(&value, sizeof(value));
+    return value;
 }
 
 } // namespace
@@ -147,11 +166,18 @@ std::array<std::byte, 40> encode_memory_info(const MemoryInfo& info) noexcept {
     return result;
 }
 
+ProcessRecord::ProcessRecord(const ProcessConfiguration& configuration) : configuration_(configuration) {}
+ProcessRecord::~ProcessRecord() = default;
+
 ProcessBuild ProcessRecord::create(const ProcessConfiguration& configuration,
                                   const MemoryAccounting& accounting,
                                   std::span<const MemoryBlock> blocks) {
-    if (configuration.baseline != Baseline::horizon_20_5_0 ||
-        configuration.address_bits != 39 || configuration.private_system_resource_bytes != 0 ||
+    const bool legacy = configuration.baseline == Baseline::horizon_20_5_0 &&
+                        configuration.platform == GuestPlatform::switch1;
+    const bool extended = configuration.baseline == Baseline::horizon_23_0_1 &&
+                          configuration.platform == GuestPlatform::switch2;
+    if ((!legacy && !extended) || configuration.address_bits != 39 ||
+        (configuration.private_system_resource_bytes && !extended) ||
         configuration.allowed_core_mask == 0) {
         return {ProcessStateError::unsupported_profile, {}};
     }
@@ -176,11 +202,25 @@ ProcessBuild ProcessRecord::create(const ProcessConfiguration& configuration,
         overlaps(heap, alias) || overlaps(heap, stack) || overlaps(alias, stack)) {
         return {ProcessStateError::invalid_layout, {}};
     }
+    const auto remote = configuration.remote_region;
+    if ((remote.address || remote.size) &&
+        (!extended || !region_valid(remote) || (remote.address | remote.size) % 0x10000 ||
+         overlaps(remote, heap) || overlaps(remote, alias) ||
+         overlaps(remote, stack)))
+        return {ProcessStateError::invalid_layout, {}};
     if (!accounting_valid(accounting, configuration)) return {ProcessStateError::invalid_accounting, {}};
     try {
         auto process = std::shared_ptr<ProcessRecord>(new ProcessRecord(configuration));
         process->accounting_ = accounting;
-        const auto updated = process->replace_memory_map(blocks);
+        if (configuration.private_system_resource_bytes) {
+            std::string error;
+            auto pool = SystemResourcePool::create(configuration.private_system_resource_bytes,
+                resource_entropy, nullptr, error);
+            if (!pool) return {ProcessStateError::resource_limit, {}};
+            process->private_memory_ = MemoryIntervalMap::create(std::move(pool));
+            if (!process->private_memory_) return {ProcessStateError::resource_limit, {}};
+        }
+        const auto updated = process->initialize_memory_map(blocks);
         if (updated != ProcessStateError::none) return {updated, {}};
         return {ProcessStateError::none, std::move(process)};
     } catch (const std::bad_alloc&) {
@@ -198,6 +238,11 @@ ProcessStateError ProcessRecord::set_accounting(const MemoryAccounting& accounti
 }
 
 ProcessStateError ProcessRecord::replace_memory_map(std::span<const MemoryBlock> blocks) {
+    if (private_memory_) return ProcessStateError::unsupported_profile;
+    return initialize_memory_map(blocks);
+}
+
+ProcessStateError ProcessRecord::initialize_memory_map(std::span<const MemoryBlock> blocks) {
     if (blocks.size() > configuration_.max_memory_blocks) return ProcessStateError::resource_limit;
     try {
         std::vector<MemoryBlock> replacement;
@@ -216,7 +261,15 @@ ProcessStateError ProcessRecord::replace_memory_map(std::span<const MemoryBlock>
         process_memory::coalesce(replacement);
         {
             std::lock_guard lock(mutex_);
-            blocks_.swap(replacement);
+            if (private_memory_) {
+                std::vector<MemoryMapUpdate> updates;
+                updates.reserve(replacement.size() + 1);
+                updates.push_back({{0, query_end}, std::nullopt, 0, 0xff});
+                for (const auto& block : replacement) updates.push_back({block.range, block, block.merge_disable});
+                const auto result = private_memory_->transact(updates, [](void*) noexcept { return true; },
+                    nullptr, configuration_.max_memory_blocks);
+                if (result != IntervalMapError::none) return ProcessStateError::resource_limit;
+            } else blocks_.swap(replacement);
         }
         return ProcessStateError::none;
     } catch (const std::bad_alloc&) {
@@ -229,6 +282,8 @@ ProcessStateError ProcessRecord::replace_memory_map(std::span<const MemoryBlock>
 ProcessStateError ProcessRecord::commit_memory_state(std::span<const MemoryBlock> blocks,
     const MemoryAccounting& accounting, bool (*apply)(void*) noexcept, void* context) {
     if (apply == nullptr) return ProcessStateError::backend_failure;
+    // Native private-process mutations must submit bounded range edits.
+    if (private_memory_) return ProcessStateError::unsupported_profile;
     auto prepared = create(configuration_, accounting, blocks);
     if (!prepared.ok()) return prepared.error;
     std::lock_guard lock(mutex_);
@@ -238,9 +293,31 @@ ProcessStateError ProcessRecord::commit_memory_state(std::span<const MemoryBlock
     return ProcessStateError::none;
 }
 
+ProcessStateError ProcessRecord::commit_memory_updates(std::span<const MemoryMapUpdate> updates,
+    const MemoryAccounting& accounting, bool (*apply)(void*) noexcept, void* context) {
+    if (!private_memory_) return ProcessStateError::unsupported_profile;
+    if (!apply) return ProcessStateError::backend_failure;
+    if (!accounting_valid(accounting, configuration_)) return ProcessStateError::invalid_accounting;
+    for (const auto& update : updates) {
+        auto block = update.replacement.value_or(MemoryBlock{});
+        block.range = update.range;
+        if (!block_valid(block) || (block.permissions & ~7u)) return ProcessStateError::invalid_memory_map;
+    }
+    // Runtime State precedes this lock; the tree and pool follow it. Native
+    // callbacks must not reenter any process metadata API.
+    std::lock_guard lock(mutex_);
+    switch (private_memory_->transact(updates, apply, context, configuration_.max_memory_blocks)) {
+    case IntervalMapError::none: accounting_ = accounting; return ProcessStateError::none;
+    case IntervalMapError::resource_limit: return ProcessStateError::resource_limit;
+    case IntervalMapError::invalid_map: return ProcessStateError::invalid_memory_map;
+    case IntervalMapError::native_failure: return ProcessStateError::backend_failure;
+    }
+    return ProcessStateError::backend_failure;
+}
+
 MemoryInfo ProcessRecord::query_memory(std::uint64_t address) const {
     std::lock_guard lock(mutex_);
-    return lookup(blocks_, address);
+    return private_memory_ ? private_memory_->query(address) : lookup(blocks_, address);
 }
 
 bool ProcessRecord::writable(std::uint64_t address, std::size_t size) const {
@@ -248,7 +325,7 @@ bool ProcessRecord::writable(std::uint64_t address, std::size_t size) const {
     std::lock_guard lock(mutex_);
     auto remaining = static_cast<std::uint64_t>(size);
     while (remaining != 0) {
-        const auto block = lookup(blocks_, address);
+        const auto block = private_memory_ ? private_memory_->query(address) : lookup(blocks_, address);
         if ((block.permissions & 2u) == 0) return false;
         const auto chunk = std::min(remaining, block.range.size - (address - block.range.address));
         address += chunk;
@@ -270,7 +347,15 @@ std::uint64_t ProcessRecord::total_memory() const {
     (void)used_bytes(accounting_, used);
     const auto free = accounting_.resource_limit_bytes - accounting_.resource_limit_used;
     // Accounting validation guarantees this sum cannot wrap.
-    return std::min(heap_capacity, used + free);
+    const auto capacity = application_capacity(configuration_.platform);
+    if (private_memory_) return std::min(capacity - configuration_.private_system_resource_bytes, used + free);
+    return std::min(capacity, used + free);
+}
+
+std::uint64_t ProcessRecord::used_system_resource() const {
+    // The provider is fixed before publication. Its assigned-page counter is
+    // observed independently of an in-flight memory-map transaction.
+    return private_memory_ ? private_memory_->assigned_bytes() : 0;
 }
 
 std::uint64_t ProcessRecord::alias_extra_size() const noexcept {
@@ -279,6 +364,7 @@ std::uint64_t ProcessRecord::alias_extra_size() const noexcept {
 
 std::vector<MemoryBlock> ProcessRecord::memory_map() const {
     const std::lock_guard lock(mutex_);
+    if (private_memory_) return private_memory_->snapshot();
     return {blocks_.begin(), blocks_.end()};
 }
 
@@ -654,6 +740,9 @@ QueryDisposition StartupQueries::cancel_synchronization(QueryRegisters& register
 }
 
 QueryDisposition StartupQueries::set_memory_permission(QueryRegisters& registers) const {
+    // Private native processes must update backing and intervals atomically via
+    // GuestMemory; this legacy metadata-only route cannot provide that contract.
+    if (process_ && process_->memory_intervals()) return QueryDisposition::unsupported_operation;
     // svcSetMemoryPermissions(address, size, permission): the guest may name any page-aligned
     // subrange of memory it owns, so the blocks it covers are split and only the covered part keeps
     // the new permission. A partial range is normal: ProtectRelro protects one part of a segment.
@@ -963,11 +1052,21 @@ QueryDisposition StartupQueries::get_info(QueryRegisters& registers) const {
     const auto type = static_cast<std::uint32_t>(original);
     const auto handle = static_cast<Handle>(registers[2]);
     const auto sub_id = registers[3];
-    if (rejected_info(type)) {
+    const auto baseline = process_ ? process_->configuration().baseline : Baseline::horizon_20_5_0;
+    const auto platform = process_ ? process_->configuration().platform : GuestPlatform::switch1;
+    if (rejected_info(type, baseline, platform)) {
         finish(registers, invalid_info, original);
         return QueryDisposition::handled;
     }
-    if (!supported_info(type)) return QueryDisposition::unsupported_operation;
+    if (!supported_info(type, baseline) &&
+        !(platform == GuestPlatform::switch2 && type >= 29 && type <= 33))
+        return QueryDisposition::unsupported_operation;
+    if (type == 8 && baseline == Baseline::horizon_23_0_1) {
+        if (handle) finish(registers, invalid_handle, original);
+        else if (sub_id) finish(registers, invalid_combination, original);
+        else finish(registers, 0, 0);
+        return QueryDisposition::handled;
+    }
     if (type == 20) {
         // svcGetInfo(UserExceptionContextAddress, handle, 0) resolves a process
         // handle and reports that process's user exception context address. The
@@ -976,7 +1075,8 @@ QueryDisposition StartupQueries::get_info(QueryRegisters& registers) const {
             finish(registers, invalid_combination, original);
             return QueryDisposition::handled;
         }
-        const auto current = handle == current_process_handle || handle == 0;
+        const auto current = handle == current_process_handle ||
+            (baseline == Baseline::horizon_20_5_0 && handle == 0);
         const auto process = current ? process_ : handles_->lookup_as<ProcessRecord>(handle);
         if (!process) {
             finish(registers, invalid_handle, original);
@@ -998,13 +1098,11 @@ QueryDisposition StartupQueries::get_info(QueryRegisters& registers) const {
         finish(registers, invalid_combination, original);
         return QueryDisposition::handled;
     }
-    // Info types that describe the calling process take the current-process pseudo-handle,
-    // and the firmware also accepts a zero handle for them (svcGetInfo(&out, 8, 0, 0) is how
-    // the SDK asks whether a debugger is attached).
-    // A zero handle describes the calling process only for a plain, supported info type;
-    // a type with extra bits set still has to name a real process.
+    // Preserve the legacy zero-handle convention for plain 20.5 queries.
+    // The 23.0.1 process-query cases require a process handle; zero is admitted
+    // only by the separate debugger and entropy cases above.
     const auto current = handle == current_process_handle ||
-                         (handle == 0 && original == type && supported_info(type));
+                         (baseline == Baseline::horizon_20_5_0 && handle == 0 && original == type && supported_info(type, baseline));
     const auto process = current ? process_ : handles_->lookup_as<ProcessRecord>(handle);
     if (!process) {
         finish(registers, invalid_handle, original);
@@ -1023,10 +1121,41 @@ QueryDisposition StartupQueries::get_info(QueryRegisters& registers) const {
     case 13: value = process->configuration().allocation_region.size; break;
     case 14: value = process->stack_region().address; break;
     case 15: value = process->stack_region().size; break;
-    case 16: value = 0; break; // Only the explicit no-private-resource profile is supported.
+    case 16: value = process->configuration().private_system_resource_bytes; break;
+    case 17: value = process->used_system_resource(); break;
     case 21: value = process->total_memory(); break;
     case 22: value = process->used_memory(); break;
     case 28: value = process->alias_extra_size(); break;
+    case 33:
+        if (process->configuration().platform != GuestPlatform::switch2)
+            return QueryDisposition::unsupported_operation;
+        // Provisional profile value, not a recovered console query result.
+        value = switch2_physical_mapping_granule;
+        break;
+    case 31: case 32: {
+        // Remote memory size and use. Nothing backs remote memory here, and the
+        // practical reference reports zero for both; provisional and unverified.
+        if (process->configuration().platform != GuestPlatform::switch2)
+            return QueryDisposition::unsupported_operation;
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            armigo::diag::write(armigo::diag::Level::warning,
+                "Armigo kernel: provisional Switch 2 GetInfo 31/32 report no remote memory (unverified)\n");
+        value = 0;
+        break;
+    }
+    case 29: case 30: {
+        // Unverified Switch 2 compatibility assumption: report the actual native
+        // remote reservation, not console geometry. Settings excludes this pair
+        // from its general allocator and uses 0x10000 allocator alignment.
+        // Verify against an owner-console GetInfo 29/30/31/32 and layout capture.
+        // The process-handle/sub-id convention follows the 23.0.1 reference.
+        const auto remote = process->configuration().remote_region;
+        if (process->configuration().platform != GuestPlatform::switch2 || !remote.size)
+            return QueryDisposition::unsupported_operation;
+        value = type == 29 ? remote.address : remote.size;
+        break;
+    }
     default: return QueryDisposition::unsupported_operation;
     }
     finish(registers, 0, value);

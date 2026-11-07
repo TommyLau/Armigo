@@ -119,6 +119,22 @@ int main() {
         CHECK(!parsed.ok);
     }
 
+    {
+        const auto parsed = parse_runner_arguments(PresentationMode::headless,
+            as_arguments({"--nup", container.string()}));
+        CHECK(parsed.ok && parsed.arguments.nup_file == container);
+        CHECK(!parsed.arguments.keys_file);
+        for (const auto flag : {"--keys", "--container", "--exefs", "--romfs", "--cache", "--update"}) {
+            const auto mixed = parse_runner_arguments(PresentationMode::headless,
+                as_arguments({"--nup", container.string(), flag, container.string()}));
+            CHECK(!mixed.ok);
+        }
+        CHECK(!parse_runner_arguments(PresentationMode::windowed,
+            as_arguments({"--nup", container.string()})).ok);
+        CHECK(!parse_runner_arguments(PresentationMode::headless,
+            as_arguments({"--nup", (directory / "absent.nup").string()})).ok);
+    }
+
     // The report carries the verification state; extraction failures leave
     // it not_verified and a verified container run sets it.
     {

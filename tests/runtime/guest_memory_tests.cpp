@@ -45,6 +45,7 @@ using namespace armigo;
 using namespace armigo::runtime;
 
 constexpr std::uint64_t mib = 1024 * 1024;
+bool private_mode = false;
 constexpr std::uint32_t result_invalid_size = 0xca01;
 constexpr std::uint32_t result_invalid_memory = 0xd401;
 constexpr std::uint32_t result_invalid_permission = 0xd801;
@@ -74,6 +75,11 @@ LaunchProfile synthetic_profile() {
     profile.process.base_alias_size = 2 * mib;
     profile.process.stack_size = 2 * mib;
     profile.permissions.handle_table_capacity = 64;
+    if (private_mode) {
+        profile.process.platform = GuestPlatform::switch2;
+        profile.process.baseline = horizon::Baseline::horizon_23_0_1;
+        profile.process.private_system_resource_bytes = 65536;
+    }
     return profile;
 }
 
@@ -208,7 +214,7 @@ void test_factory_and_host_allocations() {
     if (!fixture.memory) return;
     const auto process = fixture.memory->process();
     const auto& configuration = process->configuration();
-    CHECK(process->total_memory() == 16 * mib && process->used_memory() == 0);
+    CHECK(process->total_memory() == 16 * mib - (private_mode ? 65536 : 0) && process->used_memory() == 0);
     CHECK(configuration.heap_address != 0 && configuration.alias_address != 0 &&
           configuration.stack_address != 0);
     CHECK(configuration.heap_address % page == 0 &&
@@ -242,7 +248,7 @@ void test_factory_and_host_allocations() {
         // Thread-local pages are kernel pages: neither used memory nor charged.
         const auto charged = type == horizon::MemoryType::thread_local_storage ? 0 : page;
         CHECK(process->used_memory() == used_before + charged &&
-              process->total_memory() == 16 * mib);
+              process->total_memory() == 16 * mib - (private_mode ? 65536 : 0));
         CHECK(failed_with(fixture.memory->release(range), LaunchError::unsupported));
         pin.reset();
         CHECK(succeeded(fixture.memory->release(range)));
@@ -258,7 +264,7 @@ void test_factory_and_host_allocations() {
     CHECK(process->used_memory() == used_before &&
           same_blocks(process->memory_map(), map_before));
     // A thread-local page is still admitted when the budget is spent.
-    auto spent = fixture.memory->allocate(16 * mib, horizon::MemoryType::normal, memory::Permission::read);
+    auto spent = fixture.memory->allocate(16 * mib - (private_mode ? 65536 : 0), horizon::MemoryType::normal, memory::Permission::read);
     CHECK(std::holds_alternative<GuestMemoryPin>(spent));
     auto local = fixture.memory->allocate(page, horizon::MemoryType::thread_local_storage,
                                           memory::Permission::read | memory::Permission::write);
@@ -396,7 +402,7 @@ void test_heap_dispatch_and_pin_conflicts() {
     CHECK(info.range.address == heap && info.range.size >= 2 * mib &&
           info.type == horizon::MemoryType::normal && info.permissions == 3);
     CHECK(fixture.memory->process()->used_memory() == 2 * mib &&
-          fixture.memory->process()->total_memory() == 16 * mib);
+          fixture.memory->process()->total_memory() == 16 * mib - (private_mode ? 65536 : 0));
 
     auto pin_result = fixture.memory->pin({heap, 2 * mib}, memory::Permission::read);
     CHECK(std::holds_alternative<GuestMemoryPin>(pin_result));
@@ -998,10 +1004,11 @@ void test_heap_tail_validation_and_accounting() {
     map[0] = destination; map[1] = heap; map[2] = page;
     CHECK(handled(fixture.memory->dispatch(5, map)) && map[0] == 0);
     CHECK(fixture.memory->process()->query_memory(heap).range.size == 2 * mib);
-    CHECK(fixture.memory->process()->total_memory() == 16 * mib);
+    CHECK(fixture.memory->process()->total_memory() == 16 * mib - (private_mode ? 65536 : 0));
 
-    // The process maximum is checked before the resource budget. This request
-    // is rejected without committing the large reserved virtual heap.
+    // Switch 1 reaches its process maximum before the resource budget. Switch 2
+    // has a larger application capacity, so this explicit 8 GiB budget is the
+    // constraint instead. Neither rejection commits the large virtual heap.
     auto profile = synthetic_profile();
     profile.process.heap_size = horizon::ProcessRecord::heap_capacity;
     profile.process.stack_size = 8 * mib;
@@ -1014,7 +1021,7 @@ void test_heap_tail_validation_and_accounting() {
         CHECK(std::holds_alternative<GuestMemoryPin>(stack));
         auto request = registers_with();
         request[1] = horizon::ProcessRecord::heap_capacity - 2 * mib;
-        CHECK(handled((*memory)->dispatch(1, request)) && request[0] == 0xd001);
+        CHECK(handled((*memory)->dispatch(1, request)) && request[0] == (private_mode ? 0x10801 : 0xd001));
         CHECK(request[1] == horizon::ProcessRecord::heap_capacity - 2 * mib);
     }
 }
@@ -1091,7 +1098,7 @@ void test_query_boundaries_and_alias_identity() {
         if (i == 0) CHECK(process->query_memory(heap + page).attributes == 1);
     }
     CHECK(process->query_memory(heap).range.size == 2 * mib);
-    CHECK(process->used_memory() == used && process->total_memory() == 16 * mib);
+    CHECK(process->used_memory() == used && process->total_memory() == 16 * mib - (private_mode ? 65536 : 0));
     const auto tail = process->query_memory(std::numeric_limits<std::uint64_t>::max());
     CHECK(tail.type == horizon::MemoryType::reserved && tail.permissions == 0 && tail.attributes == 0);
     CHECK(tail.range.address == horizon::ProcessRecord::query_end &&
@@ -1241,26 +1248,94 @@ void test_observation_copy_does_not_retain_mappings() {
     });
 }
 
+void private_interval_authority() {
+    auto profile = synthetic_profile();
+    profile.process.platform = GuestPlatform::switch2;
+    profile.process.baseline = horizon::Baseline::horizon_23_0_1;
+    profile.process.private_system_resource_bytes = 3 * 4096;
+    auto handles = std::make_shared<horizon::HandleTable>(64);
+    auto created = create_guest_memory(profile, {16 * mib}, nullptr, handles);
+    CHECK(std::holds_alternative<std::shared_ptr<GuestMemory>>(created));
+    if (!std::holds_alternative<std::shared_ptr<GuestMemory>>(created)) return;
+    auto memory = std::get<std::shared_ptr<GuestMemory>>(std::move(created));
+    auto process = memory->process();
+    CHECK(process->memory_intervals() != nullptr);
+    CHECK(process->used_system_resource() == 4096);
+    const auto page = native_page_size();
+    auto made = memory->allocate(128 * page, horizon::MemoryType::normal,
+        memory::Permission::read | memory::Permission::write);
+    CHECK(std::holds_alternative<GuestMemoryPin>(made));
+    if (!std::holds_alternative<GuestMemoryPin>(made)) return;
+    auto pin = std::get<GuestMemoryPin>(std::move(made));
+    const auto range = pin->range();
+    pin->writable_bytes().front() = std::byte{0x41}; pin.reset();
+    unsigned exhausted_at = 0;
+    for (unsigned index = 1; index < 128; index += 2) {
+        const auto before = process->memory_map();
+        const auto used = process->used_memory(), total = process->total_memory();
+        horizon::QueryRegisters registers{};
+        registers[0] = range.address + index * page; registers[1] = page; registers[2] = 1;
+        const auto result = memory->dispatch(2, registers);
+        CHECK(std::holds_alternative<horizon::QueryDisposition>(result));
+        if (!std::holds_alternative<horizon::QueryDisposition>(result)) return;
+        if (registers[0] == 0xce01) {
+            exhausted_at = index;
+            const auto after = process->memory_map();
+            CHECK(after.size() == before.size());
+            for (std::size_t i = 0; i < std::min(after.size(), before.size()); ++i)
+                CHECK(horizon::encode_memory_info(after[i]) == horizon::encode_memory_info(before[i]));
+            CHECK(process->used_memory() == used && process->total_memory() == total);
+            CHECK(process->query_memory(range.address + index * page).permissions == 3);
+            CHECK(process->used_system_resource() == 4096);
+            break;
+        }
+        CHECK(registers[0] == 0 && process->query_memory(range.address + index * page).permissions == 1);
+        auto rejected = memory->pin({range.address + index * page, page}, memory::Permission::read | memory::Permission::write);
+        CHECK(std::holds_alternative<LaunchFailure>(rejected));
+    }
+    CHECK(exhausted_at != 0); if (!exhausted_at) return;
+    horizon::QueryRegisters recover{};
+    recover[0] = range.address + page; recover[1] = page; recover[2] = 3;
+    CHECK(std::holds_alternative<horizon::QueryDisposition>(memory->dispatch(2, recover)) && recover[0] == 0);
+    horizon::QueryRegisters retry{};
+    retry[0] = range.address + exhausted_at * page; retry[1] = page; retry[2] = 1;
+    CHECK(std::holds_alternative<horizon::QueryDisposition>(memory->dispatch(2, retry)) && retry[0] == 0);
+    CHECK(process->query_memory(range.address + exhausted_at * page).permissions == 1);
+    auto retained = memory->pin({range.address, page}, memory::Permission::read);
+    CHECK(std::holds_alternative<GuestMemoryPin>(retained));
+    std::weak_ptr<horizon::ProcessRecord> owner = memory->process();
+    // ProcessRecord and the pin keep the same pool-backed authority alive.
+    memory.reset(); process.reset();
+    CHECK(!owner.expired());
+    if (auto* view = std::get_if<GuestMemoryPin>(&retained)) CHECK((*view)->bytes().front() == std::byte{0x41});
+    retained = LaunchFailure{};
+    CHECK(owner.expired());
+}
+
 } // namespace
 
 int main() {
-    test_observation_copy_does_not_retain_mappings();
-    test_factory_and_host_allocations();
-    test_pin_validation_and_backing_lifetime();
-    test_release_after_partial_protection();
-    test_heap_dispatch_and_pin_conflicts();
-    test_permission_dispatch_and_native_protection();
-    test_stack_alias_map_and_exact_unmap();
-    test_read_write_shared_memory_alias_and_handles();
-    test_shared_mapping_retains_object_after_handle_close();
-    test_sub_page_shared_memory_mapping();
-    test_read_only_shared_memory_mapping();
-    test_copy_out_native_atomics();
-    test_ipc_whole_range_and_ordered_word_copy();
-    test_ipc_copy_uses_registered_alias();
-    test_service_mapper_retention_and_lifetime();
-    test_firmware_validation_order();
-    test_heap_tail_validation_and_accounting();
-    test_query_boundaries_and_alias_identity();
+    private_interval_authority();
+    for (bool mode : {false, true}) {
+        private_mode = mode;
+        test_observation_copy_does_not_retain_mappings();
+        test_factory_and_host_allocations();
+        test_pin_validation_and_backing_lifetime();
+        test_release_after_partial_protection();
+        test_heap_dispatch_and_pin_conflicts();
+        test_permission_dispatch_and_native_protection();
+        test_stack_alias_map_and_exact_unmap();
+        test_read_write_shared_memory_alias_and_handles();
+        test_shared_mapping_retains_object_after_handle_close();
+        test_sub_page_shared_memory_mapping();
+        test_read_only_shared_memory_mapping();
+        test_copy_out_native_atomics();
+        test_ipc_whole_range_and_ordered_word_copy();
+        test_ipc_copy_uses_registered_alias();
+        test_service_mapper_retention_and_lifetime();
+        test_firmware_validation_order();
+        test_heap_tail_validation_and_accounting();
+        test_query_boundaries_and_alias_identity();
+    }
     return failures.load(std::memory_order_relaxed) == 0 ? 0 : 1;
 }

@@ -139,6 +139,8 @@ PreemptPublication publish_invocation(void* record, std::uint64_t stack_low,
     return previous;
 }
 
+GuestPreemptSlot* bound_slot() noexcept { return t_preempt_slot; }
+
 void restore_invocation(const PreemptPublication& previous) noexcept {
     auto* slot = t_preempt_slot;
     if (slot == nullptr) return;

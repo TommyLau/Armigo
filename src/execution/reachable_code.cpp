@@ -459,7 +459,7 @@ private:
                 failed_here(ReachableError::indirect_call);
                 continues = options_.follow_indirect_call_return;
                 break;
-            case Opcode::ret:
+            case Opcode::ret: case Opcode::retab:
                 set_kind(SiteKind::return_);
                 return;
             case Opcode::svc:

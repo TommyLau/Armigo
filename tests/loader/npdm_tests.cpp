@@ -76,6 +76,41 @@ void test_valid_image() {
                  parts.acid_capabilities.size() * 4);
 }
 
+void test_switch2_layout() {
+    auto original = profile_image_a();
+    const auto old = std::get<ParsedNpdm>(armigo::loader::parse_npdm(original.bytes));
+    auto bytes = original.bytes;
+    const auto acid = old.acid.offset;
+    bytes.insert(bytes.begin() + acid + 0x200, 0x100, std::byte{});
+    put_u32(bytes, kMetaAcidSize, old.acid.size + 0x100);
+    put_u32(bytes, acid + 0x304, old.acid.size + 0x100 - 0x180);
+    for (const auto field : {0x320u, 0x328u, 0x330u}) {
+        const auto old_field = acid + field - 0x100;
+        const auto value = std::to_integer<unsigned>(original.bytes[old_field]) |
+            (std::to_integer<unsigned>(original.bytes[old_field + 1]) << 8) |
+            (std::to_integer<unsigned>(original.bytes[old_field + 2]) << 16) |
+            (std::to_integer<unsigned>(original.bytes[old_field + 3]) << 24);
+        put_u32(bytes, acid + field, value + 0x100);
+    }
+    const auto parsed = armigo::loader::parse_npdm(bytes);
+    ARMIGO_CHECK(std::holds_alternative<ParsedNpdm>(parsed));
+    if (const auto meta = std::get_if<ParsedNpdm>(&parsed)) {
+        ARMIGO_CHECK(meta->platform == armigo::GuestPlatform::switch2);
+        ARMIGO_CHECK(meta->acid_kernel_access_control.offset == old.acid_kernel_access_control.offset + 0x100);
+        ARMIGO_CHECK(meta->aci0_program_id == old.aci0_program_id);
+    }
+    ARMIGO_CHECK(old.platform == armigo::GuestPlatform::switch1);
+    auto broken = bytes;
+    put_u32(broken, acid + 0x320, 0x240);
+    expect_failure(broken, "npdm.acid_sections");
+    broken = bytes;
+    put_u32(broken, acid + 0x304, old.acid.size);
+    expect_failure(broken, "npdm.acid_size");
+    broken = bytes;
+    put_u32(broken, acid + 0x300, 0);
+    expect_failure(broken, "npdm.acid_magic");
+}
+
 void test_bad_meta_magic() {
     NpdmImage image = profile_image_a();
     put_u8(image.bytes, 0x00, 'X');
@@ -284,6 +319,7 @@ void test_acid_signed_size_and_validation_order() {
 
 int main() {
     test_valid_image();
+    test_switch2_layout();
     test_bad_meta_magic();
     test_truncated_image();
     test_aci0_magic();

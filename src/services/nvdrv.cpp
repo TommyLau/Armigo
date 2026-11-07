@@ -1051,6 +1051,8 @@ DriverSession::DriverSession(const DriverSession& parent)
     : converted_(parent.converted_), descriptors_(parent.descriptors_),
       mapper_(parent.mapper_), work_memory_(parent.work_memory_) {}
 
+void DriverSession::refuse_gpu_devices(const char* reason) noexcept { refused_gpu_devices_ = reason; }
+
 IpcReply DriverSession::unsupported(const char* detail) {
     diagnostic_ = detail;
     return {};
@@ -1212,6 +1214,7 @@ IpcReply DriverSession::open_device(const IpcMessage& message, std::size_t cmif,
         }
     }
     if (path.empty()) return unsupported("Driver open needs a device path");
+    if (refused_gpu_devices_ && path.size() > 4 && path.ends_with("-gpu")) return unsupported(refused_gpu_devices_);
     if (descriptors_->next_fd == std::numeric_limits<std::uint32_t>::max())
         return unsupported("Driver descriptors are exhausted");
     const auto fd = descriptors_->next_fd++;

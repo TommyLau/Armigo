@@ -36,6 +36,7 @@ struct LaunchDescription {
     // unless the caller set a host save directory: the windowed player.
     bool title_saves = false;
     std::optional<std::uint64_t> container_title_id;
+    std::filesystem::path nup_file;
     std::filesystem::path exefs_directory;
     std::filesystem::path romfs_directory;
     // Extracted add-on content: one RomFS tree per item, each directory named

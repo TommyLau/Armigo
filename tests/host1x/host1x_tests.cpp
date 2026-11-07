@@ -127,8 +127,11 @@ void test_decoder_codec() {
           h.failures[0].second.find("codec 3") != std::string::npos);
 }
 
-// The frame queue pairs a compositor's surface offset with its decoder
-// channel and hands out that channel's pictures oldest first.
+// The frame queue finds the decoder channel holding a named surface. A take
+// for a surface supplies that surface's latest picture and drops the older
+// pictures queued before it (the player skipped them); a surface with no
+// queued picture (a picture shown again from an earlier surface) takes the
+// channel's oldest picture.
 void test_frame_queue() {
     FrameQueue queue;
     queue.open(1);
@@ -136,19 +139,36 @@ void test_frame_queue() {
     auto a = std::make_shared<DecodedFrame>();
     auto b = std::make_shared<DecodedFrame>();
     auto c = std::make_shared<DecodedFrame>();
+    auto d = std::make_shared<DecodedFrame>();
     queue.push(1, 0x1000, a);
     queue.push(1, 0x2000, b);
     queue.push(2, 0x9000, c);
     const auto first = queue.find_decoder(0x2000);
     CHECK(first == 1 && queue.find_decoder(0x9000) == 2 && queue.find_decoder(0x3000) == -1);
-    CHECK(queue.take(first) == a);  // the oldest picture of the decoder that named 0x2000
-    CHECK(queue.take(first) == b);
-    CHECK(queue.take(first) == nullptr);
-    CHECK(queue.take(2) == c);
-    CHECK(queue.take(-1) == nullptr);
+    // In step: each compose names the oldest queued surface.
+    CHECK(queue.take(first, 0x1000) == a);
+    CHECK(queue.take(first, 0x2000) == b);
+    CHECK(queue.take(first, 0x1000) == nullptr);
+    // Behind: composes skipped two pictures; naming the newest surface catches up.
+    queue.push(1, 0x1000, a);
+    queue.push(1, 0x2000, b);
+    queue.push(1, 0x3000, d);
+    CHECK(queue.take(1, 0x3000) == d);
+    CHECK(queue.take(1, 0x1000) == nullptr);
+    // A reused surface supplies its latest picture.
+    queue.push(1, 0x1000, a);
+    queue.push(1, 0x2000, b);
+    queue.push(1, 0x1000, d);
+    CHECK(queue.take(1, 0x1000) == d && queue.take(1, 0x2000) == nullptr);
+    // A picture shown again from an earlier surface: the oldest queued picture.
+    queue.push(1, 0x2000, b);
+    queue.push(1, 0x3000, d);
+    CHECK(queue.take(1, 0x5000) == b && queue.take(1, 0x5000) == d);
+    CHECK(queue.take(2, 0x9000) == c);
+    CHECK(queue.take(-1, 0x9000) == nullptr);
     queue.close(1);
     queue.push(1, 0x1000, a);
-    CHECK(queue.find_decoder(0x1000) == -1 && queue.take(1) == nullptr);
+    CHECK(queue.find_decoder(0x1000) == -1 && queue.take(1, 0x1000) == nullptr);
     CHECK(!queue.is_open(1) && queue.is_open(2) && !queue.is_open(-1));
 }
 
@@ -409,13 +429,35 @@ void test_compositor_new_decoder() {
     setup.h.hub.frames().push(next, CompositorSetup::picture, frame);
     setup.execute();
     CHECK(setup.at(CompositorSetup::output, 0) != first);
-    CHECK(setup.h.hub.frames().take(next) == nullptr);  // the new channel's picture was used
+    CHECK(setup.h.hub.frames().take(next, CompositorSetup::picture) == nullptr);  // the new channel's picture was used
+}
+
+// A new decoder channel takes over a surface while the earlier channel stays
+// open: the compositor follows the channel holding the surface it names.
+void test_compositor_open_channel_switch() {
+    CompositorSetup setup(31, 0, 32 * 4);
+    setup.execute();
+    const auto first = setup.at(CompositorSetup::output, 0);
+    constexpr std::uint32_t next = CompositorSetup::decoder + 1;
+    auto frame = std::make_shared<DecodedFrame>();
+    frame->width = 8;
+    frame->height = 4;
+    frame->luma_stride = 8;
+    frame->chroma_stride = 8;
+    frame->luma.assign(32, 200);
+    frame->chroma.assign(16, 128);
+    setup.h.hub.frames().open(next);
+    setup.h.hub.frames().push(next, CompositorSetup::picture, frame);
+    CHECK(setup.h.hub.frames().is_open(CompositorSetup::decoder));
+    setup.execute();
+    CHECK(setup.at(CompositorSetup::output, 0) != first);
+    CHECK(setup.h.hub.frames().take(next, CompositorSetup::picture) == nullptr);
 }
 
 void test_compositor_failures() {
     {
         CompositorSetup setup(31, 0, 32 * 4);
-        (void)setup.h.hub.frames().take(CompositorSetup::decoder);
+        (void)setup.h.hub.frames().take(CompositorSetup::decoder, CompositorSetup::picture);
         setup.execute();
         CHECK(setup.at(setup.output, 0) == 0xcc);
         const std::lock_guard lock(setup.h.mutex);
@@ -441,6 +483,7 @@ int main() {
     test_compositor_block_linear();
     test_compositor_n420();
     test_compositor_new_decoder();
+    test_compositor_open_channel_switch();
     test_compositor_failures();
     if (failures) return 1;
     std::puts("Multimedia engine checks passed");

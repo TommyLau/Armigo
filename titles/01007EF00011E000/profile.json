@@ -227,10 +227,24 @@
           1600,
           900
         ],
-        "minimum_render_width": 1024
+        "minimum_render_width": 1024,
+        "gpu_budget_note": "At 120 fps, feed completed GPU work into the resolution controller while preserving elapsed counters; other rates retain the fixed scale.",
+        "gpu_budget_rate": 120
       },
       "nvn_driver": true,
-      "pipelines": "pipelines.tsv"
+      "pipelines": "pipelines.tsv",
+      "frame_rate": {
+        "default": 60,
+        "display_refresh_rate": 60,
+        "experimental_rates": [
+          120
+        ]
+      },
+      "frame_rates": [
+        30,
+        60,
+        120
+      ]
     }
   ]
 }

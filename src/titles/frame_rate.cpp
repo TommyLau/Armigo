@@ -113,6 +113,34 @@ bool update_fractional_counter(const FrameRateLayout& layout, std::uint64_t modu
 
 }  // namespace
 
+bool advance_frame_phases(const FramePhaseLayout& layout, std::uint64_t module_base,
+                          std::uint64_t object, const horizon::GuestBuffers& buffers,
+                          FramePhaseDispatch& dispatch) noexcept {
+    dispatch = {};
+    if (!layout.frame_step || layout.frame_step % 4 || layout.counter % 4 ||
+        !layout.phase_count || layout.phase_count > 65535)
+        return false;
+    float step = 0;
+    if (!read_value(buffers, module_base, layout.frame_step, step) ||
+        !std::isfinite(step) || step < 0 || step > maximum_step)
+        return false;
+    if (step == 0) return true;
+    float phase = 0;
+    if (!read_value(buffers, object, layout.counter, phase) ||
+        !std::isfinite(phase) || phase < 0 || phase >= layout.phase_count)
+        return false;
+    // Use the same float precision for crossing detection and persisted state.
+    // Counting before rounding could lose a phase when the stored float rounds
+    // onto a boundary. The published step limits this to at most two crossings.
+    const float advanced = phase + step * 0.5f;
+    const auto first = static_cast<std::uint32_t>(phase);
+    const auto count = static_cast<std::uint32_t>(advanced) - first;
+    const float wrapped = std::fmod(advanced, static_cast<float>(layout.phase_count));
+    if (!write_value(buffers, object, layout.counter, wrapped)) return false;
+    dispatch = {first, count};
+    return true;
+}
+
 bool update_frame_rate(const FrameRateLayout& layout, std::uint64_t module_base,
                             std::uint64_t vfr_object, std::uint32_t interval,
                             const horizon::GuestBuffers& buffers,

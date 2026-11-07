@@ -14,7 +14,7 @@
 // entry addresses with the bounded classifier (instruction.h) and register
 // effects (register_effects.h). It follows fallthrough, direct B/BL, both
 // outcomes of conditional branches, and baseline ADRP/LDR[/ADD]/BR GOT thunks
-// whose slot and target it validates. RET ends a path. Every other indirect
+// whose slot and target it validates. RET and RETAB end a path. Every other indirect
 // transfer, every word it cannot classify, and every target outside the
 // supplied executable ranges or declared external leaves is a structured
 // failure; nothing is assumed safe.
@@ -22,7 +22,7 @@
 // This is a reachability inventory only. It does not prove that any
 // instruction may run natively, does not identify exclusive-monitor windows,
 // does not recover jump tables, and never executes or modifies its input.
-// A complete collection ends every path at RET, a leaf or a terminal trap.
+// A complete collection ends every path at RET/RETAB, a leaf or a terminal trap.
 // Recorded failures leave the sites a lower bound; invalid input collects nothing.
 
 #pragma once
@@ -193,7 +193,7 @@ struct ReachableFailure {
 };
 
 enum class CollectionStatus : std::uint8_t {
-    complete,       // no failure; every path ended at RET, a leaf or a terminal trap
+    complete,       // no failure; every path ended at RET/RETAB, a leaf or a terminal trap
     partial,        // failures recorded; the inventory is a lower bound
     invalid_input,  // setup_error; nothing was collected
 };

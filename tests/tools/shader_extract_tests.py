@@ -73,6 +73,51 @@ def literal_yaz0(payload):
     return bytes(encoded)
 
 
+def literal_lz4(payload):
+    if len(payload) < 15:
+        return bytes([len(payload) << 4]) + payload
+    encoded = bytearray([0xF0])
+    remaining = len(payload) - 15
+    while remaining >= 255:
+        encoded.append(255)
+        remaining -= 255
+    encoded.append(remaining)
+    return bytes(encoded) + payload
+
+
+def nso_wrapper(container, compressed=False, empty_data=False, module_header=True):
+    """An authored NSO with shader containers in distinct image segments."""
+    segments = [bytearray(0x1000), bytearray(0x1000),
+                bytearray() if empty_data else bytearray(0x1000)]
+    image_offsets = (0, 0x4000, 0x8000)
+    for segment in segments:
+        if segment:
+            segment[0x100:0x100 + len(container)] = container
+    bss_size = 0x1800
+    if module_header:
+        struct.pack_into("<I", segments[0], 4, 0x80)
+        segments[0][0x80:0x84] = b"MOD0"
+        bss_start = image_offsets[2] + len(segments[2])
+        relative = (0x4000 - 0x80, bss_start - 0x80,
+                    bss_start + bss_size - 0x80, 0, 0, 0x8000 - 0x80)
+        struct.pack_into("<6i", segments[0], 0x84, *relative)
+    header = bytearray(0x100)
+    header[:4] = b"NSO0"
+    mask = sum(1 << i for i, segment in enumerate(segments) if compressed and segment)
+    struct.pack_into("<I", header, 0xC, 0x38 | mask)
+    struct.pack_into("<I", header, 0x3C, bss_size)
+    body = bytearray()
+    for index, segment in enumerate(segments):
+        stored = literal_lz4(segment) if mask & (1 << index) else bytes(segment)
+        file_offset = 0x100 + len(body) if stored else 0xFFFFFFFF
+        struct.pack_into("<III", header, 0x10 + index * 0x10,
+                         file_offset, image_offsets[index], len(segment))
+        struct.pack_into("<I", header, 0x60 + index * 4, len(stored))
+        header[0xA0 + index * 32:0xC0 + index * 32] = hashlib.sha256(segment).digest()
+        body.extend(stored)
+    return bytes(header + body)
+
+
 class ExtractionTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="armigo-extract-test-")
@@ -127,6 +172,73 @@ class ExtractionTests(unittest.TestCase):
             self.assertEqual(occurrence["program_key"], expected)
             self.assertEqual(occurrence["program_bytes"], len(code) - start - 24)
             self.assertEqual(occurrence["stage"], stage)
+
+    def test_nso_raw_lz4_image_offsets_and_output_bytes(self):
+        inventories = []
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                self.source.write_bytes(nso_wrapper(self.container, compressed))
+                output = self.root / ("lz4" if compressed else "raw")
+                result = self.run_tool(output, self.source)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                inventory = json.loads((output / "inventory.json").read_text())
+                self.assertEqual(inventory["unique_inputs"], 1)
+                self.assertEqual(inventory["unique_programs"], 1)
+                self.assertEqual([row["container_offset"] for row in inventory["occurrences"]],
+                                 [0x100, 0x4100, 0x8100])
+                for row in inventory["occurrences"]:
+                    directory = output / "stages" / row["input"]
+                    self.assertEqual((directory / "control.bin").read_bytes(), self.control)
+                    self.assertEqual((directory / "code.bin").read_bytes(), self.code)
+                    self.assertEqual(row["program_key"], hashlib.sha256(self.code[0x30:]).hexdigest())
+                inventories.append(inventory)
+        self.assertEqual(inventories[0], inventories[1])
+
+    def test_nso_empty_segment_and_zero_bss_are_not_shader_inputs(self):
+        self.source.write_bytes(nso_wrapper(self.container, compressed=True,
+                                            empty_data=True, module_header=False))
+        output = self.root / "empty-data"
+        result = self.run_tool(output, self.source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        inventory = json.loads((output / "inventory.json").read_text())
+        self.assertEqual([row["container_offset"] for row in inventory["occurrences"]],
+                         [0x100, 0x4100])
+        self.assertEqual(inventory["containers"], 2)
+        self.assertEqual(inventory["unique_inputs"], 1)
+
+    def test_nso_invalid_inputs_refuse_before_scanning_shader_bytes(self):
+        raw = nso_wrapper(self.container)
+        cases = []
+        corrupt = bytearray(raw)
+        corrupt[0xA0] ^= 1
+        cases.append(("hash", corrupt, "SHA-256"))
+        corrupt = bytearray(raw)
+        struct.pack_into("<I", corrupt, 0x20, len(corrupt) + 1)
+        cases.append(("range", corrupt, "file range"))
+        corrupt = bytearray(raw)
+        struct.pack_into("<I", corrupt, 0x24, 0x1000 - 1)
+        cases.append(("layout", corrupt, "layout"))
+        corrupt = bytearray(raw)
+        struct.pack_into("<I", corrupt, 0xC, 0x138)
+        cases.append(("flags", corrupt, "unsupported flag bits"))
+        # Keep the segment hash valid so the MOD0 range check is the refusal.
+        corrupt = bytearray(raw)
+        struct.pack_into("<I", corrupt, 0x100 + 0x84, 0x7FFFFFFF)
+        corrupt[0xA0:0xC0] = hashlib.sha256(corrupt[0x100:0x1100]).digest()
+        cases.append(("mod0", corrupt, "module header"))
+        corrupt = bytearray(nso_wrapper(self.container, compressed=True))
+        ro_file_offset = struct.unpack_from("<I", corrupt, 0x20)[0]
+        corrupt[ro_file_offset] = 0
+        cases.append(("lz4", corrupt, "LZ4"))
+        cases.append(("truncated", raw[:24], "header"))
+        for name, payload, diagnostic in cases:
+            with self.subTest(name=name):
+                self.source.write_bytes(payload)
+                output = self.root / name
+                result = self.run_tool(output, self.source)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stderr)
+                self.assertEqual(list((output / "stages").rglob("*.bin")), [])
 
     def test_output_cannot_be_nested_under_input_directory(self):
         inputs = self.root / "inputs"

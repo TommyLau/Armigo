@@ -71,6 +71,13 @@ public:
         return *this;
     }
 
+    Builder& implicit_general(unsigned number, Register31 at_31, Access access,
+                              OperandRole role) noexcept {
+        add(RegisterOperand{.field = implicit_operand, .number = static_cast<std::uint8_t>(number),
+            .file = RegisterFile::general, .at_31 = at_31, .bits = 64, .access = access, .role = role});
+        return *this;
+    }
+
     Builder& implicit_link() noexcept {
         add(RegisterOperand{.field = implicit_operand,
                             .number = link_register,
@@ -235,6 +242,11 @@ RegisterEffects classified(const Instruction& instruction) noexcept {
             .implicit_link()
             .control(ControlFlow::indirect_call);
         break;
+    case Opcode::retab:
+        builder.implicit_general(30, zr, Access::read, OperandRole::branch_target)
+            .implicit_general(31, Register31::stack_pointer, Access::read, OperandRole::source)
+            .control(ControlFlow::return_);
+        break;
     case Opcode::ret:
         builder.general(rn_field, zr, 64, Access::read, OperandRole::branch_target)
             .control(ControlFlow::return_);
@@ -268,7 +280,38 @@ RegisterEffects classified(const Instruction& instruction) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// Hints and barriers with no register operand.
+// Pointer-authentication effects, followed by operand-free hints and barriers.
+
+RegisterEffects authentication_effects(std::uint32_t word, PointerAuthentication kind) noexcept {
+    using P = PointerAuthentication;
+    constexpr auto zr = Register31::zero_register, sp = Register31::stack_pointer;
+    Builder builder(word);
+    switch (kind) {
+    case P::pacibsp: case P::autibsp: case P::autiasp: case P::xpaclri:
+        builder.operation(kind == P::pacibsp ? Operation::pacibsp : kind == P::autibsp ? Operation::autibsp :
+            kind == P::autiasp ? Operation::autiasp : Operation::xpaclri)
+            .implicit_general(30, zr, Access::read_write, OperandRole::destination);
+        if (kind != P::xpaclri) builder.implicit_general(31, sp, Access::read, OperandRole::source);
+        return builder.decoded();
+    case P::autia1716: case P::autib1716:
+        return builder.operation(kind == P::autia1716 ? Operation::autia1716 : Operation::autib1716)
+            .implicit_general(17, zr, Access::read_write, OperandRole::destination)
+            .implicit_general(16, zr, Access::read, OperandRole::source).decoded();
+    case P::pacia: case P::pacib: case P::autib:
+        return builder.operation(kind == P::pacia ? Operation::pacia : kind == P::pacib ? Operation::pacib : Operation::autib)
+            .general(rd_field, zr, 64, Access::read_write, OperandRole::destination)
+            .general(rn_field, sp, 64, Access::read, OperandRole::source).decoded();
+    case P::xpaci:
+        return builder.operation(Operation::xpaci)
+            .general(rd_field, zr, 64, Access::read_write, OperandRole::destination).decoded();
+    case P::pacga:
+        return builder.operation(Operation::pacga)
+            .general(rd_field, zr, 64, Access::write, OperandRole::destination)
+            .general(rn_field, zr, 64, Access::read, OperandRole::source)
+            .general(rm_field, sp, 64, Access::read, OperandRole::source).decoded();
+    default: return unknown(word);
+    }
+}
 
 RegisterEffects hint_or_barrier(std::uint32_t word) noexcept {
     if (word == 0xD503201Fu) {
@@ -2700,6 +2743,11 @@ RegisterEffects simd_vector_data(std::uint32_t word) noexcept {
 } // namespace
 
 RegisterEffects decode_register_effects(std::uint32_t word) noexcept {
+    const auto authentication = pointer_authentication(word);
+    if (authentication == PointerAuthentication::unsupported) return unknown(word);
+    if (authentication != PointerAuthentication::none && authentication != PointerAuthentication::retab)
+        return authentication_effects(word, authentication);
+
     const Instruction instruction = decode(word);
     if (instruction.classified()) {
         return classified(instruction);

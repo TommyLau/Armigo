@@ -11,6 +11,7 @@
 #include <armigo/loader/nso_module.h>
 
 #include "sha256.h"
+#include "zbic.h"
 
 #include <cstring>
 #include <new>
@@ -39,7 +40,9 @@ constexpr std::uint32_t kSupportedVersion = 0;
 // Bits 0-2 mark compressed segments; bits 3-5 request hash verification.
 constexpr std::uint32_t kCompressedFlagShift = 0;
 constexpr std::uint32_t kHashFlagShift = 3;
-constexpr std::uint32_t kKnownFlags = 0x3F;
+constexpr std::uint32_t kExecuteOnly = 1u << 6;
+constexpr std::uint32_t kZbicCompression = 1u << 7;
+constexpr std::uint32_t kKnownFlags = 0xFF;
 
 constexpr std::array<std::byte, 4> kNsoMagic{std::byte{'N'}, std::byte{'S'}, std::byte{'O'},
                                              std::byte{'0'}};
@@ -83,7 +86,7 @@ NsoReadResult failure(NsoError code, std::uint64_t detail = 0,
                       std::optional<NsoSegmentKind> segment = std::nullopt,
                       Lz4Error lz4 = Lz4Error::success) {
     NsoReadResult result;
-    result.error = NsoReadError{code, segment, lz4, detail};
+    result.error = NsoReadError{code, segment, lz4, detail, {}};
     return result;
 }
 
@@ -189,6 +192,8 @@ const char* to_string(NsoError error) noexcept {
         return "NSO module image exceeds the configured size limit";
     case NsoError::decompression_failed:
         return "NSO segment LZ4 decompression failed";
+    case NsoError::zbic_decompression_failed:
+        return "NSO segment ZBIC decompression failed";
     case NsoError::hash_mismatch:
         return "NSO segment SHA-256 does not match the stored hash";
     case NsoError::rodata_extent_invalid:
@@ -286,6 +291,7 @@ NsoReadResult read_nso_module(std::span<const std::byte> file, const NsoReadOpti
     }
 
     NsoModuleImage image;
+    image.zbic_compression = (flags & kZbicCompression) != 0;
     std::copy_n(file.begin() + 0x40, image.build_id.size(), image.build_id.begin());
     image.bss_offset = bss_offset;
     image.bss_size = bss_size;
@@ -321,7 +327,13 @@ NsoReadResult read_nso_module(std::span<const std::byte> file, const NsoReadOpti
         const std::span<const std::byte> source =
             h.file_size != 0 ? file.subspan(h.file_offset, h.file_size)
                              : std::span<const std::byte>{};
-        if (h.compressed) {
+        if (h.compressed && (flags & kZbicCompression)) {
+            if (const auto failed = detail::decompress_zbic(source, destination)) {
+                auto result = failure(NsoError::zbic_decompression_failed, 0, kind_of(i));
+                result.error.decoder_detail = *failed;
+                return result;
+            }
+        } else if (h.compressed) {
             const Lz4Result decoded = decompress_lz4_block(source, destination);
             if (!decoded.ok()) {
                 return failure(NsoError::decompression_failed, decoded.input_offset, kind_of(i),
@@ -355,7 +367,8 @@ NsoReadResult read_nso_module(std::span<const std::byte> file, const NsoReadOpti
 
     NsoSegment& text_segment = image.segments[0];
     text_segment.mapped_size = align_up(text.size);
-    text_segment.permission = SegmentPermission::read | SegmentPermission::execute;
+    text_segment.permission = (flags & kExecuteOnly) ? SegmentPermission::execute
+        : SegmentPermission::read | SegmentPermission::execute;
     NsoSegment& rodata_segment = image.segments[1];
     rodata_segment.mapped_size = align_up(rodata.image_offset + rodata.size) - rodata.image_offset;
     rodata_segment.permission = SegmentPermission::read;

@@ -83,8 +83,11 @@ struct DecodedFrame {
 
 // Decoded frames waiting for the compositor. A decoder channel queues the
 // pictures it shows in decode order, each with the luma surface offset it was
-// decoded for; the compositor names one of those offsets once to find the
-// decoder channel and then takes that channel's oldest picture.
+// decoded for. The compositor reads the surface it names: the channel holding
+// that surface supplies its latest picture, and the older pictures queued
+// before it go too, because the player skipped them and the hardware overwrote
+// them. A picture shown again from an earlier surface is not queued under the
+// surface named, so the oldest queued picture of the channel is next instead.
 class FrameQueue {
 public:
     void open(std::uint32_t fd);
@@ -92,8 +95,10 @@ public:
     void push(std::uint32_t fd, std::uint64_t luma_offset, std::shared_ptr<const DecodedFrame> frame);
     // The decoder channel with a queued picture for `luma_offset`, or -1.
     std::int64_t find_decoder(std::uint64_t luma_offset);
-    // The oldest queued picture of decoder channel `fd`, or null.
-    std::shared_ptr<const DecodedFrame> take(std::int64_t fd);
+    // The latest queued picture of decoder channel `fd` for `luma_offset`,
+    // dropping the pictures queued before it; without one, the channel's
+    // oldest queued picture. Null when the channel has none.
+    std::shared_ptr<const DecodedFrame> take(std::int64_t fd, std::uint64_t luma_offset);
     // Whether decoder channel `fd` is open.
     bool is_open(std::int64_t fd);
 

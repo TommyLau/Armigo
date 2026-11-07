@@ -10,6 +10,7 @@
 
 #include <armigo/execution/gate_code.h>
 #include <armigo/execution/gate_patch.h>
+#include <armigo/execution/guest_fault.h>
 #include <armigo/aarch64/instruction.h>
 #include <armigo/horizon/arbitration.h>
 #include <armigo/platform/guest_stack.h>
@@ -1779,6 +1780,40 @@ void test_authoritative_repin_failures(const LoadedCode& code) {
 
 } // namespace
 
+void test_guest_fault_report(const LoadedCode& code) {
+    // The entry's first load reads [x0 + 40]: x0 = 0x10 faults on the zero page.
+    install_guest_fault_handler();
+    Environment environment(code);
+    auto runtime = make_runtime(environment);
+    if (!runtime) return;
+    EntryReport report;
+    auto created = [&] {
+        auto launch = thread_launch(environment, code, report, environment.memory->initial_pin());
+        launch.entry.x0 = 0x10;
+        return REQUIRE_CREATED(runtime->create(launch));
+    }();
+    CHECK(ok(runtime->start(created.handle)));
+    CHECK(ok(runtime->join(std::nullopt)));
+    const auto snapshot = std::get<ThreadSnapshot>(runtime->snapshot(created.handle));
+    CHECK(snapshot.state == ThreadState::exited && snapshot.failure.has_value());
+    const auto failure = runtime->failure();
+    CHECK(failure.has_value());
+    if (!failure) return;
+    const auto load = code.modules->mapping(0).base_address() + code_offset(armigo_thread_runtime_entry) + 4;
+    char location[64];
+    std::snprintf(location, sizeof location, "SIGSEGV at thread-runtime+0x%llx",
+                  static_cast<unsigned long long>(code_offset(armigo_thread_runtime_entry) + 4));
+    CHECK(failure->code == LaunchError::guest_fault && failure->stage == LaunchStage::threads);
+    CHECK(failure->guest_pc == load);
+    CHECK(failure->thread_id == created.record->id());
+    CHECK(failure->detail.find(location) != std::string::npos);
+    CHECK(failure->detail.find("address 0x38") != std::string::npos);
+    CHECK(failure->detail.find("No supervisor call yet.") != std::string::npos);
+    CHECK(failure->detail.find(" x19=0x10 ") != std::string::npos);
+    CHECK(report.stack_pointer == 0);
+    CHECK(created.record->exited() && environment.memory->live_pins.load() == 0);
+}
+
 int main() {
     const auto code = load_code();
     if (!code) {
@@ -1807,6 +1842,7 @@ int main() {
     test_join_reentry_from_worker_and_stop(*code);
     test_join_dependency_cleanup(*code);
     test_authoritative_repin_failures(*code);
+    test_guest_fault_report(*code);
     if (failures == 0) {
         std::puts("Native thread runtime lifecycle and validation tests passed.");
     }

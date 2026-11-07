@@ -116,6 +116,42 @@ int main() {
         "\n" R"("override_flag":"0x0","ratio":"0x4","interval":"0x8","base_interval":"0xc"})",
         R"("layout":{"variant":"fractional-counter-30","framework_pointer":"0x200","framework_period":"0x10",)"
         R"("object_register":22,"state":"0x0","active_state":2,"counter":"0x48"})");
+    {
+        auto phase_json = replace(json, R"("base_interval":"0xc"})",
+            R"("base_interval":"0xc","frame_step":"0x208"})");
+        phase_json = replace(phase_json, R"("calls":[)",
+            R"("frame_rate":{"default":60,"display_refresh_rate":60},"frame_rates":[60,120],"calls":[)");
+        phase_json = replace(phase_json, R"("note":"Synthetic interval-update hook."}])",
+            R"("note":"Synthetic interval-update hook."},{"offset":"0x24","expected_instruction":"0x9400001b","frame_rate":120,"note":"Synthetic phase scheduler.","phases":{"original_callee":"0x90","counter":"0x0","phase_count":10}}])");
+        auto read_phases = parse(phase_json);
+        CHECK(std::holds_alternative<compat::PatchDescriptions>(read_phases));
+        if (const auto* parsed = std::get_if<compat::PatchDescriptions>(&read_phases)) {
+            const auto& phased = parsed->front();
+            auto phase_image = image;
+            const std::uint32_t branch = 0x9400001b;
+            std::memcpy(phase_image.bytes.data() + 0x24, &branch, 4);
+            CHECK(compat::validate_patch(phased, phase_image).empty());
+            CHECK(compat::call_callee(phased, phased.calls[0]) == 0x80);
+            CHECK(compat::call_callee(phased, phased.calls[1]) == 0x90);
+            for (const auto rate : {"", "0", "60"}) {
+                auto selected = compat::select_patch_calls(phased, rate);
+                CHECK(std::get<std::vector<compat::CallPatch>>(selected).size() == 1);
+                CHECK(std::get<std::vector<compat::WordPatch>>(compat::select_patch_words(phased, rate)).empty());
+            }
+            CHECK(std::get<std::vector<compat::CallPatch>>(compat::select_patch_calls(phased, "120")).size() == 2);
+            auto invalid_phase = phased;
+            invalid_phase.calls[1].phases->original_callee = 0x80;
+            CHECK(!compat::validate_patch(invalid_phase, phase_image).empty());
+            invalid_phase = phased; invalid_phase.layout.frame_step = 0;
+            CHECK(!compat::validate_patch(invalid_phase, phase_image).empty());
+        }
+        for (const auto count : {"0", "65536", "true", "1.5", "-1"})
+            CHECK(std::holds_alternative<std::string>(parse(replace(phase_json, R"("phase_count":10)",
+                (std::string("\"phase_count\":") + count).c_str()))));
+        CHECK(std::holds_alternative<std::string>(parse(replace(phase_json, R"("counter":"0x0")", R"("counter":"0x1")"))));
+        CHECK(std::holds_alternative<std::string>(parse(replace(phase_json, R"(,"frame_step":"0x208")", ""))));
+        CHECK(std::holds_alternative<std::string>(parse(replace(phase_json, R"("phase_count":10)", R"("unknown":10)"))));
+    }
     const auto counter_read = parse(counter_json);
     CHECK(std::holds_alternative<compat::PatchDescriptions>(counter_read));
     if (const auto* descriptions = std::get_if<compat::PatchDescriptions>(&counter_read)) {
@@ -253,6 +289,16 @@ int main() {
         R"("expected_instruction":"0x32170108","replacement_instruction":"0xd503203f","frame_rate":120},)";
     const auto variants_json = replace(replace(conditional_json, R"("frame_rates":[30,60])",
         R"("frame_rates":[30,60,120])"), R"("words":[)", (R"("words":[)" + private_word).c_str());
+    const auto experimental_json = replace(variants_json, R"("display_refresh_rate":60)",
+        R"("display_refresh_rate":60,"experimental_rates":[120])");
+    const auto experimental = parse(experimental_json);
+    CHECK(std::holds_alternative<compat::PatchDescriptions>(experimental));
+    if (const auto* parsed = std::get_if<compat::PatchDescriptions>(&experimental))
+        CHECK(parsed->front().frame_rate->experimental_rates == std::vector<std::uint32_t>({120}));
+    CHECK(std::holds_alternative<std::string>(parse(replace(experimental_json,
+        R"("experimental_rates":[120])", R"("experimental_rates":[120,120])"))));
+    CHECK(std::holds_alternative<std::string>(parse(replace(experimental_json,
+        R"("frame_rates":[30,60,120])", R"("frame_rates":[30,60])"))));
     const auto variants = parse(variants_json);
     CHECK(std::holds_alternative<compat::PatchDescriptions>(variants));
     if (const auto* descriptions = std::get_if<compat::PatchDescriptions>(&variants)) {

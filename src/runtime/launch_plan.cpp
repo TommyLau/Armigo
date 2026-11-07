@@ -141,6 +141,7 @@ struct Loading {
     // Instruction words of the main module replaced by the title's patch.
     std::optional<std::size_t> word_module;
     std::vector<compat::WordPatch> words;
+    std::optional<compat::CallPatch> gpu_budget_hook;
 };
 
 std::size_t compatibility_bytes(const Loading& loading, std::size_t index,
@@ -237,7 +238,7 @@ bool prepare_loaded_module(const ModulePreparationView& view, void* raw) noexcep
                     return false;
                 }
                 const auto stub = gate_address + loading.hook_gate.size() + i * 16;
-                auto hook = execution::make_call_hook_patch(actual, view.base_address + site.offset,
+                auto hook = compat::make_patch_hook(site, actual, view.base_address + site.offset,
                     stub, {gate_address, loading.hook_gate.size()});
                 if (!hook.ok()) {
                     loading.compatibility_error = execution::describe(hook.error);
@@ -388,6 +389,10 @@ LaunchResult<PreparedLaunch> load_prepared_launch(
                         if (const auto* failure = std::get_if<std::string>(&planned))
                             return fail(LaunchError::artifact_mismatch, "compatibility-resolution", *failure);
                         const auto& resolution = std::get<title::ResolutionPlan>(planned);
+                        loading.gpu_budget_hook = resolution.gpu_budget_hook;
+                        if (loading.gpu_budget_hook && patch->module != "frame-rate")
+                            return fail(LaunchError::unsupported, "compatibility-resolution",
+                                        "GPU-work feedback requires the title frame-rate module.");
                         if (!resolution.words.empty())
                             armigo::diag::write(armigo::diag::Level::info,  "compat_resolution width=%u height=%u render_target_pool=%llu "
                                          "graphics_heap=%llu process_heap=%llu root_heap=%llu floor=%.4f load_scale=%.1f\n",
@@ -422,6 +427,10 @@ LaunchResult<PreparedLaunch> load_prepared_launch(
                     if (!patch->module.empty()) {
                         loading.compatibility_module = index;
                         loading.compatibility_patch = std::make_shared<compat::InstalledPatch>(compat::InstalledPatch{*patch, 0});
+                        if (loading.gpu_budget_hook)
+                            loading.compatibility_patch->description.calls.push_back(*loading.gpu_budget_hook);
+                        if (auto error = compat::validate_patch(loading.compatibility_patch->description, source); !error.empty())
+                            return fail(LaunchError::artifact_mismatch, "compatibility-preflight", std::move(error));
                         loading.hook_gate = execution::make_local_gate_code();
                     }
                 }
@@ -454,6 +463,8 @@ LaunchResult<PreparedLaunch> load_prepared_launch(
                 return fail(LaunchError::invalid_input, "compatibility-frame-rate", *failure);
         }
         if (loading.compatibility_patch) {
+            if (loading.gpu_budget_hook && !loading.nvn_module)
+                return fail(LaunchError::unsupported, "compatibility-resolution", "GPU-work feedback requires the NVN driver.");
             auto& description = loading.compatibility_patch->description;
             auto selected = compat::select_patch_calls(description, requested_title_rate, loading.nvn_module.has_value());
             if (const auto* failure = std::get_if<std::string>(&selected))
@@ -468,6 +479,9 @@ LaunchResult<PreparedLaunch> load_prepared_launch(
                     return fail(LaunchError::artifact_mismatch, "compatibility-preflight",
                                 "Compatibility callee lacks prepared instruction coverage.");
                 for (const auto& call : description.calls) {
+                    if (!preparation::covers(prepared, compat::call_callee(description, call)))
+                        return fail(LaunchError::artifact_mismatch, "compatibility-preflight",
+                                    "Compatibility call callee lacks prepared instruction coverage.");
                     if (!preparation::covers(prepared, call.offset) ||
                         std::any_of(prepared.replacements.begin(), prepared.replacements.end(),
                             [&](const auto& item) { return item.image_offset == call.offset; }) ||
@@ -477,6 +491,7 @@ LaunchResult<PreparedLaunch> load_prepared_launch(
                             "Compatibility call must be covered and unchanged by offline preparation.");
                 }
                 compat::set_present_link(description.present_link);
+                compat::initialize_gpu_budget(*loading.compatibility_patch);
             }
         }
         if (!loading.nvn_module)

@@ -51,6 +51,7 @@ struct PlayerChoices {
     bool title_frame_rate = false;
     std::uint32_t default_frame_rate = 60;
     std::vector<std::uint32_t> supported_frame_rates = {30, 60};
+    std::vector<std::uint32_t> experimental_frame_rates;
     std::uint32_t display_refresh_rate = 0; // zero follows the frame-rate choice
     bool vsync = true;                 // macOS; iOS always synchronises
     bool performance_overlay = false;  // Apple's Metal performance HUD
@@ -67,6 +68,7 @@ PlayerChoices read_player_choices();
 // unsupported stored choices fall back to the highest declared rate <= clock.
 struct MacFrameRateSelection {
     std::vector<int> options;
+    std::vector<std::uint32_t> experimental_rates;
     int frame_rate = 0;
     double refresh_hz = 60.0;
     bool fell_back = false;

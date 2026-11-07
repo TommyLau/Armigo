@@ -253,17 +253,14 @@ bool blocking_wait(const std::function<bool()> &wait, const char *tag) {
   }
   // A guest thread blocked on a fence is invisible in the GPU's own clock.
   const auto thread = std::uint64_t(std::hash<std::thread::id>{}(std::this_thread::get_id()));
-  static thread_local char wait_name[64];
-  std::snprintf(wait_name, sizeof wait_name, "wait_begin:%s", tag ? tag : "wait");
-  timeline_event(wait_name, thread, 0);
+  timeline_wait_event(true, tag, thread, 0);
   const auto begin = timeline_now_ns();
   bool result = false;
   if (const BlockingWaitHook hook = wait_hook.load(std::memory_order_acquire))
     result = hook(wait);
   else
     result = wait();
-  std::snprintf(wait_name, sizeof wait_name, "wait_end:%s", tag ? tag : "wait");
-  timeline_event(wait_name, thread, timeline_now_ns() - begin);
+  timeline_wait_event(false, tag, thread, timeline_now_ns() - begin);
   return result;
 }
 
