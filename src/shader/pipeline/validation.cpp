@@ -10,6 +10,7 @@
 
 #include "ir.h"
 #include "facts.h"
+#include "handle_program.h"
 
 #include <algorithm>
 #include <bit>
@@ -25,9 +26,14 @@ Effects required_effects(const Operation& op) {
         effects = effects | Effects::atomic | Effects::read_memory | Effects::write_memory;
     if (const auto* texture = std::get_if<TextureInfo>(&op.info)) {
         effects = effects | Effects::texture;
+        // Implicit-LOD and bias samples and LOD queries take their level of
+        // detail from the quad's derivatives. A gather takes none: it reads the
+        // 2x2 footprint of its coordinate in the base level. The guest's gather
+        // instructions encode no level of detail, a SPIR-V or Metal gather has
+        // no level or derivative operand, and SPIR-V admits gathers in every
+        // stage while it restricts implicit-LOD sampling to fragments.
         if (texture->mode == TextureMode::sample_implicit || texture->mode == TextureMode::sample_bias ||
-            texture->mode == TextureMode::query_lod ||
-            (texture->mode == TextureMode::gather && !texture->level_or_bias)) effects = effects | Effects::derivative;
+            texture->mode == TextureMode::query_lod) effects = effects | Effects::derivative;
     }
     return effects;
 }
@@ -158,9 +164,15 @@ bool Validator::metadata(const Operation& op) {
                 !index(target.address.byte_size)) return false;
         if (!m->storage_alternatives.empty() && !m->storage_address)
             return fail("Storage alternatives require a primary storage address", op.source);
-        if ((m->global_address_high || m->storage_address) &&
-            (m->space != AddressSpace::storage || !m->dynamic_byte_offset))
+        if ((m->storage_address && m->space != AddressSpace::storage) ||
+            (m->global_address_high && m->space != AddressSpace::storage && m->space != AddressSpace::guest) ||
+            ((m->global_address_high || m->storage_address) && !m->dynamic_byte_offset))
             return fail("Global address metadata requires a storage address", op.source);
+        // A guest access names the full 64-bit guest address: the low word
+        // in the dynamic offset role and the high word, plus a displacement.
+        if (m->space == AddressSpace::guest && (!m->dynamic_byte_offset || !m->global_address_high ||
+            m->storage_address || !m->storage_alternatives.empty() || m->array_index))
+            return fail("Guest memory access requires exactly a 64-bit guest address", op.source);
         if (m->storage_address && form == IrForm::ssa)
             return fail("Runtime storage descriptor appears before legalization", op.source);
         for (auto role : {m->dynamic_byte_offset, m->array_index, m->global_address_high})
@@ -185,7 +197,8 @@ bool Validator::metadata(const Operation& op) {
             return fail("Nonconstant memory operation has a constant-buffer slot", op.source);
         if (m->space == AddressSpace::constant_buffer && m->resource && form != IrForm::legal)
             return fail("Register/SSA constant-buffer access must use its guest slot", op.source);
-        if (form == IrForm::legal && (m->space == AddressSpace::storage || m->space == AddressSpace::constant_buffer) &&
+        if (form == IrForm::legal && (m->space == AddressSpace::storage || m->space == AddressSpace::constant_buffer ||
+            m->space == AddressSpace::guest) &&
             op.opcode != Opcode::barrier && op.opcode != Opcode::memory_barrier && !m->resource)
             return fail("Legal buffer access has no resolved resource", op.source);
         if (op.opcode == Opcode::load && (m->access != Access::read || op.outputs.size() != m->elements || !m->data.empty()))
@@ -212,12 +225,24 @@ bool Validator::metadata(const Operation& op) {
                 return index(dynamic->input);
             }
             const auto& key = std::get<TextureKey>(source);
-            return (key.cbuf_slot < 18 && key.handle_byte_offset % 4 == 0) || fail("Invalid texture handle address", op.source);
+            // A key at handle_program_slot names a host-computed handle and one at
+            // texture_pool_slot a pool read (handle_program.h).
+            return ((key.cbuf_slot < 18 || key.cbuf_slot == handle_program_slot || key.cbuf_slot == texture_pool_slot) &&
+                    key.handle_byte_offset % 4 == 0) ||
+                   fail("Invalid texture handle address", op.source);
         };
         if (!handle(t->texture) || (t->sampler && !handle(*t->sampler)) || !indices(t->coordinates) ||
             !indices(t->gradients_x) || !indices(t->gradients_y) || !indices(t->offsets) || !indices(t->data) ||
             !index(t->array_layer) || !index(t->array_index) || !index(t->level_or_bias) ||
-            !index(t->compare) || !index(t->sample_index) || !index(t->lod_clamp)) return false;
+            !index(t->compare) || !index(t->sample_index) || !index(t->lod_clamp) ||
+            !index(t->pool_texture) || !index(t->pool_sampler)) return false;
+        const auto pooled = [](const std::optional<HandleSource>& source) {
+            const auto* key = source ? std::get_if<TextureKey>(&*source) : nullptr;
+            return key && key->cbuf_slot == texture_pool_slot;
+        };
+        if (pooled(t->texture) != t->pool_texture.has_value() || (t->sampler && pooled(t->sampler) != t->pool_sampler.has_value()) ||
+            (!t->sampler && t->pool_sampler))
+            return fail("Texture pool key and pool handle roles disagree", op.source);
         const bool image = op.opcode == Opcode::image_load || op.opcode == Opcode::image_store || op.opcode == Opcode::image_atomic;
         if ((image && t->mode != TextureMode::fetch) ||
             (op.opcode == Opcode::texture_sample && t->mode > TextureMode::fetch) ||
@@ -366,6 +391,22 @@ bool Validator::operand_types(const Operation& op) {
     case OperandSchema::mask_to_predicate: matches = in(0, ValueType::word32) && out(0, ValueType::predicate); break;
     case OperandSchema::is_nan: matches = in(0, numeric) && out(0, ValueType::predicate); break;
     case OperandSchema::shuffle: matches = all(op.inputs, ValueType::word32) && out(0, ValueType::word32) && out(1, ValueType::predicate); break;
+    case OperandSchema::matrix: matches = all(op.inputs, ValueType::word32) && all(op.outputs, ValueType::word32); break;
+    case OperandSchema::reduction: {
+        const auto* info = std::get_if<SubgroupInfo>(&op.info);
+        const auto kind = info ? info->reduction : std::nullopt;
+        // A word's integer interpretation, unsigned or (for the extrema only)
+        // signed, with no rounding, flush or saturation.
+        const auto& n = op.numeric;
+        const bool plain = n.rounding == Rounding::not_applicable && !n.flush_inputs && !n.flush_output && !n.saturate && !n.precise;
+        const bool unsigned_mode = n.domain == Domain::unsigned_integer && n.scalar == ScalarType::u32;
+        const bool signed_mode = n.domain == Domain::signed_integer && n.scalar == ScalarType::s32;
+        const bool extremum = kind == AtomicKind::minimum || kind == AtomicKind::maximum;
+        matches = all(op.inputs, ValueType::word32) && all(op.outputs, ValueType::word32) && plain &&
+                  (kind == AtomicKind::add || extremum || kind == AtomicKind::bit_or || kind == AtomicKind::bit_xor) &&
+                  (unsigned_mode || (signed_mode && extremum));
+        break;
+    }
     case OperandSchema::memory: case OperandSchema::texture: case OperandSchema::io: case OperandSchema::call: case OperandSchema::none: break;
     }
     return matches || fail("Operand storage types disagree with opcode schema", op.source);

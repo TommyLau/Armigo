@@ -69,6 +69,22 @@ PlayerChoices read_player_choices() {
     }
 }
 
+std::optional<int> read_frame_rate_preference(const std::string& key) {
+    @autoreleasepool {
+        id value = [NSUserDefaults.standardUserDefaults objectForKey:@(key.c_str())];
+        if (![value isKindOfClass:[NSNumber class]]) return std::nullopt;
+        return [value intValue];
+    }
+}
+
+void write_frame_rate_preference(const std::string& key, int rate) {
+    @autoreleasepool {
+        [NSUserDefaults.standardUserDefaults setInteger:rate forKey:@(key.c_str())];
+        // A restart replaces the process right after the choice; keep it.
+        [NSUserDefaults.standardUserDefaults synchronize];
+    }
+}
+
 std::vector<std::string> preferred_host_locales() {
     @autoreleasepool {
         // The app's own language (the per-app language the system's Language &

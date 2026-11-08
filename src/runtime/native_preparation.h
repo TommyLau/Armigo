@@ -76,7 +76,7 @@ struct ModuleCodePreparation {
     std::uint64_t text_begin = 0;
     std::uint64_t text_size = 0;
     std::optional<loader::ModuleHeaderInfo> module_header;
-    execution::ScalarX18Policy stack_contract{true, true, true};
+    execution::ScalarX18Policy stack_contract{true, true, true, true};
     // Embedded only: image offsets of MOVZ/MOVK words whose immediate is
     // chosen at launch. Each becomes a gate site that holds the original word
     // (16 appendix bytes each, beyond scan_text's count); the launch gives the

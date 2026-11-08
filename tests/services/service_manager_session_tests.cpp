@@ -76,7 +76,7 @@ struct Fixture {
     IpcCallContext context;
     Handle sm_handle = 0;
 
-    explicit Fixture(bool close_on_hipc = false)
+    Fixture()
         : dispatcher(handles, connect_port, this), context{71, message, read_byte, nullptr} {
         ProcessConfig process{71, true, {std::byte{3}, std::byte{'u'}, std::byte{'n'},
             std::byte{'i'}, std::byte{'t'}, std::byte{3}, std::byte{'w'}, std::byte{'a'},
@@ -93,7 +93,7 @@ struct Fixture {
                 const auto handle = handles.insert(client);
                 CHECK(handle.has_value());
                 return LookupResult{LookupKind::connected, handle.value_or(0), 0};
-            }, close_on_hipc);
+            });
         registers.fill(0x1234);
         registers[1] = 0x2000;
         CHECK(dispatcher.dispatch(0x1f, registers, context) == IpcDisposition::handled);
@@ -195,7 +195,7 @@ void test_explicit_unsupported() {
     CHECK(f.send(f.sm_handle) == IpcDisposition::unsupported && f.connections == 0);
 }
 void test_remote_close_lifecycle() {
-    Fixture f(true);
+    Fixture f;
     f.register_client();
     f.message = lookup("unit");
     CHECK(f.send(f.sm_handle) == IpcDisposition::handled);
@@ -203,7 +203,7 @@ void test_remote_close_lifecycle() {
     CHECK(f.handles.lookup(client) == f.client && !f.server_lifetime.expired());
     f.message = {}; put(f.message, 0, 2, 4);
     const auto close_message = f.message;
-    CHECK(f.send(f.sm_handle) == IpcDisposition::handled && f.registers[0] == 0);
+    CHECK(f.send(f.sm_handle) == IpcDisposition::handled && f.registers[0] == 0xf601);
     CHECK(f.message == close_message && f.handles.lookup(f.sm_handle) == f.sm);
     CHECK(f.server_lifetime.expired());
     const auto connections = f.connections;
@@ -222,24 +222,16 @@ void test_remote_close_lifecycle() {
     f.message = lookup("unit");
     CHECK(f.send(f.sm_handle) == IpcDisposition::handled && f.registers[0] == 0xe401);
 
-    Fixture pending(true);
+    Fixture pending;
     pending.register_client();
     pending.message = lookup("wait");
     CHECK(pending.send(pending.sm_handle) == IpcDisposition::pending);
     pending.message = close_message;
-    CHECK(pending.send(pending.sm_handle) == IpcDisposition::handled && pending.registers[0] == 0);
+    CHECK(pending.send(pending.sm_handle) == IpcDisposition::handled && pending.registers[0] == 0xf601);
     pending.available = true;
     const auto retry = pending.sm->service_registered(service_name("wait"));
     CHECK(retry.disposition == IpcDisposition::handled && retry.transport_result == 0xf601);
     CHECK(pending.connections == 1 && pending.server_lifetime.expired());
-
-    Fixture legacy;
-    legacy.register_client();
-    legacy.message = close_message;
-    CHECK(legacy.send(legacy.sm_handle) == IpcDisposition::handled && legacy.registers[0] == 0);
-    CHECK(!legacy.server_lifetime.expired());
-    legacy.message = lookup("unit");
-    CHECK(legacy.send(legacy.sm_handle) == IpcDisposition::handled && get(legacy.message, 16, 4) == 0);
 }
 }  // namespace
 

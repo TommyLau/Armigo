@@ -9,6 +9,7 @@
 // ============================================================================
 
 #include "player_settings.h"
+#include "npdm_fixture.h"
 
 #include <armigo/services/settings.h>
 #include <armigo/compat/patches.h>
@@ -19,8 +20,12 @@
 #include <fstream>
 #include <string>
 #include <algorithm>
+#include <cstring>
 #include <limits>
+#include <optional>
 #include <string_view>
+#include <unistd.h>
+#include <vector>
 
 namespace {
 
@@ -191,9 +196,187 @@ void test_mac_frame_rates() {
 
 }
 
+namespace {
+
+const char* const frame_rate_environment[] = {"ARMIGO_COMPAT_FRAME_RATE", "ARMIGO_VI_REFRESH_HZ",
+    "ARMIGO_COMPAT_RESOLUTION_RATE", "ARMIGO_COMPAT_RESOLUTION_WIDTH"};
+
+std::string environment_text(const char* name) {
+    const char* value = std::getenv(name);
+    return value ? value : "unset";
+}
+
+void write_file(const std::filesystem::path& path, const void* data, std::size_t size) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream(path, std::ios::binary).write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
+}
+
+} // namespace
+
+void test_title_frame_rate_policy() {
+    namespace fs = std::filesystem;
+    using namespace armigo::tools;
+    const auto root = fs::temp_directory_path() / ("armigo-player-policy-" + std::to_string(::getpid()));
+    fs::remove_all(root);
+    const auto exefs = root / "exefs";
+    const auto npdm = npdm_fixture::profile_image_a().bytes;
+    write_file(exefs / "main.npdm", npdm.data(), npdm.size());
+    std::vector<unsigned char> header(0x100);
+    std::memcpy(header.data(), "NSO0", 4);
+    for (unsigned index = 0; index < 32; ++index) header[0x40 + index] = static_cast<unsigned char>(index + 1);
+    write_file(exefs / "main", header.data(), header.size());
+    const std::string profile = R"({"version":1,"patches":[{"title_id":"0x0200000000000A42",)"
+        R"("main_build_id":"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",)"
+        R"("frame_rate":{"default":30,"display_refresh_rate":60,"experimental_rates":[120]},)"
+        R"("frame_rates":[30,60,120,"variable"]}]})";
+    write_file(root / "titles" / "0200000000000A42" / "profile.json", profile.data(), profile.size());
+    setenv("ARMIGO_TITLES", (root / "titles").c_str(), 1);
+
+    RunnerArguments arguments;
+    arguments.exefs_directory = exefs;
+    const auto policy = find_title_frame_rate_policy(arguments);
+    CHECK(policy.has_value());
+    if (policy) {
+        CHECK(policy->title_id == npdm_fixture::kProgramId);
+        CHECK(policy->default_rate == 30 && policy->display_refresh_rate == 60);
+        CHECK(policy->supported_rates ==
+              std::vector<std::uint32_t>({30, 60, 120, armigo::compat::variable_frame_rate}));
+        CHECK(policy->experimental_rates == std::vector<std::uint32_t>({120}));
+        CHECK(frame_rate_preference_key(policy->title_id) == "frame_rate.0200000000000A42");
+        const auto automatic = title_frame_rate_choices(*policy, std::nullopt);
+        CHECK(automatic.title_frame_rate && automatic.frame_rate == 0 && automatic.default_frame_rate == 30);
+        CHECK(automatic.display_refresh_rate == 60 && automatic.experimental_frame_rates == policy->experimental_rates);
+        CHECK(title_frame_rate_choices(*policy, 120).frame_rate == 120);
+        CHECK(title_frame_rate_choices(*policy, 45).frame_rate == 0);
+    }
+    CHECK(frame_rate_preference_key(std::nullopt) == "frame_rate");
+    // Other inputs, a build the settings do not describe, and settings off.
+    auto container = arguments;
+    container.container_file = root / "game.nsp";
+    CHECK(!find_title_frame_rate_policy(container));
+    header[0x40] = 0xff;
+    write_file(exefs / "main", header.data(), header.size());
+    CHECK(!find_title_frame_rate_policy(arguments));
+    header[0x40] = 1;
+    write_file(exefs / "main", header.data(), header.size());
+    CHECK(find_title_frame_rate_policy(arguments).has_value());
+    setenv("ARMIGO_TITLES", "off", 1);
+    CHECK(!find_title_frame_rate_policy(arguments));
+    unsetenv("ARMIGO_TITLES");
+    fs::remove_all(root);
+}
+
+void test_command_line_frame_rate() {
+    using namespace armigo::tools;
+    TitleFrameRatePolicy policy{0x0200000000000A42, 30, 60, {30, 60, 120}, {}};
+    armigo::platform::DisplayCapabilities fast;
+    fast.current = {1920, 1080, 120, false};
+    armigo::platform::DisplayCapabilities slow;
+    slow.current = {1920, 1080, 60, false};
+    struct Case {
+        std::optional<int> stored;
+        const char* override;
+        bool high_refresh;
+        double explicit_clock;  // zero: the default clock
+        int selected;
+        double clock;
+        const char* frame_rate;
+        const char* vi;
+        const char* resolution_rate;
+    };
+    for (const auto& test : {
+        // Auto changes nothing: the runtime selects the title default.
+        Case{std::nullopt, nullptr, true, 0, 0, 60, "unset", "unset", "unset"},
+        Case{0, nullptr, true, 0, 0, 60, "unset", "unset", "unset"},
+        Case{30, nullptr, true, 0, 30, 60, "30", "60", "30"},
+        Case{60, nullptr, false, 0, 60, 60, "60", "60", "60"},
+        Case{120, nullptr, true, 0, 120, 120, "120", "120", "120"},
+        // A 60 Hz display falls back, and so does a slower explicit clock.
+        Case{120, nullptr, false, 0, 60, 60, "60", "60", "60"},
+        Case{120, nullptr, true, 60, 60, 60, "60", "60", "60"},
+        Case{120, nullptr, true, 120, 120, 120, "120", "120", "120"},
+        // The environment wins; only a 120 fps mode gains its clock.
+        Case{60, "120", true, 0, 120, 120, "120", "120", "unset"},
+        Case{120, "30", true, 0, 30, 60, "30", "unset", "unset"},
+        Case{120, "variable", true, 0, 0, 60, "variable", "unset", "unset"},
+        Case{30, "120", true, 60, 120, 60, "120", "unset", "unset"},
+    }) {
+        for (const char* name : frame_rate_environment) unsetenv(name);
+        if (test.override) setenv("ARMIGO_COMPAT_FRAME_RATE", test.override, 1);
+        RunnerArguments launch;
+        launch.content_width = 1600;
+        launch.display_sync = false;
+        launch.operation_mode = armigo::services::OperationMode::Handheld;
+        if (test.explicit_clock) {
+            launch.refresh_hz = test.explicit_clock;
+            launch.refresh_hz_explicit = true;
+        }
+        MacFrameRateSelection observed;
+        int observed_rate = -1;
+        auto configure = mac_title_frame_rate_configuration(title_frame_rate_choices(policy, test.stored),
+            [&](const PlayerChoices& effective, const MacFrameRateSelection& selection) {
+                observed = selection;
+                observed_rate = effective.frame_rate;
+            });
+        configure(launch, test.high_refresh ? fast : slow);
+        CHECK(observed_rate == test.selected);
+        CHECK(observed.default_rate == 30);
+        CHECK(observed.options == (test.high_refresh ? std::vector<int>({0, 30, 60, 120})
+                                                     : std::vector<int>({0, 30, 60})));
+        CHECK(launch.refresh_hz == test.clock && observed.refresh_hz == test.clock);
+        CHECK(environment_text("ARMIGO_COMPAT_FRAME_RATE") == test.frame_rate);
+        CHECK(environment_text("ARMIGO_VI_REFRESH_HZ") == test.vi);
+        CHECK(environment_text("ARMIGO_COMPAT_RESOLUTION_RATE") == test.resolution_rate);
+        // The command line keeps everything else.
+        CHECK(environment_text("ARMIGO_COMPAT_RESOLUTION_WIDTH") == "unset");
+        CHECK(launch.content_width == 1600 && !launch.display_sync);
+        CHECK(launch.operation_mode == armigo::services::OperationMode::Handheld);
+        CHECK(observed.environment_override.has_value() == (test.override != nullptr));
+    }
+    for (const char* name : frame_rate_environment) unsetenv(name);
+}
+
+void test_restart_command() {
+    using armigo::tools::restart_command;
+    const std::vector<std::string> environment{"HOME=/home", "ARMIGO_COMPAT_FRAME_RATE=120",
+        "ARMIGO_VI_REFRESH_HZ=120", "ARMIGO_COMPAT_RESOLUTION_RATE=120", "ARMIGO_AUDIO=0", "MTL_HUD_ENABLED=1"};
+    const std::vector<std::string> run{"Armigo", "run", "--refresh-hz", "120", "--exefs", "exefs", "--romfs",
+        "romfs", "--width", "1600"};
+    auto command = restart_command(run, environment, false);
+    CHECK(command.arguments ==
+          std::vector<std::string>({"Armigo", "run", "--exefs", "exefs", "--romfs", "romfs", "--width", "1600"}));
+    CHECK(command.environment == std::vector<std::string>({"HOME=/home", "ARMIGO_COMPAT_RESOLUTION_RATE=120",
+                                                            "ARMIGO_AUDIO=0", "MTL_HUD_ENABLED=1"}));
+    command = restart_command(run, environment, true);
+    CHECK(command.arguments.back() == "--fullscreen" && command.arguments.size() == 9);
+    // --fullscreen follows the window: kept once in full screen, dropped when
+    // the game left full screen.
+    const std::vector<std::string> fullscreen{"Armigo", "run", "--fullscreen", "--saves", "saves"};
+    CHECK(restart_command(fullscreen, {}, true).arguments ==
+          std::vector<std::string>({"Armigo", "run", "--saves", "saves", "--fullscreen"}));
+    CHECK(restart_command(fullscreen, {}, false).arguments ==
+          std::vector<std::string>({"Armigo", "run", "--saves", "saves"}));
+    // Values that read like options stay with their options.
+    const std::vector<std::string> values{"Armigo", "run", "--report", "--refresh-hz", "--saves", "--fullscreen",
+                                          "--refresh-hz"};
+    CHECK(restart_command(values, {}, false).arguments ==
+          std::vector<std::string>({"Armigo", "run", "--report", "--refresh-hz", "--saves", "--fullscreen"}));
+    CHECK(restart_command(values, {}, true).arguments ==
+          std::vector<std::string>({"Armigo", "run", "--report", "--refresh-hz", "--saves", "--fullscreen",
+                                    "--fullscreen"}));
+    // A packed app opened from the Finder.
+    const std::vector<std::string> packed{"/Applications/Game.app/Contents/MacOS/Armigo"};
+    CHECK(restart_command(packed, {}, false).arguments == packed);
+    CHECK(restart_command(packed, {}, true).arguments ==
+          std::vector<std::string>({packed[0], "run", "--fullscreen"}));
+}
+
 int main() {
     test_manifest_and_language_selection();
     test_resolution_and_choices();
     test_mac_frame_rates();
+    test_title_frame_rate_policy();
+    test_command_line_frame_rate();
+    test_restart_command();
     return failures == 0 ? 0 : 1;
 }

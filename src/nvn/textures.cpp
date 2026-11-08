@@ -13,6 +13,8 @@
 #include "resource_layout.h"
 
 #include <armigo/graphics/texflush.h>
+#include <armigo/memory/write_tracker.h>
+#include "host_stack.h"
 
 #include <algorithm>
 #include <unordered_map>
@@ -49,6 +51,15 @@ const State* state(const Object* object) noexcept {
 
 void diagnose(const char* function, const char* message) noexcept {
     armigo::diag::write(armigo::diag::Level::error,  "Armigo NVN: %s: %s\n", function, message);
+}
+// A layout refusal names the description it refused.
+void diagnose_layout(const char* function, const TextureDescription& description) noexcept {
+    armigo::diag::write(armigo::diag::Level::error,
+                        "Armigo NVN: %s: texture layout is unsupported or invalid (target %d, format %d, %ux%ux%u, "
+                        "levels %u, samples %d, flags 0x%x, stride %u)\n",
+                        function, description.target, description.format, description.width, description.height,
+                        description.depth, description.levels, description.samples, description.flags,
+                        description.stride);
 }
 
 // A texture's identity is everything an initialization fixes except its serial
@@ -550,7 +561,7 @@ void texture_builder_set_depth_stencil_mode(NVNtextureBuilder* builder,
 std::size_t texture_builder_get_storage_size(const NVNtextureBuilder* builder) {
     const auto layout = resource_layout(state<TextureBuilderState>(builder)->description);
     if (!layout) {
-        diagnose("nvnTextureBuilderGetStorageSize", "texture layout is unsupported or invalid");
+        diagnose_layout("nvnTextureBuilderGetStorageSize", state<TextureBuilderState>(builder)->description);
         return 0;
     }
     return layout->total_size;
@@ -778,14 +789,14 @@ NVNboolean texture_initialize(NVNtexture* texture, const NVNtextureBuilder* buil
     }
     const auto* source = state<TextureBuilderState>(builder);
     const auto extras = builder_extra(builder);
-    if (extras.packaged_texture_data || extras.gl_texture_name ||
-        (source->description.flags & NVN_TEXTURE_FLAGS_SPARSE)) {
-        diagnose("nvnTextureInitialize", "packaged data import, GL interop, and sparse storage are unsupported");
+    if (extras.gl_texture_name || (source->description.flags & NVN_TEXTURE_FLAGS_SPARSE)) {
+        diagnose("nvnTextureInitialize", extras.gl_texture_name ? "GL texture interop is unsupported"
+                                                                : "sparse texture storage is unsupported");
         return 0;
     }
     const auto layout = resource_layout(source->description);
     if (!layout) {
-        diagnose("nvnTextureInitialize", "texture layout is unsupported or invalid");
+        diagnose_layout("nvnTextureInitialize", source->description);
         return 0;
     }
     if (!source->pool || source->pool->tag != pool_tag) {
@@ -800,6 +811,30 @@ NVNboolean texture_initialize(NVNtexture* texture, const NVNtextureBuilder* buil
     if (!backends().resources) {
         diagnose("nvnTextureInitialize", "resource backend is not installed");
         return 0;
+    }
+    // Packaged texture data is the texture's storage as the texture packager
+    // laid it out, in CPU memory: the driver copies it into the storage here,
+    // before the texture's first use reads it, and publishes the bytes as a
+    // flushed store for textures already made over them.
+    if (extras.packaged_texture_data) {
+        if (!source->pool->memory) {
+            diagnose("nvnTextureInitialize", "packaged texture data needs a pool with CPU storage");
+            return 0;
+        }
+        auto* storage = source->pool->memory + static_cast<std::size_t>(source->offset);
+        const std::span bytes(static_cast<const std::byte*>(extras.packaged_texture_data),
+                              static_cast<std::size_t>(layout->total_size));
+        on_host_stack([&] {
+            backends().resources->prepare_pool_write(*source->pool, static_cast<std::uint64_t>(source->offset),
+                                                     bytes.size());
+        });
+        if (!memory::WriteTracker::try_alias_store(storage, bytes)) {
+            memory::WriteTracker::prepare_host_write(storage, bytes.size());
+            std::memcpy(storage, bytes.data(), bytes.size());
+        }
+        on_host_stack([&] {
+            backends().resources->flush_pool(*source->pool, static_cast<std::uint64_t>(source->offset), bytes.size());
+        });
     }
     auto* destination = state<TextureState>(texture);
     TextureState initialized{};
@@ -952,7 +987,7 @@ void texture_cache_range(const NVNtexture* texture, const NVNtextureView* view,
     std::uint32_t layer_count = 1;
     const auto layout = resource_layout(current->description);
     if (!layout) {
-        diagnose(function, "texture layout is unsupported or invalid");
+        diagnose_layout(function, current->description);
         return;
     }
     if (!current->pool->memory || !pool_cpu_mapped(*current->pool))
@@ -1307,7 +1342,7 @@ std::optional<graphics::TextureLayoutDescription> resource_layout(
             }
             value->layer_stride = chain_size;
             if (!checked_multiply(chain_size, value->layers, value->total_size) ||
-                value->total_size > graphics::max_texture_layout_size) return std::nullopt;
+                value->total_size > graphics::max_texture_storage_size) return std::nullopt;
         }
         return std::move(*value);
     }

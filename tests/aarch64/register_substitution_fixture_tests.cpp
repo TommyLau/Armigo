@@ -94,8 +94,8 @@ const PairExpectation pair_expectations[] = {
     {18, 9, E::none},                       // 45 msr
     {18, 9, E::register_collision},         // 46 add x18, x9, x2
     {18, 18, E::same_register},             // 47
-    {18, 9, E::unknown_encoding},           // 48 ldadd
-    {18, 9, E::unknown_encoding},           // 49 cas
+    {18, 9, E::none},                       // 48 ldadd
+    {18, 9, E::none},                       // 49 cas
     {30, 9, E::unknown_encoding},           // 50 paciasp
     {18, 9, E::none},                       // 51 fmov d18, x18
     {18, 9, E::handler_defined_registers},  // 52 svc

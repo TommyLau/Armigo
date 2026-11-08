@@ -121,7 +121,16 @@ WordRole classify_word(std::uint32_t word) noexcept {
     const auto effects = aarch64::decode_register_effects(word);
     const bool known = effects.status == aarch64::EffectStatus::decoded ||
                        effects.status == aarch64::EffectStatus::unpredictable;
-    role.uses_x18 = known && ((effects.reads | effects.writes) & (1u << 18));
+    // A word the decoder cannot describe may still name x18 in a register
+    // field. It is a site too, so it is refused (the builders take only
+    // decoded words) rather than left to run on the hardware register.
+    const auto names_x18 = [word] {
+        for (const unsigned field : {0u, 5u, 10u, 16u})
+            if (((word >> field) & 31u) == 18u) return true;
+        return false;
+    };
+    role.uses_x18 = known ? ((effects.reads | effects.writes) & (1u << 18)) != 0
+                          : effects.status == aarch64::EffectStatus::unknown && names_x18();
     switch (instruction.opcode) {
     case Opcode::svc: case Opcode::hvc: case Opcode::smc: case Opcode::hlt:
     case Opcode::cache_maintenance:
@@ -249,6 +258,10 @@ namespace {
 // BR X18, and the table a byte index can reach from its ADR base.
 constexpr std::uint32_t br_x18 = 0xd61f0240u;
 constexpr std::uint32_t jump_table_entries = 256;
+// Every word a halfword table entry reaches.
+constexpr std::uint32_t halfword_jump_table_entries = 65536;
+// Words find_jump_table accepts between a table's ADD X18 and its BR X18.
+constexpr std::uint64_t jump_table_gap_words = 8;
 
 // The words a switch through virtual x18 can reach: an ADR X18 base and an
 // entry count (a power of two, as the table trampoline requires).
@@ -275,12 +288,37 @@ std::int64_t sign_extend(std::uint64_t value, unsigned bits) noexcept {
 // one word that leaves x18 alone; BR X18. The entries are read from the table;
 // the target is one of the words up to the largest, rounded up to a power of
 // two of at most 4096.
+//
+// The same bounded halfword switch whose table register is set elsewhere
+// (CMP Wi, #n; B.HI or B.HS; ADR X18, base; LDRH Wn, [Xt, Xi, ...]): the table
+// is not read, and the target is one of the 65536 words a halfword entry
+// reaches from base.
+//
+// Either form may have up to jump_table_gap_words words between its ADD and
+// the BR when none of them touches x18 or is a branch, exception or system
+// instruction; one word that leaves x18 alone is accepted as before.
+//
+// Every target the instructions can name lies in this module's text, from
+// `text_begin` to `text_end`: the 256 words of a byte index, the words up to
+// a read table's largest entry, or all 65536 a halfword entry reaches.
 template <class WordAt>
-std::optional<JumpTable> find_jump_table(std::uint64_t offset, std::uint64_t text_begin, const WordAt& word_at,
-                                         std::span<const std::byte> image) {
-    for (const std::uint64_t gap : {4u, 8u}) {
+std::optional<JumpTable> find_jump_table(std::uint64_t offset, std::uint64_t text_begin, std::uint64_t text_end,
+                                         const WordAt& word_at, std::span<const std::byte> image) {
+    const auto in_text = [&](std::uint64_t base, std::uint64_t words) {
+        return base >= text_begin && base <= text_end && words <= (text_end - base) / 4;
+    };
+    for (std::uint64_t gap = 4; gap <= 4 * (jump_table_gap_words + 1); gap += 4) {
         if (offset < text_begin + gap + 8) continue;
         if (gap == 8 && classify_word(word_at(offset - 4)).uses_x18) continue;
+        if (gap > 8) {
+            bool clear = true;
+            for (std::uint64_t at = offset - gap + 4; at != offset && clear; at += 4) {
+                const auto word = word_at(at);
+                // Op0 101x: branches, exception generation and system instructions.
+                clear = !classify_word(word).uses_x18 && (word & 0x1c000000u) != 0x14000000u;
+            }
+            if (!clear) continue;
+        }
         const auto add = word_at(offset - gap);
         if ((add & 0xffe0fc00u) != 0x8b000800u || ((add >> 5) & 31u) != 18 || (add & 31u) != 18) continue;
         const auto index = (add >> 16) & 31u;
@@ -298,12 +336,26 @@ std::optional<JumpTable> find_jump_table(std::uint64_t offset, std::uint64_t tex
         if ((adr & 0x9f00001fu) != 0x10000012u) continue;
         const auto adr_immediate = sign_extend(((adr >> 29) & 3u) | (((adr >> 5) & 0x7ffffu) << 2), 21);
         const auto base = adr_offset + static_cast<std::uint64_t>(adr_immediate);
-        if (byte_load) return JumpTable{base, jump_table_entries};
+        if (byte_load) {
+            if (!in_text(base, jump_table_entries)) continue;
+            return JumpTable{base, jump_table_entries};
+        }
 
         const auto table_register = (load >> 5) & 31u, index_register = (load >> 16) & 31u;
-        if (image.empty() || offset < text_begin + gap + 24 || table_register == 18 || table_register == 31 ||
-            index_register == 18 || index_register == 31 || table_register == index_register)
+        if (table_register == 18 || table_register == 31 || index_register == 18 || index_register == 31 ||
+            table_register == index_register)
             continue;
+        // CMP of the index (either width) with B.HI or B.HS right after it.
+        const auto guards = [&](std::uint32_t compare, std::uint32_t branch) {
+            const bool higher = (branch & 0xff00001fu) == 0x54000008u, higher_or_same = (branch & 0xff00001fu) == 0x54000002u;
+            return (higher || higher_or_same) && (compare & 0x7fc0001fu) == 0x7100001fu &&
+                   ((compare >> 5) & 31u) == index_register;
+        };
+        if (offset >= text_begin + gap + 16 && guards(word_at(adr_offset - 8), word_at(adr_offset - 4))) {
+            if (!in_text(base, halfword_jump_table_entries)) continue;
+            return JumpTable{base, halfword_jump_table_entries};
+        }
+        if (image.empty() || offset < text_begin + gap + 24) continue;
         const auto add_table = word_at(adr_offset - 4);
         const auto adrp_offset = adr_offset - 8;
         const auto adrp = word_at(adrp_offset);
@@ -333,7 +385,7 @@ std::optional<JumpTable> find_jump_table(std::uint64_t offset, std::uint64_t tex
         }
         std::uint32_t entries = 1;
         while (entries <= largest) entries <<= 1;
-        if (entries > 4096) continue;
+        if (entries > 4096 || !in_text(base, std::uint64_t{largest} + 1)) continue;
         return JumpTable{base, entries};
     }
     return std::nullopt;
@@ -418,7 +470,8 @@ std::size_t ModuleCodePreparation::scan_text(std::span<const std::byte> text, un
     for (auto& part : found) {
         for (const auto& entry : part)
             if (entry.word == br_x18) {
-                const auto table = find_jump_table(text_begin + 4 * std::uint64_t{entry.index}, text_begin, text_word, image);
+                const auto table = find_jump_table(text_begin + 4 * std::uint64_t{entry.index}, text_begin,
+                                                   text_begin + text.size(), text_word, image);
                 const auto entries = table ? std::max(table->entries, jump_table_entries) : jump_table_entries;
                 bytes += 4 * (execution::indirect_x18_table_words(entries) + (embedded ? 2 : 0));
             }
@@ -480,7 +533,7 @@ void ModuleCodePreparation::prepare(const ModulePreparationView& view) {
     // A switch through virtual x18 (find_jump_table): its base address and
     // entry count.
     const auto jump_table = [&](std::uint64_t offset) -> std::optional<JumpTable> {
-        auto table = find_jump_table(offset, text_begin, original_at, view.image);
+        auto table = find_jump_table(offset, text_begin, text_begin + text_size, original_at, view.image);
         if (table) table->base_offset += view.base_address;
         return table;
     };

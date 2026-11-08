@@ -103,6 +103,24 @@ bool scalar(GuestThreadContext& context) {
     });
 }
 
+// SP pairs past the top of imm7 run as two single-register transfers through
+// the embedded trampolines too.
+bool far_pair(GuestThreadContext& context) {
+    Fixture fixture;
+    fixture.word(0, 0xd10883ff);                      // SUB SP,SP,#0x220
+    if (!fixture.scalar(4, 0xaa0003f2) ||             // MOV X18,X0
+        !fixture.scalar(8, 0xa91f4be1) ||             // STP X1,X18,[SP,#0x1f0]
+        !fixture.scalar(12, 0xa95f4be0)) return false;  // LDP X0,X18,[SP,#0x1f0]
+    fixture.word(16, 0x910883ff);                     // ADD SP,SP,#0x220
+    fixture.word(20, ret);
+    return execute(fixture, context, [&](std::uintptr_t base) {
+        const auto run = reinterpret_cast<std::uint64_t(*)(std::uint64_t, std::uint64_t)>(base);
+        return expect(run(0x0123456789abcdefull, 0xfedcba9876543210ull) == 0xfedcba9876543210ull &&
+                          context.guest_x18() == 0x0123456789abcdefull,
+                      "Embedded split stack pair moved the wrong values.");
+    });
+}
+
 bool addresses(GuestThreadContext& context) {
     for (bool page : {false, true}) {
         Fixture fixture;
@@ -220,6 +238,6 @@ int main() {
     if (!table.ok()) return 1;
     GuestDispatchScope dispatch(table.table, context);
     if (dispatch.setup_error() != GuestDispatchFailureKind::none) return 1;
-    return refusals() && scalar(context) && addresses(context) && conditional(context) &&
+    return refusals() && scalar(context) && far_pair(context) && addresses(context) && conditional(context) &&
         indirect(context) && thread_registers(context) && host_branch() ? 0 : 1;
 }

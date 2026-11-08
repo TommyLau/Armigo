@@ -433,6 +433,28 @@ IpcReply AudioDeviceSession::request(const IpcMessage& message, std::uint64_t se
     }
     case 5:  // GetActiveChannelCount
         return value_reply(cmif, 2, 4);
+    case 15:    // AcquireAudioInputDeviceNotification(u64)
+    case 17: {  // AcquireAudioOutputDeviceNotification(u64)
+        // Fires when the set of devices changes, which it never does here.
+        std::shared_ptr<horizon::Event> event;
+        {
+            const std::lock_guard lock(mutex_);
+            if (!notification_) notification_ = std::make_shared<horizon::Event>(false);
+            event = notification_;
+        }
+        IpcReply reply;
+        reply.disposition = IpcDisposition::handled;
+        reply.size = 32;
+        write(reply.bytes, 4, (reply.size - 8) / 4);
+        write(reply.bytes, 16, sfco);
+        reply.transferred[0] = std::move(event);
+        reply.transferred_count = 1;
+        reply.transferred_as_copy = true;
+        return reply;
+    }
+    case 16:  // ReleaseAudioInputDeviceNotification(u64)
+    case 18:  // ReleaseAudioOutputDeviceNotification(u64)
+        return success_reply(cmif);
     case 19:  // SetAudioDeviceOutputVolumeAutoTuneEnabled
         return success_reply(cmif);
     case 20:  // IsAudioDeviceOutputVolumeAutoTuneEnabled

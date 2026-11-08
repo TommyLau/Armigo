@@ -41,13 +41,16 @@ std::size_t payload_size(std::uint64_t n) {
 
 // Records of every size cross the end of the ring many times; held records
 // are published later in a batch; the consumer sees each record once, in
-// order, with its argument and payload intact.
+// order, with its argument and payload intact. The consumer starts only once
+// the producer has found the ring full, so the full-ring wait runs whatever
+// the machine's load.
 void test_ordered_records_across_wraps() {
     auto ring = std::make_unique<EncodeRing>();
     constexpr std::uint64_t count = 400'000;
     std::uint64_t seen = 0, bad = 0;
     std::atomic<bool> idle{false};
     std::thread consumer([&] {
+        while (!ring->full_waits()) std::this_thread::yield();
         ring->consume([&](const EncodeRing::Header& header, const void* payload) {
             if (header.op == stop_op) return false;
             if (header.op != record_op || header.argument != std::uint32_t(seen)) { ++bad; ++seen; return true; }

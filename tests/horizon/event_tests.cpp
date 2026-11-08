@@ -112,7 +112,9 @@ void test_unsupported_and_invalid_handles() {
     const auto other = table.insert(std::make_shared<OtherObject>()).value();
     const std::array other_handles{other};
     unsupported(wait_event(table, other_handles, 0));
-    unsupported(reset_event(table, other));
+    // ResetSignal takes a readable event or a process; any other object is invalid.
+    result_is(reset_event(table, other), 0xe401);
+    unsupported(reset_event(table, current_process_handle));
     const std::array<Handle, 1> invalid{0};
     const auto bad_wait = wait_event(table, invalid, 0);
     result_is(bad_wait, 0xe401);
@@ -193,10 +195,31 @@ void test_thread_exit_wait() {
     result_is(result, 0);
     CHECK(result.index == 0);
     // ResetSignal remains an event operation.
-    CHECK(reset_event(table, handles[0]).disposition == EventDisposition::unsupported);
+    result_is(reset_event(table, handles[0]), 0xe401);
+}
+
+// The writable end signals and clears its readable end but is neither waitable
+// nor resettable: both reject its handle as invalid.
+void test_writable_end() {
+    HandleTable table(4);
+    auto readable = std::make_shared<Event>(false);
+    unsigned observed = 0;
+    auto writable = std::make_shared<WritableEvent>(readable, [&] { ++observed; });
+    const std::array readable_handles{table.insert(readable).value()};
+    const std::array writable_handles{table.insert(writable).value()};
+    result_is(wait_event(table, writable_handles, 0), 0xe401);
+    result_is(reset_event(table, writable_handles[0]), 0xe401);
+    writable->signal();
+    CHECK(readable->is_signaled() && observed == 1);
+    result_is(wait_event(table, writable_handles, 0), 0xe401);
+    result_is(wait_event(table, readable_handles, 0), 0);
+    writable->clear();
+    CHECK(!readable->is_signaled());
+    result_is(reset_event(table, readable_handles[0]), 0xfa01);
 }
 
 int main() {
+    test_writable_end();
     test_ready_reset_and_poll();
     test_blocking_signal_and_timeout();
     test_unsupported_and_invalid_handles();

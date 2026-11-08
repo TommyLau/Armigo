@@ -52,7 +52,7 @@ const char* ParseError::message() const noexcept {
         case Code::ControlTag:
             return "control tag word is not 1";
         case Code::ControlVersion:
-            return "control version is not 9, 14 or 15";
+            return "control version is not 9, 14, 15 or 16";
         case Code::ControlSizeTooSmall:
             return "declared control size is below the minimum";
         case Code::ControlSizeTooLarge:

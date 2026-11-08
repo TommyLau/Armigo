@@ -22,8 +22,7 @@ namespace armigo::services::sm {
 // Members serialize access; callbacks run under the lock and must not reenter.
 class ServiceManagerSession final : public horizon::ClientSession {
 public:
-    ServiceManagerSession(ProcessConfig process, ConnectService connect,
-        bool close_on_hipc = false);
+    ServiceManagerSession(ProcessConfig process, ConnectService connect);
     horizon::IpcReply close_server() override;
 
     horizon::IpcReply request(const horizon::IpcMessage& message,
@@ -47,7 +46,6 @@ private:
 
     mutable std::mutex mutex_;
     const std::uint64_t process_id_;
-    const bool close_on_hipc_;
     std::optional<Session> session_;
     std::optional<ServiceName> pending_name_;
     const char* diagnostic_ = nullptr;

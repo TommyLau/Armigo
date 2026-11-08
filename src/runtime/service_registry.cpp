@@ -21,7 +21,13 @@
 #include <armigo/services/account.h>
 #include <armigo/services/addon_content.h>
 #include <armigo/services/applet.h>
+#include <armigo/services/audio_device_manager.h>
 #include <armigo/services/audio_renderer.h>
+#include <armigo/services/audio_user.h>
+#include <armigo/services/hardware_opus.h>
+#include <armigo/services/nsd.h>
+#include <armigo/services/sound_mixer.h>
+#include <armigo/services/ssl.h>
 #include <armigo/services/context_writer.h>
 #include <armigo/services/file_system.h>
 #include <armigo/services/hid.h>
@@ -34,6 +40,7 @@
 #include <armigo/services/shared_font.h>
 #include <armigo/services/audio_out.h>
 #include <armigo/services/bsd.h>
+#include <armigo/services/csrng.h>
 #include <armigo/services/mm.h>
 #include <armigo/services/nifm.h>
 #include <armigo/services/performance.h>
@@ -710,7 +717,7 @@ public:
                         return services::sm::LookupResult{
                             services::sm::LookupKind::unsupported, 0, 0};
                     return registry->connect_service(process_id, name);
-                }, profile_.process.platform == GuestPlatform::switch2);
+                });
             counters_->named_ports.fetch_add(1, std::memory_order_relaxed);
             return {horizon::IpcDisposition::handled, 0, std::move(session)};
         } catch (const std::bad_alloc&) {
@@ -752,6 +759,14 @@ public:
 
     void request_stop() noexcept override {
         stopped_.store(true, std::memory_order_release);
+        // Sound mixer streams hold views of guest memory: stop pumping them
+        // and release the views before the process's memory goes away.
+        std::shared_ptr<services::audsmx::Mixer> mixer;
+        {
+            const std::lock_guard lock(sound_mixer_mutex_);
+            mixer = sound_mixer_;
+        }
+        if (mixer) mixer->stop();
         if (driver_) driver_->stop_gpu();
 #ifdef ARMIGO_HAS_RUNTIME_PRESENTATION
         if (presentation_) presentation_->request_stop();
@@ -810,6 +825,7 @@ private:
           presenter_(std::move(dependencies.presenter)),
           romfs_(std::move(dependencies.romfs)),
           addon_content_(std::move(dependencies.addon_content)),
+          display_version_(std::move(dependencies.display_version)),
           shader_directory_(std::move(dependencies.shader_package_directory)),
           pending_shader_package_(std::move(dependencies.pending_shader_package)),
           nvn_driver_(dependencies.nvn_driver),
@@ -981,6 +997,31 @@ private:
     // ARMIGO_AUDIO=silent opens that same device and clock and zero-fills the
     // samples after they are consumed. A device that cannot be opened leaves
     // that renderer muted with a diagnostic.
+    // The process's sound mixer, created with its first session. Streams pin
+    // the title's ring buffers through the process memory, which the mixer
+    // does not keep alive. A mixer reached after request_stop is stopped, so
+    // no stream opens once the stop has released the others.
+    std::shared_ptr<services::audsmx::Mixer> sound_mixer() {
+        const std::lock_guard lock(sound_mixer_mutex_);
+        if (!sound_mixer_) sound_mixer_ = make_sound_mixer();
+        if (stopped_.load(std::memory_order_acquire)) sound_mixer_->stop();
+        return sound_mixer_;
+    }
+
+    std::shared_ptr<services::audsmx::Mixer> make_sound_mixer() {
+        std::weak_ptr<GuestMemory> weak = memory_;
+        auto pinner = [weak](std::uint64_t address, std::uint64_t size)
+            -> std::optional<services::audsmx::StreamMemory> {
+            const auto memory = weak.lock();
+            if (!memory) return std::nullopt;
+            auto pinned = memory->pin({address, size}, memory::Permission::read | memory::Permission::write);
+            auto* pin = std::get_if<GuestMemoryPin>(&pinned);
+            if (!pin || !*pin || (*pin)->writable_bytes().size() != size) return std::nullopt;
+            return services::audsmx::StreamMemory{(*pin)->writable_bytes(), *pin};
+        };
+        return std::make_shared<services::audsmx::Mixer>(std::move(pinner), audio_output_factory());
+    }
+
     services::audren::OutputFactory audio_output_factory() const {
         const bool windowed = presenter_ && presenter_->mode() == platform::PresentationMode::windowed;
         const auto kind = platform::pcm_output_kind_from_setting(std::getenv("ARMIGO_AUDIO"), windowed);
@@ -1023,7 +1064,9 @@ private:
                 service_name("pctl"), service_name("prepo:u"), service_name("time:u"), service_name("acc:u0"),
                 service_name("fsp-srv"), service_name("set"), service_name("pl:u"), service_name("pl:s"),
                 service_name("apm"), service_name("hid"), service_name("nifm:u"), service_name("mm:u"),
-                service_name("bsd:u"), service_name("audout:u"), service_name("audren:u"), service_name("nfp:user"),
+                service_name("bsd:u"), service_name("audout:u"), service_name("audren:u"), service_name("aud:u"),
+                service_name("hwopus"), service_name("nfp:user"), service_name("auddmg:u"),
+                service_name("audsmx:u"), service_name("ssl"), service_name("nsd:u"),
             };
             if (profile_.process.platform == GuestPlatform::switch2 &&
                 std::find(switch2_services.begin(), switch2_services.end(), name) == switch2_services.end()) {
@@ -1041,8 +1084,8 @@ private:
             if (name == service_name("lm"))
                 session = std::make_shared<services::lm::LogManagerSession>(process_id_,
                     profile_.process.platform == GuestPlatform::switch2
-                        ? services::lm::LogManagerContract::switch2_23_0_1
-                        : services::lm::LogManagerContract::horizon_20_5_0);
+                        ? services::lm::LogManagerContract::switch2
+                        : services::lm::LogManagerContract::switch1);
             else if (name == service_name("acc:u0"))
                 session = std::make_shared<services::acc::AccountSession>(process_id_);
             else if (name == service_name("aoc:u"))
@@ -1055,9 +1098,27 @@ private:
             else if (name == service_name("bsd:u"))
                 session = std::make_shared<services::bsd::BsdSession>(process_id_, *handles);
             else if (name == service_name("nifm:u"))
-                session = std::make_shared<services::nifm::Session>(process_id_);
+                session = std::make_shared<services::nifm::Session>(
+                    process_id_, profile_.process.platform == GuestPlatform::switch2);
             else if (name == service_name("mm:u"))
                 session = std::make_shared<services::mm::Session>(process_id_);
+            else if (name == service_name("csrng") && profile_.process.platform != GuestPlatform::switch2)
+                session = std::make_shared<services::csrng::Session>(process_id_);
+            else if (name == service_name("aud:u") && profile_.process.platform == GuestPlatform::switch2)
+                session = std::make_shared<services::audio_user::UserClientSession>(process_id_,
+                                                                                    audio_output_factory());
+            else if (name == service_name("hwopus"))
+                session = std::make_shared<services::hwopus::ManagerSession>(
+                    process_id_, profile_.process.platform == GuestPlatform::switch2 ? services::hwopus::Console::switch2
+                                                                                      : services::hwopus::Console::switch1);
+            else if (name == service_name("auddmg:u") && profile_.process.platform == GuestPlatform::switch2)
+                session = std::make_shared<services::auddmg::DeviceManagerSession>(process_id_);
+            else if (name == service_name("nsd:u") && profile_.process.platform == GuestPlatform::switch2)
+                session = std::make_shared<services::nsd::NsdSession>(process_id_);
+            else if (name == service_name("ssl"))
+                session = std::make_shared<services::ssl::SslSession>(process_id_);
+            else if (name == service_name("audsmx:u") && profile_.process.platform == GuestPlatform::switch2)
+                session = std::make_shared<services::audsmx::SoundMixerSession>(process_id_, sound_mixer());
             else if (name == service_name("audout:u"))
                 session = std::make_shared<services::audout::ManagerSession>(process_id_, audio_output_factory());
             else if (name == service_name("set"))
@@ -1074,10 +1135,18 @@ private:
                 session = std::make_shared<services::prepo::PlayReportSession>(process_id_);
             else if (name == service_name("time:u"))
                 session = std::make_shared<services::time::TimeServiceSession>(
-                    process_id_, *handles, shared_clock_);
-            else if (name == service_name("fsp-srv"))
-                session = std::make_shared<services::fs::FileSystemServiceSession>(
+                    process_id_, *handles, shared_clock_, [clock = clock_]() -> std::optional<std::int64_t> {
+                        const auto sample = clock->sample();
+                        if (const auto* value = std::get_if<ClockSample>(&sample))
+                            return value->counter_time.count();
+                        return std::nullopt;
+                    });
+            else if (name == service_name("fsp-srv")) {
+                auto file_system = std::make_shared<services::fs::FileSystemServiceSession>(
                     process_id_, 0x1000, romfs_, addon_content_);
+                file_system->set_application_program_id(profile_.title_id);
+                session = std::move(file_system);
+            }
             else if (name == service_name("ro"))
                 session = std::make_shared<services::ro::LoaderSession>(process_id_);
             else if (name == service_name("nvdrv"))
@@ -1097,8 +1166,8 @@ private:
                     services::am::GameplayRecordingPolicy::Unavailable,
                     std::shared_ptr<services::am::ApplicationRunningState>{},
                     operation_mode_, profile_.process.platform == GuestPlatform::switch2
-                        ? services::am::AppletContract::switch2_23_0_1
-                        : services::am::AppletContract::horizon_20_5_0);
+                        ? services::am::AppletContract::switch2
+                        : services::am::AppletContract::switch1);
                 if (profile_.process.platform == GuestPlatform::switch2) {
                     // The graphics system session's driver session shares the
                     // process's nvdrv client state. A weak reference keeps the
@@ -1110,8 +1179,8 @@ private:
                         if (!base) return nullptr;
                         auto session = std::make_shared<services::nvdrv::DriverSession>(*base);
                         session->refuse_gpu_devices("Switch 2 NVN boundary: the title's own NVN driver opens a GPU "
-                                                    "device, which Armigo's NVN 231.40 driver replaces; that driver "
-                                                    "is not implemented yet");
+                                                    "device; Armigo serves graphics through its NVN 231.40 driver, "
+                                                    "which the title's settings must select");
                         return session;
                     };
                     graphics.wait_refresh = [vsync = std::weak_ptr<services::vi::VsyncSource>(vsync_)](
@@ -1122,45 +1191,39 @@ private:
                         if (!source->wait_sequence(target, stop)) return std::nullopt;
                         return target;
                     };
+#ifdef ARMIGO_HAS_RUNTIME_PRESENTATION
+                    // Switch 2 has no vi:u session for the NVN driver's native
+                    // windows to bind to; they present through a display of
+                    // their own, paced by the same refresh.
+                    if (nvn_driver_) graphics.native_display = make_display(*handles);
+#endif
+                    // Through the IPC buffer path, which keeps the write tracker
+                    // informed of decoded pictures written into GPU memory.
+                    graphics.write_memory = [memory = std::weak_ptr<GuestMemory>(memory_)](
+                        std::uint64_t address, std::span<const std::byte> bytes) {
+                        const auto guest = memory.lock();
+                        return guest && !bytes.empty() && guest->ipc_buffers().write_memory(address, bytes);
+                    };
+                    graphics.read_memory = [memory = std::weak_ptr<GuestMemory>(memory_)](
+                        std::uint64_t address, std::span<std::byte> bytes) {
+                        const auto guest = memory.lock();
+                        return guest && !bytes.empty() && guest->ipc_buffers().read_memory(address, bytes);
+                    };
                     applet->set_graphics_system_dependencies(std::move(graphics));
                 }
                 if (startup_user_) applet->preselect_user(services::acc::AccountSession::local_user_id());
+                if (display_version_) applet->set_display_version(*display_version_);
                 applet->grant_foreground();
                 session = std::move(applet);
             } else if (name == service_name("hid"))
-                session = std::make_shared<services::hid::HidSession>(process_id_);
+                session = std::make_shared<services::hid::HidSession>(
+                    process_id_, services::hid::SevenSixAxisSamplingState{},
+                    profile_.process.platform == GuestPlatform::switch2);
             else if (name == service_name("vi:u") || name == service_name("vi:m") ||
                      name == service_name("vi:s")) {
 #ifdef ARMIGO_HAS_RUNTIME_PRESENTATION
-                auto display = std::make_shared<services::vi::DisplaySession>(
-                    *handles, operation_mode_);
-                display->set_vsync_source(vsync_);
-                display->set_buffer_backing_lookup(graphics_access_.lookup);
-                if (nvn_driver_) platform::metal::nvn_driver::bind_native_windows(display);
-                if (observe_display_) observe_display_(display);
-                auto callback = attach_presentation_observer(
-                    presentation_->callback(), presentation_clock_, memory_);
-                auto counters = counters_;
-                display->set_presenter(
-                    [callback = std::move(callback), counters](
-                        const services::GraphicsPresentation& frame) mutable {
-                        counters->queued_frames.fetch_add(1, std::memory_order_relaxed);
-                        auto result = callback(frame);
-                        if (result.completed) {
-                            // A QueueBuffer request counts the frame once its reply
-                            // proves release. A native-window present has no request:
-                            // the presentation thread runs this callback and the frame
-                            // is consumed when it returns.
-                            if (active_presentation_completion)
-                                *active_presentation_completion = true;
-                            else if (frame.native_vsync_paced)
-                                counters->completed_frames.fetch_add(
-                                    1, std::memory_order_release);
-                        }
-                        return result;
-                    });
                 session = std::make_shared<CountingViSession>(
-                    std::move(display), counters_);
+                    make_display(*handles), counters_);
 #else
                 latch(make_failure(
                     LaunchStage::presentation, LaunchError::unsupported,
@@ -1201,6 +1264,40 @@ private:
         return {services::sm::LookupKind::connected, *handle, 0};
     }
 
+#ifdef ARMIGO_HAS_RUNTIME_PRESENTATION
+    // A display whose frames reach the host presenter; native windows of the
+    // NVN driver bind to the latest one.
+    std::shared_ptr<services::vi::DisplaySession> make_display(horizon::HandleTable& handles) {
+        auto display = std::make_shared<services::vi::DisplaySession>(handles, operation_mode_);
+        display->set_vsync_source(vsync_);
+        display->set_buffer_backing_lookup(graphics_access_.lookup);
+        if (nvn_driver_) platform::metal::nvn_driver::bind_native_windows(display);
+        if (observe_display_) observe_display_(display);
+        auto callback = attach_presentation_observer(
+            presentation_->callback(), presentation_clock_, memory_);
+        auto counters = counters_;
+        display->set_presenter(
+            [callback = std::move(callback), counters](
+                const services::GraphicsPresentation& frame) mutable {
+                counters->queued_frames.fetch_add(1, std::memory_order_relaxed);
+                auto result = callback(frame);
+                if (result.completed) {
+                    // A QueueBuffer request counts the frame once its reply
+                    // proves release. A native-window present has no request:
+                    // the presentation thread runs this callback and the frame
+                    // is consumed when it returns.
+                    if (active_presentation_completion)
+                        *active_presentation_completion = true;
+                    else if (frame.native_vsync_paced)
+                        counters->completed_frames.fetch_add(
+                            1, std::memory_order_release);
+                }
+                return result;
+            });
+        return display;
+    }
+#endif
+
     void latch(LaunchFailure failure) const {
         std::lock_guard lock(failure_mutex_);
         if (!first_failure_) first_failure_ = std::move(failure);
@@ -1211,11 +1308,14 @@ private:
     services::OperationMode operation_mode_ = services::OperationMode::Console;
     std::weak_ptr<horizon::HandleTable> handles_;
     std::shared_ptr<GuestMemory> memory_;
+    std::mutex sound_mixer_mutex_;
+    std::shared_ptr<services::audsmx::Mixer> sound_mixer_;
     std::shared_ptr<GuestClock> clock_;
     std::shared_ptr<PresentationClock> presentation_clock_;
     std::shared_ptr<platform::Presenter> presenter_;
     std::shared_ptr<romfs::Storage> romfs_;
     std::shared_ptr<const services::AddOnContentCatalog> addon_content_;
+    std::optional<std::string> display_version_;
     std::filesystem::path shader_directory_;
     std::shared_ptr<PendingShaderPackage> pending_shader_package_;
     bool nvn_driver_ = false;

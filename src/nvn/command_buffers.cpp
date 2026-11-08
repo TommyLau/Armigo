@@ -85,21 +85,21 @@ struct CommandList {
     std::vector<CommandBlock> blocks;
     std::byte* cursor = nullptr;
     std::byte* end_cursor = nullptr;
-    std::uint8_t* native_start = nullptr;
+    std::uintptr_t native_start = 0;
     // The game command memory the recording took, in the native positions the
     // game reads back: one range per segment it used. range_start opens the
     // range of the current segment while recording.
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> native_ranges;
-    std::uint8_t* range_start = nullptr;
+    std::uintptr_t range_start = 0;
 
     // A recording that comes back to memory it already took (the game added
     // the same segment again) keeps one range there: the ranges of one list
     // never overlap, so the registry's index stays a set of disjoint ranges.
-    void close_native_range(const std::uint8_t* end) {
+    void close_native_range(std::uintptr_t end) {
         if (!range_start) return;
-        auto start = reinterpret_cast<std::uintptr_t>(range_start);
-        auto stop = reinterpret_cast<std::uintptr_t>(end);
-        range_start = nullptr;
+        auto start = range_start;
+        auto stop = end;
+        range_start = 0;
         std::erase_if(native_ranges, [&](const auto& range) {
             if (std::max(range.second, range.first + 1) <= start || std::max(stop, start + 1) <= range.first)
                 return false;
@@ -184,6 +184,9 @@ struct CommandSubmission {
     FlatMap64<DescriptorPoolState> descriptor_pools;
     FlatMap64<MemoryPoolState> scratch_pools;
     std::vector<SyncState*> syncs;
+    // A list of the submission records an event wait: only then does replay
+    // look for waits to park the submission's queue at.
+    bool event_waits = false;
 };
 
 namespace {
@@ -303,7 +306,7 @@ constexpr std::size_t native_command_size = 4;
 void account_native_command(NVNcommandBuffer* command_buffer, CommandBufferState& state) noexcept {
     if (!state.donated_cursor) return;
     if (std::size_t(state.donated_end - state.donated_cursor) < native_command_size &&
-        state.memory_callback && !state.callback_exhausted) {
+        state.memory_callback && !state.command_callback_disabled && !state.callback_exhausted) {
         // The game's callback runs guest code on top of live NVN frames: an
         // asynchronous stop must not unwind through them.
         const execution::GuestPreemptHold hold;
@@ -329,7 +332,7 @@ bool request_control_memory(NVNcommandBuffer* command_buffer, CommandBufferState
     if (consume())
         return true;
 
-    if (!state.memory_callback || state.control_exhausted) {
+    if (!state.memory_callback || state.control_callback_disabled || state.control_exhausted) {
         if (!state.control_exhausted)
             diagnostic("command recording", "out of donated control memory");
         state.control_exhausted = 1;
@@ -398,7 +401,7 @@ void* append_record(NVNcommandBuffer* command_buffer, Op op, std::size_t payload
     std::memcpy(storage, &header, sizeof(header));
     if (op == Op::call)
         list->stamped_registrations = 0;
-    if (op == Op::call || op == Op::bind_textures_deferred || op == Op::fence_sync ||
+    if (op == Op::call || op == Op::bind_textures_deferred || op == Op::fence_sync || op == Op::wait_event ||
         op == Op::set_texture_pool || op == Op::set_sampler_pool || op == Op::shader_scratch_memory)
         list->submit_records.push_back(storage);
     return storage + sizeof(header);
@@ -664,6 +667,12 @@ constexpr std::size_t payload_minimum(Op op) noexcept {
         return sizeof(DispatchIndirect);
     case Op::sampler_registrations:
         return sizeof(SamplerRegistrations);
+    case Op::push_constants:
+        return sizeof(PushConstants);
+    case Op::draw_mesh_tasks:
+        return sizeof(DrawMeshTasks);
+    case Op::draw_mesh_tasks_indirect:
+        return sizeof(DrawMeshTasksIndirect);
     case Op::call:
         return sizeof(CommandCall);
     default:
@@ -966,6 +975,9 @@ CommandWalkStatus prepare_list(CommandSubmission& submission, NVNcommandHandle h
             if (value.pool) submission.scratch_pools.emplace(reinterpret_cast<std::uint64_t>(record), *value.pool);
             break;
         }
+        case Op::wait_event:
+            submission.event_waits = true;
+            break;
         default: return CommandWalkStatus::malformed_record;
         }
     }
@@ -1022,11 +1034,18 @@ void command_add_command_memory(NVNcommandBuffer* command_buffer, const NVNmemor
     const auto* memory = as<MemoryPoolState>(pool);
     if (!pool || !memory->memory) {
         // Nothing to account against: records need no game memory.
-        state->donated_base = state->donated_end = state->donated_cursor = nullptr;
+        state->donated_base = state->donated_end = state->donated_cursor = 0;
         state->callback_exhausted = 0;
         return;
     }
-    if (offset < 0 || std::uint64_t(offset) > memory->size || size > memory->size - std::uint64_t(offset)) {
+    // The range starts inside the pool and is no larger than it. Its end is
+    // not bounded by the pool: the title's driver takes such a range (a game's
+    // ring of 512-byte chunks from offset 4 runs 4 bytes past a 1 MiB pool),
+    // and nothing is written there; the range only accounts for the game's
+    // command-memory position.
+    const auto base = reinterpret_cast<std::uintptr_t>(memory->memory) + std::uintptr_t(offset);
+    if (offset < 0 || std::uint64_t(offset) >= memory->size || size > memory->size ||
+        size > std::numeric_limits<std::uintptr_t>::max() - base) {
         diagnostic("nvnCommandBufferAddCommandMemory", "invalid pool range");
         static std::atomic<int> detailed{0};
         if (detailed.fetch_add(1, std::memory_order_relaxed) < 3)
@@ -1034,13 +1053,13 @@ void command_add_command_memory(NVNcommandBuffer* command_buffer, const NVNmemor
                          static_cast<const void*>(pool), pool ? static_cast<const void*>(memory->memory) : nullptr,
                          pool ? static_cast<unsigned long long>(memory->size) : 0ull,
                          static_cast<long long>(offset), size);
-        state->donated_base = state->donated_end = state->donated_cursor = nullptr;
+        state->donated_base = state->donated_end = state->donated_cursor = 0;
         return;
     }
-    state->donated_base = memory->memory + offset;
-    state->donated_cursor = state->donated_base;
-    state->donated_end = state->donated_base + size;
-    state->segment_base = state->donated_base;
+    state->donated_base = base;
+    state->donated_cursor = base;
+    state->donated_end = base + size;
+    state->segment_base = memory->memory + offset;
     state->callback_exhausted = 0;
     if (state->recording && state->list) state->list->range_start = state->donated_cursor;
 }
@@ -1128,7 +1147,7 @@ NVNcommandHandle command_end_recording(NVNcommandBuffer* command_buffer) {
     // position replaces the list, and handles the game cached run the new
     // commands, as they would natively. Recordings without game command memory
     // take a counter handle.
-    NVNcommandHandle handle = reinterpret_cast<NVNcommandHandle>(recorded->native_start);
+    NVNcommandHandle handle = static_cast<NVNcommandHandle>(recorded->native_start);
     if (!handle) {
         handle = next_handle.fetch_add(1, std::memory_order_relaxed);
         if (!handle) handle = next_handle.fetch_add(1, std::memory_order_relaxed);
@@ -2049,6 +2068,47 @@ void command_signal_event(NVNcommandBuffer* c, const NVNevent* event, NVNeventSi
 
 } // namespace
 
+void command_refuse(NVNcommandBuffer* c, const char* operation, const char* detail) noexcept {
+    diagnostic(operation, detail);
+    fail_recording(c);
+}
+
+void command_draw_mesh_tasks(NVNcommandBuffer* c, int first, int count) noexcept {
+    if (first < 0 || count < 0) {
+        diagnostic("nvnCommandBufferDrawMeshTasks", "negative first task or count");
+        fail_recording(c);
+        return;
+    }
+    if (auto* p = append<DrawMeshTasks>(c, Op::draw_mesh_tasks, "nvnCommandBufferDrawMeshTasks"))
+        *p = {first, count};
+}
+
+void command_draw_mesh_tasks_indirect(NVNcommandBuffer* c, NVNbufferAddress address) noexcept {
+    if (auto* p = append<DrawMeshTasksIndirect>(c, Op::draw_mesh_tasks_indirect,
+                                                "nvnCommandBufferDrawMeshTasksIndirect"))
+        p->address = address;
+}
+
+void command_push_constants(NVNcommandBuffer* c, NVNshaderStage stage, std::uint32_t bank, std::uint32_t offset,
+                            std::uint32_t size, const void* data, const char* operation) noexcept {
+    if (stage < NVN_SHADER_STAGE_VERTEX || stage > NVN_SHADER_STAGE_COMPUTE || offset % 4 || size % 4 ||
+        offset > push_constant_bytes || size > push_constant_bytes - offset || (size && !data)) {
+        diagnostic(operation, "invalid stage, or range outside the push-constant block");
+        fail_recording(c);
+        return;
+    }
+    auto* p = append<PushConstants>(c, Op::push_constants, operation);
+    if (!p)
+        return;
+    p->stage = stage;
+    p->bank = bank;
+    p->offset = offset;
+    p->size = size;
+    std::memset(p->data, 0, sizeof p->data);
+    if (size)
+        std::memcpy(p->data, data, size);
+}
+
 CommandWalkStatus walk_commands(NVNcommandHandle handle, CommandVisitor visitor, void* context) noexcept {
     if (!visitor)
         return CommandWalkStatus::stopped;
@@ -2098,6 +2158,8 @@ void fence_commands(const CommandSubmission& submission, std::uint64_t fence) no
         sync->fenced = 1;
     }
 }
+
+bool submission_has_event_waits(const CommandSubmission& submission) noexcept { return submission.event_waits; }
 
 std::string_view command_walk_status_name(CommandWalkStatus status) noexcept {
     switch (status) {

@@ -229,6 +229,8 @@ void validate_stage_resources(const CompiledGraphicsStage& stage,
     // The command-stream renderer binds vertex input through descriptors only.
     require(!stage.vertex_fetch_buffer_index,
             "Shader-side vertex fetch stages are supported by the NVN driver only");
+    require(!stage.guest_memory, "Guest-memory window tables are supported by the NVN driver only");
+    require(!stage.requires_rasterizer_discard, "Vertex stages without outputs are supported by the NVN driver only");
     if (stage.draw_support_buffer_index)
         require(expected == shader_input::Stage::Vertex &&
                     *stage.draw_support_buffer_index < 31 &&
@@ -296,7 +298,7 @@ void validate_stage_pair(const CompiledGraphicsPair& pair,
     // sample-mask export into the rasterizer coverage. Depth-bias emulation
     // stays exclusive with a guest depth export (validate_stage_resources).
     require(vertex.interface.position_input_mask == 0 &&
-                vertex.interface.position_output_mask == 15 &&
+                vertex.interface.position_output_mask && !(vertex.interface.position_output_mask & ~15u) &&
                 vertex.interface.color_output_mask == 0 &&
                 !vertex.fragment_output_types_from_render_targets &&
                 !vertex.writes_fragment_depth && !vertex.writes_sample_mask &&

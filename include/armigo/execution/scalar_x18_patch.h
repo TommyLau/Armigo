@@ -41,6 +41,9 @@ struct ScalarX18Policy {
     // TSD slot, or other runtime storage used by the trampoline. This builder
     // cannot prove address isolation and does not provide a memory sandbox.
     bool runtime_storage_disjoint = false;
+    // The same holds for the 32 bytes below guest SP. Only a CASP pair
+    // starting at x18 needs it; without it that form is refused.
+    bool pair_stack_scratch_available = false;
 };
 
 struct ScalarX18Patch {
@@ -72,9 +75,11 @@ struct ScalarX18PatchResult {
 //
 // Unsigned-offset and unscaled LDR/STR/LDUR/STUR of any transfer width through
 // SP, pair loads and stores (LDP/STP/LDNP/STNP, LDPSW), and their pre-index
-// and post-index forms, compensate for the 16-byte spill. Pre-index and
-// post-index become one plain offset access followed by an SP update in the
-// trampoline epilogue. Immediate ADD/ADDS/SUB/SUBS W18/X18 from WSP/SP instead
+// and post-index forms, compensate for the 16-byte spill. A general-register
+// pair whose compensated offset leaves imm7 (only at its top) becomes two
+// single-register transfers at the same addresses. Pre-index and post-index
+// become plain offset accesses (one, or two for such a pair) followed by an SP
+// update in the trampoline epilogue. Immediate ADD/ADDS/SUB/SUBS W18/X18 from WSP/SP instead
 // reconstruct the original SP in the value scratch, preserving the original
 // immediate, width and flag behavior. AdvSIMD structures through general bases,
 // general/vector copies and integer/FP conversions use checked substitution;

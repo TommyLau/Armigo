@@ -302,7 +302,40 @@ std::set<std::uint64_t> validate_storage_buffers_v3(const Json& items, const Jso
     return metals;
 }
 
-void validate_textures_v2(const Json& items) {
+// Slot 31 names handle program (offset / 4), not a constant buffer. Slots 18
+// through 30 stay outside the constant-buffer range. `elements` is how many
+// consecutive programs the binding needs (one per array element, or one for a
+// descriptor fact). The stage loader uses the same rule.
+constexpr std::uint64_t handle_program_slot = 31;
+constexpr std::size_t handle_program_limit = 4096;
+
+std::size_t validate_handle_programs(const Json& metadata) {
+    const Json* programs = find_member(metadata, "handle_programs");
+    if (programs == nullptr) return 0;
+    require(programs->is_array(), "handle_programs must be an array");
+    require(programs->array().size() <= handle_program_limit,
+            "handle_programs exceeds its count policy");
+    for (const Json& program : programs->array()) {
+        require(program.is_array(), "handle program must be an array");
+        require(program.array().size() <= handle_program_limit,
+                "handle program exceeds its count policy");
+        for (const Json& word : program.array()) {
+            require(is_uint(word, 0xffffffffu), "handle program word is invalid");
+        }
+    }
+    return programs->array().size();
+}
+
+bool admits_texture_slot(const Json& slot_value, std::uint64_t offset, std::uint64_t elements,
+                         std::size_t programs) {
+    if (!is_uint(slot_value, handle_program_slot)) return false;
+    const auto slot = uint_value(slot_value);
+    if (slot != handle_program_slot) return slot <= 17;
+    if ((offset & 3ull) != 0 || elements == 0) return false;
+    return offset / 4ull + elements <= programs;
+}
+
+void validate_textures_v2(const Json& items, std::size_t programs) {
     require(items.is_array() && items.array().size() <= 32, "textures must be an array of at most 32 entries");
     std::set<std::uint64_t> texture_handles, sampler_handles, textures, samplers;
     for (const Json& item : items.array()) {
@@ -318,7 +351,8 @@ void validate_textures_v2(const Json& items) {
         }
         const auto handle = number(item, "handle_byte_offset");
         auto& handles = kind == "texture" ? texture_handles : sampler_handles;
-        require(is_uint(m(item, "cbuf_slot"), 17) && is_uint(m(item, "handle_byte_offset"), 32764) && handle % 4 == 0 &&
+        require(is_uint(m(item, "handle_byte_offset"), 32764) && handle % 4 == 0 &&
+                    admits_texture_slot(m(item, "cbuf_slot"), handle, 1, programs) &&
                     handles.insert(handle).second,
                 "texture provenance reflection is invalid");
         if (kind == "texture") {
@@ -350,7 +384,7 @@ std::optional<std::uint64_t> validate_argument_buffer_v3(const Json& value) {
     return number(value, "buffer_index");
 }
 
-void validate_textures_v3(const Json& items, const Json& argument_buffer) {
+void validate_textures_v3(const Json& items, const Json& argument_buffer, std::size_t programs) {
     require(items.is_array() && items.array().size() <= 4096, "textures must be an array of at most 4096 entries");
     std::set<std::uint64_t> resource_ids;
     for (const Json& item : items.array()) {
@@ -373,8 +407,10 @@ void validate_textures_v3(const Json& items, const Json& argument_buffer) {
                   "comparison", "normalized_coordinates");
         }
         const auto length = number(item, "array_length"), offset = number(item, "handle_byte_offset");
-        require(is_uint(m(item, "cbuf_slot"), 17) && is_uint(m(item, "handle_byte_offset"), 65532) && offset % 4 == 0 &&
-                    is_uint(m(item, "array_length"), 0xffffffff) && length > 0 && length <= 16384 && offset + length * 4 <= 65536,
+        require(is_uint(m(item, "handle_byte_offset"), 65532) && offset % 4 == 0 &&
+                    is_uint(m(item, "array_length"), 0xffffffff) && length > 0 && length <= 16384 &&
+                    offset + length * 4 <= 65536 &&
+                    admits_texture_slot(m(item, "cbuf_slot"), offset, length, programs),
                 "texture provenance reflection is invalid");
         require(m(item, "comparison").is_bool() && m(item, "normalized_coordinates").is_bool(),
                 kind + " reflection is invalid");
@@ -457,7 +493,7 @@ void validate_vertex_streams(const Json& items) {
     }
 }
 
-void validate_dependencies(const Json& items) {
+void validate_dependencies(const Json& items, std::size_t programs) {
     require(items.is_array() && items.array().size() <= 1024, "dependencies must be an array of at most 1024 entries");
     std::set<std::tuple<std::string, std::uint64_t, std::uint64_t, std::uint64_t>> keys;
     for (const Json& item : items.array()) {
@@ -473,8 +509,9 @@ void validate_dependencies(const Json& items) {
                     is_uint(m(item, "component"), 3),
                 "dependency reflection is invalid");
         if (text(item, "kind") == "texture_descriptor") {
-            require(is_uint(m(item, "index"), 17) && is_uint(m(item, "byte_offset"), 32764) &&
-                        number(item, "byte_offset") % 4 == 0 && number(item, "component") == 0,
+            const auto offset = number(item, "byte_offset");
+            require(is_uint(m(item, "byte_offset"), 32764) && offset % 4 == 0 && number(item, "component") == 0 &&
+                        admits_texture_slot(m(item, "index"), offset, 1, programs),
                     "texture descriptor dependency key is invalid");
             texture_descriptor_value(m(item, "value"), "texture descriptor dependency");
         }
@@ -597,7 +634,9 @@ bool validate_interface_v2(const Json& value, std::string_view stage, const Json
         return false;
     }
     if (stage == "vertex") {
-        require(number(value, "position_input_mask") == 0 && number(value, "position_output_mask") == 15 &&
+        // A position output may declare only some components; the stage gives
+        // the rest the hardware default (0, 0, 0, 1).
+        require(number(value, "position_input_mask") == 0 && number(value, "position_output_mask") != 0 &&
                     number(value, "color_output_mask") == 0 && m(value, "color_outputs").array().empty() &&
                     !boolean(value, "writes_fragment_depth") && !boolean(value, "writes_sample_mask") &&
                     m(value, "generic_inputs").array().size() == streams.array().size(),
@@ -653,7 +692,8 @@ std::string validate_reflection_v2(const Json& metadata, std::span<const std::by
         "source_file", "source_digest", "stage", "entry_point", "vertex_depth", "fragment_position", "c1_digest", "profile",
         "constant_buffers", "support_buffers", "textures", "vertex_streams", "vertex_inputs", "interface", "dependencies"};
     if (v3) required.insert("argument_buffer");
-    std::set<std::string, std::less<>> optional{"fragment_output_mode", "depth_bias_mode", "y_direction", "point_size", "point_coord"};
+    std::set<std::string, std::less<>> optional{"fragment_output_mode", "depth_bias_mode", "y_direction", "point_size",
+                                                "point_coord", "handle_programs"};
     if (v3) optional.insert({"storage_buffers", "custom_border", "draw_support", "vertex_fetch", "compute"});
     require(metadata.is_object(), "reflection has an unexpected schema");
     for (const auto& [key, value] : metadata.object()) {
@@ -742,8 +782,9 @@ std::string validate_reflection_v2(const Json& metadata, std::span<const std::by
     const auto storage_indices = v3 ? validate_storage_buffers_v3(storage_buffers, m(metadata, "constant_buffers"))
                                     : std::set<std::uint64_t>{};
     const auto argument_index = v3 ? validate_argument_buffer_v3(m(metadata, "argument_buffer")) : std::nullopt;
-    if (v3) validate_textures_v3(m(metadata, "textures"), m(metadata, "argument_buffer"));
-    else validate_textures_v2(m(metadata, "textures"));
+    const auto programs = validate_handle_programs(metadata);
+    if (v3) validate_textures_v3(m(metadata, "textures"), m(metadata, "argument_buffer"), programs);
+    else validate_textures_v2(m(metadata, "textures"), programs);
     validate_vertex_streams(m(metadata, "vertex_streams"));
     validate_vertex_inputs_v2(m(metadata, "vertex_inputs"), m(metadata, "vertex_streams"), stage);
     std::set<std::uint64_t> vertex_indices;
@@ -831,7 +872,7 @@ std::string validate_reflection_v2(const Json& metadata, std::span<const std::by
                 return constant_indices.contains(index) || support_indices.contains(index);
             }),
             "constant/support buffer indices overlap vertex streams");
-    validate_dependencies(m(metadata, "dependencies"));
+    validate_dependencies(m(metadata, "dependencies"), programs);
     for (const Json& item : m(metadata, "dependencies").array()) {
         if (text(item, "kind") == "compute_local_size") {
             require(stage == "compute" && m(item, "value") == m(m(metadata, "compute"), "local_size"),
@@ -1033,7 +1074,8 @@ std::string variant_data(const Json& metadata) {
         }
         result.emplace("dependencies", std::move(dependencies));
         for (const std::string_view name : {"fragment_output_mode", "depth_bias_mode", "y_direction", "point_size",
-                                            "point_coord", "custom_border", "draw_support", "vertex_fetch", "compute"}) {
+                                            "point_coord", "custom_border", "draw_support", "vertex_fetch", "compute",
+                                            "handle_programs"}) {
             if (const Json* value = find_member(metadata, name)) result.emplace(name, *value);
         }
         if (schema == "armigo-shader-stage-v3") {

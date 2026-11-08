@@ -65,7 +65,7 @@ public:
         for (const auto& record : records_) {
             *output_ << (record.instant - epoch_).count() << '\t' << record.instant.time_since_epoch().count()
                      << '\t' << record.index << '\t' << record.position << '\t'
-                     << (script_clock_ == InputScript::Clock::milliseconds ? "milliseconds" : "presents")
+                     << input_clock_name(script_clock_)
                      << '\t' << record.input.buttons << '\t' << record.input.left_x << '\t' << record.input.left_y
                      << '\t' << record.input.right_x << '\t' << record.input.right_y << '\n';
         }

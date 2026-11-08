@@ -10,6 +10,7 @@
 
 #include "stage_internal.h"
 #include "custom_border.h"
+#include "matrix_plan.h"
 #include "../dispatch.h"
 #include "../../graphics_operations.h"
 #include <armigo/shader/rne_multiply.h>
@@ -33,7 +34,6 @@ std::uint64_t output_key(IoSemantic semantic, std::uint16_t location, unsigned c
 }
 struct Flow {
     bool reachable{true};
-    Definitions defined;
     OutputComponents outputs;
     // Only paths that have not lost predicate correlations may witness a write.
     bool exact{true};
@@ -67,13 +67,10 @@ bool reserved_entry(const std::string& name) {
 }
 
 Flow merge(const std::vector<Flow>& flows) {
-    Flow result{false, {}, {}};
+    Flow result{false, {}};
     for (const auto& flow : flows) if (flow.reachable) {
         if (!result.reachable) result = flow;
         else {
-            Definitions common;
-            std::set_intersection(result.defined.begin(), result.defined.end(), flow.defined.begin(), flow.defined.end(), std::inserter(common, common.end()));
-            result.defined = std::move(common);
             OutputComponents common_outputs;
             std::set_intersection(result.outputs.begin(), result.outputs.end(), flow.outputs.begin(), flow.outputs.end(), std::inserter(common_outputs, common_outputs.end()));
             result.outputs = std::move(common_outputs);
@@ -99,7 +96,7 @@ class Definedness {
         OperationId operation;
         std::optional<Operand> condition;
         std::vector<std::size_t> next, predecessors;
-        Definitions live, predicates;
+        Definitions predicates;
         std::map<Environment, Flow> incoming;
         std::size_t precise_updates{};
         bool queued{}, widened{};
@@ -279,36 +276,30 @@ class Definedness {
             step();
             const auto index = queue.begin()->second; queue.erase(queue.begin());
             auto& n = nodes_[index]; n.queued = false;
-            Definitions live, predicates;
+            Definitions predicates;
             for (auto next : n.next) {
-                step(nodes_[next].live.size() + nodes_[next].predicates.size());
-                live.insert(nodes_[next].live.begin(), nodes_[next].live.end());
+                step(nodes_[next].predicates.size());
                 predicates.insert(nodes_[next].predicates.begin(), nodes_[next].predicates.end());
             }
-            auto use = [&](const Operand& operand) {
-                step();
-                if (const auto* id = std::get_if<ValueId>(&operand)) live.insert(id->value);
-            };
             if (n.operation.valid()) {
                 const auto& op = p_.ir.operations[n.operation.value];
                 bool tracked = false;
                 for (const auto& output : op.outputs) {
                     const auto id = std::get<ValueId>(output).value;
-                    live.erase(id); tracked |= predicates.erase(id) != 0;
+                    tracked |= predicates.erase(id) != 0;
                 }
                 for (const auto& input : op.inputs) {
-                    use(input);
+                    step();
                     if (tracked && boolean_expression(op.opcode))
                         if (const auto* id = std::get_if<ValueId>(&input); id && p_.ir.values[id->value].type == ValueType::predicate)
                             predicates.insert(id->value);
                 }
             }
             if (n.condition) {
-                use(*n.condition);
+                step();
                 if (const auto* id = std::get_if<ValueId>(&*n.condition)) predicates.insert(id->value);
             }
-            if (live != n.live || predicates != n.predicates) {
-                n.live = std::move(live);
+            if (predicates != n.predicates) {
                 n.predicates = std::move(predicates);
                 for (auto pred : n.predecessors) if (!nodes_[pred].queued) {
                     queue.emplace(rank_[pred], pred); nodes_[pred].queued = true;
@@ -345,19 +336,18 @@ class Definedness {
     void run(std::size_t entry) {
         std::set<std::pair<std::size_t, std::size_t>> queue;
         auto propagate = [&](std::size_t target, Environment env, Flow flow) {
-            step(env.size() + flow.defined.size() + flow.outputs.size() + 1);
+            step(env.size() + flow.outputs.size() + 1);
             auto& n = nodes_[target];
             std::erase_if(env, [&](const auto& item) { return !n.predicates.contains(item.first); });
             canonicalize(env);
-            std::erase_if(flow.defined, [&](auto id) { return !n.live.contains(id); });
             // When both arms establish identical must-facts, their differing
             // Boolean constants can be represented by one fresh atom (and its
             // aliases/complements). This is their exact union, so future guards
             // retain correlations without enumerating independent choices.
             if (!n.widened) {
                 for (auto it = n.incoming.begin(); it != n.incoming.end();) {
-                    step(flow.defined.size() + flow.outputs.size() + 1);
-                    if (it->first != env && it->second.defined == flow.defined && it->second.outputs == flow.outputs) {
+                    step(flow.outputs.size() + 1);
+                    if (it->first != env && it->second.outputs == flow.outputs) {
                         if (auto joined = coalesce(env, it->first)) {
                             env = std::move(*joined);
                             flow.exact &= it->second.exact;
@@ -376,12 +366,10 @@ class Definedness {
             if (n.widened || (n.precise_updates == environment_limit && !n.incoming.contains(env))) {
                 for (const auto& [old_env, old_flow] : n.incoming) {
                     env = join(env, old_env);
-                    intersect(flow.defined, old_flow.defined);
                     intersect(flow.outputs, old_flow.outputs);
                 }
                 flow.exact = false;
                 if (n.widened && n.incoming.begin()->first == env &&
-                    n.incoming.begin()->second.defined == flow.defined &&
                     n.incoming.begin()->second.outputs == flow.outputs) return;
                 n.incoming.clear();
                 n.widened = true;
@@ -390,7 +378,6 @@ class Definedness {
             if (inserted && !n.widened) ++n.precise_updates;
             bool changed = inserted;
             if (!inserted) {
-                changed |= intersect(found->second.defined, flow.defined);
                 changed |= intersect(found->second.outputs, flow.outputs);
                 if (flow.exact && !found->second.exact) {
                     found->second.exact = true;
@@ -406,10 +393,10 @@ class Definedness {
             auto& n = nodes_[index]; n.queued = false;
             // Charge the snapshot before copying it, including output facts.
             for (const auto& [env, flow] : n.incoming)
-                step(env.size() + flow.defined.size() + flow.outputs.size() + 1);
+                step(env.size() + flow.outputs.size() + 1);
             const auto incoming = n.incoming;
             for (const auto& [environment, incoming_flow] : incoming) {
-                step(environment.size() + incoming_flow.defined.size() + incoming_flow.outputs.size() + 1);
+                step(environment.size() + incoming_flow.outputs.size() + 1);
                 if (n.condition) {
                     const auto truth = boolean(*n.condition, environment);
                     for (unsigned arm = 0; arm < 2; ++arm)
@@ -432,7 +419,6 @@ class Definedness {
                         ? evaluate(op, environment) : std::optional<Boolean>{};
                     for (const auto& output : op.outputs) {
                         const auto id = std::get<ValueId>(output).value;
-                        flow.defined.insert(id);
                         if (p_.ir.values[id].type != ValueType::predicate ||
                             n.next.empty() || !nodes_[n.next[0]].predicates.contains(id)) continue;
                         step(env.size() + 1);
@@ -464,12 +450,11 @@ class Definedness {
         }
     }
     Flow proof(std::size_t index) {
-        Flow result{false, {}, {}};
+        Flow result{false, {}};
         for (const auto& [env, flow] : nodes_[index].incoming) {
-            step(flow.defined.size() + flow.outputs.size() + 1);
+            step(flow.outputs.size() + 1);
             if (!result.reachable) result = flow;
             else {
-                intersect(result.defined, flow.defined);
                 intersect(result.outputs, flow.outputs);
             }
         }
@@ -506,6 +491,12 @@ class StageContext final : public MslContext {
     std::uint64_t steps_{};
     OperationId current_;
     std::optional<DepthConvention> depth_;
+    // A vertex stage that writes no output (see ResourcePlan).
+    bool void_vertex_{};
+    // SIMD-groups of a compute stage with warp matrix operations, each with a
+    // 256-word threadgroup scratch block; zero without such operations.
+    std::uint32_t matrix_groups_{};
+    std::optional<MatrixPlan> matrix_plan_;
     bool fixed_point_size_ = false;
 
     void append(std::string_view text) {
@@ -548,7 +539,7 @@ class StageContext final : public MslContext {
                 line("if (armigo_" + name + "_is_s32) out." + name + "_s32 = as_type<int4>(" + raw + ");");
             }
         }
-        line(p_.ir.stage == Stage::compute ? "return;" : "return out;");
+        line(p_.ir.stage == Stage::compute || void_vertex_ ? "return;" : "return out;");
     }
     void region(RegionId id, unsigned nesting = 0) {
         step();
@@ -567,8 +558,8 @@ class StageContext final : public MslContext {
                     require(flow_.reachable, "Unreachable operation in structured sequence");
                     require(op_id.value < p_.ir.operations.size() && operations_.insert(op_id.value).second, "Invalid or repeated operation");
                     current_ = op_id;
-                    const auto proof = definedness_->operation(op_id);
-                    live_ = proof.reachable; flow_.defined = proof.defined; flow_.outputs = proof.outputs;
+                    const auto proof = definedness_ ? definedness_->operation(op_id) : Flow{};
+                    live_ = proof.reachable; flow_.outputs = proof.outputs;
                     const auto& op = operation(op_id);
                     // Check all raw inputs before callbacks can assign aliased destinations.
                     for (const auto& value : op.inputs) {
@@ -605,8 +596,8 @@ class StageContext final : public MslContext {
                 }
             } else if constexpr (std::is_same_v<T, IfRegion>) {
                 require(flow_.reachable, "Unreachable conditional region");
-                const auto proof = definedness_->region(id);
-                live_ = proof.reachable; flow_.defined = proof.defined; flow_.outputs = proof.outputs;
+                const auto proof = definedness_ ? definedness_->region(id) : Flow{};
+                live_ = proof.reachable; flow_.outputs = proof.outputs;
                 auto condition = take(operand(r.condition, ScalarType::boolean));
                 const auto incoming = flow_;
                 line("if (" + condition + ") {"); ++indent_;
@@ -653,8 +644,8 @@ class StageContext final : public MslContext {
             } else if constexpr (std::is_same_v<T, ReturnRegion>) {
                 require(r.values.empty(), "Entry point cannot return IR values", DiagnosticCode::unsupported_capability);
                 require(flow_.reachable, "Unreachable return region");
-                const auto proof = definedness_->region(id);
-                live_ = proof.reachable; flow_.defined = proof.defined; flow_.outputs = proof.outputs;
+                const auto proof = definedness_ ? definedness_->region(id) : Flow{};
+                live_ = proof.reachable; flow_.outputs = proof.outputs;
                 emit_return(); flow_.reachable = false;
             }
         }, p_.regions[id.value]);
@@ -666,6 +657,8 @@ public:
     bool fragment_output_types_from_render_targets() const override {
         return options_.fragment_output_types_from_render_targets;
     }
+    std::uint32_t guest_memory_tag() const override { return options_.guest_memory_tag; }
+    const MatrixPlan* matrix_plan() const override { return matrix_plan_ ? &*matrix_plan_ : nullptr; }
     const Operation& operation(OperationId id) const override { return p_.ir.operations.at(id.value); }
     Diagnostic error(OperationId id, DiagnosticCode code, std::string message, std::string modifier = {}) const override {
         auto error = diagnose(Phase::emit_msl, code, id.value < p_.ir.operations.size() ? operation(id).source : SourceLocation{}, std::move(message));
@@ -699,7 +692,6 @@ public:
             require(id.value < p_.ir.values.size() && p_.ir.values[id.value].type == storage_type(type), "Assignment changes storage width");
             require(p_.ir.values[id.value].kind == ValueKind::mutable_local || assignments_.insert(id.value).second, "Temporary assigned more than once");
             line("value" + number(id.value) + " = " + raw(std::string(expression), type) + ";");
-            flow_.defined.insert(id.value);
         });
     }
     Status statement(std::string_view statement) override {
@@ -722,6 +714,214 @@ inline uint armigo_cbuf_word(constant uint* cb, ulong address, uint size_bytes, 
             else if (name == "armigo_mul_rtz_ftz") source = armigo::shader::emit_rtz_ftz_multiply_msl();
             else if (name == "armigo_i2f")
                 source = std::string(armigo::shader::graphics::detail::integer_to_float_msl_helper());
+            else if (name == "armigo_mma") source = R"(
+// HMMA.16816 on the SIMD-group matrix hardware. Lane L (g = L / 4, t = L % 4)
+// holds A rows g and g + 8 at k = 2t, 2t + 1 (a.x, a.y) and k + 8 (a.z, a.w),
+// B at k = 2t, 2t + 1 (b.x) and k + 8 (b.y) of column g, and C and D at rows
+// g, g + 8 and columns 2t, 2t + 1. Words reach the binary16 matrices through
+// the SIMD-group's scratch block s, row-major: A (16x16) at word 0, B
+// transposed (8x16) at word 128 and C, then D (16x8) at word 192. A's
+// quadrants are (row 0, k 0), (row 8, k 0), (row 0, k 8) and (row 8, k 8),
+// B's halves k 0 and k 8.
+inline void armigo_mma_put_a(threadgroup uint* s, uint lane, uint4 a) {
+    const uint g = (lane & 31u) >> 2u, t = lane & 3u;
+    s[g * 8u + t] = a.x; s[(g + 8u) * 8u + t] = a.y;
+    s[g * 8u + 4u + t] = a.z; s[(g + 8u) * 8u + 4u + t] = a.w;
+}
+inline void armigo_mma_put_b(threadgroup uint* s, uint lane, uint2 b) {
+    const uint g = (lane & 31u) >> 2u, t = lane & 3u;
+    s[128u + g * 8u + t] = b.x; s[128u + g * 8u + 4u + t] = b.y;
+}
+inline void armigo_mma_put_c(threadgroup uint* s, uint lane, uint2 c) {
+    const uint g = (lane & 31u) >> 2u, t = lane & 3u;
+    s[192u + g * 4u + t] = c.x; s[224u + g * 4u + t] = c.y;
+}
+inline void armigo_mma_get_a(thread simdgroup_half8x8 (&a)[4], const threadgroup uint* s) {
+    const threadgroup half* h = reinterpret_cast<const threadgroup half*>(s);
+    simdgroup_load(a[0], h, 16); simdgroup_load(a[1], h + 128, 16);
+    simdgroup_load(a[2], h + 8, 16); simdgroup_load(a[3], h + 136, 16);
+}
+inline void armigo_mma_get_b(thread simdgroup_half8x8 (&b)[2], const threadgroup uint* s) {
+    const threadgroup half* h = reinterpret_cast<const threadgroup half*>(s) + 256;
+    simdgroup_load(b[0], h, 16, ulong2(0, 0), true); simdgroup_load(b[1], h + 8, 16, ulong2(0, 0), true);
+}
+inline void armigo_mma_get_c(thread simdgroup_half8x8 (&c)[2], const threadgroup uint* s) {
+    const threadgroup half* h = reinterpret_cast<const threadgroup half*>(s) + 384;
+    simdgroup_load(c[0], h, 8); simdgroup_load(c[1], h + 64, 8);
+}
+// D = A B + C: binary16 products are exact in binary32, which accumulates
+// them over k with C; the second multiply-accumulate rounds each element to
+// binary16 once, as the D words hold it, so a D kept as the next C equals
+// the words read back.
+inline void armigo_mma(thread simdgroup_half8x8 (&d)[2],
+                       thread const simdgroup_half8x8& a0, thread const simdgroup_half8x8& a1,
+                       thread const simdgroup_half8x8& a2, thread const simdgroup_half8x8& a3,
+                       thread const simdgroup_half8x8& b0, thread const simdgroup_half8x8& b1,
+                       thread const simdgroup_half8x8& c0, thread const simdgroup_half8x8& c1) {
+    simdgroup_float8x8 low, high;
+    simdgroup_multiply_accumulate(low, a0, b0, c0); simdgroup_multiply_accumulate(d[0], a2, b1, low);
+    simdgroup_multiply_accumulate(high, a1, b0, c1); simdgroup_multiply_accumulate(d[1], a3, b1, high);
+}
+inline uint2 armigo_mma_lanes(threadgroup uint* s, uint lane, thread const simdgroup_half8x8 (&d)[2]) {
+    const uint g = (lane & 31u) >> 2u, t = lane & 3u;
+    threadgroup half* h = reinterpret_cast<threadgroup half*>(s) + 384;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_store(d[0], h, 8); simdgroup_store(d[1], h + 64, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    return uint2(s[192u + g * 4u + t], s[224u + g * 4u + t]);
+}
+)";
+            else if (name == "armigo_ldsm_tiles") source = R"(
+// The blocks in `mask` of an LDSM as matrices, each block's rows as the
+// matrix's rows or, with `transpose`, its columns. Lanes 8m to 8m + 7 hold
+// block m's row addresses. When every such block's rows are 16-byte aligned
+// rows inside the allocation at one nonzero stride, the matrix hardware reads
+// each block in place; otherwise each lane copies its row into the scratch
+// block s, a word outside the allocation reading zero, and the hardware reads
+// the copies.
+inline void armigo_ldsm_tiles(thread simdgroup_half8x8 (&tiles)[4], threadgroup atomic_uint* words, uint extent, uint lane,
+                              uint address, bool transpose, uint mask, threadgroup uint* s) {
+    const uint block = (lane & 31u) >> 3u;
+    const bool used = ((mask >> block) & 1u) != 0u;
+    const uint first = simd_shuffle(address, ushort(block * 8u));
+    const uint stride = simd_shuffle(address, ushort(block * 8u + 1u)) - first;
+    const bool row = !used || ((address & 15u) == 0u && address < extent && extent - address >= 16u && stride != 0u &&
+                               stride <= extent && address == first + (lane & 7u) * stride);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_all(row)) {
+        const threadgroup half* h = reinterpret_cast<const threadgroup half*>(words);
+        for (uint m = 0u; m < 4u; ++m) {
+            if (((mask >> m) & 1u) == 0u) continue;
+            const uint origin = simd_broadcast(address, ushort(8u * m));
+            const uint step = simd_broadcast(address, ushort(8u * m + 1u)) - origin;
+            simdgroup_load(tiles[m], h + origin / 2u, step / 2u, ulong2(0, 0), transpose);
+        }
+    } else {
+        if (used)
+            for (uint j = 0u; j < 4u; ++j) {
+                const uint byte = address + 4u * j;
+                s[32u * block + 4u * (lane & 7u) + j] =
+                    byte / 4u < extent / 4u ? atomic_load_explicit(&words[byte / 4u], memory_order_relaxed) : 0u;
+            }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const threadgroup half* h = reinterpret_cast<const threadgroup half*>(s);
+        for (uint m = 0u; m < 4u; ++m)
+            if ((mask >> m) & 1u) simdgroup_load(tiles[m], h + 64u * m, 8, ulong2(0, 0), transpose);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+)";
+            else if (name == "armigo_ldsm") source = R"(
+inline uint4 armigo_ldsm(threadgroup atomic_uint* words, uint extent, uint lane, uint address, uint count, uint transposed) {
+    // Lanes 8i to 8i + 7 hold block i's row addresses. Lane L (g = L / 4,
+    // t = L % 4) receives row g at columns 2t, 2t + 1 of each block or,
+    // transposed, column g at rows 2t, 2t + 1. A word outside the allocation
+    // reads zero.
+    const uint g = (lane & 31u) >> 2u, t = lane & 3u;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    uint4 result = uint4(0u);
+    for (uint m = 0u; m < count; ++m) {
+        if (transposed == 0u) {
+            const uint byte = simd_shuffle(address, ushort(g + 8u * m)) + 4u * t;
+            result[m] = byte / 4u < extent / 4u ? atomic_load_explicit(&words[byte / 4u], memory_order_relaxed) : 0u;
+        } else {
+            uint halves[2];
+            for (uint j = 0u; j < 2u; ++j) {
+                const uint byte = simd_shuffle(address, ushort(2u * t + j + 8u * m)) + 2u * g;
+                const uint word = byte / 4u < extent / 4u ? atomic_load_explicit(&words[byte / 4u], memory_order_relaxed) : 0u;
+                halves[j] = (word >> ((byte & 2u) * 8u)) & 0xffffu;
+            }
+            result[m] = halves[0] | (halves[1] << 16u);
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    return result;
+}
+)";
+            else if (name == "armigo_guest_address") source = R"(
+inline void armigo_guest_written(device uint* table, uint entry) {
+    // The write log after the 8,192 entries: set pool entry's bit once.
+    device atomic_uint* log = reinterpret_cast<device atomic_uint*>(table + 65544u + entry / 32u);
+    const uint bit = 1u << (entry & 31u);
+    if ((atomic_load_explicit(log, memory_order_relaxed) & bit) == 0u)
+        atomic_fetch_or_explicit(log, bit, memory_order_relaxed);
+}
+__attribute__((noinline)) ulong armigo_guest_search(device uint* table, ulong address, uint bytes, uint tag, bool write) {
+    // The lookup's slow path, compiled once per stage rather than inlined at
+    // every access: a binary search over the pools sorted by start for the
+    // last one starting at or below the address, then the miss record. A
+    // write marks its pool in the write log. A miss is counted, the access
+    // that first sets the latch records its program tag and address, and the
+    // result is zero.
+    if ((address & ulong(bytes - 1u)) == 0ul) {
+        device const uint* entries = table + 8;
+        const uint count = clamp(table[0], 1u, 8192u);
+        uint low = 1u, high = count;
+        while (low < high) {
+            const uint middle = (low + high) / 2u;
+            const ulong start = ulong(entries[middle * 8u]) | (ulong(entries[middle * 8u + 1u]) << 32u);
+            if (start <= address) low = middle + 1u; else high = middle;
+        }
+        const uint found = low - 1u;
+        if (found != 0u && found < count) {
+            device const uint* entry = entries + found * 8u;
+            const ulong start = ulong(entry[0]) | (ulong(entry[1]) << 32u);
+            const ulong end = ulong(entry[2]) | (ulong(entry[3]) << 32u);
+            if (address >= start && address < end && ulong(bytes) <= end - address) {
+                if (write) armigo_guest_written(table, found);
+                return address + (ulong(entry[4]) | (ulong(entry[5]) << 32u));
+            }
+        }
+    }
+    atomic_fetch_add_explicit(reinterpret_cast<device atomic_uint*>(table + 1), 1u, memory_order_relaxed);
+    if (atomic_exchange_explicit(reinterpret_cast<device atomic_uint*>(table + 5), 1u, memory_order_relaxed) == 0u) {
+        table[2] = tag;
+        table[3] = uint(address);
+        table[4] = uint(address >> 32u);
+    }
+    return 0ul;
+}
+inline ulong armigo_guest_address(device uint* table, ulong address, uint bytes, uint tag, bool write) {
+    // The device address of [address, address + bytes) inside one listed
+    // guest-memory pool at its natural alignment (bytes is a power of two).
+    // The chunk hint names the pool of a chunk wholly inside one; the
+    // partial hint names the first pool overlapping a chunk that pools
+    // share, and the next four pools from it are tried. Anything else takes
+    // the search. A write marks its pool in the write log.
+    if ((address & ulong(bytes - 1u)) == 0ul) {
+        device const uint* entries = table + 8;
+        const ulong chunk = address >> 21u;
+        device const uint* slot = entries + (uint(chunk) & 8191u) * 8u;
+        const uint count = clamp(table[0], 1u, 8192u);
+        const uint hint = slot[6];
+        const uint found = hint & 8191u;
+        if (hint != 0u && ulong(hint >> 13u) == chunk && found < count) {
+            device const uint* entry = entries + found * 8u;
+            const ulong start = ulong(entry[0]) | (ulong(entry[1]) << 32u);
+            const ulong end = ulong(entry[2]) | (ulong(entry[3]) << 32u);
+            if (address >= start && address < end && ulong(bytes) <= end - address) {
+                if (write) armigo_guest_written(table, found);
+                return address + (ulong(entry[4]) | (ulong(entry[5]) << 32u));
+            }
+        }
+        const uint partial = slot[7];
+        if (partial != 0u && ulong(partial >> 13u) == chunk) {
+            for (uint next = partial & 8191u, tried = 0u; next < count && tried < 4u; ++next, ++tried) {
+                device const uint* entry = entries + next * 8u;
+                const ulong start = ulong(entry[0]) | (ulong(entry[1]) << 32u);
+                if (start > address) break;
+                const ulong end = ulong(entry[2]) | (ulong(entry[3]) << 32u);
+                if (address < end) {
+                    if (ulong(bytes) > end - address) break;
+                    if (write) armigo_guest_written(table, next);
+                    return address + (ulong(entry[4]) | (ulong(entry[5]) << 32u));
+                }
+            }
+        }
+    }
+    return armigo_guest_search(table, address, bytes, tag, write);
+}
+)";
             // armigo_cbuf_word, armigo_multiply_rne: requested by the memory
             // generators (runtime window guard, perspective-correction
             // product). armigo_reciprocal_rne stays registered as the reserved
@@ -734,6 +934,24 @@ inline uint armigo_cbuf_word(constant uint* cb, ulong address, uint size_bytes, 
             helpers_ += source; helper_names_.insert(std::string(name));
         });
     }
+    bool marks_pool_reads() const {
+        if (!std::any_of(plan_.resources.begin(), plan_.resources.end(), [](const auto& r) {
+                const auto* t = std::get_if<TextureUse>(&r.use);
+                return t && t->pool;
+            })) return false;
+        if (std::any_of(plan_.io.begin(), plan_.io.end(), [](const auto& io) {
+                return io.access == Access::write && (io.semantic == IoSemantic::fragment_depth ||
+                                                      io.semantic == IoSemantic::sample_mask);
+            })) return false;
+        for (const auto& op : p_.ir.operations) {
+            const auto effects = required_effects(op);
+            if (includes(effects, Effects::discard)) return false;
+            if (!includes(effects, Effects::write_memory) && !includes(effects, Effects::atomic)) continue;
+            const auto* memory = std::get_if<MemoryInfo>(&op.info);
+            if (!memory || memory->space != AddressSpace::local) return false;
+        }
+        return true;
+    }
     MslArtifact emit() {
         // A vertex stage writes the fixed point size at entry, and a program
         // exporting its own size through attribute 0x6c overrides it. BotW
@@ -744,7 +962,19 @@ inline uint armigo_cbuf_word(constant uint* cb, ulong address, uint size_bytes, 
         // topology class unspecified so the export is valid with any primitive;
         // layered stages (layer or viewport index exports) need the class and
         // therefore get no synthesized size.
-        fixed_point_size_ = plan_.stage == Stage::vertex &&
+        if (std::any_of(p_.ir.operations.begin(), p_.ir.operations.end(),
+                        [](const Operation& op) { return op.opcode == Opcode::matrix_multiply_add; })) {
+            require(plan_.stage == Stage::compute && plan_.compute,
+                    "Warp matrix operations need a compute stage's threadgroup memory", DiagnosticCode::unsupported_capability);
+            const auto& size = plan_.compute->local_size.dimensions;
+            matrix_groups_ = (size[0] * size[1] * size[2] + 31u) / 32u;
+            require(plan_.compute->shared_memory_bytes + matrix_groups_ * 1024u <= 32768u,
+                    "Shared memory and warp matrix scratch exceed the threadgroup memory", DiagnosticCode::limit_exceeded);
+            matrix_plan_ = plan_matrices(p_, [this] { step(); });
+        }
+        void_vertex_ = plan_.stage == Stage::vertex &&
+            std::none_of(plan_.io.begin(), plan_.io.end(), [](const auto& io) { return io.access == Access::write; });
+        fixed_point_size_ = plan_.stage == Stage::vertex && !void_vertex_ &&
             std::none_of(plan_.io.begin(), plan_.io.end(), [](const auto& io) {
                 return io.access == Access::write &&
                        (io.semantic == IoSemantic::point_size || io.semantic == IoSemantic::layer ||
@@ -764,11 +994,15 @@ inline uint armigo_cbuf_word(constant uint* cb, ulong address, uint size_bytes, 
         for (auto& op : structural.operations) if (auto* memory = std::get_if<MemoryInfo>(&op.info))
             if (memory->space == AddressSpace::constant_buffer) memory->resource.reset();
         take(validate(structural, IrForm::registers, Phase::emit_msl));
-        definedness_.emplace(p_, plan_, steps_);
+        // The proofs only check stage outputs, so a stage that writes none
+        // (compute) needs no analysis: every region counts as reachable.
+        if (std::any_of(plan_.io.begin(), plan_.io.end(), [](const IoUse& io) { return io.access == Access::write; }))
+            definedness_.emplace(p_, plan_, steps_);
         if (ir.stage == Stage::vertex) {
             // armigo-output-init-v1: an output with a write on some live path is
             // initialized at entry as a whole.
-            const auto& written = definedness_->written();
+            static const OutputComponents none;
+            const auto& written = definedness_ ? definedness_->written() : none;
             for (const auto& io : plan_.io) if (io.access == Access::write) {
                 bool written_somewhere = false;
                 for (unsigned component = 0; component < 4; ++component) if (io.mask & (1u << component))
@@ -777,18 +1011,24 @@ inline uint armigo_cbuf_word(constant uint* cb, ulong address, uint size_bytes, 
                     for (unsigned component = 0; component < 4; ++component) if (io.mask & (1u << component))
                         initialized_outputs_.insert(output_key(io.semantic, io.location, component));
             }
+            // A position output may declare only some components: the
+            // hardware supplies (0, 0, 0, 1) for the rest, which GLSLC relies on
+            // when it drops a constant w of 1. Entry initializes them below.
             bool position = false;
-            for (const auto& io : plan_.io) if (io.semantic == IoSemantic::position && io.access == Access::write && io.mask == 15) position = true;
-            require(position, "Vertex stage must declare a complete position output");
+            for (const auto& io : plan_.io)
+                if (io.semantic == IoSemantic::position && io.access == Access::write && io.mask && !(io.mask & ~15u))
+                    position = true;
+            require(position || void_vertex_, "Vertex stage must declare a position output");
             for (const auto& d : plan_.dependencies) if (d.key.kind == FactKind::depth_convention) {
                 require(!depth_ && std::holds_alternative<DepthConvention>(d.value), "Conflicting/invalid vertex depth dependency");
                 depth_ = std::get<DepthConvention>(d.value);
             }
-            if (!depth_) {
+            if (!depth_ && !void_vertex_) {
                 auto d = diagnose(Phase::emit_msl, DiagnosticCode::missing_fact, {}, "Vertex stage requires a recorded clip-depth convention");
                 d.missing_fact = FactKey{FactKind::depth_convention}; throw Failure{d};
             }
-            require(*depth_ <= DepthConvention::negative_one_to_one, "Unknown vertex depth convention");
+            // A void vertex writes no position, so it may carry no depth fact.
+            if (depth_) require(*depth_ <= DepthConvention::negative_one_to_one, "Unknown vertex depth convention");
         }
         // Barriers stay where the guest placed them: the guest program already
         // keeps a barrier workgroup-uniform on the hardware, so control flow
@@ -809,9 +1049,11 @@ inline uint armigo_cbuf_word(constant uint* cb, ulong address, uint size_bytes, 
             for (const auto* member : members) append("    " + resource_argument(*member) + ";\n");
             append("};\n");
         }
+        append(pool_declarations(plan_));
         if (plan_.custom_border) append(std::string(custom_border_msl));
         append(io_declarations(plan_, false, options_.fragment_output_types_from_render_targets, options_.emulate_depth_bias, fixed_point_size_));
-        append(io_declarations(plan_, true, options_.fragment_output_types_from_render_targets, options_.emulate_depth_bias, fixed_point_size_));
+        append(io_declarations(plan_, true, options_.fragment_output_types_from_render_targets, options_.emulate_depth_bias, fixed_point_size_,
+                               options_.invariant_position));
         const bool vertex_fetch = plan_.vertex_fetch_buffer_index.has_value();
         if (vertex_fetch) append(std::string(vertex_fetch_msl()));
         // The S2R SR_YDIRECTION sign is draw state, so the stage declares the
@@ -842,7 +1084,13 @@ inline uint armigo_cbuf_word(constant uint* cb, ulong address, uint size_bytes, 
             append("constant bool armigo_border_records_ [[function_constant(12)]];\n"
                    "constant bool armigo_border_records = is_function_constant_defined("
                    "armigo_border_records_) ? armigo_border_records_ : true;\n");
-        append((ir.stage == Stage::compute ? "kernel void " : ir.stage == Stage::vertex ? "vertex ArmigoOutput " : "fragment ArmigoOutput ") + entry + "(");
+        // A pool read's mark is a store, which would move the depth test
+        // after the stage; the mark is the host's own and must not move it
+        // (the project documentation). A stage that discards, writes
+        // depth, sample mask or memory itself keeps the test where it was.
+        if (ir.stage == Stage::fragment && !options_.emulate_depth_bias && marks_pool_reads()) append("[[early_fragment_tests]] ");
+        append((ir.stage == Stage::compute ? "kernel void " : void_vertex_ ? "vertex void " :
+                ir.stage == Stage::vertex ? "vertex ArmigoOutput " : "fragment ArmigoOutput ") + entry + "(");
         bool argument = false;
         // A fetching stage reads its generic inputs itself: no stage_in.
         const auto stage_input = [&](const IoUse& io) {
@@ -891,6 +1139,11 @@ inline uint armigo_cbuf_word(constant uint* cb, ulong address, uint size_bytes, 
                 io_name(io.semantic, io.location) + " [[" + attribute + "]]");
             argument = true;
         }
+        if (matrix_groups_) {
+            if (argument) append(",\n    ");
+            append("uint armigo_simdgroup [[simdgroup_index_in_threadgroup]]");
+            argument = true;
+        }
         if (plan_.argument_buffer) {
             if (argument) append(",\n    ");
             append("const device ArmigoStageResources& resources [[buffer(" + number(plan_.argument_buffer->buffer_index) + ")]]");
@@ -909,8 +1162,8 @@ inline uint armigo_cbuf_word(constant uint* cb, ulong address, uint size_bytes, 
         }
         if (plan_.draw_support_buffer_index) {
             if (argument) append(",\n    ");
-            append("constant uint& armigo_guest_first_instance [[buffer(" +
-                number(*plan_.draw_support_buffer_index) + ")]]");
+            append((ir.stage == Stage::fragment ? "constant uint* armigo_draw_parameters [[buffer(" :
+                "constant uint& armigo_guest_first_instance [[buffer(") + number(*plan_.draw_support_buffer_index) + ")]]");
             argument = true;
         }
         const bool input_position = std::any_of(plan_.io.begin(), plan_.io.end(), [](const auto& io) {
@@ -923,7 +1176,7 @@ inline uint armigo_cbuf_word(constant uint* cb, ulong address, uint size_bytes, 
             if (!input_position) append(",\n    float4 armigo_position [[position]]");
         }
         append(") {\n");
-        if (ir.stage != Stage::compute) line("ArmigoOutput out;");
+        if (ir.stage != Stage::compute && !void_vertex_) line("ArmigoOutput out;");
         if (vertex_fetch) {
             if (std::any_of(plan_.io.begin(), plan_.io.end(), [](const auto& io) {
                     return io.access == Access::read && io.semantic == IoSemantic::generic; }))
@@ -980,6 +1233,23 @@ inline uint armigo_cbuf_word(constant uint* cb, ulong address, uint size_bytes, 
         }
         if (plan_.compute && plan_.compute->shared_memory_bytes)
             line("threadgroup atomic_uint armigo_shared_words[" + number(plan_.compute->shared_memory_bytes / 4) + "];");
+        if (matrix_groups_) {
+            line("threadgroup uint armigo_matrix_scratch[" + number(matrix_groups_ * 256u) + "];");
+            line("threadgroup uint* const armigo_mma_block = armigo_matrix_scratch + armigo_simdgroup * 256u;");
+            line("const simdgroup_half8x8 armigo_mma_zero = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);");
+            // LDSM tiles (as A quadrants, t, and B halves, u) and the D of a
+            // chain's middle are read in other blocks: they live for the
+            // whole function.
+            std::set<std::uint32_t> a_tiles, b_tiles, kept;
+            for (const auto& [id, load] : matrix_plan_->loads) {
+                if (load.a_tiles) a_tiles.insert(id);
+                if (load.b_tiles) b_tiles.insert(id);
+            }
+            for (const auto& [id, multiply] : matrix_plan_->multiplies) if (multiply.kept) kept.insert(id);
+            for (const auto id : a_tiles) line("simdgroup_half8x8 armigo_t" + number(id) + "[4];");
+            for (const auto id : b_tiles) line("simdgroup_half8x8 armigo_u" + number(id) + "[4];");
+            for (const auto id : kept) line("simdgroup_half8x8 armigo_e" + number(id) + "[2];");
+        }
         // armigo-local-zero-init-v1: the allocation fact sizes the per-thread
         // array indexed by LDL/STL; the zero fill keeps a load before any store
         // defined (Maxwell leaves guest local memory uninitialized).
@@ -995,8 +1265,10 @@ inline uint armigo_cbuf_word(constant uint* cb, ulong address, uint size_bytes, 
         if (ir.stage == Stage::vertex)
             for (const auto& io : plan_.io) if (io.access == Access::write)
                 for (unsigned component = 0; component < 4; ++component) {
-                    if (!(io.mask & (1u << component)) ||
-                        !initialized_outputs_.contains(output_key(io.semantic, io.location, component))) continue;
+                    // Undeclared position components hold the hardware default.
+                    const bool undeclared_position = io.semantic == IoSemantic::position && !(io.mask & (1u << component));
+                    if (!undeclared_position && (!(io.mask & (1u << component)) ||
+                        !initialized_outputs_.contains(output_key(io.semantic, io.location, component)))) continue;
                     const auto target = "out." + io_name(io.semantic, io.location) +
                         (io.semantic == IoSemantic::generic ? "_" + number(component) :
                          io.type.components > 1 ? std::string(".") + std::string(1, "xyzw"[component]) : std::string());
@@ -1016,6 +1288,8 @@ inline uint armigo_cbuf_word(constant uint* cb, ulong address, uint size_bytes, 
         }
         for (const auto& io : plan_.io) if (io.access == Access::read && io.semantic == IoSemantic::instance_id)
             line("const uint " + io_name(io.semantic, io.location) + " = armigo_instance_index - armigo_guest_first_instance;");
+        for (const auto& io : plan_.io) if (io.access == Access::read && io.semantic == IoSemantic::render_target_height)
+            line("const uint " + io_name(io.semantic, io.location) + " = armigo_draw_parameters[1];");
         // Owner decision: every value starts at zero/false, so a read whose
         // definition does not reach every structured path observes zero instead
         // of an uninitialized MSL local.
@@ -1024,8 +1298,8 @@ inline uint armigo_cbuf_word(constant uint* cb, ulong address, uint size_bytes, 
         require(regions_.size() == p_.regions.size() && blocks_.size() == ir.blocks.size() && operations_.size() == ir.operations.size(),
                 "Structured traversal does not cover every region/block/operation");
         if (flow_.reachable) {
-            const auto proof = definedness_->fallthrough();
-            live_ = proof.reachable; flow_.defined = proof.defined; flow_.outputs = proof.outputs;
+            const auto proof = definedness_ ? definedness_->fallthrough() : Flow{};
+            live_ = proof.reachable; flow_.outputs = proof.outputs;
             emit_return();
         }
         append("}\n");
@@ -1041,6 +1315,14 @@ inline uint armigo_cbuf_word(constant uint* cb, ulong address, uint size_bytes, 
         reflection.fragment_position = options_.fragment_position;
         reflection.emulate_depth_bias = options_.emulate_depth_bias;
         reflection.fixed_point_size = fixed_point_size_;
+        reflection.requires_rasterizer_discard = void_vertex_;
+        reflection.reads_render_target_height = std::any_of(plan_.io.begin(), plan_.io.end(),
+            [](const auto& io) { return io.access == Access::read && io.semantic == IoSemantic::render_target_height; });
+        reflection.guest_memory_tag = options_.guest_memory_tag;
+        reflection.guest_memory_writes = std::any_of(p_.ir.operations.begin(), p_.ir.operations.end(), [](const Operation& op) {
+            const auto* memory = std::get_if<MemoryInfo>(&op.info);
+            return memory && memory->space == AddressSpace::guest && memory->access != Access::read;
+        });
         reflection.reads_point_coord = std::any_of(plan_.io.begin(), plan_.io.end(),
             [](const auto& io) { return io.access == Access::read && io.semantic == IoSemantic::point_coord; });
         return {prelude + helpers_ + text_, entry, std::move(reflection)};

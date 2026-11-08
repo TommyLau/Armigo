@@ -105,7 +105,8 @@ public:
     };
 
     // A zero timeout expires before blocking, a negative one waits without a deadline,
-    // and a positive one is the guest duration in nanoseconds. The optional arbitration
+    // and a positive one arrives already converted by the SVC layer. A host caller
+    // passes raw nanoseconds; this wait does not convert again. The optional arbitration
     // argument is retained for source compatibility; mutex and address waits have separate
     // queues.
     explicit ProcessWideKey(std::shared_ptr<Arbitration> arbitration = {});

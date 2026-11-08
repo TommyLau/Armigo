@@ -63,6 +63,51 @@ std::optional<Handle> HandleTable::insert(std::shared_ptr<KernelObject> object) 
     return (static_cast<Handle>(serial) << index_bits) | static_cast<Handle>(index);
 }
 
+std::optional<Handle> HandleTable::reserve() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (free_head_ == no_index) return std::nullopt;
+    const std::uint32_t index = free_head_;
+    Entry& entry = entries_[index];
+    free_head_ = entry.next_free;
+    const std::uint16_t serial = next_serial_;
+    next_serial_ = serial == max_serial ? min_serial : static_cast<std::uint16_t>(serial + 1);
+    entry.serial = serial;
+    entry.next_free = no_index;
+    entry.reserved = true;
+    ++count_;
+    return (static_cast<Handle>(serial) << index_bits) | static_cast<Handle>(index);
+}
+
+HandleTable::Entry* HandleTable::find_reserved_entry(Handle handle) {
+    if ((handle & ~(index_mask | (serial_mask << index_bits))) != 0) return nullptr;
+    const std::uint32_t index = handle & index_mask;
+    const std::uint32_t serial = (handle >> index_bits) & serial_mask;
+    if (serial == 0 || index >= capacity_) return nullptr;
+    Entry& entry = entries_[index];
+    return entry.reserved && entry.serial == serial ? &entry : nullptr;
+}
+
+bool HandleTable::commit(Handle handle, std::shared_ptr<KernelObject> object) {
+    if (!object) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    Entry* entry = find_reserved_entry(handle);
+    if (entry == nullptr) return false;
+    entry->object = std::move(object);
+    entry->reserved = false;
+    return true;
+}
+
+void HandleTable::cancel(Handle handle) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Entry* entry = find_reserved_entry(handle);
+    if (entry == nullptr) return;
+    entry->reserved = false;
+    entry->serial = 0;
+    entry->next_free = free_head_;
+    free_head_ = static_cast<std::uint32_t>(handle & index_mask);
+    --count_;
+}
+
 std::shared_ptr<KernelObject> HandleTable::lookup(Handle handle) const {
     std::shared_ptr<KernelObject> pinned;
     {

@@ -149,6 +149,7 @@ private:
     mutable std::mutex mutex_;
     float volume_ = 1.0f;
     std::shared_ptr<horizon::Event> event_;
+    std::shared_ptr<horizon::Event> notification_;  // device-set changes, never signalled
     const char* diagnostic_ = nullptr;
 };
 

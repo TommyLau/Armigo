@@ -11,6 +11,7 @@
 #pragma once
 
 #import <Metal/Metal.h>
+#import <objc/runtime.h>
 
 #include "pso_manifest.h"
 
@@ -20,6 +21,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -65,6 +67,60 @@ inline bool archive_intact(const std::filesystem::path& path) {
            stem.compare(dash + 1, std::string::npos, file_digest_prefix(path)) == 0;
 }
 
+// Metal opens an archive with NSDataReadingMappedIfSafe. A file on an external
+// drive is not "safe", so that read copies the whole archive into a malloc for
+// the rest of the run. newArchiveWithURL has no option for this. While archives
+// are opened, a .marchive read asks for a mapping instead, and the previous
+// implementation is put back before this returns. Opens are serialized, so
+// the saved implementation is always the original one.
+using ArchiveFileRead = id (*)(id, SEL, NSString*, NSUInteger, NSUInteger, NSError**);
+
+inline std::mutex& mapped_archive_read_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+inline ArchiveFileRead& mapped_archive_read_saved() {
+    static ArchiveFileRead function = nullptr;
+    return function;
+}
+
+extern "C" inline id armigo_marchive_read(id self, SEL command, NSString* path,
+                                           NSUInteger options, NSUInteger maximum,
+                                           NSError** error) {
+    if (path != nil && [path hasSuffix:@".marchive"]) {
+        options = (options & ~static_cast<NSUInteger>(NSDataReadingMappedIfSafe)) |
+            NSDataReadingMappedAlways;
+    }
+    return mapped_archive_read_saved()(self, command, path, options, maximum, error);
+}
+
+inline Method mapped_archive_read_method() {
+    return class_getInstanceMethod([NSData class],
+        sel_registerName("initWithContentsOfFile:options:maxLength:error:"));
+}
+
+inline void begin_mapped_archive_reads() {
+    Method method = mapped_archive_read_method();
+    if (!method) return;
+    mapped_archive_read_saved() = reinterpret_cast<ArchiveFileRead>(
+        method_setImplementation(method, reinterpret_cast<IMP>(armigo_marchive_read)));
+}
+
+inline void end_mapped_archive_reads() {
+    Method method = mapped_archive_read_method();
+    const auto saved = mapped_archive_read_saved();
+    if (method && saved) method_setImplementation(method, reinterpret_cast<IMP>(saved));
+}
+
+struct MappedArchiveReads {
+    MappedArchiveReads() : lock(mapped_archive_read_mutex()) { begin_mapped_archive_reads(); }
+    ~MappedArchiveReads() { end_mapped_archive_reads(); }
+    std::lock_guard<std::mutex> lock;
+    MappedArchiveReads(const MappedArchiveReads&) = delete;
+    MappedArchiveReads& operator=(const MappedArchiveReads&) = delete;
+};
+
 // The Metal 4 binary archives in a directory, for the compiler to look
 // pipelines up in, in the order they were written (their names start with the
 // time). A file that fails its digest, or does not open as an archive (written
@@ -89,6 +145,7 @@ inline ArchiveSet open_archives(id<MTLDevice> device, const std::filesystem::pat
     dispatch_apply(paths.size(), dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^(std::size_t index) {
         checked[index] = archive_intact(listed[index]);
     });
+    MappedArchiveReads mapped_reads;
     for (std::size_t index = 0; index != paths.size(); ++index) {
         id<MTL4Archive> archive = nil;
         if (intact[index]) {

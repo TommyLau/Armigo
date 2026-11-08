@@ -12,7 +12,7 @@
 //
 // Bounded byte-range validation reports structured failures instead of
 // exceptions. Admission bounds, alignment, version checks and validation order
-// follow the Horizon 20.5.0 loader. Overlapping ranges are permitted when each
+// follow the Horizon loader. Overlapping ranges are permitted when each
 // range independently satisfies its parent bounds. Validation checks the image
 // and header, parent bounds, ACID magic and version, ACID subsections, signed
 // size, and ACI0 magic and subsections in that order.
@@ -28,7 +28,7 @@ constexpr std::uint32_t kMetaMagic = 0x4154454Du;  // "META" little-endian
 constexpr std::uint32_t kAci0Magic = 0x30494341u;  // "ACI0" little-endian
 constexpr std::uint32_t kAcidMagic = 0x44494341u;  // "ACID" little-endian
 
-// Fixed offsets inside the META header (Horizon 20.5.0 metadata layout).
+// Fixed offsets inside the META header (Horizon metadata layout).
 constexpr std::size_t kMetaOffsetFlags = 0x0C;
 constexpr std::size_t kMetaOffsetMainThreadPriority = 0x0E;
 constexpr std::size_t kMetaOffsetMainThreadIdealCore = 0x0F;

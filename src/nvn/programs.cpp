@@ -106,16 +106,48 @@ NVNboolean set_shaders(NVNprogram* object, int count, const NVNshaderData* shade
         }
         // Control section: constant byte size at +0x6fc, constant offset from
         // the shader data at +0x700, stage at +0x714. A stage without
-        // constants has size zero.
+        // constants has size zero. API 231 controls are native: constant size
+        // at +0x3c, offset at +0x40 and stage selector byte at +0x56, and the
+        // constants are hardware constant buffer 1 as well.
+        const auto api = selected_api_version();
+        const bool native = api && api->major == 231;
         for (int i = 0; i < count; ++i) {
             const auto* control = static_cast<const std::byte*>(shaders[i].control);
             if (!control) continue;
             std::uint32_t c1_size = 0, c1_offset = 0, stage = 0;
-            std::memcpy(&c1_size, control + 0x6fc, 4);
-            std::memcpy(&c1_offset, control + 0x700, 4);
-            std::memcpy(&stage, control + 0x714, 4);
+            std::memcpy(&c1_size, control + (native ? 0x3c : 0x6fc), 4);
+            std::memcpy(&c1_offset, control + (native ? 0x40 : 0x700), 4);
+            if (native) stage = std::to_integer<std::uint32_t>(control[0x56]);
+            else std::memcpy(&stage, control + 0x714, 4);
             if (stage < executable->constants.size() && c1_size)
                 executable->constants[stage] = {shaders[i].data + c1_offset, c1_size};
+            // Compute driver data counts: push words at +0xa9, uniform and
+            // storage entries at +0xb1 and +0xb2, texture, separate texture,
+            // separate sampler and image handles at +0xb3..+0xb6, and the
+            // total byte size (u16) at +0xba, which the counts must make. A
+            // program whose counts do not, or whose driver data is larger than
+            // the replay's driver block, is kept without a layout, and the
+            // replay refuses its dispatches.
+            if (native && stage == NVN_SHADER_STAGE_COMPUTE) {
+                const auto byte = [&](std::size_t offset) { return std::to_integer<std::uint32_t>(control[offset]); };
+                ComputeDriverLayout layout;
+                layout.push_bytes = 4 * byte(0xa9);
+                layout.uniforms = byte(0xb1);
+                layout.storages = byte(0xb2);
+                layout.textures = byte(0xb3);
+                layout.separate_textures = byte(0xb4);
+                layout.separate_samplers = byte(0xb5);
+                layout.images = byte(0xb6);
+                layout.size = byte(0xba) | byte(0xbb) << 8;
+                if (layout.image_base() + 8 * layout.images != layout.size)
+                    diagnostic("Compute control section's driver data counts do not make its size");
+                else if (layout.size > compute_driver_data_bytes)
+                    armigo::diag::write(armigo::diag::Level::error,
+                                        "Armigo NVN program: compute driver data of %u bytes exceeds the %u bytes the "
+                                        "replay binds\n", layout.size, compute_driver_data_bytes);
+                else
+                    executable->compute_layout = layout;
+            }
         }
         // Descriptors are diagnostic metadata only; replay consumes the retained artifacts.
         if (count) std::copy_n(shaders, count, executable->state.stages);

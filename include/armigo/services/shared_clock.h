@@ -53,7 +53,7 @@ enum class InitializeResult {
     time_out_of_range,
 };
 
-// Constructs the firmware 20.5.0 startup page in caller-owned storage. Requires
+// Constructs the firmware startup page in caller-owned storage. Requires
 // exactly page_size bytes, backing_alignment alignment and exclusive access
 // before any guest/host reader can observe the page. Validation failures leave
 // all bytes unchanged. No pointers, handles, threads or ownership are retained.

@@ -26,7 +26,8 @@ namespace armigo::platform::metal::nvn_driver {
 // driver created, in the order it was first used. Fields are tab separated:
 //   S <stage identity>                          a shader stage's Metal library
 //   R <vertex identity> <fragment identity|-> <v1:state hex>   a render pipeline
-//   C <stage identity>                          a compute pipeline
+//   C <stage identity>                          a compute pipeline.
+//     A packaged compute list is these rows, one per packaged compute stage.
 //   K <vertex> <fragment> <color> <mask> <depth> <stencil> <samples>   a clear
 //     pipeline: the clear functions, then the Metal pixel formats, color write mask
 //     and sample count as decimal numbers
@@ -53,6 +54,20 @@ struct PsoRow {
 // The seed's rows in order, then the user's rows the seed lacks, in order.
 [[nodiscard]] std::vector<PsoRow> merge_pso_manifests(const std::vector<PsoRow>& seed,
                                                       const std::vector<PsoRow>& user);
+
+// File name of the packaged compute list, under the shader package's native section.
+inline constexpr std::string_view compute_pipeline_manifest_file = "compute-pipelines.tsv";
+
+// One C row per identity, in the order given. An empty identity, one that
+// cannot be a single field, and a later repeat are left out. The rows are
+// not sorted.
+[[nodiscard]] std::string compute_stage_manifest(const std::vector<std::string>& identities);
+
+// The title list first, when it is set, then the packaged compute list when
+// that file is present. An empty result is a pack with nothing to archive.
+[[nodiscard]] std::vector<std::string> select_pipeline_manifests(std::string_view title_list,
+                                                                std::string_view compute_list,
+                                                                bool compute_list_exists);
 
 [[nodiscard]] std::string pso_hex_encode(const void* bytes, std::size_t size);
 // False unless `text` is exactly 2 * size lowercase hex digits.

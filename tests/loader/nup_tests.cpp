@@ -93,5 +93,62 @@ int main() {
         ARMIGO_CHECK(std::get<NupFailure>(archive->read_exefs(
             std::get<NupSelection>(archive->select()))).operation == "nup.file_hash");
     }
+    {
+        auto zs_archive = [](std::uint32_t first, std::uint32_t second, int second_size = 4) {
+            Bytes bytes = fixture();
+            std::memcpy(bytes.data() + pool + 21, "x.zs", 4);
+            std::memcpy(bytes.data() + pool + 28, "b.zs", 4);
+            put(bytes, file + 4 * 0x50, 28);
+            put(bytes, file + 4 * 0x50 + 4, 4);
+            put(bytes, blob + 2 * 16, first);
+            put(bytes, blob + 4 * 16, second);
+            if (second_size != 4) {
+                put(bytes, file + 4 * 0x50 + 8, static_cast<std::uint64_t>(second_size), 8);
+                put(bytes, file + 4 * 0x50 + 24, static_cast<std::uint64_t>(second_size), 8);
+                if (second_size == 0) put(bytes, file + 4 * 0x50 + 16, 0, 8);
+            }
+            rehash(bytes);
+            return bytes;
+        };
+        auto mismatches = [](const Bytes& bytes) {
+            Temporary temp;
+            auto archive = std::get<std::shared_ptr<NupArchive>>(temp.open(bytes));
+            return archive->zs_frame_mismatches(std::get<NupSelection>(archive->select()));
+        };
+        auto paths = mismatches(zs_archive(0xfd2fb528u, 0));
+        const auto* damaged = std::get_if<std::vector<std::string>>(&paths);
+        ARMIGO_CHECK(damaged && damaged->size() == 1 && damaged->front() == "b.zs");
+        paths = mismatches(zs_archive(0xfd2fb528u, 0x184d2a50u));
+        damaged = std::get_if<std::vector<std::string>>(&paths);
+        ARMIGO_CHECK(damaged && damaged->empty());
+        paths = mismatches(zs_archive(0x184d2a5fu, 0xfd2fb528u));
+        damaged = std::get_if<std::vector<std::string>>(&paths);
+        ARMIGO_CHECK(damaged && damaged->empty());
+        paths = mismatches(zs_archive(0x184d2a40u, 0x194d2a50u));
+        damaged = std::get_if<std::vector<std::string>>(&paths);
+        ARMIGO_CHECK(damaged && damaged->size() == 2 && (*damaged)[0] == "b.zs" && (*damaged)[1] == "x.zs");
+        Bytes named = fixture();
+        std::memcpy(named.data() + pool + 21, "X.ZS", 4);
+        put(named, blob + 2 * 16, 0xfd2fb528u);
+        rehash(named);
+        paths = mismatches(named);
+        damaged = std::get_if<std::vector<std::string>>(&paths);
+        ARMIGO_CHECK(damaged && damaged->empty());
+        paths = mismatches(fixture());
+        damaged = std::get_if<std::vector<std::string>>(&paths);
+        ARMIGO_CHECK(damaged && damaged->empty());
+        paths = mismatches(zs_archive(0xfd2fb528u, 0, 0));
+        damaged = std::get_if<std::vector<std::string>>(&paths);
+        ARMIGO_CHECK(damaged && damaged->empty());
+        paths = mismatches(zs_archive(0xfd2fb528u, 0xfd2fb528u, 3));
+        damaged = std::get_if<std::vector<std::string>>(&paths);
+        ARMIGO_CHECK(damaged && damaged->size() == 1 && damaged->front() == "b.zs");
+        Bytes coded = zs_archive(0xfd2fb528u, 0xfd2fb528u);
+        put(coded, file + 2 * 0x50 + 64, 1, 1);
+        rehash(coded);
+        paths = mismatches(coded);
+        const auto* failure = std::get_if<NupFailure>(&paths);
+        ARMIGO_CHECK(failure && failure->operation == "nup.codec");
+    }
     return armigo::loader::test::finish("NUP reader");
 }

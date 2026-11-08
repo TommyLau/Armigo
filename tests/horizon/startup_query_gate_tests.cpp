@@ -158,7 +158,9 @@ int main() {
                 "Guest sleep classification is wrong.")) return 1;
 
     // Reuse an authored gate site with a sleep opcode in the dispatch metadata.
-    const std::array sleep_sites = {GuestGateSite{base + 4, aarch64::encode_svc(0x0b).word}};
+    // The second authored site carries svcBreak.
+    const std::array sleep_sites = {GuestGateSite{base + 4, aarch64::encode_svc(0x0b).word},
+                                    GuestGateSite{base + 12, aarch64::encode_svc(0x26).word}};
     const auto sleep_table = GuestSiteTable::build(sleep_sites);
     if (!expect(sleep_table.ok(), "Synthetic sleep site was rejected.")) return 1;
     using namespace armigo::runtime;
@@ -239,6 +241,43 @@ int main() {
         if (!expect(process.scheduled_count() == before_sleep + 1,
                     "A timed sleep was not a scheduling event.")) return 1;
     }
+    // A Switch 2 process waits on the 31.25 MHz counter. The same injected clock
+    // records the deadline, so a second rounding would land on 160 ns, not 96.
+    {
+        ProcessConfiguration switch2_configuration = configuration;
+        switch2_configuration.platform = GuestPlatform::switch2;
+        const auto switch2_process = ProcessRecord::create(
+            switch2_configuration, {0x2000, 0, 0, 0x4000, 0x100000, 0x6000}, blocks);
+        if (!expect(switch2_process.ok(), "Synthetic Switch 2 process was rejected.")) return 1;
+        HandleTable switch2_handles(8);
+        auto switch2_thread = std::make_shared<ThreadRecord>(switch2_process.process, 77, 17);
+        if (!switch2_handles.insert(switch2_thread)) return 1;
+        Output switch2_output;
+        StartupQueries switch2_queries(switch2_process.process, switch2_handles, switch2_thread,
+                                       {Output::write, nullptr, &switch2_output});
+        IpcDispatcher switch2_ipc(switch2_handles, nullptr);
+        StartupSupervisor switch2_supervisor(switch2_queries, switch2_ipc, {}, clock.get());
+        GuestThreadContext switch2_registers;
+        GuestDispatchScope switch2_scope(sleep_table.table, switch2_registers,
+                                         switch2_supervisor.binding(),
+                                         GateFailurePolicy::resume_unchanged);
+        const std::array switch2_cases = {
+            SleepCase{1, 96}, SleepCase{1'000'000, 1'000'064},
+            SleepCase{std::numeric_limits<std::int64_t>::max(), -1},
+        };
+        for (const auto test : switch2_cases) {
+            RegisterImage input;
+            for (unsigned reg = 0; reg < 31; ++reg) input.x[reg] = upper | reg;
+            input.x[0] = static_cast<std::uint64_t>(test.input);
+            const auto previous_waits = waits;
+            RegisterImage result;
+            armigo_test_guest_run_site(&input, &result, base);
+            const auto expected_deadline = test.duration < 0 ? ClockInstant::max()
+                : now + std::chrono::nanoseconds(test.duration);
+            if (!expect(waits == previous_waits + 1 && observed_deadline == expected_deadline,
+                        "Switch 2 sleep tick rounding is wrong.")) return 1;
+        }
+    }
     cancel_wait = true;
     RegisterImage cancelled_input;
     for (unsigned reg = 0; reg < 31; ++reg) cancelled_input.x[reg] = upper | reg;
@@ -250,6 +289,27 @@ int main() {
                     "Host-cancelled sleep fabricated a guest return.")) return 1;
     if (!expect(sleep_scope.failure_count() == 1,
                 "Host-cancelled sleep without an exit target did not fail.")) return 1;
+
+    // A notification Break (reason bit 31) returns with cleared result registers;
+    // any other reason is the guest's fatal path.
+    RegisterImage notify;
+    for (unsigned reg = 0; reg < 31; ++reg) notify.x[reg] = upper | reg;
+    notify.x[0] = upper | 0x80000004u;
+    notify.nzcv = 0xa0000000;
+    RegisterImage notified;
+    armigo_test_guest_run_site(&notify, &notified, base + 8);
+    for (unsigned reg = 0; reg < 18; ++reg)
+        if (!expect(notified.x[reg] == 0, "Notification Break did not clear its return registers.")) return 1;
+    for (unsigned reg = 19; reg < 30; ++reg)
+        if (!expect(notified.x[reg] == notify.x[reg], "Notification Break changed a preserved register.")) return 1;
+    if (!expect(sleep_scope.failure_count() == 1 && notified.nzcv == notify.nzcv,
+                "Notification Break was treated as fatal.")) return 1;
+    RegisterImage fatal = notify;
+    fatal.x[0] = 0x80000000ull << 1; // Bit 31 of the 32-bit reason is clear.
+    RegisterImage stopped;
+    armigo_test_guest_run_site(&fatal, &stopped, base + 8);
+    if (!expect(sleep_scope.failure_count() == 2 && stopped.x[0] == fatal.x[0],
+                "A fatal Break did not fail the gate.")) return 1;
 
     return 0;
 }

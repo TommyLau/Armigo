@@ -23,6 +23,10 @@ enum class FrameRateVariant {
     FractionalCounter30,
     FractionalCountdown30,
     FractionalRepeat30,
+    // The title divides its base rate by its own frame rate into the ratio its
+    // clock steps by each frame, whatever time the frame took. A hook on that
+    // division gives it a divisor from the measured frame period instead.
+    RatioDivision,
 };
 
 // Every address is an offset supplied by the compatibility manifest. No title
@@ -83,9 +87,16 @@ bool advance_frame_phases(const FramePhaseLayout& layout, std::uint64_t module_b
 // nonpositive period is a successful no-op for the ratio. A layout's frame step
 // is written whenever a positive period exists, including under the override. The optional maximum-rate hint is
 // nonzero only after the measured update succeeds; errors and no-ops clear it.
+// RatioDivision: the divisor that turns the title's base rate into the
+// measured frame step: 60 / step, where step is the period in 60 Hz frames
+// with the same bounds as a published frame step (20-300 Hz). The ratio then
+// becomes step * base / 60, so the title's time follows real time.
+float ratio_division_divisor(double period_seconds) noexcept;
+
 bool update_frame_rate(const FrameRateLayout& layout, std::uint64_t module_base,
                        std::uint64_t vfr_object, std::uint32_t interval,
                        const horizon::GuestBuffers& buffers,
-                       std::uint32_t* maximum_rate = nullptr) noexcept;
+                       std::uint32_t* maximum_rate = nullptr,
+                       std::uint64_t counter_frequency = 19'200'000) noexcept;
 
 }  // namespace armigo::titles

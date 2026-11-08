@@ -13,11 +13,15 @@
 
 #include <armigo/graphics/texflush.h>
 #include <armigo/memory/write_tracker.h>
+#include <armigo/nvn/driver.h>
 
 #include "nvn/resource_layout.h"
 #include "platform/metal/nvn_resources.h"
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
+#include <atomic>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -207,6 +211,197 @@ std::vector<std::byte> read_native_rgba(metal::Resources& resources, id<MTLDevic
 // format-view usage. A mip-mapped colour texture keeps format views, which
 // leaves it uncompressed for mip chains that sample a level next to the one
 // they render.
+// Guest-memory tables lease their pools: a GPU-inaccessible pool is never
+// listed, an unchanged pool set is not listed again, and a released pool
+// waits for the submissions that leased it. A table leased while the release
+// waits already leaves the pool out. With no lease pending, a release does not
+// wait.
+void check_guest_memory_claims(metal::Resources &resources) {
+  Pages visible_pages(1), hidden_pages(1), later_pages(1);
+  CHECK(visible_pages.bytes() && hidden_pages.bytes() && later_pages.bytes());
+  if (!visible_pages.bytes() || !hidden_pages.bytes() || !later_pages.bytes())
+    return;
+  nvn::MemoryPoolState visible{}, hidden{}, later{};
+  visible.memory = reinterpret_cast<std::uint8_t *>(visible_pages.bytes());
+  visible.size = visible_pages.size();
+  hidden.memory = reinterpret_cast<std::uint8_t *>(hidden_pages.bytes());
+  hidden.size = hidden_pages.size();
+  hidden.flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS;
+  later.memory = reinterpret_cast<std::uint8_t *>(later_pages.bytes());
+  later.size = later_pages.size();
+  CHECK(resources.register_pool(visible));
+  CHECK(resources.register_pool(hidden));
+  const auto visible_begin = reinterpret_cast<std::uint64_t>(visible.memory);
+  const auto listed = [&](const std::vector<metal::Resources::GuestMemoryPool> &pools, std::uint64_t begin) {
+    return std::ranges::any_of(pools, [&](const auto &pool) { return pool.begin == begin; });
+  };
+  std::vector<metal::Resources::GuestMemoryPool> pools;
+  const auto generation = resources.claim_guest_memory_pools(0, pools);
+  CHECK(generation != 0 && pools.size() == 1 && listed(pools, visible_begin));
+  CHECK(!listed(pools, reinterpret_cast<std::uint64_t>(hidden.memory)));
+  std::vector<metal::Resources::GuestMemoryPool> unchanged(1);
+  CHECK(resources.claim_guest_memory_pools(generation, unchanged) == generation && unchanged.size() == 1 &&
+        unchanged.front().begin == 0);
+
+  // While the release waits, a new lease leaves the pool out; retiring both
+  // ends the wait.
+  std::atomic<bool> claimed{false};
+  std::uint64_t during_generation = 0;
+  std::vector<metal::Resources::GuestMemoryPool> during;
+  std::thread retiring([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    during_generation = resources.claim_guest_memory_pools(generation, during);
+    claimed = true;
+    resources.complete_gpu_writes(resources.gpu_write_generation());
+  });
+  resources.release_pool(visible);
+  retiring.join();
+  CHECK(claimed && during_generation != generation && !listed(during, visible_begin));
+  CHECK(resources.buffer_at(visible_begin, 64).buffer == nil);
+  // With no lease outstanding a release does not wait.
+  CHECK(resources.register_pool(later));
+  const auto start = std::chrono::steady_clock::now();
+  resources.release_pool(later);
+  CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(1));
+  resources.release_pool(hidden);
+}
+
+// A guest-memory lease holds back the release of its pools until the
+// submission that took it retires, and only that: the generic replay
+// completion hook (which a held queue can block) is not used. A release whose
+// wait fails keeps the pool registered, and its range cannot be registered
+// again. (CPU invalidation does not wait: as on the console, the guest's sync
+// wait orders its reads after the GPU work, whose stores land in its pages.)
+void check_guest_lease_waits(id<MTLDevice> device) {
+  Pages first_pages(1), second_pages(1);
+  CHECK(first_pages.bytes() && second_pages.bytes());
+  if (!first_pages.bytes() || !second_pages.bytes())
+    return;
+  metal::Resources resources(device);
+  unsigned hook_calls = 0;
+  resources.set_completion_hook([&] {
+    ++hook_calls;
+    return false;
+  });
+  nvn::MemoryPoolState first{}, second{};
+  first.memory = reinterpret_cast<std::uint8_t *>(first_pages.bytes());
+  first.size = first_pages.size();
+  second.memory = reinterpret_cast<std::uint8_t *>(second_pages.bytes());
+  second.size = second_pages.size();
+  CHECK(resources.register_pool(first));
+  CHECK(resources.register_pool(second));
+  const auto first_begin = reinterpret_cast<std::uint64_t>(first.memory);
+  const auto second_begin = reinterpret_cast<std::uint64_t>(second.memory);
+  std::vector<metal::Resources::GuestMemoryPool> pools;
+  // Completes every write noted so far after a delay, from another thread,
+  // as the replay's retirement does.
+  const auto retire_later = [&](std::atomic<bool> &retired) {
+    return std::thread([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      retired = true;
+      resources.complete_gpu_writes(resources.gpu_write_generation());
+    });
+  };
+
+  // Release waits for the lease without the generic hook, then removes.
+  CHECK(resources.claim_guest_memory_pools(0, pools) != 0 && pools.size() == 2);
+  std::atomic<bool> retired{false};
+  auto retiring = retire_later(retired);
+  resources.release_pool(first);
+  CHECK(retired && hook_calls == 0);
+  CHECK(resources.buffer_at(first_begin, 64).buffer == nil);
+  retiring.join();
+
+  // A lease that never retires: the release gives up and keeps the pool.
+  resources.set_lease_wait_timeout(std::chrono::milliseconds(100));
+  resources.claim_guest_memory_pools(0, pools);
+  resources.release_pool(second);
+  CHECK(resources.buffer_at(second_begin, 64).buffer != nil);
+  CHECK(!resources.register_pool(second));
+  resources.complete_gpu_writes(resources.gpu_write_generation());
+  resources.set_completion_hook({});
+}
+
+// A GPU write found once it completed (the guest-memory write log) reaches a
+// texture with storage of its own: its next use uploads the bytes the GPU
+// stored, which its CPU write tracking never saw, once, and nothing when the
+// stores left its bytes as uploaded. The write needs no
+// write generation, so publishing it before the replay completes its
+// submission's generation refuses nothing. Such a texture's data comes from
+// its backing until the GPU writes the texture itself.
+void check_completed_gpu_write(id<MTLDevice> device, metal::Resources &resources, id<MTLCommandQueue> queue) {
+  Pages pages(1);
+  CHECK(pages.bytes() != nullptr);
+  if (!pages.bytes())
+    return;
+  nvn::MemoryPoolState pool{};
+  pool.memory = reinterpret_cast<std::uint8_t *>(pages.bytes());
+  pool.size = pages.size();
+  pool.flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+  std::memset(pool.memory, 0x10, pool.size);
+  CHECK(resources.register_pool(pool));
+  nvn::TextureState texture = make_texture(pool, 9811);
+  resources.register_texture(texture);
+  id<MTLTexture> first = resources.texture(texture, nullptr);
+  CHECK(first != nil);
+  const auto before = read_native_rgba(resources, device, queue, first);
+  CHECK(std::ranges::all_of(before, [](std::byte value) { return value == std::byte{0x10}; }));
+  // The GPU stores into the pool: the CPU tracker does not see it.
+  const auto address = reinterpret_cast<std::uint64_t>(pool.memory);
+  const auto span = resources.buffer_at(address, texture.size);
+  CHECK(span.buffer != nil);
+  id<MTLCommandBuffer> commands = [queue commandBuffer];
+  id<MTLBlitCommandEncoder> fill = [commands blitCommandEncoder];
+  [fill fillBuffer:span.buffer range:NSMakeRange(span.offset, texture.size) value:0x60];
+  [fill endEncoding];
+  [commands commit];
+  CHECK(complete(commands));
+  CHECK(resources.backing_feeds_texture(address, texture.size));
+  // An unrelated write is still pending: its generation is incomplete.
+  Pages other(1);
+  nvn::MemoryPoolState other_pool{};
+  other_pool.memory = reinterpret_cast<std::uint8_t *>(other.bytes());
+  other_pool.size = other.size();
+  other_pool.flags = pool.flags;
+  CHECK(other.bytes() && resources.register_pool(other_pool));
+  resources.note_gpu_write(reinterpret_cast<std::uint64_t>(other_pool.memory), 64);
+  resources.note_completed_gpu_write(address, pool.size);
+  const auto uploads = resources.upload_counts();
+  const auto after = read_native_rgba(resources, device, queue, resources.texture(texture, nullptr));
+  CHECK(std::ranges::all_of(after, [](std::byte value) { return value == std::byte{0x60}; }));
+  const auto refreshed = resources.upload_counts();
+  CHECK(refreshed.gpu + refreshed.cpu == uploads.gpu + uploads.cpu + 1);
+  CHECK(resources.texture(texture, nullptr) != nil);
+  const auto again = resources.upload_counts();
+  CHECK(again.gpu + again.cpu == refreshed.gpu + refreshed.cpu);
+  // Stores into the pool that leave the texture's bytes as uploaded upload
+  // nothing; stores that change them upload once.
+  resources.note_completed_gpu_write(address, pool.size);
+  CHECK(resources.texture(texture, nullptr) != nil);
+  const auto unchanged = resources.upload_counts();
+  CHECK(unchanged.gpu + unchanged.cpu == again.gpu + again.cpu);
+  commands = [queue commandBuffer];
+  fill = [commands blitCommandEncoder];
+  [fill fillBuffer:span.buffer range:NSMakeRange(span.offset, texture.size) value:0x70];
+  [fill endEncoding];
+  [commands commit];
+  CHECK(complete(commands));
+  resources.note_completed_gpu_write(address, pool.size);
+  const auto changed = read_native_rgba(resources, device, queue, resources.texture(texture, nullptr));
+  CHECK(std::ranges::all_of(changed, [](std::byte value) { return value == std::byte{0x70}; }));
+  const auto rewritten = resources.upload_counts();
+  CHECK(rewritten.gpu + rewritten.cpu == unchanged.gpu + unchanged.cpu + 1);
+  resources.complete_gpu_writes(resources.gpu_write_generation());
+  // Once the GPU wrote the texture, its data no longer comes from the pool.
+  resources.note_gpu_write(texture);
+  CHECK(!resources.backing_feeds_texture(address, texture.size));
+  // Pool bytes with no texture registered feed the next texture made there.
+  CHECK(resources.backing_feeds_texture(reinterpret_cast<std::uint64_t>(other_pool.memory), 64));
+  resources.complete_gpu_writes(resources.gpu_write_generation());
+  resources.release_pool(other_pool);
+  resources.release_pool(pool);
+}
+
 void check_texture_usage(metal::Resources &resources) {
   Pages pages(4);
   CHECK(pages.bytes() != nullptr);
@@ -229,6 +424,16 @@ void check_texture_usage(metal::Resources &resources) {
   CHECK(plain != nil);
   CHECK((plain.usage & MTLTextureUsageRenderTarget) &&
         !(plain.usage & (MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView)));
+  // Its first storage image write gives it writable storage in place of the
+  // old, which the caller copies; a second asks for nothing.
+  id<MTLTexture> previous = nil;
+  id<MTLTexture> writable = resources.upgrade_for_image_write(single.serial, previous);
+  CHECK(writable && previous == plain && writable != plain &&
+        (writable.usage & MTLTextureUsageShaderWrite) && writable.width == plain.width &&
+        writable.pixelFormat == plain.pixelFormat && writable.mipmapLevelCount == plain.mipmapLevelCount);
+  CHECK(storage_of(resources.texture(single, nullptr)) == writable);
+  CHECK(resources.upgrade_for_image_write(single.serial, previous) == writable && previous == nil);
+  CHECK(resources.upgrade_for_image_write(single.serial + 1000, previous) == nil);
   nvn::TextureState chain = make_texture(pool, 62);
   chain.description.levels = 3;
   const auto layout = nvn::resource_layout(chain.description);
@@ -1028,6 +1233,51 @@ void check_cached_pool_flush(id<MTLDevice> device, metal::Resources &resources,
   resources.release_pool(pool);
   resources.set_completion_hook({});
   armigo::memory::WriteTracker::remove_range(pool.memory);
+}
+
+// A texture in a CPU-cached pool that the CPU writes after its first use, with
+// no flush: by default the write waits for a flush call; with the title policy
+// for natively flushing titles it shows at the texture's next use.
+void check_cached_pool_cpu_write_after_creation(id<MTLDevice> device, metal::Resources &resources,
+                                                id<MTLCommandQueue> queue) {
+  Pages pages(4);
+  CHECK(pages.bytes() != nullptr);
+  if (!pages.bytes())
+    return;
+  nvn::MemoryPoolState pool{};
+  pool.memory = reinterpret_cast<std::uint8_t *>(pages.bytes());
+  pool.size = pages.size();
+  pool.flags =
+      NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+  CHECK(resources.register_pool(pool));
+  CHECK(armigo::memory::WriteTracker::tracked(pool.memory, pool.size));
+  nvn::TextureState state = make_texture(pool, 461);
+  resources.register_texture(state);
+  const auto transfer = whole_rgba_transfer();
+  const auto pattern_of = [](unsigned seed) {
+    std::vector<std::byte> pattern(64);
+    for (std::size_t i = 0; i < pattern.size(); ++i)
+      pattern[i] = std::byte((i * seed + 5) & 0xff);
+    return pattern;
+  };
+  auto first = pattern_of(11), second = pattern_of(47);
+  CHECK(nvn::transfer_pool_texels(state, transfer, first.data(), true));
+  id<MTLTexture> texture = resources.texture(state, nullptr);
+  CHECK(texture != nil);
+  if (texture) CHECK(read_native_rgba(resources, device, queue, texture) == first);
+  // The second write lands after the texture's first use. By default a
+  // cached pool's writes wait for a flush; a title whose cache maintenance
+  // runs natively selects the policy that takes them at the next use.
+  CHECK(nvn::transfer_pool_texels(state, transfer, second.data(), true));
+  texture = resources.texture(state, nullptr);
+  CHECK(texture != nil && read_native_rgba(resources, device, queue, texture) == first);
+  nvn::set_title_policy({.cpu_cached_texture_writes = true});
+  texture = resources.texture(state, nullptr);
+  CHECK(texture != nil);
+  if (texture) CHECK(read_native_rgba(resources, device, queue, texture) == second);
+  nvn::set_title_policy({});
+  resources.release_texture(state);
+  resources.release_pool(pool);
 }
 
 void check_depth_storage(id<MTLDevice> device, metal::Resources &resources,
@@ -1854,6 +2104,9 @@ int main() {
     metal::Resources resources(device);
     resources.wait_for_gpu_deswizzle(std::chrono::seconds(10));
     check_buffer_pool(device, resources, queue);
+    check_guest_memory_claims(resources);
+    check_guest_lease_waits(device);
+    check_completed_gpu_write(device, resources, queue);
     check_texture_resources(device, resources, queue);
     check_texture_usage(resources);
     check_texture_slot_revalidation(resources);
@@ -1864,6 +2117,7 @@ int main() {
     check_upload_certificates_follow_cpu_mapping(device);
     check_sampler_registration_order(resources);
     check_cached_pool_flush(device, resources, queue);
+    check_cached_pool_cpu_write_after_creation(device, resources, queue);
     check_depth_storage(device, resources, queue);
     check_subresources(device, resources, queue);
     check_layout_round_trips(device, resources, queue);

@@ -22,9 +22,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <memory>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -353,6 +355,75 @@ bool address_provenance_escapes() {
     AnalysisLimits limits;
     limits.max_address_steps = 0;
     ok &= check(!analyze(fixture, limits).ok(), "Address provenance has a bounded work budget.");
+    return ok;
+}
+
+// Atomic read-modify-writes are data references of their full width, store
+// only their stored operands, and load only the old memory value.
+bool atomic_data_references() {
+    bool ok = true;
+    const auto program = [](std::uint64_t data, std::initializer_list<std::uint32_t> words) {
+        Fixture fixture;
+        fixture.root(0x40);
+        fixture.put(0x40, 0x91001652u); // ADD X18, X18, #5.
+        fixture.put(0x44, a64::encode_ret());
+        fixture.put(0, a64::encode_adr(0, fixture.base, fixture.base + data));
+        std::uint64_t offset = 4;
+        for (const auto word : words) {
+            fixture.put(offset, word);
+            offset += 4;
+        }
+        fixture.put(offset, a64::encode_ret());
+        return fixture;
+    };
+    // An atomic on reached code is refused like a load or store.
+    ok &= rejects(program(0x40, {0xb8210002u}), "data reference"); // LDADD W1, W2, [X0].
+    // CASP covers both halves: 16 bytes from 0x38 reach code at 0x40, 8 do not.
+    ok &= rejects(program(0x38, {0x48227c04u}), "data reference"); // CASP X2, X3, X4, X5, [X0].
+    ok &= check(analyze(program(0x38, {0x08227c04u})).ok(), // CASP W2, W3, W4, W5, [X0].
+                "An 8-byte CASP ending before reached code is a proven data reference.");
+
+    // A proven data atomic gives its result no address provenance, and an ST
+    // alias (no destination) is an ordinary data reference.
+    ok &= check(analyze(program(0x2000, {0xb8210002u, 0xb9400043u})).ok(), // LDADD; LDR W3, [X2].
+                "An atomic's old value must not inherit its base's address provenance.");
+    ok &= check(analyze(program(0x2000, {0xb821001fu})).ok(), // STADD W1, [X0].
+                "An ST alias on proven data is a data reference.");
+    // The old value of a relocated pointer is an address, in either half.
+    auto relocated = program(0x2000, {0x48227c04u, 0xb9400043u}); // CASP X2, X3, ...; LDR W3, [X2].
+    relocated.put(0x2000, relocated.base + 0x40, 8);
+    relocated.pointers.push_back({0x2000, {0, 0x40}});
+    ok &= rejects(relocated, "data reference");
+    relocated = program(0x2000, {0x48227c04u, 0xb9400063u}); // ...; LDR W3, [X3].
+    relocated.put(0x2008, relocated.base + 0x40, 8);
+    relocated.pointers.push_back({0x2008, {0, 0x40}});
+    ok &= rejects(relocated, "data reference");
+
+    // A stored module address escapes; a compared one does not.
+    for (const auto& [word, stored_register, stored] : {
+             std::tuple{0xf8218002u, 1u, true},   // SWP X1, X2, [X0]: X1 stored.
+             std::tuple{0xb8210002u, 1u, true},   // LDADD W1, W2, [X0]: X1 combined.
+             std::tuple{0xc8a27c01u, 1u, true},   // CAS X2, X1, [X0]: X1 desired.
+             std::tuple{0xc8a17c02u, 1u, false},  // CAS X1, X2, [X0]: X1 compared.
+             std::tuple{0x48247c02u, 3u, true},   // CASP X4, X5, X2, X3, [X0]: X3 desired.
+             std::tuple{0x48227c04u, 3u, false},  // CASP X2, X3, X4, X5, [X0]: X3 compared.
+         }) {
+        // The base's producer must precede the access directly.
+        auto fixture = program(0x2008, {0xd503201fu, word});
+        fixture.put(0, a64::encode_adr(stored_register, fixture.base, fixture.base + 0x2000));
+        fixture.put(4, a64::encode_adr(0, fixture.base + 4, fixture.base + 0x2008));
+        if (stored) {
+            ok &= rejects(fixture, "stored data reference");
+            continue;
+        }
+        const auto admitted = analyze(fixture);
+        if (!admitted.ok()) std::fprintf(stderr, "Compared atomic: %s\n", admitted.error.c_str());
+        ok &= check(admitted.ok(), "A compared module address does not escape.");
+    }
+    // The escape does not depend on the base being a module address.
+    auto escape = program(0x2008, {0xb8210002u});
+    escape.put(0, a64::encode_adr(1, escape.base, escape.base + 0x2000));
+    ok &= rejects(escape, "stored data reference");
     return ok;
 }
 
@@ -723,6 +794,28 @@ bool saved_return_provenance() {
     limits = {};
     limits.max_return_stack_slots = 0;
     ok &= refused(frame, 0, ReturnError::stack_slot_limit, limits);
+
+    // CAS and CASP only compare Rs (Rs+1); a frame address there does not
+    // escape. A desired Rt (Rt+1) or an LSE source does.
+    for (const auto& [word, alias, escapes] : {
+             std::tuple{0xc8a07c41u, 0u, false}, // CAS X0, X1, [X2].
+             std::tuple{0x88a07c41u, 0u, false}, // CAS W0, W1, [X2].
+             std::tuple{0x48207c44u, 1u, false}, // CASP X0, X1, X4, X5, [X2].
+             std::tuple{0x08207c44u, 1u, false}, // CASP W0, W1, W4, W5, [X2].
+             std::tuple{0xc8a17c40u, 0u, true},  // CAS X1, X0, [X2].
+             std::tuple{0x48247c40u, 1u, true},  // CASP X4, X5, X0, X1, [X2].
+             std::tuple{0xf8200043u, 0u, true},  // LDADD X0, X3, [X2].
+             std::tuple{0xf8208043u, 0u, true},  // SWP X0, X3, [X2].
+         }) {
+        Fixture atomic;
+        atomic.put(0, 0xa9bf7bfdu); // STP X29, X30, [SP, #-16]!.
+        atomic.put(4, 0x910003e0u | alias); // MOV Xalias, SP.
+        atomic.put(8, word);
+        atomic.put(12, 0xa8c17bfdu); // LDP X29, X30, [SP], #16.
+        atomic.put(16, a64::encode_ret());
+        ok &= escapes ? refused(atomic, 8, ReturnError::stack_pointer_escape)
+                      : check(analyze(atomic).ok(), "A compared frame address does not escape.");
+    }
 
     Fixture second(0x200000);
     second.put(0, 0x910013deu); // ADD X30, X30, #4.
@@ -1528,6 +1621,7 @@ int main() {
     ok &= authenticated_return_provenance();
     ok &= register_addressed_code_reads();
     ok &= address_provenance_escapes();
+    ok &= atomic_data_references();
     ok &= guest_relocation_store();
     ok &= targets();
     ok &= cross_module_exclusive_x18_ingress();

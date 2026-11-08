@@ -139,8 +139,10 @@ void accounting_and_queries() {
     CHECK(queries.dispatch(0x29, r) == QueryDisposition::handled && r[0] == 0xf001);
 }
 
-void legacy_zero_profile_is_unchanged() {
-    auto c = config(0); c.platform = GuestPlatform::switch1; c.baseline = Baseline::horizon_20_5_0;
+void switch1_horizon_23_profile() {
+    auto c = config(0);
+    c.platform = GuestPlatform::switch1;
+    c.baseline = Baseline::horizon_23_0_1;
     auto a = usage(0);
     auto built = ProcessRecord::create(c, a, blocks(1));
     CHECK(built.ok()); if (!built.ok()) return;
@@ -148,16 +150,32 @@ void legacy_zero_profile_is_unchanged() {
     HandleTable handles(64);
     auto thread = std::make_shared<ThreadRecord>(built.process, 3, 44);
     StartupQueries queries(built.process, handles, thread);
-    QueryRegisters r{}; r[1] = 16;
+    QueryRegisters r{};
+    r[1] = 16; r[2] = current_process_handle;
     CHECK(queries.dispatch(0x29, r) == QueryDisposition::handled && r[0] == 0 && r[1] == 0);
+    r = {}; r[1] = 16; r[2] = 0;
+    CHECK(queries.dispatch(0x29, r) == QueryDisposition::handled && r[0] == 0xe401 && r[1] == 16);
     r = {}; r[1] = 17; r[2] = current_process_handle;
-    CHECK(queries.dispatch(0x29, r) == QueryDisposition::unsupported_operation);
-    for (unsigned id : {29u, 36u, 38u}) {
-        r = {}; r[1] = id;
+    CHECK(queries.dispatch(0x29, r) == QueryDisposition::handled && r[0] == 0 && r[1] == 0);
+    r = {}; r[1] = 20; r[2] = 0;
+    CHECK(queries.dispatch(0x29, r) == QueryDisposition::handled && r[0] == 0xe401);
+    for (unsigned id : {29u, 30u, 31u, 32u, 33u}) {
+        r = {}; r[1] = id; r[2] = current_process_handle;
         CHECK(queries.dispatch(0x29, r) == QueryDisposition::handled && r[0] == 0xf001);
+    }
+    for (unsigned id : {36u, 37u, 38u}) {
+        r = {}; r[1] = id; r[2] = current_process_handle;
+        const auto before = r;
+        CHECK(queries.dispatch(0x29, r) == QueryDisposition::unsupported_operation);
+        CHECK(r == before);
     }
     c.private_system_resource_bytes = 2 * mib;
     CHECK(ProcessRecord::create(c, usage(2 * mib), blocks(1)).error == ProcessStateError::unsupported_profile);
+    c.private_system_resource_bytes = 0;
+    // A platform value outside the enumeration is not admitted as Switch 1.
+    c.baseline = Baseline::horizon_23_0_1;
+    c.platform = static_cast<GuestPlatform>(2);
+    CHECK(ProcessRecord::create(c, usage(0), blocks(1)).error == ProcessStateError::unsupported_profile);
 }
 
 void publication_refusal_accounting() {
@@ -190,6 +208,6 @@ void publication_refusal_accounting() {
 }
 }
 int main() {
-    accounting_and_queries(); legacy_zero_profile_is_unchanged(); publication_refusal_accounting();
+    accounting_and_queries(); switch1_horizon_23_profile(); publication_refusal_accounting();
     return failures ? 1 : 0;
 }

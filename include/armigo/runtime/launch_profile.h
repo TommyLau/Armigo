@@ -21,7 +21,7 @@ namespace armigo::runtime {
 
 // Lane A validates META/ACI0/ACID bounds and requested capabilities against
 // their restrictions before returning a profile. No SDK-private objects or
-// title defaults. The admitted 20.5.0 subset is GetInfo, QueryMemory,
+// title defaults. The admitted subset is GetInfo, QueryMemory,
 // GetThreadPriority and GetThreadId on a 64-bit, 39-bit process with no
 // private system resource. NPDM authentication and additional
 // profiles remain unsupported. Unknown
@@ -39,6 +39,15 @@ struct ProcessPermissions {
     std::vector<std::byte> service_access_control;
     // Validated effective FS access data; lane F must enforce it or reject.
     std::vector<std::byte> file_system_access_control;
+    // Owner grants FS keeps beside the permission mask: requested content
+    // owner ids and save-data owner ids with their accessibility byte (bit 0
+    // read, bit 1 write), each admitted by the ACID's list or id range.
+    std::vector<std::uint64_t> content_owner_ids;
+    struct SaveDataOwner {
+        std::uint64_t id = 0;
+        std::uint8_t accessibility = 0;
+    };
+    std::vector<SaveDataOwner> save_data_owners;
     std::uint32_t handle_table_capacity = 0;
     // Retained admitted capabilities for downstream process initialization.
     std::uint32_t intended_kernel_version = 0;

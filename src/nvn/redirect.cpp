@@ -29,7 +29,8 @@ DriverSelection select_driver(bool title_enabled, std::span<const std::byte> ima
 
 RedirectResult redirect_bootstrap_loader(const runtime::ModulePreparationView& view,
     const execution::PreparedImage& prepared, std::uint64_t text_offset,
-    std::uint64_t text_size, std::optional<std::size_t> embedded_stub_offset) noexcept {
+    std::uint64_t text_size, std::optional<std::size_t> embedded_stub_offset, BootstrapLoader loader) noexcept {
+    if (!loader) loader = &armigo_nvn_bootstrap_loader;
     const linker::Symbol* exported = nullptr;
     for (const auto& symbol : view.metadata.symbols) {
         if (symbol.name != "nvnBootstrapLoader" || !symbol.defined()) continue;
@@ -104,14 +105,14 @@ RedirectResult redirect_bootstrap_loader(const runtime::ModulePreparationView& v
         const std::array<std::uint32_t, 3> code{page.word,
             0xf9400210u | (static_cast<std::uint32_t>((key & 4095) / 8) << 10), 0xd61f0200u};
         const std::array<std::uint32_t, 4> branch{enter.word, 0xd503201f, 0xd503201f, 0xd503201f};
-        const auto destination = reinterpret_cast<std::uintptr_t>(&armigo_nvn_bootstrap_loader);
+        const auto destination = reinterpret_cast<std::uintptr_t>(loader);
         std::memcpy(view.appended_code.data() + stub, code.data(), sizeof(code));
         std::memcpy(view.appended_data.data() + execution::embedded_nvn_bootstrap_offset, &destination, 8);
         std::memcpy(view.image.data() + at, branch.data(), sizeof(branch));
         return {nullptr, at};
     }
     const std::array<std::uint32_t, 2> branch{0x58000050u, 0xd61f0200u};
-    const auto destination = reinterpret_cast<std::uintptr_t>(&armigo_nvn_bootstrap_loader);
+    const auto destination = reinterpret_cast<std::uintptr_t>(loader);
     static_assert(sizeof(destination) == 8);
     std::memcpy(view.image.data() + at, branch.data(), 8);
     std::memcpy(view.image.data() + at + 8, &destination, 8);

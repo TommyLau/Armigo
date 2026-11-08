@@ -9,12 +9,15 @@
 // ============================================================================
 
 #include <armigo/services/play_report.h>
+#include <armigo/horizon/event.h>
+#include <armigo/horizon/startup_queries.h>
 
 #include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -411,11 +414,127 @@ void test_save_with_opt_in_flag() {
     }
 }
 
+// SendReportWithUser (10500): the report comes in a copied transfer memory and
+// a domain session gets an async context object back, which it may release.
+IpcMessage send_request(Handle memory, std::uint32_t memory_size, std::uint32_t report_size) {
+    IpcMessage message{};
+    put(message, 0, 6 | (1u << 16)); // One X buffer.
+    put(message, 4, 0x80000000u | 22);
+    put(message, 8, 3); // Send PID and copy one handle.
+    put(message, 12, 999);
+    put(message, 20, memory);
+    put(message, 24, (5u << 16) | (2u << 6) | (1u << 12));
+    put(message, 28, static_cast<std::uint32_t>(room_address));
+    put(message, 32, (0x38u << 16) | 1);
+    put(message, 36, 1);
+    put(message, 48, 0x49434653);
+    put(message, 52, 1);
+    put(message, 56, 10500);
+    put(message, 68, memory_size);
+    put(message, 72, report_size);
+    put(message, 80, 1); // User ID.
+    put(message, 96, 999);
+    return message;
+}
+
+void test_send_report_with_user() {
+    Fixture fixture;
+    const auto memory = fixture.handles.insert(
+        std::make_shared<TransferMemoryRecord>(AddressRange{report_address, 0x1000}, 0)).value();
+    const auto size = static_cast<std::uint32_t>(fixture.memory.report.size());
+    // A session that is not a domain cannot receive the async context.
+    fixture.message = send_request(memory, 0x1000, size);
+    put(fixture.message, 32, 0);
+    fixture.reject();
+    fixture.message = control(0);
+    CHECK(fixture.send() == IpcDisposition::handled);
+    for (const std::uint32_t object : {2u, 3u}) {
+        fixture.message = send_request(memory, 0x1000, size);
+        CHECK(fixture.send() == IpcDisposition::handled);
+        CHECK(get(fixture.message, 16) == 1);
+        CHECK(get(fixture.message, 32) == 0x4f434653 && get(fixture.message, 40) == 0);
+        CHECK(get(fixture.message, 44) == 0x2749f93d && get(fixture.message, 48) == object);
+        CHECK(fixture.session->diagnostic() == nullptr && fixture.memory.writes == 0);
+    }
+    // Validation results, in the save commands' order.
+    fixture.message = send_request(memory, 0x1000, size);
+    put(fixture.message, 80, 0);
+    fixture.result(0x281, true);
+    fixture.message = send_request(memory, 0x2000, size);
+    fixture.result(0x281, true);
+    fixture.message = send_request(memory, 0x1000, 0);
+    fixture.result(0x1281, true);
+    fixture.message = send_request(memory, 0x1000, 0x1001);
+    fixture.result(0x1281, true);
+    fixture.memory.report[0] = std::byte{0xc1}; // Not a MessagePack map.
+    fixture.message = send_request(memory, 0x1000, size);
+    fixture.result(0x1281, true);
+    fixture.memory.report[0] = std::byte{0x81};
+    fixture.memory.room[0] = std::byte{'T'};
+    fixture.message = send_request(memory, 0x1000, size);
+    fixture.result(0xa81, true);
+    fixture.memory.room[0] = std::byte{'t'};
+    // No copied handle, or one that is not a transfer memory.
+    fixture.message = send_request(memory, 0x1000, size);
+    put(fixture.message, 8, 1);
+    fixture.reject();
+    fixture.message = send_request(fixture.handle, 0x1000, size);
+    fixture.reject();
+    // An async context has completed: its event is signaled, Cancel and
+    // GetResult succeed, and other commands stay unsupported.
+    const auto context = [&](std::uint32_t object, std::uint32_t command) {
+        fixture.message = IpcMessage{};
+        put(fixture.message, 0, 4);
+        put(fixture.message, 4, 12);
+        put(fixture.message, 16, (16u << 16) | 1);
+        put(fixture.message, 20, object);
+        put(fixture.message, 32, 0x49434653);
+        put(fixture.message, 36, 1);
+        put(fixture.message, 40, command);
+    };
+    context(3, 0);
+    CHECK(fixture.send() == IpcDisposition::handled);
+    // One copied handle; the dispatcher moves the domain and CMIF headers past it.
+    CHECK((get(fixture.message, 8) >> 1 & 15) == 1 && get(fixture.message, 48) == 0x4f434653);
+    CHECK(get(fixture.message, 56) == 0);
+    const auto event = fixture.handles.lookup_as<Event>(static_cast<Handle>(get(fixture.message, 20)));
+    CHECK(event && event->is_signaled());
+    for (const std::uint32_t command : {1u, 2u}) {
+        context(3, command);
+        CHECK(fixture.send() == IpcDisposition::handled);
+        CHECK(get(fixture.message, 32) == 0x4f434653 && get(fixture.message, 40) == 0);
+        CHECK(get(fixture.message, 8) == 0 || (get(fixture.message, 4) & 0x80000000u) == 0);
+    }
+    context(3, 3);
+    fixture.reject();
+    context(9, 2);
+    fixture.reject();
+    const std::pair<std::uint32_t, bool> closes[] = {{2, true}, {2, false}, {7, false}, {1, false}};
+    // A released context takes no more commands.
+    for (const auto& [object, open] : closes) {
+        fixture.message = IpcMessage{};
+        put(fixture.message, 0, 4);
+        put(fixture.message, 4, 8);
+        put(fixture.message, 16, 2);
+        put(fixture.message, 20, object);
+        if (open) {
+            CHECK(fixture.send() == IpcDisposition::handled);
+            CHECK(get(fixture.message, 16) == 0x4f434653);
+            CHECK(fixture.session->diagnostic() == nullptr);
+        } else {
+            fixture.reject();
+        }
+    }
+    context(2, 2);
+    fixture.reject();
+}
+
 int main() {
     test_session_controls_and_lifetime();
     test_save_and_malformed_buffers();
     test_save_with_opt_in_flag();
     test_report_contract();
+    test_send_report_with_user();
     std::printf("Play-report service failures: %u\n", failures);
     return failures ? 1 : 0;
 }

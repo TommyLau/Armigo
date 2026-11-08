@@ -381,6 +381,14 @@ bool window_texture_overlaps(std::uint64_t address, std::uint64_t size) {
   }
   return false;
 }
+bool set_window_active_textures(NVNwindow *window, int count) {
+  const auto instance = host(window);
+  if (!instance || count < 2 || count > state<WindowState>(window).texture_count)
+    return false;
+  const std::lock_guard lock(instance->mutex);
+  return instance->active &&
+         instance->producer->set_active_textures(static_cast<std::size_t>(count));
+}
 void register_present_entries() {
   register_queue_entries();
   register_sync_entries();

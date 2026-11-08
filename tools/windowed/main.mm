@@ -20,30 +20,48 @@
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
 
+#include <mach-o/dyld.h>
+#include <spawn.h>
+
 #include <algorithm>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <string_view>
 #include <vector>
 
-// The Settings window of a packed app (the app menu's Settings..., Command-,):
-// choices are kept under the same keys as iOS, with declared 120 fps modes
-// admitted on capable Mac displays. They take effect on the next launch.
+extern char** environ;
+
+// The Settings window (the app menu's Settings..., Command-,). A packed app
+// keeps its choices under the same keys as iOS, with declared 120 fps modes
+// admitted on capable Mac displays; they take effect on the next launch. A
+// run started from the command line offers the title's frame rate alone. A
+// new frame rate goes through the Frame Rate menu, which offers to restart.
 @interface ArmigoSettingsWindow : NSObject <NSWindowDelegate>
+- (instancetype)initWithFrameRates:(ArmigoFrameRateMenu*)frameRates frameRateOnly:(BOOL)frameRateOnly;
 - (void)install;
-- (void)setFrameRates:(const armigo::tools::MacFrameRateSelection&)selection;
 - (void)show:(id)sender;
 - (BOOL)writeSnapshot:(NSString*)path;
 @end
 
 @implementation ArmigoSettingsWindow {
     NSWindow* _window;
-    armigo::tools::MacFrameRateSelection _frameRates;
+    ArmigoFrameRateMenu* _frameRates;
+    BOOL _frameRateOnly;
+    NSPopUpButton* _rate;
+    NSTextField* _rateStatus;
 }
 
-- (void)setFrameRates:(const armigo::tools::MacFrameRateSelection&)selection {
-    _frameRates = selection;
+- (instancetype)initWithFrameRates:(ArmigoFrameRateMenu*)frameRates frameRateOnly:(BOOL)frameRateOnly {
+    self = [super init];
+    if (!self) return nil;
+    _frameRates = frameRates;
+    _frameRateOnly = frameRateOnly;
+    __weak ArmigoSettingsWindow* weak = self;
+    frameRates.changed = ^{ [weak refreshFrameRate]; };
+    return self;
 }
 
 - (void)install {
@@ -81,50 +99,80 @@
     return label;
 }
 
+- (void)refreshFrameRate {
+    if (!_rate) return;
+    armigo::tools::populate_player_frame_rate_menu(_rate, _frameRates.selection, _frameRates.storedRate);
+    _rateStatus.stringValue = _frameRates.status;
+}
+
 - (void)build {
-    NSPopUpButton* mode = [self popUpForKey:@"console_mode" titles:@[@"Docked", @"Handheld"]
-                                     values:@[@"docked", @"handheld"]];
-    NSPopUpButton* resolution = [self popUpForKey:@"resolution"
-        titles:@[@"Auto (Native)", @"720p", @"900p", @"1080p", @"1440p", @"4K", @"Native"]
-        values:@[@"auto", @"720p", @"900p", @"1080p", @"1440p", @"2160p", @"native"]];
-    NSPopUpButton* rate = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
-    armigo::tools::populate_player_frame_rate_menu(rate, _frameRates,
-        static_cast<int>([NSUserDefaults.standardUserDefaults integerForKey:@"frame_rate"]));
-    rate.target = self;
-    rate.action = @selector(choose:);
-    [rate.widthAnchor constraintEqualToConstant:240].active = YES;
-    NSPopUpButton* vsync = [self popUpForKey:@"vsync" titles:@[@"On", @"Off"] values:@[@YES, @NO]];
-    NSPopUpButton* overlay = [self popUpForKey:@"performance_overlay" titles:@[@"Off", @"On"] values:@[@NO, @YES]];
-    NSGridView* grid = [NSGridView gridViewWithViews:@[
-        @[[self heading:@"Display"], NSGridCell.emptyContentView],
-        @[[NSTextField labelWithString:@"Console Mode:"], mode],
-        @[[NSTextField labelWithString:@"Resolution:"], resolution],
-        @[[NSTextField labelWithString:@"Frame Rate:"], rate],
-        @[[NSTextField labelWithString:@"V-Sync:"], vsync],
-        @[[self heading:@"Overlay"], NSGridCell.emptyContentView],
-        @[[NSTextField labelWithString:@"Performance Overlay:"], overlay],
-    ]];
+    _rate = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    _rate.target = self;
+    _rate.action = @selector(chooseFrameRate:);
+    [_rate.widthAnchor constraintEqualToConstant:240].active = YES;
+    _rateStatus = [NSTextField labelWithString:@""];
+    _rateStatus.textColor = NSColor.secondaryLabelColor;
+    _rateStatus.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    [self refreshFrameRate];
+    NSArray<NSArray<NSView*>*>* rows;
+    NSString* note;
+    if (_frameRateOnly) {
+        rows = @[
+            @[[self heading:@"Display"], NSGridCell.emptyContentView],
+            @[[NSTextField labelWithString:@"Frame Rate:"], _rate],
+            @[NSGridCell.emptyContentView, _rateStatus],
+        ];
+        note = @"The frame rate is kept for this title. A new frame rate restarts the game;\n"
+               @"the command line sets the other options.";
+    } else {
+        NSPopUpButton* mode = [self popUpForKey:@"console_mode" titles:@[@"Docked", @"Handheld"]
+                                         values:@[@"docked", @"handheld"]];
+        NSPopUpButton* resolution = [self popUpForKey:@"resolution"
+            titles:@[@"Auto (Native)", @"720p", @"900p", @"1080p", @"1440p", @"4K", @"Native"]
+            values:@[@"auto", @"720p", @"900p", @"1080p", @"1440p", @"2160p", @"native"]];
+        NSPopUpButton* vsync = [self popUpForKey:@"vsync" titles:@[@"On", @"Off"] values:@[@YES, @NO]];
+        NSPopUpButton* overlay = [self popUpForKey:@"performance_overlay" titles:@[@"Off", @"On"]
+                                            values:@[@NO, @YES]];
+        rows = @[
+            @[[self heading:@"Display"], NSGridCell.emptyContentView],
+            @[[NSTextField labelWithString:@"Console Mode:"], mode],
+            @[[NSTextField labelWithString:@"Resolution:"], resolution],
+            @[[NSTextField labelWithString:@"Frame Rate:"], _rate],
+            @[NSGridCell.emptyContentView, _rateStatus],
+            @[[NSTextField labelWithString:@"V-Sync:"], vsync],
+            @[[self heading:@"Overlay"], NSGridCell.emptyContentView],
+            @[[NSTextField labelWithString:@"Performance Overlay:"], overlay],
+        ];
+        note = @"Game language follows this app's language in system Settings.\n"
+               @"A new frame rate restarts the game; other changes take effect the next time the game starts.";
+    }
+    NSGridView* grid = [NSGridView gridViewWithViews:rows];
     [grid columnAtIndex:0].xPlacement = NSGridCellPlacementTrailing;
-    [grid cellAtColumnIndex:0 rowIndex:5].xPlacement = NSGridCellPlacementLeading;
-    [grid cellAtColumnIndex:0 rowIndex:0].xPlacement = NSGridCellPlacementLeading;
+    for (NSInteger row = 0; row < grid.numberOfRows; ++row) {
+        NSView* first = [grid cellAtColumnIndex:0 rowIndex:row].contentView;
+        if ([first isKindOfClass:[NSTextField class]] && ((NSTextField*)first).font.fontDescriptor.symbolicTraits &
+                                                             NSFontDescriptorTraitBold)
+            [grid cellAtColumnIndex:0 rowIndex:row].xPlacement = NSGridCellPlacementLeading;
+    }
     grid.rowSpacing = 10;
-    NSTextField* note = [NSTextField wrappingLabelWithString:
-        @"Game language follows this app's language in system Settings.\n"
-        @"Changes take effect the next time the game starts."];
-    note.textColor = NSColor.secondaryLabelColor;
-    note.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
-    NSStackView* stack = [NSStackView stackViewWithViews:@[grid, note]];
+    NSTextField* label = [NSTextField wrappingLabelWithString:note];
+    label.textColor = NSColor.secondaryLabelColor;
+    label.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    NSStackView* stack = [NSStackView stackViewWithViews:@[grid, label]];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeLeading;
     stack.spacing = 16;
     stack.edgeInsets = NSEdgeInsetsMake(20, 20, 20, 20);
-    [note.widthAnchor constraintEqualToConstant:380].active = YES;
-    _window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 420, 320)
+    [label.widthAnchor constraintEqualToConstant:380].active = YES;
+    _window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 420, _frameRateOnly ? 180 : 360)
                                           styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
                                             backing:NSBackingStoreBuffered
                                               defer:NO];
     _window.title = @"Settings";
     _window.releasedWhenClosed = NO;
+    // Opens over the game in full screen, on whichever space is active.
+    _window.collectionBehavior = NSWindowCollectionBehaviorFullScreenAuxiliary |
+                                 NSWindowCollectionBehaviorMoveToActiveSpace;
     _window.contentView = stack;
     [_window center];
 }
@@ -132,6 +180,7 @@
 - (void)show:(id)sender {
     (void)sender;
     if (!_window) [self build];
+    [self refreshFrameRate];
     [_window makeKeyAndOrderFront:nil];
 }
 
@@ -149,9 +198,145 @@
     NSArray* choice = sender.selectedItem.representedObject;
     [NSUserDefaults.standardUserDefaults setObject:choice[1] forKey:choice[0]];
 }
+
+- (void)chooseFrameRate:(NSPopUpButton*)sender {
+    NSArray* choice = sender.selectedItem.representedObject;
+    [_frameRates chooseRate:[choice[1] intValue]];
+}
 @end
 
+namespace {
+
+// The command line and environment the game started with, kept for a restart
+// from the Frame Rate menu, and whether one was asked for.
+struct Restart {
+    std::vector<std::string> arguments;
+    std::vector<std::string> environment;
+    bool requested = false;
+    bool fullscreen = false;
+};
+Restart restart;
+
+// The game's own window: the application delegate's, or the main window.
+NSWindow* game_window() {
+    id delegate = NSApp.delegate;
+    if ([delegate respondsToSelector:@selector(window)]) return [delegate window];
+    return NSApp.mainWindow;
+}
+
+// Clicks the button titled title in view or below it; false when there is none.
+bool press_button(NSView* view, NSString* title) {
+    if ([view isKindOfClass:NSButton.class] && [((NSButton*)view).title isEqualToString:title]) {
+        [(NSButton*)view performClick:nil];
+        return true;
+    }
+    for (NSView* subview in view.subviews)
+        if (press_button(subview, title)) return true;
+    return false;
+}
+
+// Installs the Frame Rate menu and the Settings window for the running game.
+// Restarting closes the game the way Quit does and starts it again once the
+// runtime has shut down.
+void install_frame_rate_controls(const armigo::tools::MacFrameRateSelection& selection,
+                                 const std::string& key, bool frame_rate_only) {
+    static ArmigoFrameRateMenu* frame_rates;
+    static ArmigoSettingsWindow* settings;
+    frame_rates = [[ArmigoFrameRateMenu alloc] initWithSelection:selection key:key];
+    frame_rates.restart = ^{
+        NSWindow* window = game_window();
+        restart.fullscreen = window && (window.styleMask & NSWindowStyleMaskFullScreen);
+        restart.requested = true;
+        armigo::diag::write(armigo::diag::Level::info, "Armigo: restarting the game for its new frame rate.\n");
+        [NSApp terminate:nil];
+    };
+    settings = [[ArmigoSettingsWindow alloc] initWithFrameRates:frame_rates frameRateOnly:frame_rate_only];
+    if (const char* snapshot = std::getenv("ARMIGO_SETTINGS_SNAPSHOT"); snapshot && *snapshot) {
+        // Verification aid: write the Settings window's contents as a PNG.
+        if (![settings writeSnapshot:@(snapshot)])
+            armigo::diag::write(armigo::diag::Level::error, "Cannot write %s\n", snapshot);
+    }
+    if (const char* choice = std::getenv("ARMIGO_FRAME_RATE_CHOICE"); choice && *choice) {
+        // Verification aid: RATE@SECONDS brings the game to the front that
+        // long after it starts, as a player's click would, chooses RATE in the
+        // Frame Rate menu and clicks Restart Now in the prompt it shows. Timers
+        // fire in every run loop mode, so the click also reaches a modal alert.
+        int rate = 0;
+        double seconds = 0;
+        if (std::sscanf(choice, "%d@%lf", &rate, &seconds) == 2 && seconds >= 0) {
+            auto after = [](double delay, void (^step)(void)) {
+                NSTimer* timer = [NSTimer timerWithTimeInterval:delay repeats:NO block:^(NSTimer*) { step(); }];
+                [NSRunLoop.mainRunLoop addTimer:timer forMode:NSRunLoopCommonModes];
+            };
+            after(seconds, ^{
+                [NSApp activate];
+                [game_window() makeKeyAndOrderFront:nil];
+                after(0.5, ^{
+                    after(0.5, ^{
+                        for (NSWindow* window in NSApp.windows) {
+                            const bool sheet = window.sheet;
+                            if (press_button(window.contentView, @"Restart Now")) {
+                                armigo::diag::write(armigo::diag::Level::info, "Armigo: clicked Restart Now in %s.\n",
+                                                    sheet ? "a sheet" : "an alert");
+                                return;
+                            }
+                        }
+                        armigo::diag::error("%s", "Armigo: no Restart Now prompt to answer.\n");
+                    });
+                    [frame_rates chooseRate:rate];
+                });
+            });
+        }
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [frame_rates install];
+        [settings install];
+    });
+}
+
+// Replaces this process with the game started again: same process id, so the
+// terminal and anything waiting on it keep following the game. Returns only
+// when that fails.
+void restart_game() {
+    char path[PATH_MAX];
+    std::uint32_t size = sizeof path;
+    if (_NSGetExecutablePath(path, &size) != 0) {
+        armigo::diag::error("%s", "Armigo: the game cannot restart: its executable path is unavailable.\n");
+        return;
+    }
+    const auto command = armigo::tools::restart_command(restart.arguments, restart.environment, restart.fullscreen);
+    std::vector<char*> arguments;
+    for (const auto& argument : command.arguments) arguments.push_back(const_cast<char*>(argument.c_str()));
+    arguments.push_back(nullptr);
+    std::vector<char*> environment;
+    for (const auto& entry : command.environment) environment.push_back(const_cast<char*>(entry.c_str()));
+    environment.push_back(nullptr);
+    std::fflush(nullptr);
+    posix_spawnattr_t attributes;
+    posix_spawn_file_actions_t files;
+    int error = posix_spawnattr_init(&attributes);
+    if (error == 0) {
+        error = posix_spawn_file_actions_init(&files);
+        // Only the standard streams carry over; every other descriptor closes.
+        if (error == 0) {
+            error = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETEXEC | POSIX_SPAWN_CLOEXEC_DEFAULT);
+            for (int descriptor : {0, 1, 2})
+                if (error == 0) error = posix_spawn_file_actions_addinherit_np(&files, descriptor);
+            pid_t pid = 0;
+            if (error == 0)
+                error = posix_spawn(&pid, path, &files, &attributes, arguments.data(), environment.data());
+            posix_spawn_file_actions_destroy(&files);
+        }
+        posix_spawnattr_destroy(&attributes);
+    }
+    armigo::diag::error("Armigo: the game cannot restart: %s\n", std::strerror(error));
+}
+
+} // namespace
+
 int main(int argc, char* argv[]) {
+    restart.arguments.assign(argv, argv + argc);
+    for (char** entry = environ; *entry; ++entry) restart.environment.emplace_back(*entry);
     armigo::diag::use_player_defaults();
     armigo::tools::raise_open_file_limit();
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
@@ -223,15 +408,7 @@ int main(int argc, char* argv[]) {
             configure_launch = armigo::tools::mac_player_launch_configuration(choices, width,
                 [language, width](const armigo::tools::PlayerChoices& effective,
                                   const armigo::tools::MacFrameRateSelection& selection) {
-                static ArmigoSettingsWindow* settings;
-                settings = [ArmigoSettingsWindow new];
-                [settings setFrameRates:selection];
-                if (const char* snapshot = std::getenv("ARMIGO_SETTINGS_SNAPSHOT"); snapshot && *snapshot) {
-                    // Verification aid: write the Settings window's contents as a PNG.
-                    if (![settings writeSnapshot:@(snapshot)])
-                        armigo::diag::write(armigo::diag::Level::error, "Cannot write %s\n", snapshot);
-                }
-                dispatch_async(dispatch_get_main_queue(), ^{ [settings install]; });
+                install_frame_rate_controls(selection, armigo::tools::frame_rate_preference_key(std::nullopt), false);
                 armigo::diag::write(armigo::diag::Level::info,
                     "Armigo settings: language=%s region=%u mode=%s resolution=%s/%u frame_rate=%s "
                     "vsync=%s overlay=%s\n", language.c_str(), armigo::services::set::console_region_code(),
@@ -239,6 +416,20 @@ int main(int argc, char* argv[]) {
                     effective.frame_rate ? std::to_string(effective.frame_rate).c_str() : "auto",
                     effective.vsync ? "on" : "off", effective.performance_overlay ? "on" : "off");
             });
+        } else if (parsed.ok && !parsed.help) {
+            // A title run from the command line keeps the frame rate chosen
+            // for it in this app; the command line sets everything else.
+            if (const auto policy = armigo::tools::find_title_frame_rate_policy(parsed.arguments)) {
+                const auto key = armigo::tools::frame_rate_preference_key(policy->title_id);
+                configure_launch = armigo::tools::mac_title_frame_rate_configuration(
+                    armigo::tools::title_frame_rate_choices(*policy, armigo::tools::read_frame_rate_preference(key)),
+                    [key](const armigo::tools::PlayerChoices& effective,
+                          const armigo::tools::MacFrameRateSelection& selection) {
+                    install_frame_rate_controls(selection, key, true);
+                    armigo::diag::write(armigo::diag::Level::info, "Armigo settings: frame_rate=%s\n",
+                        effective.frame_rate ? std::to_string(effective.frame_rate).c_str() : "auto");
+                });
+            }
         }
         if (parsed.help) {
             std::printf("Usage: armigo run --exefs DIR --romfs DIR [--shaders DIR] [options]\n"
@@ -254,8 +445,16 @@ int main(int argc, char* argv[]) {
         const auto report = armigo::tools::run_windowed_shell(
             parsed.arguments, environment, armigo::tools::create_application_host, configure_launch);
         const auto fields = armigo::tools::report_fields(report);
-        if (!armigo::tools::emit_shell_report(@"run-windowed", fields,
-                                              parsed.arguments.report_file)) {
+        const bool reported = armigo::tools::emit_shell_report(@"run-windowed", fields,
+                                                               parsed.arguments.report_file);
+        // A runtime that did not stop within its bound still has live threads
+        // (possibly writing saves); it ends with the process, never restarts.
+        if (restart.requested && !report.runtime_retained && report.result.quiescent)
+            restart_game();
+        else if (restart.requested)
+            armigo::diag::error("%s", "Armigo: the game did not shut down cleanly, so it was not restarted; "
+                                      "start it again to use the new frame rate.\n");
+        if (!reported) {
             armigo::tools::exit_process_if_runtime_retained(1);
             return 1;
         }

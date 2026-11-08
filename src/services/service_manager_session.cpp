@@ -15,14 +15,11 @@
 
 namespace armigo::services::sm {
 
-ServiceManagerSession::ServiceManagerSession(ProcessConfig process, ConnectService connect,
-    bool close_on_hipc)
-    : process_id_(process.process_id), close_on_hipc_(close_on_hipc),
-      session_(std::in_place, std::move(process), std::move(connect)) {}
+ServiceManagerSession::ServiceManagerSession(ProcessConfig process, ConnectService connect)
+    : process_id_(process.process_id), session_(std::in_place, std::move(process), std::move(connect)) {}
 
 horizon::IpcReply ServiceManagerSession::close_server() {
     const std::lock_guard lock(mutex_);
-    if (!close_on_hipc_) return ClientSession::close_server();
     if (!session_) return {.disposition = horizon::IpcDisposition::handled,
                            .transport_result = horizon::session_closed_result};
     session_.reset();

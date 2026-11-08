@@ -757,6 +757,52 @@ void shuffle_text_tests() {
     }
 }
 
+// A word reduced across the active lanes: unsigned for every kind, signed
+// for the extrema only, and no other numeric interpretation.
+void subgroup_reduce_tests() {
+    const ComputeConfiguration compute{{32, 1, 1}, 0};
+    const EvidenceOrigin origin{OriginKind::explicit_option, "synthetic-compute"};
+    auto reduce_fixture = [&](AtomicKind kind, NumericMode numeric) {
+        Fixture f;
+        f.p.ir.stage = Stage::compute;
+        f.plan.stage = Stage::compute;
+        f.p.profile.supports_simd_shuffle = true;
+        f.plan.profile = f.p.profile;
+        f.p.requirements.compute = compute;
+        f.plan.compute = compute;
+        f.p.ir.dependencies = {{FactKey{FactKind::compute_local_size}, FactValue{ComputeLocalSize{{32, 1, 1}}}, origin},
+                               {FactKey{FactKind::compute_shared_memory_bytes}, FactValue{std::uint32_t{0}}, origin}};
+        f.plan.dependencies = f.p.ir.dependencies;
+        Operation op;
+        op.opcode = Opcode::subgroup_reduce;
+        op.numeric = numeric;
+        op.inputs = {f.defined_word()};
+        op.outputs.push_back(f.value(ValueType::word32));
+        SubgroupInfo info;
+        info.reduction = kind;
+        op.info = info;
+        f.operation(std::move(op));
+        return f;
+    };
+    const NumericMode unsigned_mode{Domain::unsigned_integer, ScalarType::u32};
+    const NumericMode signed_mode{Domain::signed_integer, ScalarType::s32};
+    contains(accepted(reduce_fixture(AtomicKind::add, unsigned_mode), "reduce_sum"), "simd_sum(", "unsigned sum");
+    contains(accepted(reduce_fixture(AtomicKind::bit_or, unsigned_mode), "reduce_or"), "simd_or(", "unsigned or");
+    contains(accepted(reduce_fixture(AtomicKind::bit_xor, unsigned_mode), "reduce_xor"), "simd_xor(", "unsigned xor");
+    contains(accepted(reduce_fixture(AtomicKind::minimum, unsigned_mode), "reduce_min"), "simd_min(", "unsigned minimum");
+    contains(accepted(reduce_fixture(AtomicKind::maximum, signed_mode), "reduce_max_signed"), "as_type<int>(", "signed maximum");
+    rejected(reduce_fixture(AtomicKind::add, NumericMode{Domain::floating, ScalarType::f32, Rounding::nearest_even}),
+             "Floating reduction");
+    rejected(reduce_fixture(AtomicKind::add, NumericMode{Domain::unsigned_integer, ScalarType::u64}), "64-bit reduction");
+    rejected(reduce_fixture(AtomicKind::bit_or, signed_mode), "Signed or");
+    rejected(reduce_fixture(AtomicKind::bit_xor, signed_mode), "Signed xor");
+    rejected(reduce_fixture(AtomicKind::add, signed_mode), "Signed sum");
+    NumericMode flushed = unsigned_mode;
+    flushed.flush_output = true;
+    rejected(reduce_fixture(AtomicKind::minimum, flushed), "Flushed reduction");
+    rejected(reduce_fixture(AtomicKind::bit_and, unsigned_mode), "And reduction");
+}
+
 void modifier_rejection_tests() {
     { // modes without a native equivalent are named, never approximated.
         rejected(binary_fixture(Opcode::add, floating(Rounding::toward_zero)),
@@ -914,6 +960,7 @@ int main(int argc, char** argv) {
     }
     opcode_text_tests();
     shuffle_text_tests();
+    subgroup_reduce_tests();
     modifier_rejection_tests();
 #if defined(ARMIGO_MSL_EXPR_GPU)
     if (run_gpu) failures += armigo::shader::test::msl_expr::run_gpu_cases();

@@ -29,6 +29,11 @@ inline constexpr std::size_t texture_gob_size =
 // Total storage described by a layout is capped at the same policy limit the
 // descriptor resolver applies, so no conversion can allocate beyond it.
 inline constexpr std::size_t max_texture_layout_size = 256u * 1024u * 1024u;
+// A layout's storage itself may be larger: the largest texture a targeted
+// title allocates is a 12288 x 12288 DEPTH16 shadow atlas (288 MiB with its
+// block-linear rows), which the GPU renders and samples in place. Conversions
+// and CPU transfers stay within max_texture_layout_size.
+inline constexpr std::size_t max_texture_storage_size = 1024u * 1024u * 1024u;
 inline constexpr std::uint32_t max_texture_layout_levels = 16;
 
 enum class TextureStorageLayout : std::uint8_t {

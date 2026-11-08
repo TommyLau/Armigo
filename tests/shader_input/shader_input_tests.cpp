@@ -26,8 +26,8 @@ using namespace armigo::shader_input;
 // control group: prefix, magic, tag, version, size bounds, truncation, tails.
 // ---------------------------------------------------------------------------
 
-ARMIGO_SI_TEST(control, accepts_versions_9_14_and_15) {
-    for (const std::uint32_t version : {9u, 14u, 15u}) {
+ARMIGO_SI_TEST(control, accepts_versions_9_14_15_and_16) {
+    for (const std::uint32_t version : {9u, 14u, 15u, 16u}) {
         const test::CodeSpec code;
         test::ControlSpec spec = test::control_for(code);
         spec.version = version;
@@ -60,7 +60,7 @@ ARMIGO_SI_TEST(control, rejects_wrong_tag) {
 }
 
 ARMIGO_SI_TEST(control, rejects_unsupported_version) {
-    for (const std::uint32_t version : {0u, 8u, 10u, 13u, 16u}) {
+    for (const std::uint32_t version : {0u, 8u, 10u, 13u, 17u}) {
         test::CodeSpec code;
         test::ControlSpec spec = test::control_for(code);
         spec.version = version;

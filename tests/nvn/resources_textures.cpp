@@ -67,6 +67,13 @@ struct MockResources final : ResourceBackend {
         flush_offset = offset;
         flush_size = size;
     }
+    // What the storage held when the driver announced its write.
+    unsigned prepares = 0;
+    std::byte prepared_first{};
+    void prepare_pool_write(const MemoryPoolState& pool, std::uint64_t offset, std::uint64_t) override {
+        ++prepares;
+        prepared_first = reinterpret_cast<const std::byte*>(pool.memory)[offset];
+    }
     void invalidate_pool(const MemoryPoolState&, std::uint64_t offset, std::uint64_t size) override {
         invalidate_offset = offset;
         invalidate_size = size;
@@ -451,10 +458,26 @@ void test_initialization_and_snapshot(MockResources& resources) {
     auto& invalid_builder = object_state<TextureBuilderState>(fixture.builder);
     const auto set_packaged = entry<void (*)(NVNtextureBuilder*, const void*)>("nvnTextureBuilderSetPackagedTextureData");
     const auto set_gl_name = entry<void (*)(NVNtextureBuilder*, std::uint32_t)>("nvnTextureBuilderSetGLTextureName");
-    set_packaged(&fixture.builder, fixture.memory.data());
+    // Packaged texture data is copied into the texture's storage at
+    // initialization and published as a flush of exactly that range.
+    const auto storage_size =
+        entry<std::size_t (*)(const NVNtextureBuilder*)>("nvnTextureBuilderGetStorageSize")(&fixture.builder);
+    std::vector<std::byte> packaged(storage_size);
+    for (std::size_t i = 0; i < packaged.size(); ++i) packaged[i] = static_cast<std::byte>(i * 7 + 3);
+    set_packaged(&fixture.builder, packaged.data());
     CHECK(entry<const void* (*)(const NVNtextureBuilder*)>("nvnTextureBuilderGetPackagedTextureData")(&fixture.builder) ==
-          fixture.memory.data());
-    CHECK(!initialize(&fixture.texture, &fixture.builder));
+          packaged.data());
+    resources.flush_offset = resources.flush_size = 0;
+    const auto packaged_offset = static_cast<std::size_t>(object_state<TextureBuilderState>(fixture.builder).offset);
+    fixture.memory[packaged_offset] = std::byte{0xaa};
+    const auto prepares = resources.prepares;
+    CHECK(storage_size != 0 && initialize(&fixture.texture, &fixture.builder));
+    // The backend drains its pool readers while the old bytes are in place,
+    // then the bytes are copied and published.
+    CHECK(resources.prepares == prepares + 1 && resources.prepared_first == std::byte{0xaa});
+    CHECK(std::memcmp(fixture.memory.data() + packaged_offset, packaged.data(), packaged.size()) == 0);
+    CHECK(resources.flush_offset == packaged_offset && resources.flush_size == packaged.size());
+    finalize(&fixture.texture);
     set_packaged(&fixture.builder, nullptr);
     set_gl_name(&fixture.builder, 1);
     CHECK(entry<std::uint32_t (*)(const NVNtextureBuilder*)>("nvnTextureBuilderGetGLTextureName")(&fixture.builder) == 1);

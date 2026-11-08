@@ -17,12 +17,14 @@
 #include "../nvn/backend.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <span>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -140,18 +142,20 @@ class NativeThreadRuntime final : public ThreadRuntime {
         execution::GuestSupervisor scheduling_boundary;
     };
     static execution::GateStatus compatibility_call(const execution::CallHookSite& site,
-        execution::GateCall& call, execution::GuestThreadContext&, void* raw) {
+        execution::GateCall& call, execution::GuestThreadContext& thread, void* raw) {
         auto& runtime = *static_cast<NativeThreadRuntime*>(raw);
         const auto& patch = runtime.dependencies_.launch.compatibility_patch;
         if (!patch) {
             call.set_failure_message("Compatibility hook has no retained module state.");
             return execution::GateStatus::failed;
         }
+        const auto& counter = thread.counter();
+        const auto frequency = counter && counter->read_ticks ? counter->frequency : 0;
         return compat::handle_patch(*patch, call, runtime.dependencies_.memory->ipc_buffers(),
                                    site.call_return_address, {[](void*) noexcept {
                                        auto* backend = nvn::backends().replay;
                                        return backend ? backend->gpu_frame_work_ns() : std::uint64_t{0};
-                                   }, nullptr});
+                                   }, nullptr}, frequency);
     }
     static thread_local Invocation* current_;
     static thread_local NativeThreadRuntime* active_runtime_;
@@ -274,7 +278,12 @@ public:
             worker->stack = std::move(stack);
             workers_.reserve(workers_.size() + 1);
             const auto handle = dependencies_.handles->insert(worker->record);
-            if (!handle) return fail(LaunchError::resource_limit, "create_thread", "Thread handle table is full.");
+            if (!handle) {
+                // The kernel unwinds the unpublished thread and returns 0xd201.
+                auto error = fail(LaunchError::resource_limit, "create_thread", "Thread handle table is full.");
+                error.guest_result = 0xd201;
+                return error;
+            }
             worker->handle = *handle;
             worker->record->set_creation_handle(*handle);
             if (launch.original_process) {
@@ -548,6 +557,21 @@ private:
                static_cast<unsigned long long>(fault->x[29]), describe_code_address(fault->x[30]).c_str(),
                static_cast<unsigned long long>(fault->sp), static_cast<unsigned long long>(fault->pstate),
                static_cast<unsigned long long>(fault->fpcr), static_cast<unsigned long long>(fault->fpsr));
+        // The frame-record chain from fp, read through checked guest memory
+        // and stopped at the first frame that is not readable or not above
+        // the previous one.
+        if (dependencies_.memory) {
+            const auto memory = dependencies_.memory->ipc_buffers();
+            std::uint64_t frame = fault->x[29];
+            detail += " Frames:";
+            for (int depth = 0; depth != 12 && frame != 0; ++depth) {
+                std::array<std::uint64_t, 2> record{};
+                if (!memory.read_memory(frame, std::as_writable_bytes(std::span(record)))) break;
+                append(" %s", describe_code_address(record[1]).c_str());
+                if (record[0] <= frame) break;
+                frame = record[0];
+            }
+        }
         armigo::diag::write(armigo::diag::Level::error, "Armigo runtime: %s\n", detail.c_str());
         auto error = fail(LaunchError::guest_fault, "guest_fault", detail.c_str());
         error.guest_pc = fault->pc;
@@ -817,7 +841,8 @@ private:
                 else {
                     auto binding = std::get<ThreadServiceBinding>(std::move(result));
                     if (!stop_.stop_requested()) {
-                        if (worker.context.set_counter(dependencies_.clock->counter()) != execution::GuestCounterError::none)
+                        if (worker.context.set_counter(dependencies_.clock->counter(horizon::counter_rate(
+                                dependencies_.profile.process.platform))) != execution::GuestCounterError::none)
                             record_failure(worker, fail(LaunchError::host_failure, "bind_thread_clock", "Clock counter is invalid."));
                         else {
                             Invocation invocation{

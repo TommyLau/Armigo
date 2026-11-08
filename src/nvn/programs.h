@@ -16,6 +16,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -46,6 +47,27 @@ struct PendingStages {
     std::atomic<bool> finished{false};
 };
 
+// An API 231 compute stage's driver data (hardware constant buffer 0), laid
+// out per shader from its control section. Words 1-3 hold the dispatch's
+// workgroup counts; from 0x10 come the push block (push_bytes, rounded up to
+// 16), then 16-byte uniform and storage buffer entries (address, size), then
+// 8-byte handles: textures, separate textures, separate samplers and images,
+// `size` bytes in all.
+// The driver data the replay binds for a stage (hardware constant buffer 0).
+inline constexpr std::uint32_t compute_driver_data_bytes = 0xa00;
+struct ComputeDriverLayout {
+    std::uint32_t push_bytes = 0;
+    std::uint32_t uniforms = 0, storages = 0;
+    std::uint32_t textures = 0, separate_textures = 0, separate_samplers = 0, images = 0;
+    std::uint32_t size = 0;
+    std::uint32_t uniform_base() const { return 0x10 + ((push_bytes + 15) & ~15u); }
+    std::uint32_t storage_base() const { return uniform_base() + 16 * uniforms; }
+    std::uint32_t texture_base() const { return storage_base() + 16 * storages; }
+    std::uint32_t separate_texture_base() const { return texture_base() + 8 * textures; }
+    std::uint32_t separate_sampler_base() const { return separate_texture_base() + 8 * separate_textures; }
+    std::uint32_t image_base() const { return separate_sampler_base() + 8 * separate_samplers; }
+};
+
 struct ResolvedProgram {
     ProgramState state{};
     // Complete for every caller of retain_program. A program published with
@@ -53,6 +75,8 @@ struct ResolvedProgram {
     // reads them before that (command recording only keeps the program).
     std::array<std::shared_ptr<const platform::CompiledGraphicsStage>, 6> stages;
     std::array<ProgramConstants, 6> constants{};
+    // API 231 compute stages only.
+    std::optional<ComputeDriverLayout> compute_layout;
     // Set once before publication; command recording can retain a live
     // snapshot directly without entering the serial registry.
     std::weak_ptr<const ResolvedProgram> owner;

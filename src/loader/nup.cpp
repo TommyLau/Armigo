@@ -301,6 +301,41 @@ std::variant<NupFailure, std::size_t> NupArchive::read(
     return static_cast<std::size_t>(count);
 }
 
+std::variant<NupFailure, std::vector<std::string>> NupArchive::zs_frame_mismatches(
+    const NupSelection& selection) const {
+    auto zs_name = [](const std::string& path) {
+        const auto slash = path.rfind('/');
+        const auto base = slash == std::string::npos ? std::string::size_type{0} : slash + 1;
+        const auto dot = path.rfind('.');
+        if (dot == std::string::npos || dot <= base || path.size() - dot != 3) return false;
+        const auto lower = [](unsigned char c) {
+            return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : static_cast<char>(c);
+        };
+        return lower(static_cast<unsigned char>(path[dot + 1])) == 'z' &&
+            lower(static_cast<unsigned char>(path[dot + 2])) == 's';
+    };
+    auto frame = [](std::span<const std::byte> head) {
+        if (head.size() != 4) return false;
+        const auto byte = [&](std::size_t index) {
+            return std::to_integer<unsigned char>(head[index]);
+        };
+        if (byte(0) == 0x28 && byte(1) == 0xb5 && byte(2) == 0x2f && byte(3) == 0xfd) return true;
+        return (byte(0) & 0xf0) == 0x50 && byte(1) == 0x2a && byte(2) == 0x4d && byte(3) == 0x18;
+    };
+    std::vector<std::string> damaged;
+    for (const auto& [path, index] : selection.romfs) {
+        if (!zs_name(path)) continue;
+        if (index >= files_.size()) return bad("file", "The file index is invalid.");
+        if (files_[index].size == 0) continue;
+        std::array<std::byte, 4> head{};
+        auto read_head = read(index, 0, head);
+        if (const auto* failure = std::get_if<NupFailure>(&read_head)) return *failure;
+        const auto count = std::get<std::size_t>(read_head);
+        if (!frame(std::span<const std::byte>(head.data(), count))) damaged.push_back(path);
+    }
+    return damaged;
+}
+
 std::optional<NupFailure> NupArchive::verify(std::uint32_t index) const {
     if (index >= files_.size()) return bad("file", "The file index is invalid.");
     CC_SHA256_CTX context;

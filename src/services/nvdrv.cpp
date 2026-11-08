@@ -329,7 +329,7 @@ std::optional<services::GraphicsBufferBacking> retain_exported_memory(
     return backing;
 }
 
-// The GPU a Horizon 20.5.0 console reports: a Tegra X1 (GM20B) with one GPC and
+// The GPU a Horizon console reports: a Tegra X1 (GM20B) with one GPC and
 // two TPCs. The guest SDK selects its GPU code paths from these values, so they
 // describe the emulated console rather than the host GPU.
 struct GpuCharacteristics {

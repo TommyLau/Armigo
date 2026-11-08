@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/event.h>
 #include <armigo/runtime/guest_memory.h>
 #include <armigo/runtime/kernel_queries.h>
 #include <armigo/horizon/read_only_shared_memory.h>
@@ -270,6 +271,27 @@ void run_physical_mapping_contract() {
     CHECK(call(0x2c, base, 4 * 4096) == 0); // Already occupied, including attributes.
     attribute = {}; attribute[0] = base; attribute[1] = 4096; attribute[2] = 8;
     CHECK(std::holds_alternative<QueryDisposition>(memory->dispatch(3, attribute)) && attribute[0] == 0);
+    // Invalid masks, values and lock clears are invalid combinations (0xe801),
+    // checked before the memory state: an unsupported bit on mapped memory and a
+    // lock clear on unmapped memory both fail with it.
+    attribute = {}; attribute[0] = base; attribute[1] = 4096; attribute[2] = 2;
+    CHECK(std::holds_alternative<QueryDisposition>(memory->dispatch(3, attribute)) && attribute[0] == 0xe801);
+    attribute = {}; attribute[0] = base; attribute[1] = 4096; attribute[2] = 0; attribute[3] = 8;
+    CHECK(std::holds_alternative<QueryDisposition>(memory->dispatch(3, attribute)) && attribute[0] == 0xe801);
+    attribute = {}; attribute[0] = base + 64 * 4096; attribute[1] = 4096; attribute[2] = 0x10;
+    CHECK(std::holds_alternative<QueryDisposition>(memory->dispatch(3, attribute)) && attribute[0] == 0xe801);
+    attribute = {}; attribute[0] = base + 64 * 4096; attribute[1] = 4096; attribute[2] = 8;
+    CHECK(std::holds_alternative<QueryDisposition>(memory->dispatch(3, attribute)) && attribute[0] == 0xd401);
+    // SetGpuMemoryAttribute (Switch 2 svc 0x80) changes only the GPU-accessible
+    // attribute, which QueryMemory reports.
+    QueryRegisters gpu{}; gpu[0] = base; gpu[1] = 4096; gpu[2] = 0x20; gpu[3] = 0x20;
+    CHECK(std::holds_alternative<QueryDisposition>(memory->dispatch(0x80, gpu)) && gpu[0] == 0);
+    CHECK(process->query_memory(base).attributes == 0x20);
+    gpu = {}; gpu[0] = base; gpu[1] = 4096; gpu[2] = 8; gpu[3] = 8;
+    CHECK(std::holds_alternative<QueryDisposition>(memory->dispatch(0x80, gpu)) && gpu[0] == 0xe801);
+    gpu = {}; gpu[0] = base; gpu[1] = 4096; gpu[2] = 0x20;
+    CHECK(std::holds_alternative<QueryDisposition>(memory->dispatch(0x80, gpu)) && gpu[0] == 0);
+    CHECK(process->query_memory(base).attributes == 0);
     CHECK(call(0x2c, base, 9 * 4096) == 0x10801);
     CHECK(process->used_memory() == initial + 4 * 4096);
     CHECK(call(0x2d, base, 4096) == 0);
@@ -395,19 +417,19 @@ void run_remote_window_contract() {
         invalid.remote_region = range;
         CHECK(ProcessRecord::create(invalid, accounting).error == ProcessStateError::invalid_layout);
     }
-    auto legacy = valid;
-    legacy.platform = GuestPlatform::switch1;
-    legacy.baseline = Baseline::horizon_20_5_0;
-    CHECK(ProcessRecord::create(legacy, accounting).error == ProcessStateError::invalid_layout);
-    legacy.remote_region = {};
-    auto legacy_record = ProcessRecord::create(legacy, accounting);
-    CHECK(legacy_record.ok());
-    if (legacy_record.ok()) {
-        StartupQueries legacy_queries(legacy_record.process, *handles,
-            std::make_shared<ThreadRecord>(legacy_record.process, 78, 17));
+    auto switch1 = valid;
+    switch1.platform = GuestPlatform::switch1;
+    switch1.baseline = Baseline::horizon_23_0_1;
+    CHECK(ProcessRecord::create(switch1, accounting).error == ProcessStateError::invalid_layout);
+    switch1.remote_region = {};
+    auto switch1_record = ProcessRecord::create(switch1, accounting);
+    CHECK(switch1_record.ok());
+    if (switch1_record.ok()) {
+        StartupQueries switch1_queries(switch1_record.process, *handles,
+            std::make_shared<ThreadRecord>(switch1_record.process, 78, 17));
         QueryRegisters registers{};
         registers[1] = 29; registers[2] = current_process_handle;
-        CHECK(legacy_queries.dispatch(0x29, registers) == QueryDisposition::handled);
+        CHECK(switch1_queries.dispatch(0x29, registers) == QueryDisposition::handled);
         CHECK(registers[0] == 0xf001);
     }
     auto missing = valid;
@@ -605,10 +627,49 @@ int run_dispatch_integration(bool private_resources) {
 
 } // namespace
 
+// CreateTransferMemory locks the owner's read-write range until the last
+// reference goes; a full handle table returns 0xd201 and unlocks it again.
+void run_transfer_contract() {
+    auto handles = std::make_shared<HandleTable>(2);
+    auto made = create_guest_memory(profile(), {4 * mib}, nullptr, handles);
+    CHECK(std::holds_alternative<std::shared_ptr<GuestMemory>>(made));
+    if (!std::holds_alternative<std::shared_ptr<GuestMemory>>(made)) return;
+    auto memory = std::get<std::shared_ptr<GuestMemory>>(std::move(made));
+    const auto process = memory->process();
+    QueryRegisters heap{}; heap[1] = 2 * mib;
+    CHECK(std::holds_alternative<QueryDisposition>(memory->dispatch(1, heap)) && heap[0] == 0);
+    const auto base = process->heap_region().address;
+    const auto transfer = [&](std::uint64_t address, std::uint64_t size, std::uint64_t permission) {
+        QueryRegisters r{}; r[1] = address; r[2] = size; r[3] = permission;
+        const auto result = memory->dispatch(0x15, r);
+        CHECK(std::holds_alternative<QueryDisposition>(result) &&
+              std::get<QueryDisposition>(result) == QueryDisposition::handled);
+        return r;
+    };
+    CHECK(transfer(base + 8, 0x1000, 0)[0] == 0xcc01);
+    CHECK(transfer(base, 0, 0)[0] == 0xca01);
+    CHECK(transfer(base, 0x1000, 2)[0] == 0xd801);
+    const auto created = transfer(base, 0x4000, 0);
+    CHECK(created[0] == 0 && created[1] != 0);
+    CHECK(process->query_memory(base).attributes == 1 && process->query_memory(base).permissions == 3);
+    CHECK(transfer(base + 0x1000, 0x1000, 3)[0] == 0xd401);
+    // A locked range cannot be reprotected meanwhile.
+    QueryRegisters protect{}; protect[0] = base; protect[1] = 0x1000; protect[2] = 1;
+    CHECK(std::holds_alternative<QueryDisposition>(memory->dispatch(2, protect)) && protect[0] != 0);
+    CHECK(handles->close(static_cast<Handle>(created[1])));
+    CHECK(process->query_memory(base).attributes == 0);
+    const auto first = handles->insert(std::make_shared<Event>());
+    const auto second = handles->insert(std::make_shared<Event>());
+    CHECK(first && second);
+    CHECK(transfer(base, 0x4000, 1)[0] == 0xd201);
+    CHECK(process->query_memory(base).attributes == 0);
+}
+
 int main() {
     run_physical_mapping_contract();
     run_application_budget_contract();
     run_remote_window_contract();
+    run_transfer_contract();
     const auto legacy = run_dispatch_integration<armigo::runtime::StartupSupervisor>(false);
     const auto private_resources = run_dispatch_integration<armigo::runtime::StartupSupervisor>(true);
     return legacy || private_resources || failures;

@@ -13,6 +13,7 @@
 #include "firmware.h"
 #include "icon.h"
 #include "ios.h"
+#include "package_tools.h"
 #include "sample_jpeg.h"
 #include "settings.h"
 #include "space.h"
@@ -114,6 +115,18 @@ void test_arguments() {
     CHECK(failure_of(duplicate) && failure_of(duplicate)->exit_code == 2);
     const auto two_games = parse({"armigo", "a.xci", "b.xci", "--keys", "keys.txt"});
     CHECK(failure_of(two_games) && failure_of(two_games)->exit_code == 2);
+    // "pack" is the default verb; a shaders-only pack needs no firmware but an explicit output.
+    const auto verb = parse({"armigo", "pack", "game.xci", "--keys", "keys.txt", "--firmware", "fw"});
+    CHECK(command_of(verb) && command_of(verb)->game == "game.xci" && !command_of(verb)->shaders_only);
+    const auto shaders = parse({"armigo", "pack", "game.nup", "--keys", "keys.txt", "--shaders-only", "--output", "out"});
+    CHECK(command_of(shaders) && command_of(shaders)->shaders_only && command_of(shaders)->output == "out");
+    const auto shaders_default_output = parse({"armigo", "game.xci", "--keys", "keys.txt", "--shaders-only"});
+    CHECK(failure_of(shaders_default_output) && failure_of(shaders_default_output)->exit_code == 2);
+    const auto shaders_ios = parse({"armigo", "game.xci", "--keys", "keys.txt", "--shaders-only", "--output", "out",
+                                    "--platform", "ios"});
+    CHECK(failure_of(shaders_ios) && failure_of(shaders_ios)->exit_code == 2);
+    const auto no_firmware = parse({"armigo", "game.xci", "--keys", "keys.txt", "--output", "out"});
+    CHECK(failure_of(no_firmware) && failure_of(no_firmware)->exit_code == 2);
 }
 
 void test_space() {
@@ -185,8 +198,8 @@ void test_build_id() {
     const std::string absent(64, 'b');
     {
         std::ofstream profile(folder / "profile.json");
-        profile << "{\"patches\":[{\"title_id\":\"0x0100000000000001\",\"main_build_id\":\"" << present
-                << "\"}]}";
+        profile << "{\"version\":1,\"patches\":[{\"title_id\":\"0x0100000000000001\",\"main_build_id\":\""
+                << present << "\"}]}";
     }
     std::array<std::byte, 32> build_id{};
     CHECK(pack::parse_build_id(present, build_id));
@@ -341,13 +354,24 @@ void test_bundle_and_icon() {
         std::ofstream stream(player, std::ios::binary);
         stream << player_bytes;
     }
-    spec.app_path = directory / "Sample.app";
+    // The app is assembled under a hidden name that is not a bundle and
+    // appears under its own name only when published whole.
+    const fs::path app = directory / "Sample.app";
+    const fs::path assembly = pack::assembly_path(app, 42);
+    CHECK(assembly.parent_path() == directory);
+    CHECK(assembly.filename().string().starts_with("."));
+    CHECK(assembly.extension() != ".app");
+    CHECK(pack::assembly_path(app, 43) != assembly);
+    spec.app_path = assembly;
     spec.player = player;
     spec.title_folder = title;
     spec.icon = jpeg;
     const auto assembled = pack::assemble_application(spec);
     CHECK(std::holds_alternative<fs::path>(assembled));
-    const fs::path contents = spec.app_path / "Contents";
+    CHECK(!fs::exists(app));
+    CHECK(pack::publish_application(assembly, app).empty());
+    CHECK(!fs::exists(assembly));
+    const fs::path contents = app / "Contents";
     CHECK(fs::is_regular_file(contents / "Info.plist"));
     CHECK(fs::is_regular_file(contents / "Resources" / "AppIcon.icns"));
     CHECK(fs::is_regular_file(contents / "Resources" / "Armigo" / "pack.json"));
@@ -356,8 +380,17 @@ void test_bundle_and_icon() {
     std::ifstream copied(contents / "MacOS" / "Armigo", std::ios::binary);
     std::string copied_bytes((std::istreambuf_iterator<char>(copied)), std::istreambuf_iterator<char>());
     CHECK(copied_bytes == player_bytes);
+    // Publishing never replaces an app that is already there.
+    fs::create_directories(assembly / "Contents");
+    const std::string refused = pack::publish_application(assembly, app);
+    CHECK(refused.find("already exists") != std::string::npos);
+    CHECK(fs::is_directory(assembly / "Contents"));
+    CHECK(fs::is_regular_file(contents / "Info.plist"));
+    fs::remove_all(assembly);
 
-    spec.app_path = directory / "SampleIos.app";
+    const fs::path ios_app = directory / "SampleIos.app";
+    const fs::path ios_assembly = pack::assembly_path(ios_app, 42);
+    spec.app_path = ios_assembly;
     spec.platform = "ios";
     spec.icon = std::get<std::vector<std::byte>>(png);
     spec.languages = {"en-US", "ja", "fr", "zh-TW", "zh-CN", "zh-Hant", "zh-Hans"};
@@ -415,7 +448,9 @@ void test_bundle_and_icon() {
     CHECK(fs::is_regular_file(directory / "entitlements.plist"));
     CHECK(!fs::exists(spec.app_path / "Contents"));
     CHECK(!fs::exists(spec.app_path / "_CodeSignature"));
-    CHECK(pack::create_ios_ipa(spec.app_path).empty());
+    // The IPA is made from the assembly and names the app by its final name.
+    CHECK(pack::create_ios_ipa(ios_assembly, ios_app).empty());
+    CHECK(!fs::exists(ios_app));
     const fs::path ipa = directory / "SampleIos.ipa";
     CHECK(fs::is_regular_file(ipa));
     CHECK(pack::run_pack_tool({"/usr/bin/unzip", "-tqq", ipa.string()}).empty());
@@ -425,7 +460,8 @@ void test_bundle_and_icon() {
     std::ifstream archive(ipa, std::ios::binary);
     const std::string archive_bytes((std::istreambuf_iterator<char>(archive)), std::istreambuf_iterator<char>());
     CHECK(archive_bytes.find("Payload/SampleIos.app/ArmigoPlayer") != std::string::npos);
-    CHECK(!pack::create_ios_ipa(spec.app_path).empty());
+    CHECK(archive_bytes.find(".partial") == std::string::npos);
+    CHECK(!pack::create_ios_ipa(ios_assembly, ios_app).empty());
     fs::remove_all(directory);
 }
 
@@ -566,12 +602,12 @@ void test_firmware_input() {
     std::array<char, 256> version_bytes{};
     version_bytes[8] = 'N';
     version_bytes[9] = 'X';
-    std::memcpy(version_bytes.data() + 0x68, "20.5.0", 6);
+    std::memcpy(version_bytes.data() + 0x68, "23.0.1", 6);
     const fs::path version_file = directory / "version";
     std::ofstream(version_file, std::ios::binary).write(version_bytes.data(), version_bytes.size());
-    const auto version = pack::read_firmware_version(version_file);
-    CHECK(std::holds_alternative<pack::FirmwareResources>(version));
-    CHECK(std::get<pack::FirmwareResources>(version).version == "20.5.0");
+    const auto current = pack::read_firmware_version(version_file);
+    CHECK(std::holds_alternative<pack::FirmwareResources>(current));
+    CHECK(std::get<pack::FirmwareResources>(current).version == "23.0.1");
     fs::remove_all(directory);
 }
 
@@ -609,6 +645,49 @@ void test_git_work_tree() {
 
 } // namespace
 
+void write_text(const fs::path& path, std::string_view text) {
+    fs::create_directories(path.parent_path());
+    std::ofstream(path, std::ios::binary) << text;
+}
+
+void test_compare_packages() {
+    const auto compare = parse({"armigo", "pack", "--compare", "old", "new"});
+    CHECK(command_of(compare) && command_of(compare)->compare.size() == 2 && command_of(compare)->compare[1] == "new");
+    CHECK(failure_of(parse({"armigo", "--compare", "old"})));
+    CHECK(failure_of(parse({"armigo", "game.xci", "--keys", "k", "--compare", "old", "new"})));
+
+    const fs::path root = fs::temp_directory_path() / "armigo_pack_compare";
+    fs::remove_all(root);
+    const fs::path a = root / "a", b = root / "b";
+    const std::string profile_a = R"({\"metal_version\":\"1\",\"source_version\":\"aa\"})";
+    const std::string profile_b = R"({\"metal_version\":\"1\",\"source_version\":\"bb\"})";
+    write_text(a / "manifest.json", "{\"chain_id\":\"c1\",\"entries\":[1,2],\"profile_text\":\"" + profile_a + "\"}");
+    write_text(b / "manifest.json", "{\"chain_id\":\"c2\",\"entries\":[1,2],\"profile_text\":\"" + profile_b + "\"}");
+    write_text(a / "stages/s1/program.bin", "p1");
+    write_text(b / "stages/s1/program.bin", "p1");
+    write_text(a / "stages/s1/reflection.json", "r1");
+    write_text(b / "stages/s1/reflection.json", "r2");
+    write_text(a / "stages/s2/program.bin", "p2");
+    write_text(b / "stages/s3/program.bin", "p3");
+    const auto result = pack::compare_packages(a, b);
+    CHECK(std::holds_alternative<pack::PackageComparison>(result));
+    if (const auto* comparison = std::get_if<pack::PackageComparison>(&result)) {
+        CHECK(!comparison->same());
+        CHECK(comparison->common == 1 && comparison->only_old == 1 && comparison->only_new == 1);
+        CHECK(comparison->identical.at("program.bin") == 1 && comparison->differing.at("reflection.json") == 1);
+        const auto text = pack::format_comparison(*comparison);
+        CHECK(text.find("chain_id: \"c1\" -> \"c2\"") != std::string::npos);
+        CHECK(text.find("profile.source_version: \"aa\" -> \"bb\"") != std::string::npos);
+        CHECK(text.find("profile.metal_version") == std::string::npos);
+        CHECK(text.find("entries") == std::string::npos);
+        CHECK(text.find("differs: s1/reflection.json") != std::string::npos);
+    }
+    const auto self = pack::compare_packages(a, a);
+    CHECK(std::holds_alternative<pack::PackageComparison>(self) && std::get<pack::PackageComparison>(self).same());
+    CHECK(std::holds_alternative<std::string>(pack::compare_packages(a, root / "missing")));
+    fs::remove_all(root);
+}
+
 int main() {
     test_arguments();
     test_space();
@@ -621,6 +700,7 @@ int main() {
     test_firmware_input();
     test_embedded_preparer_environment();
     test_git_work_tree();
+    test_compare_packages();
     if (failures != 0) {
         std::printf("%d checks failed\n", failures);
         return 1;

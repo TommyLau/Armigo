@@ -28,6 +28,9 @@
 
 #include <filesystem>
 
+#ifdef ARMIGO_HAS_NATIVE_SHADERS
+#include "nvn_native_stages.h"
+#endif
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -149,7 +152,19 @@ std::string install_driver(std::shared_ptr<MetalShaderPackage> package, const st
     // Driver callbacks run on the host stack of the gate, not the guest's.
     if (!std::getenv("ARMIGO_NVN_GUEST_STACK"))
         nvn::set_host_stack_provider(&armigo_execution_gate_callback_stack);
+#ifdef ARMIGO_HAS_NATIVE_SHADERS
+    if (package) nvn::set_native_shader_package(package->directory());
+#endif
     nvn::set_program_package(std::move(package), title_cache);
+    if (const auto version = nvn::selected_api_version(); version && version->major == 231) {
+#ifdef ARMIGO_HAS_NATIVE_SHADERS
+        nvn::set_native_program_resolver();
+#else
+        armigo::diag::write(armigo::diag::Level::error,
+                            "Armigo NVN 231.40: this build has no native shader front end; programs fail\n");
+        nvn::set_program_resolver(nullptr, nullptr);
+#endif
+    }
     Resources* lookup = resources.get();
     nvn::set_texture_exporter(make_texture_exporter(
         device, [lookup](const nvn::TextureState& texture) { return lookup->texture(texture, nullptr); }));

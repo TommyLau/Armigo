@@ -617,7 +617,12 @@ Result InfoUpdater::update_behavior_info(BehaviorInfo& behaviour_) {
         return ResultInvalidUpdateInfo;
     }
 
-    if (in_params->revision != behaviour_.get_user_revision()) {
+    // A Switch 2 library may open the renderer with one tag and mark its updates
+    // with the other for the same revision, so a native renderer compares
+    // revision numbers; any other renderer still needs the exact tag.
+    if (behaviour_.is_native_platform()
+            ? get_revision_num(in_params->revision) != get_revision_num(behaviour_.get_user_revision())
+            : in_params->revision != behaviour_.get_user_revision()) {
         return ResultInvalidUpdateInfo;
     }
 

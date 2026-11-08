@@ -26,6 +26,9 @@ constexpr std::uint32_t pointer_capacity = 0x1000;
 constexpr std::uint32_t state_free = 1;
 // Submit's evaluation found no network profile to connect with.
 constexpr std::uint32_t result_no_candidate = 0x8986e;
+// No network interface is connected (2110-0106).
+constexpr std::uint32_t result_not_connected = 0xd46e;
+constexpr std::size_t switch2_profile_bytes = 436;
 // The network-connection library applet and its mode for that result.
 constexpr std::uint32_t network_connection_applet = 15;
 constexpr std::uint32_t applet_mode_all_foreground = 0;
@@ -92,6 +95,27 @@ std::optional<Outcome> run(Object& object, ProcessState& process, std::uint32_t 
             outcome.created->requirement_preset = static_cast<std::int32_t>(read(message, raw));
             outcome.created->events[0] = std::make_shared<Event>(false);
             outcome.created->events[1] = std::make_shared<Event>(false);
+            return outcome;
+        }
+        if (command == 21) {
+            // IsAnyInternetRequestAccepted(client id in a 4-byte input pointer
+            // buffer) -> bool. Without a network no request is ever accepted.
+            if (!buffers || buffers->size() != 1 || (*buffers)[0].size < 4) {
+                diagnostic = "Network command 21 needs the client id buffer";
+                return std::nullopt;
+            }
+            outcome.output.push_back(0);
+            return outcome;
+        }
+        if (command == 101 && process.switch2) {
+            // The current connection's profile into a 436-byte buffer. No
+            // interface is ever connected here, so it fails and writes nothing.
+            if (!buffers || buffers->size() != 1 || !(*buffers)[0].output ||
+                (*buffers)[0].size < switch2_profile_bytes) {
+                diagnostic = "Network command 101 needs one 436-byte output buffer";
+                return std::nullopt;
+            }
+            outcome.result = result_not_connected;
             return outcome;
         }
         return std::nullopt;
@@ -163,8 +187,8 @@ std::optional<Outcome> run(Object& object, ProcessState& process, std::uint32_t 
 }
 } // namespace
 
-Session::Session(std::uint64_t process_id)
-    : process_(std::make_shared<ProcessState>(process_id)), object_(std::make_shared<Object>()) {}
+Session::Session(std::uint64_t process_id, bool switch2)
+    : process_(std::make_shared<ProcessState>(process_id, switch2)), object_(std::make_shared<Object>()) {}
 
 Session::Session(std::shared_ptr<ProcessState> process, std::shared_ptr<Object> object)
     : process_(std::move(process)), object_(std::move(object)) {}

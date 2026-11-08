@@ -170,11 +170,9 @@ IpcReply UserSession::handle(const IpcMessage& message, std::uint64_t sender_pid
             if (!availability_event_) availability_event_ = std::make_shared<horizon::Event>(false);
             event = availability_event_;
         }
-        IpcReply reply;
-        reply.disposition = IpcDisposition::handled;
-        reply.size = 32;
-        write(reply.bytes, 4, (reply.size - 8) / 4);
-        write(reply.bytes, 16, sfco);
+        // The reply follows the request's layout: a domain request's reply
+        // keeps its domain header before the CMIF header.
+        auto reply = success_reply(cmif);
         reply.transferred[0] = std::move(event);
         reply.transferred_count = 1;
         reply.transferred_as_copy = true;

@@ -18,6 +18,7 @@
 #include <armigo/audio/pcm_output.h>
 
 #include "renderer/command/data_source/decode.h"
+#include "renderer/common/feature_support.h"
 #include "renderer/common/guest_memory.h"
 #include "renderer/voice/voice_state.h"
 
@@ -56,6 +57,10 @@ T get(const std::vector<std::byte>& bytes, std::size_t offset) {
 
 constexpr std::uint32_t revision(unsigned number) {
     return 0x00564552u + ((0x30u + number) << 24);  // "REV" followed by '0' + number
+}
+// A Switch 2 library's tag: "REv" followed by '0' + number.
+constexpr std::uint32_t tagged_revision(unsigned number, char letter) {
+    return 0x00004552u + (std::uint32_t(std::uint8_t(letter)) << 16) + ((0x30u + number) << 24);
 }
 
 // Pins only ranges inside one host allocation standing in for guest memory.
@@ -220,13 +225,17 @@ struct UpdateLayout {
     std::uint32_t voice_stride;   // 0x170, or 0x188 from revision 15
     bool dirty_mixes;             // revision 7 and later prefix the mixes
     std::uint32_t effect_status;  // 0x10, or 0x90 from revision 9
+    char open_tag = 'V';          // 'v' opens as a Switch 2 library
+    char update_tag = 'V';        // the tag the updates carry
+    char rejected_tag = 0;        // an update tag the renderer must refuse first
 };
 
 constexpr std::uint32_t pool_count = 4;  // effects + voices * 4 wave buffers
 constexpr std::uint32_t mix_in_size = 0x930;
 
 std::vector<std::byte> build_update(const UpdateLayout& layout, const PoolMemory& pool,
-                                    std::uint32_t samples_offset, std::uint32_t samples) {
+                                    std::uint32_t samples_offset, std::uint32_t samples, char tag = 0) {
+    const auto update_revision = tagged_revision(layout.revision_number, tag ? tag : layout.update_tag);
     const std::uint32_t behaviour = 0x10;
     const std::uint32_t pools = pool_count * 0x20;
     const std::uint32_t resources = 0x70;
@@ -237,7 +246,7 @@ std::vector<std::byte> build_update(const UpdateLayout& layout, const PoolMemory
     const std::uint32_t total = 0x40 + behaviour + pools + resources + voices + mixes + sinks + performance;
     std::vector<std::byte> input(total);
     // Update header.
-    put<std::uint32_t>(input, 0x00, revision(layout.revision_number));
+    put<std::uint32_t>(input, 0x00, update_revision);
     put<std::uint32_t>(input, 0x04, behaviour);
     put<std::uint32_t>(input, 0x08, pools);
     put<std::uint32_t>(input, 0x0C, voices);
@@ -250,7 +259,7 @@ std::vector<std::byte> build_update(const UpdateLayout& layout, const PoolMemory
     put<std::uint32_t>(input, 0x3C, total);
     std::size_t at = 0x40;
     // Behaviour: revision, flags (no forced mapping).
-    put<std::uint32_t>(input, at, revision(layout.revision_number));
+    put<std::uint32_t>(input, at, update_revision);
     at += behaviour;
     // Memory pool 0 requests attachment of the whole pool; the rest stay invalid.
     put<std::uint64_t>(input, at + 0x00, pool.address());
@@ -341,7 +350,7 @@ void render_path_test(const UpdateLayout& layout) {
     parameter.mixes = 2;
     parameter.voices = 1;
     parameter.sinks = 1;
-    parameter.revision = revision(layout.revision_number);
+    parameter.revision = tagged_revision(layout.revision_number, layout.open_tag);
     std::uint64_t work_buffer_size = 0;
     CHECK(armigo::audio::AudioRenderer::work_buffer_size(parameter, work_buffer_size) == 0);
     CHECK(work_buffer_size != 0 && work_buffer_size % 0x1000 == 0);
@@ -359,12 +368,18 @@ void render_path_test(const UpdateLayout& layout) {
     CHECK(renderer.initialize(parameter, work_buffer_size - 0x1000, options) == (153u | (4u << 9)));
     CHECK(renderer.initialize(parameter, work_buffer_size, options) == 0);
 
-    auto input = build_update(layout, pool, samples_offset, samples);
     const std::uint32_t expected_output = 0x40 + pool_count * 0x10 + 0x10 + 0x20 + 0x10 + 0xB0 + 0x10;
     std::vector<std::byte> status(expected_output);
     std::vector<std::byte> performance;
+    if (layout.rejected_tag) {
+        auto refused = build_update(layout, pool, samples_offset, samples, layout.rejected_tag);
+        CHECK(renderer.update(refused, performance, status) == (153u | (41u << 9)));
+    }
+    auto input = build_update(layout, pool, samples_offset, samples);
     CHECK(renderer.update(input, performance, status) == 0);
-    CHECK(get<std::uint32_t>(status, 0x00) == revision(15));
+    // The renderer reports its own revision with the tag of the library.
+    CHECK(get<std::uint32_t>(status, 0x00) ==
+          (layout.open_tag == 'v' ? tagged_revision(16, 'v') : revision(15)));
     CHECK(get<std::uint32_t>(status, 0x04) == 0xB0);
     CHECK(get<std::uint32_t>(status, 0x08) == pool_count * 0x10);
     CHECK(get<std::uint32_t>(status, 0x0C) == 0x10);
@@ -467,11 +482,36 @@ void render_thread_test() {
 
 }  // namespace
 
+// Switch 2 libraries tag revisions 'REv' and accept one revision more; tags of
+// neither platform carry no number.
+void revision_tests() {
+    namespace rn = armigo::audio::renderer;
+    constexpr std::uint32_t native16 = 0x00764552u + ((0x30u + 16) << 24);  // "REv@"
+    constexpr std::uint32_t native15 = 0x00764552u + ((0x30u + 15) << 24);
+    static_assert(rn::is_native_revision(native16) && !rn::is_native_revision(revision(15)));
+    static_assert(rn::get_revision_num(native16) == 16 && rn::get_revision_num(revision(15)) == 15);
+    static_assert(rn::get_revision_num(native15) == rn::get_revision_num(revision(15)));
+    static_assert(rn::get_revision_num(0x00584552u + (0x35u << 24)) == ~0u);  // "REX5"
+    static_assert(rn::check_valid_revision(native16) && !rn::check_valid_revision(revision(16)));
+    static_assert(rn::encode_revision(16, true) == native16 && rn::encode_revision(15, false) == revision(15));
+    static_assert(!rn::check_feature_supported(rn::SupportTags::Splitter, 0x00584552u + (0x35u << 24)));
+    static_assert(rn::check_feature_supported(rn::SupportTags::VoiceInParameterV2, native16));
+}
+
 int main() {
+    revision_tests();
     adpcm_tests();
     render_path_test({.revision_number = 8, .voice_stride = 0x170, .dirty_mixes = true, .effect_status = 0x10});
     render_path_test({.revision_number = 15, .voice_stride = 0x188, .dirty_mixes = true, .effect_status = 0x90});
     render_path_test({.revision_number = 5, .voice_stride = 0x170, .dirty_mixes = false, .effect_status = 0x10});
+    // A Switch 1 renderer needs the exact tag; a Switch 2 renderer accepts its
+    // revision under either tag.
+    render_path_test({.revision_number = 15, .voice_stride = 0x188, .dirty_mixes = true, .effect_status = 0x90,
+                      .rejected_tag = 'v'});
+    render_path_test({.revision_number = 15, .voice_stride = 0x188, .dirty_mixes = true, .effect_status = 0x90,
+                      .open_tag = 'v', .update_tag = 'V'});
+    render_path_test({.revision_number = 15, .voice_stride = 0x188, .dirty_mixes = true, .effect_status = 0x90,
+                      .open_tag = 'v', .update_tag = 'v'});
     render_thread_test();
     std::printf("audio renderer failures: %u\n", failures);
     return failures ? 1 : 0;

@@ -97,7 +97,8 @@ void StructuredValidator::payloads() {
             const auto& op = p.operations[id.value];
             for (const auto& input : op.inputs) operand(input, block.function);
             if (const auto* memory = std::get_if<MemoryInfo>(&op.info)) {
-                if ((memory->space == AddressSpace::storage || memory->space == AddressSpace::constant_buffer) &&
+                if ((memory->space == AddressSpace::storage || memory->space == AddressSpace::constant_buffer ||
+                     memory->space == AddressSpace::guest) &&
                     op.opcode != Opcode::barrier && op.opcode != Opcode::memory_barrier) resource(memory->resource, 0);
             }
             if (const auto* texture = std::get_if<TextureInfo>(&op.info)) {

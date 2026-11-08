@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string_view>
 
@@ -91,5 +92,8 @@ void testing_set_frame_stats(bool enabled) noexcept;
 void testing_set_sink(TestingSink sink, void* context) noexcept;
 void testing_close_log() noexcept;
 [[nodiscard]] std::uint64_t testing_last_run_bytes() noexcept;
+// Times an exit-time write used the buffer that outlives the main thread's
+// thread_local line state. Zero while that state is still alive.
+[[nodiscard]] std::uint64_t testing_exit_pending_appends() noexcept;
 
 } // namespace armigo::diag

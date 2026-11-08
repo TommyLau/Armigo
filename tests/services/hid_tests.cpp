@@ -484,6 +484,20 @@ void test_npad_configuration_and_shared_memory() {
     CHECK(fixture.session->touch_activated());
     check_reply(fixture.session->request(request(11, true, one_u64(test_pid + 1)).message, test_pid), 40, 0x60a);
 
+    CHECK(!fixture.session->mouse_activated());
+    check_reply(fixture.call(21, true, one_u64(test_pid)), 40);
+    CHECK(fixture.session->mouse_activated());
+    check_reply(fixture.session->request(request(21, true, one_u64(test_pid + 1)).message, test_pid), 40, 0x60a);
+    CHECK(!fixture.session->keyboard_activated());
+    check_reply(fixture.call(31, true, one_u64(test_pid)), 40);
+    CHECK(fixture.session->keyboard_activated());
+    check_reply(fixture.session->request(request(31, true, one_u64(test_pid + 1)).message, test_pid), 40, 0x60a);
+    std::array<std::byte, 16> mouse_version{};
+    put32(mouse_version, 0, 1);
+    put_u64(mouse_version, 8, test_pid);
+    check_reply(fixture.call(3150, true, mouse_version), 40);
+    CHECK(fixture.session->mouse_library_version() == 1);
+
     std::array<std::byte, 16> revision{};
     put32(revision, 0, 5);
     put_u64(revision, 8, test_pid);
@@ -633,6 +647,47 @@ void test_vibration_and_six_axis() {
     check_reply(fixture.session->request_with_buffers(batch.message, test_pid, mismatched), 40,
                 0x106ca);
 
+    // DisconnectNpad: player two's controller is not presented, so it is
+    // already disconnected; the presented controller and invalid ids are refused.
+    std::array<std::byte, 16> disconnect{};
+    put32(disconnect, 0, 1);
+    put_u64(disconnect, 8, test_pid);
+    check_reply(fixture.call(107, true, disconnect), 40);
+    put32(disconnect, 0, 0);
+    CHECK(fixture.call(107, true, disconnect).disposition == IpcDisposition::unsupported);
+    put32(disconnect, 0, 9);
+    CHECK(fixture.call(107, true, disconnect).disposition == IpcDisposition::unsupported);
+
+    // IsVibrationDeviceMounted: an unknown style is refused; a FullKey motor
+    // answers one byte.
+    std::array<std::byte, 16> mount{};
+    put32(mount, 0, 1);
+    put_u64(mount, 8, test_pid);
+    check_reply(fixture.call(211, true, mount), 40, 0xf4ca);
+    put32(mount, 0, 3);
+    const auto mounted = fixture.call(211, true, mount);
+    check_reply(mounted, 44);
+    CHECK(get32(mounted.bytes, 32) <= 1);
+
+    // Switch 2 vibration (214): a u16 and the aruid, then the handle and value
+    // arrays. It sends the values and never fails; Switch 1 has no 214.
+    std::array<std::byte, 16> switch2_args{};
+    put_u64(switch2_args, 8, test_pid);
+    put32(memory.bytes, 0x40, 3);
+    put_float(memory.bytes, 0x80, 0.25f);
+    put_float(memory.bytes, 0x84, 100.0f);
+    put_float(memory.bytes, 0x88, 0.75f);
+    put_float(memory.bytes, 0x8c, 200.0f);
+    const std::array switch2_descriptors{PointerInput{0x40, 4}, PointerInput{0x80, 16}};
+    batch = request(214, false, switch2_args, switch2_descriptors);
+    armigo::horizon::GuestBuffers switch2_buffers(WireMemory::read, WireMemory::write, &memory);
+    switch2_buffers.add({0x40, 4, true, false});
+    switch2_buffers.add({0x80, 16, true, false});
+    CHECK(fixture.session->request_with_buffers(batch.message, test_pid, switch2_buffers).disposition ==
+          IpcDisposition::unsupported);
+    HidSession switch2(test_pid, {}, true);
+    check_reply(switch2.request_with_buffers(batch.message, test_pid, switch2_buffers), 40);
+
     // FullKey's ordinary SDK handle has device index 2, unlike its vibration handles.
     check_reply(fixture.call(66, true, id_aruid(0x20003)), 40);
     std::array<std::byte, 16> drift{};
@@ -748,6 +803,32 @@ void test_host_input_samples() {
     CHECK(static_cast<std::int32_t>(get32(bytes, sample + 36)) == -4000);
     CHECK(get64(bytes, sample + 40) == 1);
     CHECK(get64(bytes, sample) == 2 * get64(bytes, sample + 8));
+}
+
+
+// An immediate publication is the latest sample when it returns, without
+// waiting for the 5 ms sampler (guest-present input scripts rely on it).
+void test_host_input_published_now() {
+    RootFixture fixture;
+    check_reply(fixture.call(100, true, id_aruid(1)), 40);
+    WireMemory memory;
+    put32(memory.bytes, 0x40, 0);
+    const std::array supported_descriptor{PointerInput{0x40, 40}};
+    auto ids_request = request(102, true, one_u64(test_pid), supported_descriptor);
+    armigo::horizon::GuestBuffers ids(WireMemory::read, WireMemory::write, &memory);
+    ids.add({0x40, 40, true, false});
+    check_reply(fixture.session->request_with_buffers(ids_request.message, test_pid, ids), 40);
+    check_reply(fixture.call(103, true, one_u64(test_pid)), 40);
+    constexpr std::size_t ring = 0x9a00 + 0x28;
+    const auto& bytes = fixture.resource->shared_memory()->bytes();
+    for (const std::uint64_t buttons : {0x5u, 0x9u, 0x0u}) {
+        const auto x = static_cast<std::int16_t>(buttons * 100);
+        armigo::services::hid::publish_host_full_key_input_now({buttons, x, -x, x, -x});
+        const auto sample = ring + 0x20 + static_cast<std::size_t>(get64(bytes, ring + 16)) * 0x30;
+        CHECK(get64(bytes, sample + 16) == buttons);
+        CHECK(static_cast<std::int32_t>(get32(bytes, sample + 24)) == x);
+        CHECK(static_cast<std::int32_t>(get32(bytes, sample + 28)) == -x);
+    }
 }
 
 
@@ -946,6 +1027,7 @@ int main() {
     test_dispatcher_transfers();
     // Last: the host input source stays set for the rest of the process.
     test_host_input_samples();
+    test_host_input_published_now();
     test_six_axis_samples();
     test_vibration_sink();
     test_six_axis_waits_for_connection();

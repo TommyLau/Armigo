@@ -34,7 +34,6 @@ constexpr std::uint32_t invalid_copy = 0xe601;
 constexpr std::uint32_t invalid_combination = 0xe801;
 constexpr std::uint32_t invalid_info = 0xf001;
 constexpr std::uint32_t invalid_address = 0xcc01;
-constexpr std::uint32_t out_of_handles = 0xbe01;
 constexpr std::uint64_t result_limit = ProcessRecord::query_end;
 constexpr std::uint64_t high_word = 0xffffffff00000000ull;
 
@@ -121,24 +120,23 @@ void finish(QueryRegisters& registers, std::uint32_t result, std::uint64_t value
     std::fill(registers.begin() + 2, registers.end(), 0);
 }
 
-bool supported_info(std::uint32_t type, Baseline baseline) {
-    if (type == 17) return baseline == Baseline::horizon_23_0_1;
+bool supported_info(std::uint32_t type) {
     switch (type) {
     case 0: case 2: case 3: case 4: case 5: case 8: case 11: case 12: case 13:
-    case 14: case 15: case 16: case 20: case 21: case 22: case 28:
+    case 14: case 15: case 16: case 17: case 20: case 21: case 22: case 28:
         return true;
     default:
         return false;
     }
 }
 
-// These are unrecognized by the selected kernel's GetInfo switch. Other
-// recognized types remain unsupported Armigo capabilities, not guest errors.
-bool rejected_info(std::uint32_t type, Baseline baseline, GuestPlatform platform) {
+// These are unrecognized by the Horizon 23.0.1 GetInfo switch. Types 29-33
+// are recognized on the Switch 2 platform only. Types 36-38 are recognized
+// and left unimplemented, so they stay unsupported rather than invalid.
+// Other recognized types remain unsupported Armigo capabilities, not guest errors.
+bool rejected_info(std::uint32_t type, GuestPlatform platform) {
     if (platform == GuestPlatform::switch2 && type >= 29 && type <= 33) return false;
-    if (baseline == Baseline::horizon_23_0_1)
-        return type == 19 || (type >= 29 && type <= 33) || type == 35 || type > 38;
-    return type == 19 || (type >= 29 && type <= 33) || type > 34;
+    return type == 19 || (type >= 29 && type <= 33) || type == 35 || type > 38;
 }
 
 std::uint64_t resource_entropy(void*) noexcept {
@@ -172,12 +170,15 @@ ProcessRecord::~ProcessRecord() = default;
 ProcessBuild ProcessRecord::create(const ProcessConfiguration& configuration,
                                   const MemoryAccounting& accounting,
                                   std::span<const MemoryBlock> blocks) {
-    const bool legacy = configuration.baseline == Baseline::horizon_20_5_0 &&
-                        configuration.platform == GuestPlatform::switch1;
-    const bool extended = configuration.baseline == Baseline::horizon_23_0_1 &&
-                          configuration.platform == GuestPlatform::switch2;
-    if ((!legacy && !extended) || configuration.address_bits != 39 ||
-        (configuration.private_system_resource_bytes && !extended) ||
+    // Horizon 23.0.1 is the only accepted release. A remote region is Switch 2
+    // platform data. Private system resources, and with them physical memory
+    // mapping, exist in the Switch 1 23.0.1 kernel too; they are admitted only
+    // for Switch 2 processes because no Switch 1 target declares them.
+    const bool switch2 = configuration.platform == GuestPlatform::switch2;
+    if ((!switch2 && configuration.platform != GuestPlatform::switch1) ||
+        configuration.baseline != Baseline::horizon_23_0_1 ||
+        configuration.address_bits != 39 ||
+        (configuration.private_system_resource_bytes && !switch2) ||
         configuration.allowed_core_mask == 0) {
         return {ProcessStateError::unsupported_profile, {}};
     }
@@ -204,7 +205,7 @@ ProcessBuild ProcessRecord::create(const ProcessConfiguration& configuration,
     }
     const auto remote = configuration.remote_region;
     if ((remote.address || remote.size) &&
-        (!extended || !region_valid(remote) || (remote.address | remote.size) % 0x10000 ||
+        (!switch2 || !region_valid(remote) || (remote.address | remote.size) % 0x10000 ||
          overlaps(remote, heap) || overlaps(remote, alias) ||
          overlaps(remote, stack)))
         return {ProcessStateError::invalid_layout, {}};
@@ -595,6 +596,12 @@ std::size_t describe_break(std::uint64_t reason, std::uint64_t address, std::uin
     return length < capacity ? length : capacity - 1;
 }
 
+std::int64_t svc_wait_timeout(const ProcessRecord* process, std::int64_t timeout) noexcept {
+    if (timeout <= 0) return timeout;
+    const auto platform = process ? process->configuration().platform : GuestPlatform::switch1;
+    return kernel_timeout(timeout, counter_rate(platform)).count();
+}
+
 QueryDisposition StartupQueries::dispatch(std::uint16_t supervisor_call,
                                           QueryRegisters& registers) const {
     unsupported_detail_ = nullptr;
@@ -630,12 +637,29 @@ QueryDisposition StartupQueries::dispatch(std::uint16_t supervisor_call,
     }
     case 0x15:
         return create_transfer_memory(registers);
-    case 0x12: {
-        // svcClearEvent(handle): clears an event whether or not it was signalled.
-        // Any other object, or no object, is an invalid handle.
-        const auto event = handles_->lookup_as<Event>(static_cast<Handle>(registers[0]));
-        if (event) (void)event->reset();
+    case 0x11: {
+        // svcSignalEvent(handle): signals an event whose writable end a
+        // service handed out. A readable end, any other object or no object
+        // is an invalid handle.
+        const auto event = handles_->lookup_as<WritableEvent>(static_cast<Handle>(registers[0]));
+        if (event) event->signal();
         finish(registers, event ? 0 : 0xe401, 0);
+        return QueryDisposition::handled;
+    }
+    case 0x12: {
+        // svcClearEvent(handle): clears an event through its writable or its
+        // readable end, whether or not it was signalled. Any other object, or
+        // no object, is an invalid handle.
+        const auto handle = static_cast<Handle>(registers[0]);
+        bool cleared = false;
+        if (const auto writable = handles_->lookup_as<WritableEvent>(handle)) {
+            writable->clear();
+            cleared = true;
+        } else if (const auto event = handles_->lookup_as<Event>(handle)) {
+            (void)event->reset();
+            cleared = true;
+        }
+        finish(registers, cleared ? 0 : 0xe401, 0);
         return QueryDisposition::handled;
     }
     case 0x17: {
@@ -721,7 +745,7 @@ QueryDisposition StartupQueries::wait_synchronization(QueryRegisters& registers)
         }
     }
     const auto result = wait_event(*handles_, std::span<const Handle>(handles.data(), count),
-        static_cast<std::int64_t>(registers[3]), *thread_, cancellation_);
+        svc_wait_timeout(process_.get(), static_cast<std::int64_t>(registers[3])), *thread_, cancellation_);
     if (result.disposition == EventDisposition::cancelled) return QueryDisposition::cancelled;
     if (result.disposition == EventDisposition::unsupported) {
         unsupported_detail_ = result.detail ? result.detail : "The wait is not implemented.";
@@ -776,27 +800,44 @@ QueryDisposition StartupQueries::set_memory_permission(QueryRegisters& registers
 QueryDisposition StartupQueries::create_transfer_memory(QueryRegisters& registers) const {
     // svcCreateTransferMemory(out_handle, address, size, permission). The kernel
     // returns the new handle in x1 and the SDK wrapper stores it through the out
-    // pointer, so only x0 and x1 carry results here.
-    const auto address = registers[1];
-    const auto size = registers[2];
-    const auto permission = registers[3];
-    constexpr std::uint64_t page = 4096;
-    if (size == 0 || (size & (page - 1)) != 0 || (address & (page - 1)) != 0 ||
-        permission > 3 || address > result_limit || size > result_limit - address) {
-        finish(registers, invalid_address, address);
+    // pointer, so only x0 and x1 carry results here. This is the path without
+    // native guest memory, which owns the same contract in a native process.
+    const AddressRange range{registers[1], registers[2]};
+    if (const auto result = process_memory::validate_transfer(range, registers[3])) {
+        finish(registers, result, 0);
         return QueryDisposition::handled;
     }
-    // Internal metadata boundaries do not divide one compatible owned range.
-    // Uniform validation still rejects holes and every public state mismatch.
-    if (!process_memory::uniform(process_->memory_map(), {address, size})) {
-        finish(registers, invalid_address, address);
+    // The owner's range must be one read-write data mapping without attributes;
+    // the kernel locks it until the object's last reference is gone.
+    const auto blocks = process_->memory_map();
+    const auto owner = process_memory::uniform(blocks, range);
+    if (!owner || !process_memory::transferable(*owner)) {
+        finish(registers, process_memory::invalid_memory, 0);
         return QueryDisposition::handled;
     }
-    auto record = std::make_shared<TransferMemoryRecord>(AddressRange{address, size},
-                                                         static_cast<std::uint32_t>(permission));
-    const auto handle = handles_->insert(std::move(record));
+    auto locked = *owner;
+    locked.attributes |= process_memory::locked_attribute;
+    if (process_->replace_memory_map(process_memory::replace(blocks, range, locked)) != ProcessStateError::none) {
+        finish(registers, process_memory::invalid_memory, 0);
+        return QueryDisposition::handled;
+    }
+    const auto unlock = [range](ProcessRecord& process) {
+        const auto current = process.memory_map();
+        const auto block = process_memory::uniform(current, range);
+        if (!block || !(block->attributes & process_memory::locked_attribute)) return;
+        auto restored = *block;
+        restored.attributes &= static_cast<std::uint8_t>(~process_memory::locked_attribute);
+        (void)process.replace_memory_map(process_memory::replace(current, range, restored));
+    };
+    auto record = std::make_shared<TransferMemoryRecord>(range, static_cast<std::uint32_t>(registers[3]),
+        [process = std::weak_ptr<ProcessRecord>(process_), unlock] {
+            if (const auto owner = process.lock()) unlock(*owner);
+        });
+    const auto handle = handles_->insert(record);
     if (!handle) {
-        finish(registers, out_of_handles, 0);
+        record->disarm();
+        unlock(*process_);
+        finish(registers, process_memory::out_of_handles, 0);
         return QueryDisposition::handled;
     }
     finish(registers, 0, 0);
@@ -872,7 +913,7 @@ QueryDisposition StartupQueries::arbitrate(QueryRegisters& registers) const {
     if (copy_out_.write_word == nullptr) return QueryDisposition::unsupported_operation;
     const auto key = registers[1] & ~std::uint64_t{3};
     const auto tag = static_cast<std::uint32_t>(registers[2]);
-    const auto timeout = static_cast<std::int64_t>(registers[3]);
+    const auto timeout = svc_wait_timeout(process_.get(), static_cast<std::int64_t>(registers[3]));
     switch (keys_->wait(guest_words(), mutex, key, tag, timeout, cancellation_,
                         thread_ ? thread_->priority() : 32)) {
     case ProcessWideKey::WaitOutcome::signaled:
@@ -944,7 +985,7 @@ QueryDisposition StartupQueries::wait_for_address(QueryRegisters& registers) con
         std::uint32_t type;
     } check{this, address, registers[2], type};
     const auto outcome = arbitration_->wait_transaction(
-        address, static_cast<std::int64_t>(registers[3]), [](void* raw) noexcept {
+        address, svc_wait_timeout(process_.get(), static_cast<std::int64_t>(registers[3])), [](void* raw) noexcept {
             const auto& check = *static_cast<Check*>(raw);
             if (check.type == 3) {
                 std::uint64_t observed = 0;
@@ -1017,7 +1058,7 @@ QueryDisposition StartupQueries::signal_to_address(QueryRegisters& registers) co
             if (check.type == 0) return ArbitrateOutcome::succeeded;
             auto desired = check.value + 1u;
             if (check.type == 2 && waiting != 0) {
-                // Horizon 20.5.0 subtracts one when all present waiters are selected,
+                // Subtracts one when all present waiters are selected,
                 // including zero/negative counts. A partial selection only compares.
                 desired = check.count <= 0 || waiting <= static_cast<std::size_t>(check.count)
                     ? check.value - 1u : check.value;
@@ -1052,16 +1093,17 @@ QueryDisposition StartupQueries::get_info(QueryRegisters& registers) const {
     const auto type = static_cast<std::uint32_t>(original);
     const auto handle = static_cast<Handle>(registers[2]);
     const auto sub_id = registers[3];
-    const auto baseline = process_ ? process_->configuration().baseline : Baseline::horizon_20_5_0;
     const auto platform = process_ ? process_->configuration().platform : GuestPlatform::switch1;
-    if (rejected_info(type, baseline, platform)) {
+    if (rejected_info(type, platform)) {
         finish(registers, invalid_info, original);
         return QueryDisposition::handled;
     }
-    if (!supported_info(type, baseline) &&
+    if (!supported_info(type) &&
         !(platform == GuestPlatform::switch2 && type >= 29 && type <= 33))
         return QueryDisposition::unsupported_operation;
-    if (type == 8 && baseline == Baseline::horizon_23_0_1) {
+    // IsCurrentProcessBeingDebugged requires a zero handle, then a zero sub-id.
+    // A nonzero handle is invalid before a nonzero sub-id is an invalid combination.
+    if (type == 8) {
         if (handle) finish(registers, invalid_handle, original);
         else if (sub_id) finish(registers, invalid_combination, original);
         else finish(registers, 0, 0);
@@ -1070,14 +1112,13 @@ QueryDisposition StartupQueries::get_info(QueryRegisters& registers) const {
     if (type == 20) {
         // svcGetInfo(UserExceptionContextAddress, handle, 0) resolves a process
         // handle and reports that process's user exception context address. The
-        // SDK passes the current-process pseudo-handle.
+        // SDK passes the current-process pseudo-handle. Zero is not an alias.
         if (sub_id != 0) {
             finish(registers, invalid_combination, original);
             return QueryDisposition::handled;
         }
-        const auto current = handle == current_process_handle ||
-            (baseline == Baseline::horizon_20_5_0 && handle == 0);
-        const auto process = current ? process_ : handles_->lookup_as<ProcessRecord>(handle);
+        const auto process = handle == current_process_handle
+            ? process_ : handles_->lookup_as<ProcessRecord>(handle);
         if (!process) {
             finish(registers, invalid_handle, original);
             return QueryDisposition::handled;
@@ -1098,12 +1139,11 @@ QueryDisposition StartupQueries::get_info(QueryRegisters& registers) const {
         finish(registers, invalid_combination, original);
         return QueryDisposition::handled;
     }
-    // Preserve the legacy zero-handle convention for plain 20.5 queries.
-    // The 23.0.1 process-query cases require a process handle; zero is admitted
-    // only by the separate debugger and entropy cases above.
-    const auto current = handle == current_process_handle ||
-                         (baseline == Baseline::horizon_20_5_0 && handle == 0 && original == type && supported_info(type, baseline));
-    const auto process = current ? process_ : handles_->lookup_as<ProcessRecord>(handle);
+    // Process queries require a real process handle. The current-process
+    // pseudo-handle is valid. Zero is admitted only by the debugger and
+    // entropy cases above.
+    const auto process = handle == current_process_handle
+        ? process_ : handles_->lookup_as<ProcessRecord>(handle);
     if (!process) {
         finish(registers, invalid_handle, original);
         return QueryDisposition::handled;
@@ -1115,8 +1155,6 @@ QueryDisposition StartupQueries::get_info(QueryRegisters& registers) const {
     case 3: value = process->alias_region().size; break;
     case 4: value = process->heap_region().address; break;
     case 5: value = process->heap_region().size; break;
-    // IsCurrentProcessBeingDebugged: this runtime attaches no debugger to the guest.
-    case 8: value = 0; break;
     case 12: value = process->configuration().allocation_region.address; break;
     case 13: value = process->configuration().allocation_region.size; break;
     case 14: value = process->stack_region().address; break;
@@ -1129,12 +1167,16 @@ QueryDisposition StartupQueries::get_info(QueryRegisters& registers) const {
     case 33:
         if (process->configuration().platform != GuestPlatform::switch2)
             return QueryDisposition::unsupported_operation;
-        // Provisional profile value, not a recovered console query result.
+        // Provisional Switch 2 value; no Switch 2 kernel is available. The title
+        // SDK uses it as a page granule (the RELRO alignment mask in its module
+        // loader, the first range its VAMM maps), and both practical references
+        // answer 4 KiB, the Switch 1 page size.
         value = switch2_physical_mapping_granule;
         break;
     case 31: case 32: {
-        // Remote memory size and use. Nothing backs remote memory here, and the
-        // practical reference reports zero for both; provisional and unverified.
+        // Remote memory size and use, which the SDK's GetRemoteMemoryUsage
+        // returns for its graphics boot. Provisional: nothing backs remote
+        // memory here, and both practical references report zero for both.
         if (process->configuration().platform != GuestPlatform::switch2)
             return QueryDisposition::unsupported_operation;
         static std::atomic<bool> warned{false};
@@ -1145,11 +1187,14 @@ QueryDisposition StartupQueries::get_info(QueryRegisters& registers) const {
         break;
     }
     case 29: case 30: {
-        // Unverified Switch 2 compatibility assumption: report the actual native
-        // remote reservation, not console geometry. Settings excludes this pair
-        // from its general allocator and uses 0x10000 allocator alignment.
-        // Verify against an owner-console GetInfo 29/30/31/32 and layout capture.
-        // The process-handle/sub-id convention follows the 23.0.1 reference.
+        // Provisional Switch 2 remote region: report the actual native remote
+        // reservation, not console geometry. The title SDK's RemoteRegionManager
+        // allocates over [base 29, base 29 + size 30); the 23.0.1 settings program
+        // excludes the pair from its general allocator and uses 0x10000 allocator
+        // alignment. The practical references disagree on the geometry (the upper
+        // half of the alias region, or no region), so the size stays a host
+        // estimate until an owner-console layout capture. The process-handle and
+        // sub-id convention follows the 23.0.1 kernel.
         const auto remote = process->configuration().remote_region;
         if (process->configuration().platform != GuestPlatform::switch2 || !remote.size)
             return QueryDisposition::unsupported_operation;
@@ -1233,14 +1278,20 @@ void StartupQueries::query_thread(QueryRegisters& registers, bool identifier) co
 
 void StartupQueries::query_memory(QueryRegisters& registers) const {
     const auto destination = registers[0];
+    // The kernel checks the whole 40-byte output against the process address space
+    // before it queries. That early failure leaves x1 as the guest passed it; the
+    // query itself clears the page-info word before the copy can fail.
+    constexpr std::uint64_t info_size = 40;
+    if (destination < ProcessRecord::aslr_start ||
+        destination > std::numeric_limits<std::uint64_t>::max() - (info_size - 1) ||
+        destination + (info_size - 1) > ProcessRecord::query_end - 1) {
+        finish(registers, invalid_copy, registers[1]);
+        return;
+    }
     const auto page_info = registers[1] & high_word;
     const auto info = encode_memory_info(process_->query_memory(registers[2]));
     bool copied = true;
     for (std::size_t offset = 0; copied && offset < info.size(); offset += 4) {
-        if (destination > std::numeric_limits<std::uint64_t>::max() - offset) {
-            copied = false;
-            break;
-        }
         const auto address = destination + offset;
         if (!process_->writable(address, 4)) {
             copied = false;

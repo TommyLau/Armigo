@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <armigo/compat/observer.h>
 #include <armigo/titles/frame_rate.h>
 #include <armigo/loader/nso_module.h>
 #include <armigo/execution/gate.h>
@@ -45,6 +46,13 @@ struct PhaseCallPatch {
 struct GpuBudgetInstruction {
     std::uint32_t target_rate = 0;
 };
+// The title's frame-ratio division (FDIV Sd, Sn, Sm): before it runs, the
+// divisor register Sm receives 60 / the measured frame step, so the ratio its
+// clock steps by follows the frame's real duration. Until a period has been
+// measured, the title's own division runs.
+struct FrameRatioDivision {
+    std::uint32_t divisor_register = 0;
+};
 struct CallPatch {
     std::uint64_t offset = 0;
     std::uint32_t expected_instruction = 0;
@@ -57,6 +65,8 @@ struct CallPatch {
     // Generated only for an explicitly enabled resolution-feedback site.
     // This intercepts a MOVZ constant, rather than calling a guest function.
     std::optional<GpuBudgetInstruction> gpu_budget;
+    // Only in a ratio-division layout: an instruction hook, not a call.
+    std::optional<FrameRatioDivision> frame_ratio;
 };
 // One instruction of the main module replaced at load time. The expected word
 // must be present, unchanged by preparation, or the title is not patched.
@@ -82,8 +92,8 @@ struct FrameRateSettings {
     std::vector<std::uint32_t> supported_rates;
     std::vector<std::uint32_t> experimental_rates;
 };
-// Instruction sites of the internal-resolution patch
-// (titles/01007EF00011E000/resolution.h). Each
+// Instruction sites of the internal-resolution module
+// (armigo/titles/resolution.h). Each
 // site is one MOVZ or MOVK; the pairs are the two halves of one value.
 struct ResolutionSites {
     // Swapchain width, height << 32, once per place that initializes the size:
@@ -104,8 +114,9 @@ struct ResolutionSites {
 // Where the packer finds this title's shader stages. Absent profile settings
 // keep the historical choice: BNSH containers and a minus-one-to-one vertex
 // depth. A gfd-cache description reads .gsc members of CPK archives plus the
-// packages embedded in the main module.
-enum class ShaderContainerSet { Bnsh, GfdCache };
+// packages embedded in the main module. A glslc description reads the GLSLC
+// compiler outputs compiled into the main module.
+enum class ShaderContainerSet { Bnsh, GfdCache, Glslc };
 enum class ShaderVertexDepth { NegativeOneToOne, ZeroToOne };
 struct ShaderCacheFallback {
     std::string cache;
@@ -130,6 +141,17 @@ struct PatchDescription {
     // its preselected-user launch parameter. Extracted input carries no
     // control data; the compatibility description supplies the setting.
     bool startup_user = false;
+    // NVN driver behaviour the title selects ("nvn_policy" object); each
+    // member defaults to the driver's own behaviour.
+    struct NvnPolicy {
+        bool cpu_cached_texture_writes = false;
+        // "timestamps": "report" (default) or "segment".
+        bool segment_timestamps = false;
+        // "barriers": "full" (default) or "game".
+        bool game_barriers = false;
+        // "hoist_implicit_samples": a boolean, false by default.
+        bool hoist_implicit_samples = false;
+    } nvn_policy;
     // The title's pipeline list (the profile's "pipelines" file, resolved to
     // its path in the title folder); empty for none. Only the NVN driver
     // uses it, as its pipeline warm-up seed.
@@ -148,26 +170,48 @@ struct PatchDescription {
     std::string note;
 };
 struct GpuBudgetContext;
+struct FrameRatioContext;
 struct InstalledPatch {
     PatchDescription description;
     std::uint64_t module_base = 0;
     std::shared_ptr<GpuBudgetContext> gpu_budget;
+    std::shared_ptr<FrameRatioContext> frame_ratio;
+    // Debugging observers (ARMIGO_OBSERVE); never part of a title's settings.
+    std::vector<ObservePoint> observers;
 };
 inline std::uint64_t call_callee(const PatchDescription& patch, const CallPatch& call) noexcept {
-    if (call.gpu_budget) return call.offset + 4;
+    if (call.gpu_budget || call.frame_ratio) return call.offset + 4;
     return call.phases ? call.phases->original_callee : patch.original_callee;
 }
 void initialize_gpu_budget(InstalledPatch& patch);
+void initialize_frame_ratio(InstalledPatch& patch);
+// Appendix bytes of one call's stub: a call hook takes 16, a frame-ratio
+// division runs its displaced instruction after the gate and takes an
+// observer stub.
+inline std::size_t call_stub_bytes(const CallPatch& call) noexcept {
+    return call.frame_ratio ? observe_stub_bytes : 16;
+}
 struct PatchFeedback {
     std::uint64_t (*gpu_work_ns)(void*) noexcept = nullptr;
     void* context = nullptr;
 };
 execution::CallHookPatchResult make_patch_hook(const CallPatch& site, std::uint32_t actual,
     std::uint64_t address, std::uint64_t trampoline, execution::CallHookCodeRegion gate);
+// A call module a profile names by "module": it owns the gate handling of
+// the calls it describes. Instruction hooks a title module adds (a frame-ratio
+// division, a GPU-budget constant) are handled by their own kind.
+struct CallModule {
+    std::string_view name;
+    execution::GateStatus (*handle)(const InstalledPatch& patch, const CallPatch& site,
+                                    execution::GateCall& call, const horizon::GuestBuffers& memory,
+                                    std::uint64_t counter_frequency) noexcept;
+};
+const CallModule* find_call_module(std::string_view name) noexcept;
 execution::GateStatus handle_patch(const InstalledPatch& patch, execution::GateCall& call,
                                     const horizon::GuestBuffers& memory,
                                     std::uint64_t call_return_address,
-                                    PatchFeedback feedback = {}) noexcept;
+                                    PatchFeedback feedback = {},
+                                    std::uint64_t counter_frequency = 19'200'000) noexcept;
 // Present policy of the patch installed for this process (false unless a
 // title's compatibility description enables it). Read by the display service.
 void set_present_link(bool enabled) noexcept;

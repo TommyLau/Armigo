@@ -82,6 +82,10 @@ struct Case {
     // A comparison result: convert the predicate through the all-bits mask and
     // export it without the NaN guard, which would distort a full mask.
     bool predicate_word{};
+    // A carry operation: the result word is followed by its carry predicate;
+    // export_carry exports that predicate instead of the word.
+    bool carry_output{};
+    bool export_carry{};
     // Optional follow-up instruction consuming a predicate the guest
     // instruction wrote, so paired-predicate results reach a register.
     std::uint64_t post_instruction{};
@@ -288,11 +292,16 @@ struct FragmentBuilder {
         auto loaded = load_words(4);
         Operation compute;
         item.build(compute, loaded);
-        const auto result = value(item.predicate_word ? ValueType::predicate : ValueType::word32);
+        auto result = value(item.predicate_word ? ValueType::predicate : ValueType::word32);
         compute.outputs.push_back(result);
+        if (item.carry_output) {
+            const auto carry = value(ValueType::predicate);
+            compute.outputs.push_back(carry);
+            if (item.export_carry) result = carry;
+        }
         add(std::move(compute));
         ValueId exported;
-        if (item.predicate_word) {
+        if (item.predicate_word || item.export_carry) {
             // A comparison exports through its all-bits mask, then as one of
             // two finite words: a raw full mask would be a NaN float at the
             // render target, whose payload the target does not promise.
@@ -664,6 +673,54 @@ std::vector<Case> make_cases(id<MTLDevice> device, id<MTL4Compiler> compiler) {
                   },
                   {source}, armigo::shader::graphics::detail::evaluate_integer_to_float({source, 0, 0}, 4u)};
         cases.push_back(std::move(item));
+    }
+    { // Carry arithmetic adds or subtracts the carry predicate as one unit
+      // and reports the 33rd bit: the carry term must not absorb the sum.
+        const auto carry = [&](const char* name, Opcode opcode, std::uint32_t left, std::uint32_t right, bool incoming,
+                               std::uint32_t expected, bool export_carry) {
+            Case item{name,
+                      [opcode, incoming](Operation& self, std::vector<ValueId>& loaded) {
+                          self.opcode = opcode;
+                          self.numeric = {Domain::unsigned_integer, ScalarType::u32};
+                          self.inputs.push_back(loaded[0]);
+                          self.inputs.push_back(loaded[1]);
+                          self.inputs.push_back(LiteralBits{incoming ? 1u : 0u, ValueType::predicate});
+                      },
+                      {left, right}, expected};
+            item.carry_output = true;
+            item.export_carry = export_carry;
+            item.compare_words = !export_carry;
+            cases.push_back(std::move(item));
+        };
+        carry("add_carry_sum", Opcode::add_carry, 2u, 3u, false, 5u, false);
+        carry("add_carry_sum_with_carry_in", Opcode::add_carry, 2u, 3u, true, 6u, false);
+        carry("add_carry_wrapped_sum", Opcode::add_carry, 0xffffffffu, 1u, true, 1u, false);
+        carry("add_carry_out", Opcode::add_carry, 0xffffffffu, 1u, true, 0x3f800000u, true);
+        carry("add_carry_no_out", Opcode::add_carry, 2u, 3u, true, 0x40000000u, true);
+        carry("subtract_borrow_difference", Opcode::subtract_borrow, 5u, 3u, true, 1u, false);
+        carry("subtract_borrow_out", Opcode::subtract_borrow, 0u, 1u, false, 0x3f800000u, true);
+    }
+    { // The signed most-significant bit of a negative word is its highest
+      // zero bit; zero and minus one report none.
+        const auto msb = [&](const char* name, std::uint32_t source, std::uint32_t expected) {
+            Case item{name,
+                      [](Operation& self, std::vector<ValueId>& loaded) {
+                          self.opcode = Opcode::find_msb;
+                          self.numeric = {Domain::signed_integer, ScalarType::s32};
+                          self.inputs.push_back(loaded[0]);
+                      },
+                      {source}, expected};
+            // The no-bit result is a NaN pattern, so the export guard tests
+            // the (finite) input instead of the result.
+            item.compare_words = true;
+            item.guard_on_input = true;
+            cases.push_back(std::move(item));
+        };
+        msb("find_msb_signed_negative", 0x81010101u, 30u);
+        msb("find_msb_signed_minimum", 0x80000000u, 30u);
+        msb("find_msb_signed_minus_two", 0xfffffffeu, 0u);
+        msb("find_msb_signed_zero", 0u, 0xffffffffu);
+        msb("find_msb_signed_positive", 0x00012345u, 16u);
     }
     { // Draw and export sanity: a literal word without any load.
         Case item{"literal_export",

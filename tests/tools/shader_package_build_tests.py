@@ -605,6 +605,23 @@ out.write_bytes(prefix+hashlib.sha256(source.read_bytes()).digest())
         self.assertEqual(len(manifest["entries"]), 2)
         self.assertTrue(all(entry["stage"] == "vertex" for entry in manifest["entries"]))
 
+    def test_builds_v2_vertex_stage_with_partial_position(self):
+        # A vertex stage may declare only position X/Y/Z: the translation
+        # supplies the hardware default W. No declared position still fails.
+        partial = self.stage_v2(
+            "partial-position", seed=7,
+            mutate=lambda value: value["interface"].update(position_output_mask=7))
+        output = self.root / "partial-position-out"
+        result = self.run_tool(output, (partial,))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(len(manifest["entries"]), 1)
+        missing = self.stage_v2(
+            "missing-position", seed=9,
+            mutate=lambda value: value["interface"].update(position_output_mask=0))
+        self.failure(self.root / "missing-position-out", (missing,),
+                     "vertex interface is outside the supported profile")
+
     def test_builds_v2_vertex_stage_textures(self):
         # The draw backend binds vertex-stage texture/sampler pairs through
         # the same guest descriptor path as fragment stages, so the builder
@@ -1386,6 +1403,150 @@ out.write_bytes(prefix+hashlib.sha256(source.read_bytes()).digest())
         self.assertEqual(result, 1)
         self.assertFalse((self.root / "artifact-budget").exists())
         self.assertFalse(list(self.root.glob(".armigo-package-*")))
+
+    def test_admits_handle_program_slot_and_refuses_a_bad_program(self):
+        # Slot 31 names program (handle_byte_offset / 4). The binding's
+        # array length selects that many consecutive programs. A descriptor
+        # fact at the same slot needs the one program at its own offset.
+        sys.path.insert(0, str(TOOLS))
+        self.addCleanup(lambda: sys.path.remove(str(TOOLS)))
+        module = importlib.import_module("build_package")
+
+        def bytes_of(stage):
+            return ((stage / "program.bin").read_bytes(),
+                    (stage / "source.metal").read_bytes())
+
+        def accept(stage):
+            metadata = json.loads((stage / "reflection.json").read_text())
+            program, source = bytes_of(stage)
+            module.validate_reflection(metadata, program, source)
+            return metadata, program, source
+
+        def v2(value):
+            value["handle_programs"] = [[0xffffffff, 0]]
+            value["textures"] = [
+                {**self.TEXTURE_ENTRY, "cbuf_slot": 31, "handle_byte_offset": 0},
+                {**self.SAMPLER_ENTRY, "cbuf_slot": 31, "handle_byte_offset": 0}]
+            value["dependencies"].append(
+                {**self.DESCRIPTOR_FACT, "index": 31, "byte_offset": 0})
+
+        v2_stage = self.stage_v2("handle-v2", "fragment", 176, 31, mutate=v2)
+        metadata, program, source = accept(v2_stage)
+        output = self.root / "handle-v2-out"
+        result = self.run_tool(output, (v2_stage,))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads((output / "manifest.json").read_text())
+        packaged = json.loads((output / manifest["entries"][0]["directory"] /
+                               "reflection.json").read_text())
+        self.assertEqual(packaged["handle_programs"], [[0xffffffff, 0]])
+        self.assertEqual(packaged["textures"][0]["cbuf_slot"], 31)
+        bare = json.loads(canonical(metadata))
+        bare.pop("handle_programs")
+        self.assertNotEqual(module.variant_data(metadata), module.variant_data(bare))
+
+        texture = self.v3_texture(0, first=0, array_length=2)
+        texture.update(cbuf_slot=31, handle_byte_offset=0)
+        sampler = {"kind": "sampler", "resource_id": 1, "array_length": 1,
+                   "cbuf_slot": 31, "handle_byte_offset": 0,
+                   "comparison": False, "normalized_coordinates": True,
+                   "location": {"kind": "direct", "namespace": "sampler",
+                                "first": 0, "count": 1}}
+
+        def v3(value):
+            value["handle_programs"] = [[1, 2, 3], []]
+            value["dependencies"].append({
+                "kind": "texture_descriptor", "index": 31, "byte_offset": 0,
+                "component": 0, "origin": "derived",
+                "value": {"dimension": "d2", "array": False, "multisample": False,
+                          "scalar": "f32", "component_format": "floating",
+                          "normalized_coordinates": True, "comparison": False}})
+
+        v3_stage = self.stage_v3("handle-v3", [texture, sampler], mutate=v3)
+        v3_metadata, v3_program, v3_source = accept(v3_stage)
+        v3_output = self.root / "handle-v3-out"
+        result = self.run_tool(v3_output, (v3_stage,))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        # The last of 4096 programs, and a program of 4096 words, are in range.
+        # An unused program list does not disturb a constant-buffer binding.
+        last = json.loads(canonical(metadata))
+        last["handle_programs"] = [[] for _ in range(4096)]
+        for item in last["textures"]:
+            item["handle_byte_offset"] = 16380
+        for item in last["dependencies"]:
+            if item["kind"] == "texture_descriptor":
+                item["byte_offset"] = 16380
+        module.validate_reflection(last, program, source)
+        words = json.loads(canonical(metadata))
+        words["handle_programs"] = [list(range(4096))]
+        module.validate_reflection(words, program, source)
+        unused = self.stage_v2("handle-unused", mutate=lambda value:
+                               value.update(handle_programs=[[1]]))
+        accept(unused)
+
+        def refuse(base, program_bytes, source_bytes, message, mutate):
+            broken = json.loads(canonical(base))
+            mutate(broken)
+            with self.assertRaisesRegex(RuntimeError, message):
+                module.validate_reflection(broken, program_bytes, source_bytes)
+
+        def shift_handles(value, offset):
+            for item in value["textures"]:
+                item["handle_byte_offset"] = offset
+
+        refuse(metadata, program, source, "texture provenance",
+               lambda value: shift_handles(value, 4))
+        refuse(metadata, program, source, "texture provenance",
+               lambda value: value["textures"][1].update(handle_byte_offset=4))
+        refuse(metadata, program, source, "texture provenance",
+               lambda value: shift_handles(value, 2))
+        refuse(metadata, program, source, "texture provenance",
+               lambda value: value.pop("handle_programs"))
+        refuse(metadata, program, source, "texture provenance",
+               lambda value: value.update(handle_programs=[]))
+        refuse(metadata, program, source, "texture provenance",
+               lambda value: value["textures"][0].update(cbuf_slot=18))
+        refuse(metadata, program, source, "texture provenance",
+               lambda value: value["textures"][0].update(cbuf_slot=30))
+        def descriptor(value):
+            return next(item for item in value["dependencies"]
+                        if item["kind"] == "texture_descriptor")
+
+        refuse(metadata, program, source, "texture descriptor dependency key",
+               lambda value: descriptor(value).update(byte_offset=4))
+        refuse(metadata, program, source, "texture descriptor dependency key",
+               lambda value: descriptor(value).update(index=18))
+        refuse(v3_metadata, v3_program, v3_source, "texture provenance",
+               lambda value: value.update(handle_programs=[[1]]))
+        refuse(v3_metadata, v3_program, v3_source, "storage-buffer reflection is invalid",
+               lambda value: value.update(storage_buffers=[self.v3_storage(cbuf_slot=31)]))
+        refuse(metadata, program, source, "constant-buffer reflection is invalid",
+               lambda value: value["constant_buffers"][0].update(guest_binding=31))
+        refuse(metadata, program, source, "handle_programs must be an array",
+               lambda value: value.update(handle_programs={}))
+        refuse(metadata, program, source, "handle_programs must be an array",
+               lambda value: value.update(handle_programs="words"))
+        refuse(metadata, program, source, "handle program must be an array",
+               lambda value: value.update(handle_programs=[1]))
+        refuse(metadata, program, source, "handle program word is invalid",
+               lambda value: value.update(handle_programs=[[1.5]]))
+        refuse(metadata, program, source, "handle program word is invalid",
+               lambda value: value.update(handle_programs=[[True]]))
+        refuse(metadata, program, source, "handle program word is invalid",
+               lambda value: value.update(handle_programs=[["1"]]))
+        refuse(metadata, program, source, "handle program word is invalid",
+               lambda value: value.update(handle_programs=[[-1]]))
+        refuse(metadata, program, source, "handle program word is invalid",
+               lambda value: value.update(handle_programs=[[2 ** 32]]))
+        refuse(metadata, program, source, "handle_programs exceeds its count policy",
+               lambda value: value.update(handle_programs=[[] for _ in range(4097)]))
+        refuse(metadata, program, source, "handle program exceeds its count policy",
+               lambda value: value.update(handle_programs=[list(range(4097))]))
+        legacy = self.stage("handle-v1")
+        legacy_metadata = json.loads((legacy / "reflection.json").read_text())
+        legacy_metadata["handle_programs"] = [[1]]
+        with self.assertRaisesRegex(RuntimeError, "unexpected schema"):
+            module.validate_reflection(legacy_metadata, *bytes_of(legacy))
 
     def test_tool_failure_timeout_and_cleanup(self):
         stage = self.stage("tool")

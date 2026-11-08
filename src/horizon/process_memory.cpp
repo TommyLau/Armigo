@@ -41,6 +41,14 @@ std::uint32_t validate_range(AddressRange r) noexcept {
         return invalid_memory;
     return 0;
 }
+std::uint32_t validate_transfer(AddressRange range, std::uint64_t permission) noexcept {
+    if (const auto result = validate_range(range)) return result;
+    return permission == 0 || permission == 1 || permission == 3 ? 0 : invalid_permission;
+}
+bool transferable(const MemoryBlock& block) noexcept {
+    return (block.type == MemoryType::normal || block.type == MemoryType::code_data) &&
+           block.permissions == 3 && !block.attributes && !block.ipc_references && !block.device_references;
+}
 std::uint32_t validate_heap_size(std::uint64_t size) noexcept {
     return size >= ProcessRecord::heap_capacity || size % (2u << 20) ? invalid_size : 0;
 }

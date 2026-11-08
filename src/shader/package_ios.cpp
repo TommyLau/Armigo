@@ -480,6 +480,9 @@ std::string digest(const Json& value, std::string_view key) {
 struct InputPackage {
     fs::path root;
     std::string source_version;
+    // Copied onto the iOS manifest when the macOS manifest recorded it; the
+    // stages are then retranslated with implicit samples hoisted as well.
+    std::optional<Json> sample_hoisting;
     std::vector<detail::Stage> stages;
 };
 
@@ -488,8 +491,18 @@ InputPackage load_package(const fs::path& supplied) {
     InputPackage result;
     result.root = fs::canonical(supplied, error);
     detail::require(!error && fs::is_directory(result.root, error), "macOS package must name a directory");
-    const Json manifest = detail::parse_json(
+    Json manifest = detail::parse_json(
         detail::read_regular(result.root / "manifest.json", maximum_manifest_size, "package manifest"));
+    // Optional, and the only extra key. Anything else still fails exact.
+    if (manifest.is_object()) {
+        auto& fields = manifest.object();
+        if (const auto found = fields.find("sample_hoisting"); found != fields.end()) {
+            detail::require(found->second.is_string() && found->second.string() == "implicit",
+                            "Package sample hoisting is unsupported");
+            result.sample_hoisting = found->second;
+            fields.erase(found);
+        }
+    }
     exact(manifest, "package manifest", "schema", "source_version", "chain_id", "platform", "profile_text",
           "complete_inventory", "runnable", "entries");
     detail::require(text(manifest, "schema") == "armigo-metal-package-v1", "Package schema is unsupported");
@@ -562,10 +575,11 @@ si::Stage input_stage(std::string_view stage) {
     throw std::runtime_error("Package reflection stage is unsupported");
 }
 
-tr::StageOptions stage_options(const detail::Stage& stage, si::Stage kind) {
+tr::StageOptions stage_options(const detail::Stage& stage, si::Stage kind, bool hoist_implicit_samples) {
     tr::StageOptions options;
     options.texture_handle_cbuf = 2;
     options.texture_descriptors_derived = true;
+    options.hoist_implicit_samples = hoist_implicit_samples;
     if (kind == si::Stage::Vertex) {
         const std::string& depth = text(stage.metadata, "vertex_depth");
         detail::require(depth == "minus-one-to-one" || depth == "zero-to-one", "Vertex depth convention is invalid");
@@ -594,7 +608,7 @@ tr::StageOptions stage_options(const detail::Stage& stage, si::Stage kind) {
     return options;
 }
 
-detail::Stage retranslate_stage(const detail::Stage& input, const fs::path& work_root) {
+detail::Stage retranslate_stage(const detail::Stage& input, const fs::path& work_root, bool hoist_implicit_samples) {
     const si::Stage kind = input_stage(input.stage);
     std::vector<std::byte> control(si::format::control_min_size);
     store_u32(control, 0, si::format::control_magic);
@@ -610,7 +624,8 @@ detail::Stage retranslate_stage(const detail::Stage& input, const fs::path& work
     std::vector<std::byte> code(code_size);
     if (wrapper_size != 0) store_u32(code, 0, si::format::code_wrapper_magic);
     std::copy(input.program.begin(), input.program.end(), code.begin() + static_cast<std::ptrdiff_t>(wrapper_size));
-    const auto options = stage_options(input, kind);
+    // The macOS package records how its stages were translated; translate them the same way.
+    const auto options = stage_options(input, kind, hoist_implicit_samples);
     const tr::TranslatedStage translated = tr::translate_stage(control, code, options);
     const auto reflection = as_bytes(translated.reflection);
     detail::require(translated.program == input.program && reflection.size() == input.reflection.size() &&
@@ -647,7 +662,9 @@ std::variant<std::string, IosBuildReport> build_impl(const IosBuildOptions& opti
         std::deque<std::future<detail::Stage>> pending;
         const auto submit_next = [&] {
             const detail::Stage& stage = input.stages[next];
-            pending.push_back(pool.submit<detail::Stage>([&stage, &work] { return retranslate_stage(stage, work); }));
+            pending.push_back(pool.submit<detail::Stage>([&stage, &work, hoist = input.sample_hoisting.has_value()] {
+                return retranslate_stage(stage, work, hoist);
+            }));
             ++next;
         };
         for (std::size_t index = 0; index < std::min(input.stages.size(), std::size_t(options.jobs) * 2); ++index) submit_next();
@@ -747,6 +764,10 @@ std::variant<std::string, IosBuildReport> build_impl(const IosBuildOptions& opti
     manifest.emplace("profile_text", Json{profile_text});
     manifest.emplace("complete_inventory", Json{false});
     manifest.emplace("runnable", Json{false});
+    // Unchanged from the macOS manifest. Absent stays absent, so a plain iOS
+    // manifest stays byte-identical. The key is outside profile_text.
+    if (input.sample_hoisting)
+        manifest.emplace("sample_hoisting", *input.sample_hoisting);
     manifest.emplace("entries", std::move(entries));
     const std::string manifest_text = detail::canonical_json(Json{std::move(manifest)}) + "\n";
     detail::require(manifest_text.size() <= detail::maximum_output_bytes - artifact_bytes,

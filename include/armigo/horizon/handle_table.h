@@ -97,6 +97,17 @@ public:
     // when insertion fails.
     std::optional<Handle> insert(std::shared_ptr<KernelObject> object);
 
+    // Takes a slot and its handle before the object exists, as the kernel
+    // does before work whose result it publishes (connecting a named port).
+    // The slot counts as used and names no object until commit; cancel frees
+    // it. Fails (std::nullopt) when the table is full.
+    std::optional<Handle> reserve();
+    // Publishes a reserved handle's object. Fails for a null object or a
+    // handle that is not reserved.
+    bool commit(Handle handle, std::shared_ptr<KernelObject> object);
+    // Frees a reserved handle that was never committed.
+    void cancel(Handle handle);
+
     // Returns the object for handle, or null for a zero handle, a handle
     // with reserved bits set (including pseudo-handles), a zero serial, an
     // out-of-range index, a stale serial, or a wrong generation. The
@@ -136,10 +147,12 @@ private:
         std::shared_ptr<KernelObject> object;
         std::uint16_t serial = 0;
         std::uint32_t next_free = no_index;
+        bool reserved = false;
     };
 
     // The caller must hold mutex_. Returns the entry when handle names its
     // current generation, otherwise null.
+    Entry* find_reserved_entry(Handle handle);
     const Entry* find_valid_entry(Handle handle) const;
 
     // Slot allocation order is an internal policy: the constructor chains

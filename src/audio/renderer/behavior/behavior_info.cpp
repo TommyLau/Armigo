@@ -20,8 +20,7 @@ u32 BehaviorInfo::get_process_revision_num() const {
 }
 
 u32 BehaviorInfo::get_process_revision() const {
-    return make_magic('R', 'E', 'V',
-                             static_cast<char>(static_cast<u8>('0') + process_revision));
+    return encode_revision(process_revision, native_platform);
 }
 
 u32 BehaviorInfo::get_user_revision_num() const {
@@ -29,11 +28,12 @@ u32 BehaviorInfo::get_user_revision_num() const {
 }
 
 u32 BehaviorInfo::get_user_revision() const {
-    return make_magic('R', 'E', 'V',
-                             static_cast<char>(static_cast<u8>('0') + user_revision));
+    return encode_revision(user_revision, native_platform);
 }
 
 void BehaviorInfo::set_user_lib_revision(const u32 user_revision_) {
+    native_platform = is_native_revision(user_revision_);
+    process_revision = native_platform ? NativeCurrentRevision : CurrentRevision;
     user_revision = get_revision_num(user_revision_);
 }
 

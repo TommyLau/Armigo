@@ -28,7 +28,12 @@ planned, not supported.
 - An Apple Silicon Mac with macOS 26 or later.
 - Xcode 26 or later with its Metal toolchain installed, and the iOS SDK if
   you pack for iOS.
-- CMake 3.25 or later and Ninja (`brew install cmake ninja`).
+- CMake 3.25 or later and Ninja (`brew install cmake ninja`). Homebrew puts
+  them in `/opt/homebrew/bin`; that directory must be on your `PATH` in the
+  shell you build and pack from.
+- Free disk space for the app plus the packer's work files: about twice the
+  finished app. Breath of the Wild with its update and both add-on packs makes
+  a 15.9 GiB app, so start with at least 35 GB free.
 - For iOS: a device with iOS 26 or later, and your own way to sign apps.
 
 ## Build
@@ -39,22 +44,48 @@ cmake --build --preset macos-release
 ```
 
 This builds the packer `build/macos-release/armigo` and the player it puts in
-every app. To run the tests:
+every app.
+
+## What you need from your console
+
+All of these come from a console and games you own; Armigo provides none of them.
+
+- **The game**: an `.xci` or `.nsp` of the base game, plus `.nsp` files of its
+  update and add-on content. Only the titles and game versions listed in
+  `titles/<TitleID>/profile.json` are supported.
+- **Keys**: your console's `prod.keys`. They must be at least as new as the
+  firmware you give Armigo. If packing stops with "The keys do not provide
+  'key_area_key_application_NN'", your keys are older than the firmware: dump
+  them again from a console running that firmware version or newer.
+- **Firmware**: your console's 23.0.1 firmware, as a `.zip` or a folder of its
+  `.nca` files.
+
+## Pack your own game
+
+macOS:
 
 ```sh
-ctest --preset macos-release
+build/macos-release/armigo "My Game.xci" --update "My Game v1.2.nsp" \
+  --dlc "My Game DLC.nsp" --keys prod.keys --firmware Firmware.23.0.1.zip \
+  --output "$HOME/Games"
 ```
 
-## Pack your game
+This writes `<Name>.app` into that folder. For iOS and iPadOS, add
+`--platform ios` to write `<Name>.ipa`.
 
-```sh
-build/macos-release/armigo "My Game.nsp" --update "My Game v1.2.nsp" \
-  --dlc "My Game DLC.nsp" --keys prod.keys --firmware firmware/ --output "$HOME/Games"
-```
+Packing translates and compiles every shader and pipeline the game uses, so it
+takes several minutes and uses every CPU core. The app is self-contained: the
+game, its prepared code, shaders, pipelines and settings are inside it, and
+your original files are not needed to play.
 
-This writes `<Name>.app` into that folder. Add `--platform ios` to write `<Name>.ipa`
-instead. [PACKING.md](PACKING.md) explains every input and option, what goes
-into the app, and how to sign the iOS app yourself.
+## Signing
+
+Armigo signs nothing. A macOS app runs as written, on the linker's ad-hoc
+signature. To install the `.ipa` on an iPhone or iPad, sign it with your own
+Apple developer identity and a provisioning profile for your device.
+
+[PACKING.md](PACKING.md) explains every input and option, what goes into the
+app, and how to sign the iOS app yourself.
 
 ## Playing
 

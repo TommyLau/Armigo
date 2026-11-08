@@ -21,6 +21,8 @@
 #include <functional>
 #include <memory>
 #include <deque>
+#include <optional>
+#include <string>
 #include <vector>
 
 namespace armigo::horizon {
@@ -29,7 +31,8 @@ class TransferMemoryRecord;
 
 namespace armigo::services::am {
 
-enum class AppletContract { horizon_20_5_0, switch2_23_0_1 };
+// Platform policy for applet commands. Horizon 23.0.1 is the release on both.
+enum class AppletContract { switch1, switch2 };
 
 // Portable launch policy, separate from application metadata and permissions.
 enum class GameplayRecordingPolicy : std::uint8_t { Unavailable };
@@ -75,7 +78,7 @@ public:
                          GameplayRecordingPolicy recording_policy = GameplayRecordingPolicy::Unavailable,
                          std::shared_ptr<ApplicationRunningState> running_state = {},
                          OperationMode operation_mode = OperationMode::Console,
-                         AppletContract contract = AppletContract::horizon_20_5_0);
+                         AppletContract contract = AppletContract::switch1);
     horizon::IpcReply close_server() override;
     horizon::IpcReply request(const horizon::IpcMessage&, std::uint64_t sender_pid) override;
     horizon::IpcReply request_with_buffers(const horizon::IpcMessage&, std::uint64_t sender_pid,
@@ -92,6 +95,9 @@ public:
     // Switch 2: what the graphics system session needs from the launch.
     // Without it, its driver and display refresh requests stay unsupported.
     void set_graphics_system_dependencies(gsv::GraphicsSystemDependencies dependencies);
+    // The display version ApplicationFunctions 23 reports for a launch whose
+    // package has no control data. Unset, the command is unsupported.
+    void set_display_version(std::string version);
     const char* diagnostic() const;
     std::size_t domain_object_count() const;
     std::optional<std::uint32_t> application_proxy_configuration() const;
@@ -190,6 +196,8 @@ private:
     bool self_controller_2400_ = false;
     bool exit_to_library_on_next_program_ = false;
     std::uint32_t terminate_result_ = 0;
+    std::optional<std::string> display_version_;
+    bool display_version_warned_ = false;
     std::optional<std::uint32_t> common_state_command66_;
     bool common_state_boost_active_ = false;
     std::array<std::optional<bool>, 3> self_controller_flags_{};
@@ -212,7 +220,6 @@ private:
     std::shared_ptr<horizon::Event> application_state_event_;
     bool focused_ = false;
     bool focus_notification_pending_ = false;
-    bool foreground_rights_acquired_ = false;
     bool focus_notifications_enabled_ = true;
     bool background_mode_enabled_ = false;
     bool focus_suspending_enabled_ = true;

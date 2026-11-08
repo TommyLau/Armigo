@@ -81,7 +81,8 @@ public:
     }
 
     // Times the producer found the ring full and waited for the consumer.
-    std::uint64_t full_waits() const { return full_waits_; }
+    // How often the producer found the ring full; readable from any thread.
+    std::uint64_t full_waits() const { return full_waits_.load(std::memory_order_relaxed); }
 
     // Consumer: replays records in order until exec returns false. Between
     // records it spins for up to spin_ns while idle() is false (records come
@@ -140,7 +141,7 @@ private:
     void room(std::uint64_t end) {
         if (end - cached_read_ <= capacity) return;
         if (end - (cached_read_ = read_.load(std::memory_order_acquire)) <= capacity) return;
-        ++full_waits_;
+        full_waits_.fetch_add(1, std::memory_order_relaxed);
         write_.store(local_write_, std::memory_order_seq_cst);
         wake();
         for (int i = 0; end - (cached_read_ = read_.load(std::memory_order_acquire)) > capacity; ++i) {
@@ -152,7 +153,8 @@ private:
     std::unique_ptr<std::byte[]> storage_;
     dispatch_semaphore_t wake_;
     // Producer-only: its write position and its last view of the read position.
-    std::uint64_t local_write_ = 0, cached_read_ = 0, full_waits_ = 0;
+    std::uint64_t local_write_ = 0, cached_read_ = 0;
+    std::atomic<std::uint64_t> full_waits_{0};
     // Each shared position on its own line: the two threads write them from
     // different cores.
     alignas(128) std::atomic<std::uint64_t> write_{0};

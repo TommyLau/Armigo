@@ -13,6 +13,8 @@
 // first/last bit return -1 (all bits set) for an empty result.
 
 #include "expressions.h"
+#include "matrix_plan.h"
+#include <tuple>
 #include "../dispatch.h"
 
 namespace armigo::shader::pipeline {
@@ -190,7 +192,9 @@ Status carry_operation(MslContext& c, OperationId id, bool addition) {
         const auto left = operand_at(c, op, 0, ScalarType::u32);
         const auto right = operand_at(c, op, 1, ScalarType::u32);
         const auto carry_in = operand_at(c, op, 2, ScalarType::boolean);
-        const auto incoming = carry_in + " ? 1ul : 0ul";
+        // The conditional binds loosest, so the carry term keeps its own
+        // parentheses inside the sum.
+        const auto incoming = "(" + carry_in + " ? 1ul : 0ul)";
         const auto wide = bits_constant(c, id, 0, true, addition
             ? "(ulong(" + left + ") + ulong(" + right + ") + " + incoming + ")"
             : "(ulong(" + left + ") - ulong(" + right + ") - " + incoming + ")");
@@ -365,8 +369,11 @@ Status word_query(MslContext& c, OperationId id, Opcode opcode) {
                 // The signed most-significant bit excludes the sign: a
                 // negative value reports its highest zero bit, and zero or
                 // negative one have no such bit.
-                const auto typed = bits_constant(c, id, 1, wide,
-                    "as_type<" + std::string(scalar(raw_scalar == ScalarType::u64 ? ScalarType::s64 : ScalarType::s32)) + ">(" + value + ")");
+                // The reinterpreted word is a signed constant: an unsigned
+                // carrier would make the negative test below never true.
+                const auto signed_scalar = std::string(scalar(raw_scalar == ScalarType::u64 ? ScalarType::s64 : ScalarType::s32));
+                const auto typed = "armigo_w" + number(id.value) + "_1";
+                take(c.statement("const " + signed_scalar + " " + typed + " = as_type<" + signed_scalar + ">(" + value + ");"));
                 const auto inverted = wide ? "~as_type<ulong>(" + typed + ")" : "~as_type<uint>(" + typed + ")";
                 const auto direct = wide ? "as_type<ulong>(" + typed + ")" : "as_type<uint>(" + typed + ")";
                 const auto typed_zero = wide ? "0l" : "0";
@@ -702,9 +709,193 @@ Status generate_shuffle(MslContext& c, OperationId id) {
                 bits_constant(c, id, 7, false, "((" + clamp + " & ~" + segment + ") | " + segment_base + ")");
             in_range = "(" + source_lane + " <= " + segment_top + ")";
         }
-        const auto picked = bits_constant(c, id, 8, false, "simd_shuffle(" + data + ", " + source_lane + ")");
+        // The transfer takes the source lane's low five bits, so Metal always
+        // receives a lane of the SIMD-group; a source outside the range is
+        // invalid above and returns the caller's own value.
+        const auto picked = bits_constant(c, id, 8, false, "simd_shuffle(" + data + ", " + source_lane + " & 31u)");
         take(assign_bits(c, op, 0, "(" + in_range + " ? " + picked + " : " + data + ")"));
         take(c.assign(output_at(op, 1), in_range, ScalarType::boolean));
+    });
+}
+
+namespace {
+// Votes and the ballot take the predicate of every active SIMD-group lane, as
+// the guest's warp votes take every active thread: lanes a guard or branch
+// has left are absent from both. Apple SIMD-groups are 32 lanes wide, so the
+// low word of the Metal ballot is the guest's lane mask.
+void require_vote(MslContext& c, const Operation& op) {
+    require(op.inputs.size() == 1 && op.outputs.size() == 1, "Votes take one predicate and return one result");
+    require(std::holds_alternative<SubgroupInfo>(op.info) && std::get<SubgroupInfo>(op.info).width == 32,
+            "Votes require the 32-lane subgroup contract");
+    require(c.resources().profile.supports_simd_shuffle,
+            "Metal profile does not expose SIMD-group votes", DiagnosticCode::unsupported_capability);
+}
+
+Status vote(MslContext& c, OperationId id, Opcode opcode) {
+    return callback(c, id, [&] {
+        const auto& op = c.operation(id);
+        require_vote(c, op);
+        const auto predicate = operand_at(c, op, 0, ScalarType::boolean);
+        if (opcode == Opcode::ballot) {
+            take(assign_bits(c, op, 0, "uint(ulong(simd_ballot(" + predicate + ")))"));
+            return;
+        }
+        // Equal holds when the active lanes agree: all true or all false.
+        const auto result = opcode == Opcode::vote_all ? "simd_all(" + predicate + ")"
+                            : opcode == Opcode::vote_any
+                                ? "simd_any(" + predicate + ")"
+                                : "(simd_all(" + predicate + ") || !simd_any(" + predicate + "))";
+        take(c.assign(output_at(op, 0), result, ScalarType::boolean));
+    });
+}
+} // namespace
+
+Status generate_ballot(MslContext& c, OperationId id) { return vote(c, id, Opcode::ballot); }
+
+Status generate_vote_all(MslContext& c, OperationId id) { return vote(c, id, Opcode::vote_all); }
+
+Status generate_vote_any(MslContext& c, OperationId id) { return vote(c, id, Opcode::vote_any); }
+
+Status generate_vote_equal(MslContext& c, OperationId id) { return vote(c, id, Opcode::vote_equal); }
+
+// A word reduced across the active SIMD-group lanes, as the guest's warp
+// reduction takes every active thread: the sum wraps modulo 2^32, and the
+// extrema compare as the numeric mode's signedness says.
+Status generate_subgroup_reduce(MslContext& c, OperationId id) {
+    return callback(c, id, [&] {
+        const auto& op = c.operation(id);
+        require(op.inputs.size() == 1 && op.outputs.size() == 1, "A subgroup reduction takes one word and returns one");
+        const auto* info = std::get_if<SubgroupInfo>(&op.info);
+        require(info && info->width == 32 && info->reduction, "Subgroup reductions require the 32-lane subgroup contract and a kind");
+        require(c.resources().profile.supports_simd_shuffle,
+                "Metal profile does not expose SIMD-group reductions", DiagnosticCode::unsupported_capability);
+        const bool signed_order = op.numeric.domain == Domain::signed_integer;
+        const auto type = signed_order ? ScalarType::s32 : ScalarType::u32;
+        std::string function;
+        switch (*info->reduction) {
+        case AtomicKind::add: function = "simd_sum"; break;
+        case AtomicKind::minimum: function = "simd_min"; break;
+        case AtomicKind::maximum: function = "simd_max"; break;
+        case AtomicKind::bit_or: function = "simd_or"; break;
+        case AtomicKind::bit_xor: function = "simd_xor"; break;
+        default: fail("Subgroup reduction kind is not admitted", DiagnosticCode::unsupported_capability);
+        }
+        take(c.assign(output_at(op, 0), function + "(" + operand_at(c, op, 0, type) + ")", type));
+    });
+}
+
+namespace {
+// A tile's matrix: an LDSM's block as an A quadrant (t) or B half (u), a
+// multiply's own scratch quadrant (a) or half (b), or a half of a D (e).
+std::string matrix_tile(const MatrixPlan::Tile& tile, bool b) {
+    using Source = MatrixPlan::Tile::Source;
+    const char* name = tile.source == Source::load ? (b ? "armigo_u" : "armigo_t") :
+                       tile.source == Source::product ? "armigo_e" : (b ? "armigo_b" : "armigo_a");
+    return name + number(tile.op.value) + "[" + number(tile.index) + "]";
+}
+} // namespace
+
+// HMMA.16816 on the SIMD-group matrix hardware (armigo_mma). The matrix plan
+// keeps operands in the SIMD-group's matrices where an operation made them:
+// A's quadrants and B's halves as the LDSM that read them or an earlier
+// multiply of the block with the same words, A's quadrants as the D halves of
+// earlier multiplies, C as the D of the multiply before it in a chain. The
+// other operands go through the scratch block.
+// Every lane executes it, as every guest lane executes the instruction.
+Status generate_matrix_multiply_add(MslContext& c, OperationId id) {
+    return callback(c, id, [&] {
+        const auto& op = c.operation(id);
+        require(op.inputs.size() == 9 && op.outputs.size() == 2,
+                "Matrix multiply-add takes the lane, A, B and C words and returns D");
+        require(std::holds_alternative<SubgroupInfo>(op.info) && std::get<SubgroupInfo>(op.info).width == 32,
+                "Matrix multiply-add requires the 32-lane subgroup contract");
+        require(c.resources().profile.supports_simd_shuffle,
+                "Metal profile does not expose SIMD-group shuffles", DiagnosticCode::unsupported_capability);
+        require(c.program().ir.stage == Stage::compute, "Matrix multiply-add needs a compute stage", DiagnosticCode::unsupported_capability);
+        const auto* plan = c.matrix_plan();
+        require(plan && plan->multiplies.contains(id.value), "Matrix multiply-add has no matrix plan");
+        const auto& multiply = plan->multiplies.at(id.value);
+        take(c.require_helper("armigo_mma"));
+        const auto self = number(id.value);
+        const auto word = [&](std::size_t i) { return operand_at(c, op, i, ScalarType::u32); };
+        using Source = MatrixPlan::Tile::Source;
+        const bool own_a = multiply.a[0].source == Source::own && multiply.a[0].op == id;
+        const bool own_b = multiply.b[0].source == Source::own && multiply.b[0].op == id;
+        const bool own_c = multiply.c == MatrixPlan::Multiply::Accumulator::lanes;
+        if (own_a || own_b || own_c) {
+            take(c.statement("simdgroup_barrier(mem_flags::mem_threadgroup);"));
+            if (own_a)
+                take(c.statement("armigo_mma_put_a(armigo_mma_block, " + word(0) + ", uint4(" + word(1) + ", " + word(2) + ", " +
+                                 word(3) + ", " + word(4) + "));"));
+            if (own_b) take(c.statement("armigo_mma_put_b(armigo_mma_block, " + word(0) + ", uint2(" + word(5) + ", " + word(6) + "));"));
+            if (own_c) take(c.statement("armigo_mma_put_c(armigo_mma_block, " + word(0) + ", uint2(" + word(7) + ", " + word(8) + "));"));
+            take(c.statement("simdgroup_barrier(mem_flags::mem_threadgroup);"));
+        }
+        if (own_a) take(c.statement("simdgroup_half8x8 armigo_a" + self + "[4]; armigo_mma_get_a(armigo_a" + self + ", armigo_mma_block);"));
+        if (own_b) take(c.statement("simdgroup_half8x8 armigo_b" + self + "[2]; armigo_mma_get_b(armigo_b" + self + ", armigo_mma_block);"));
+        if (own_c) take(c.statement("simdgroup_half8x8 armigo_c" + self + "[2]; armigo_mma_get_c(armigo_c" + self + ", armigo_mma_block);"));
+        const auto accumulator = [&](unsigned i) {
+            switch (multiply.c) {
+            case MatrixPlan::Multiply::Accumulator::zero: return std::string("armigo_mma_zero");
+            case MatrixPlan::Multiply::Accumulator::chain: return "armigo_e" + number(multiply.c_from.value) + "[" + number(i) + "]";
+            case MatrixPlan::Multiply::Accumulator::lanes: break;
+            }
+            return "armigo_c" + self + "[" + number(i) + "]";
+        };
+        take(c.statement(std::string(multiply.kept ? "" : "simdgroup_half8x8 armigo_e" + self + "[2]; ") + "armigo_mma(armigo_e" + self +
+                         ", " + matrix_tile(multiply.a[0], false) + ", " + matrix_tile(multiply.a[1], false) + ", " +
+                         matrix_tile(multiply.a[2], false) + ", " + matrix_tile(multiply.a[3], false) + ", " +
+                         matrix_tile(multiply.b[0], true) + ", " + matrix_tile(multiply.b[1], true) + ", " + accumulator(0) + ", " +
+                         accumulator(1) + ");"));
+        if (!multiply.lanes) return;
+        const auto result = "armigo_d" + self;
+        take(c.statement("const uint2 " + result + " = armigo_mma_lanes(armigo_mma_block, " + word(0) + ", armigo_e" + self + ");"));
+        for (std::size_t i = 0; i < 2; ++i)
+            take(c.assign(output_at(op, i), result + "." + std::string(1, "xy"[i]), ScalarType::u32));
+    });
+}
+
+// LDSM through one helper: the lanes trade their row addresses with
+// SIMD-group shuffles and read their words of each 8x8 block from the shared
+// memory words between SIMD-group barriers; a word outside the allocation
+// reads zero, as a guarded shared load does. Blocks that multiplies take as
+// A quadrants or B halves are loaded as matrices too (armigo_ldsm_tiles), and
+// the lanes' words are read only when something else uses them.
+Status generate_matrix_load(MslContext& c, OperationId id) {
+    return callback(c, id, [&] {
+        const auto& op = c.operation(id);
+        require(op.inputs.size() == 3 && !op.outputs.empty() && op.outputs.size() <= 4,
+                "Matrix load takes the lane, the row address and the transposed flag and returns one word per block");
+        require(std::holds_alternative<SubgroupInfo>(op.info) && std::get<SubgroupInfo>(op.info).width == 32,
+                "Matrix load requires the 32-lane subgroup contract");
+        require(c.resources().profile.supports_simd_shuffle,
+                "Metal profile does not expose SIMD-group shuffles", DiagnosticCode::unsupported_capability);
+        const auto& compute = c.resources().compute;
+        require(c.program().ir.stage == Stage::compute && compute && compute->shared_memory_bytes,
+                "Matrix load needs a compute stage's shared memory", DiagnosticCode::unsupported_capability);
+        const auto* transposed = std::get_if<LiteralBits>(&op.inputs[2]);
+        require(transposed && transposed->bits <= 1, "Matrix load mode must be a literal 0 or 1");
+        MatrixPlan::Load load;
+        if (const auto* plan = c.matrix_plan(); plan && plan->loads.contains(id.value)) load = plan->loads.at(id.value);
+        const auto self = number(id.value);
+        const auto lane = operand_at(c, op, 0, ScalarType::u32), address = operand_at(c, op, 1, ScalarType::u32);
+        const auto memory = "armigo_shared_words, " + number(compute->shared_memory_bytes) + "u, " + lane + ", " + address;
+        // An A quadrant is a block's rows (.MT88: its columns), a B half its
+        // columns (.MT88: its rows).
+        for (const auto& [mask, name, transpose] : {std::tuple{load.a_tiles, "armigo_t", transposed->bits != 0},
+                                                    std::tuple{load.b_tiles, "armigo_u", transposed->bits == 0}}) {
+            if (!mask) continue;
+            take(c.require_helper("armigo_ldsm_tiles"));
+            take(c.statement("armigo_ldsm_tiles(" + std::string(name) + self + ", " + memory + ", " + (transpose ? "true" : "false") +
+                             ", " + number(mask) + "u, armigo_mma_block);"));
+        }
+        if (!load.lanes) return;
+        take(c.require_helper("armigo_ldsm"));
+        const auto result = "armigo_m" + self;
+        take(c.statement("const uint4 " + result + " = armigo_ldsm(" + memory + ", " + number(op.outputs.size()) + "u, " +
+                         number(transposed->bits) + "u);"));
+        for (std::size_t i = 0; i < op.outputs.size(); ++i)
+            take(c.assign(output_at(op, i), result + "." + std::string(1, "xyzw"[i]), ScalarType::u32));
     });
 }
 } // namespace armigo::shader::pipeline

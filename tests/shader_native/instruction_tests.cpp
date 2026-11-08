@@ -97,6 +97,7 @@ int main() {
         put(control, 0, 0x98761234); put(control, 4, 0xc9); put(control, 8, 20);
         put(control, 0x30, control.size()); put(control, 0x38, code.size());
         put(control, 0x40, code.size()); put(control, 0x44, code.size()); control[0x56] = std::byte{5};
+        put(control, 0x58, 32); put(control, 0x5c, 1); put(control, 0x60, 1);
         std::array<sn::Instruction, 3> stream{instruction(0x94d), instruction(0x3a9), instruction(0x918)};
         field(stream[0], 87, 4, 7);
         for (unsigned n = 0; n < stream.size(); ++n) for (unsigned w = 0; w < 4; ++w) put(code, n * 16 + w * 4, stream[n].words[w]);

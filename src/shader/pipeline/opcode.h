@@ -115,7 +115,10 @@ struct Arity {
     X(vote_all,             1,1, 1,1, subgroup,   subgroup) \
     X(vote_any,             1,1, 1,1, subgroup,   subgroup) \
     X(vote_equal,           1,1, 1,1, subgroup,   subgroup) \
-    X(call,                 0,256,0,256,call,     call)
+    X(subgroup_reduce,      1,1, 1,1, subgroup,   subgroup) \
+    X(call,                 0,256,0,256,call,     call) \
+    X(matrix_multiply_add,  9,9, 2,2, subgroup,   subgroup) \
+    X(matrix_load,          3,3, 1,4, subgroup,   barrier)
 
 enum class Opcode : std::uint16_t {
 #define ARMIGO_ENUM(name, ...) name,
@@ -147,7 +150,17 @@ enum class OperandSchema : std::uint8_t {
     numeric, copy, comparison, select, conversion, bitcast, carry, shift, funnel,
     extract, insert, pack_half, unpack_half, pack_word64, unpack_word64,
     predicate_logic, predicate_to_mask, mask_to_predicate, is_nan,
-    shuffle, ballot, vote, memory, texture, io, call, none
+    shuffle, ballot, vote, memory, texture, io, call, none,
+    // Warp matrix multiply-add 16x8x16 with binary16 sources and
+    // accumulator: the lane id, A (4 words), B (2) and C (2 packed words)
+    // in, D (2 packed words) out. Warp matrix load: the lane id, the lane's
+    // shared-memory row address and the transposed flag (0 or 1) in, one
+    // word per 8x8 block out; it orders shared memory as a barrier does.
+    matrix,
+    // A word reduced across the active subgroup lanes: one word in, the
+    // reduction (SubgroupInfo::reduction, signedness from the numeric mode)
+    // out.
+    reduction
 };
 [[nodiscard]] constexpr OperandSchema operand_schema(Opcode opcode) {
     switch (opcode) {
@@ -173,12 +186,14 @@ enum class OperandSchema : std::uint8_t {
     case Opcode::shuffle: return OperandSchema::shuffle;
     case Opcode::ballot: return OperandSchema::ballot;
     case Opcode::vote_all: case Opcode::vote_any: case Opcode::vote_equal: return OperandSchema::vote;
+    case Opcode::subgroup_reduce: return OperandSchema::reduction;
     case Opcode::load: case Opcode::store: case Opcode::atomic:
     case Opcode::memory_barrier: case Opcode::barrier: return OperandSchema::memory;
     case Opcode::texture_sample: case Opcode::texture_query: case Opcode::image_load:
     case Opcode::image_store: case Opcode::image_atomic: return OperandSchema::texture;
     case Opcode::load_io: case Opcode::store_io: case Opcode::interpolate: return OperandSchema::io;
     case Opcode::call: return OperandSchema::call;
+    case Opcode::matrix_multiply_add: case Opcode::matrix_load: return OperandSchema::matrix;
     case Opcode::discard: case Opcode::count: return OperandSchema::none;
     default: return OperandSchema::numeric;
     }

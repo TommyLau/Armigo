@@ -18,6 +18,8 @@
 #include <armigo/shader/source_version.h>
 #include <armigo/shader/vertex_fetch.h>
 #include <armigo/memory/write_tracker.h>
+#include "../../shader/pipeline/handle_program.h"
+#include "../../shader/pipeline/types.h"
 #include "sha256.h"
 #include "texture_fact.h"
 
@@ -352,8 +354,12 @@ bool identity_less(const pi::Identity& lhs, const pi::Identity& rhs) noexcept {
 }
 
 bool program_header_matches(Stage stage, std::span<const std::byte> bytes) noexcept {
-    // Compute programs carry no SPH header and are matched by digest alone.
-    if (stage == Stage::Compute) return true;
+    // Compute programs carry no SPH header, and API 231 task and mesh
+    // programs (the tessellation stage kinds) carry their own: all are
+    // matched by digest alone.
+    if (stage == Stage::Compute || stage == Stage::TessellationControl ||
+        stage == Stage::TessellationEvaluation)
+        return true;
     std::uint32_t word = 0;
     for (unsigned i = 0; i != 4; ++i) word |= std::uint32_t{std::to_integer<unsigned char>(bytes[i])} << (8 * i);
     return ((word >> shader_input::format::sph_stage_shift) & shader_input::format::sph_stage_mask) ==
@@ -505,12 +511,22 @@ Stage parse_stage(std::string_view value) {
     if (value == "vertex") return Stage::Vertex;
     if (value == "fragment") return Stage::Fragment;
     if (value == "compute") return Stage::Compute;
+    if (value == "task") return Stage::TessellationControl;
+    if (value == "mesh") return Stage::TessellationEvaluation;
     fail(MetalShaderPackageError::Code::Manifest, "Entry stage is unsupported");
 }
 
 const char* stage_name(Stage stage) {
-    return stage == Stage::Vertex ? "vertex" : stage == Stage::Compute ? "compute" : "fragment";
+    return stage == Stage::Vertex ? "vertex" : stage == Stage::Compute ? "compute"
+        : stage == Stage::TessellationControl ? "task" : stage == Stage::TessellationEvaluation ? "mesh" : "fragment";
 }
+
+// API 231 task and mesh stages take the tessellation stage kinds; a mesh
+// stage's outputs and clip position follow a vertex stage's rules.
+bool mesh_launched(Stage stage) {
+    return stage == Stage::TessellationControl || stage == Stage::TessellationEvaluation;
+}
+bool vertex_like(Stage stage) { return stage == Stage::Vertex || stage == Stage::TessellationEvaluation; }
 
 shader::graphics::Interpolation parse_interpolation(std::string_view value) {
     if (value == "constant") return shader::graphics::Interpolation::Constant;
@@ -539,6 +555,13 @@ constexpr std::uint32_t admitted_v2_profile_version = 1;
 // ("fixed-one-v1" or "program-v1"), and the point-coordinate origin constant
 // (index 11) of fragment stages that read the point coordinate.
 constexpr std::uint32_t admitted_v3_profile_version = 3;
+// Stages of API 231 programs are translated at run time by the native front
+// end, whose host policy is its own; only run-time stages may carry it. The
+// disabled pixel-rate profile is requested only by the API 231 driver, which
+// cannot enable pixel-rate shading.
+constexpr std::string_view admitted_native_profile_identity = "armigo-native-metal4";
+constexpr std::string_view admitted_native_disabled_rate_profile_identity = "armigo-native-metal4-vprs-disabled";
+constexpr std::uint32_t admitted_native_profile_version = 3;
 
 bool admitted_v2_dependency(std::string_view kind) {
     return kind == "depth_convention" || kind == "vertex_attribute_format" ||
@@ -710,6 +733,25 @@ std::optional<DerivedTextureFact> legacy_texture_fact(
     return fact;
 }
 
+// Slot 31 names handle program (offset / 4), not a constant buffer. Slots 18
+// through 30 stay outside the constant-buffer range. `elements` is how many
+// consecutive programs the binding needs (one per array element).
+std::uint32_t handle_or_constant_slot(id value, std::string_view field,
+                                      const CompiledGraphicsStage& stage,
+                                      std::uint32_t offset, std::uint32_t elements) {
+    const auto slot = integer(value, field, armigo::shader::pipeline::handle_program_slot);
+    if (slot != armigo::shader::pipeline::handle_program_slot) {
+        if (slot > 17)
+            fail(MetalShaderPackageError::Code::Manifest, std::string(field) + " is outside its range");
+        return slot;
+    }
+    const auto index = offset / 4u;
+    if ((offset & 3u) || !elements ||
+        std::uint64_t{index} + elements > stage.handle_programs.size())
+        reflection_error("Handle program index is outside the stage's programs");
+    return slot;
+}
+
 CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
                                               const Entry& entry,
                                               std::string_view source_version,
@@ -720,10 +762,16 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
     [schema removeObjectForKey:@"depth_bias_mode"];
     [schema removeObjectForKey:@"y_direction"];
     [schema removeObjectForKey:@"point_size"];
+    [schema removeObjectForKey:@"rasterizer_discard"];
     [schema removeObjectForKey:@"point_coord"];
+    // Optional, like draw_support: the writer emits it only when the stage has
+    // programs, so a reflection without it stays valid. Unknown keys still fail.
+    [schema removeObjectForKey:@"handle_programs"];
     if (v3) [schema removeObjectForKey:@"draw_support"];
+    if (v3) [schema removeObjectForKey:@"guest_memory"];
     if (v3) [schema removeObjectForKey:@"vertex_fetch"];
     if (v3) [schema removeObjectForKey:@"compute"];
+    if (v3) [schema removeObjectForKey:@"mesh_launch"];
     if (v3) {
         [schema removeObjectForKey:@"storage_buffers"];
         [schema removeObjectForKey:@"custom_border"];
@@ -746,9 +794,34 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
         integer(root[@"program_size"], "program_size", pi::maximum_program_size) != entry.program_size ||
         text("program_file") != "program.bin" || text("source_file") != "source.metal" ||
         !lower_hex(text("source_digest")) || text("stage") != stage_name(entry.stage) ||
-        (entry.stage == Stage::Compute && !v3))
+        ((entry.stage == Stage::Compute || mesh_launched(entry.stage)) && !v3))
         reflection_error("Reflection identity or fixed fields do not match the manifest");
     CompiledGraphicsStage stage;
+    // Task and mesh stages launch as Metal object and mesh threadgroups of
+    // their control's thread count, within what Metal can launch and output.
+    if ((root[@"mesh_launch"] != nil) != mesh_launched(entry.stage))
+        reflection_error("Mesh launch reflection does not match the stage");
+    if (mesh_launched(entry.stage)) {
+        NSDictionary* launch = object(root[@"mesh_launch"], "mesh_launch");
+        const bool task = entry.stage == Stage::TessellationControl;
+        if (task) exact(launch, {"threads", "payload_bytes"}, "mesh_launch");
+        else exact(launch, {"threads", "payload_bytes", "task", "primitive_vertices", "max_vertices",
+                            "max_primitives"}, "mesh_launch");
+        const auto threads = integer(launch[@"threads"], "mesh launch threads", 1024);
+        if (!threads) reflection_error("Mesh launch threads are at least one");
+        CompiledMeshLaunch result{{static_cast<std::uint32_t>(threads), 1, 1},
+            static_cast<std::uint32_t>(integer(launch[@"payload_bytes"], "mesh launch payload", 16384))};
+        if (task) {
+            stage.task = result;
+        } else {
+            result.launched_by_task = boolean(launch[@"task"], "mesh launch task");
+            const auto vertices = integer(launch[@"primitive_vertices"], "mesh primitive vertices", 3);
+            if (!vertices) reflection_error("Mesh primitives have at least one vertex");
+            integer(launch[@"max_vertices"], "mesh vertices", 256);
+            integer(launch[@"max_primitives"], "mesh primitives", 512);
+            stage.mesh = result;
+        }
+    }
     // Compute stages specialize on their launch: the local size and static
     // shared memory the translator was given must equal the queue meta data.
     if ((root[@"compute"] != nil) != (entry.stage == Stage::Compute))
@@ -784,10 +857,15 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
     }
     if (root[@"point_size"] != nil) {
         const auto mode = text("point_size");
-        if (entry.stage != Stage::Vertex || (mode != "fixed-one-v1" && mode != "program-v1"))
+        if (!vertex_like(entry.stage) || (mode != "fixed-one-v1" && mode != "program-v1"))
             reflection_error("Point-size mode is invalid for this stage");
         stage.writes_point_size = true;
         stage.fixed_point_size = mode == "fixed-one-v1";
+    }
+    if (root[@"rasterizer_discard"] != nil) {
+        if (entry.stage != Stage::Vertex || text("rasterizer_discard") != "required-v1")
+            reflection_error("Rasterizer-discard requirement is invalid for this stage");
+        stage.requires_rasterizer_discard = true;
     }
     if (root[@"point_coord"] != nil) {
         if (entry.stage != Stage::Fragment || text("point_coord") != "attribute-v1")
@@ -798,6 +876,8 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
     stage.entry_point = text("entry_point");
     if (stage.entry_point != (entry.stage == Stage::Vertex ? "armigo_vertex_main"
                               : entry.stage == Stage::Compute ? "armigo_compute_main"
+                              : entry.stage == Stage::TessellationControl ? "armigo_object_main"
+                              : entry.stage == Stage::TessellationEvaluation ? "armigo_mesh_main"
                                                               : "armigo_fragment_main"))
         reflection_error("Reflection entry point is unsupported");
     const auto depth = text("vertex_depth");
@@ -813,9 +893,14 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
         reflection_error("Reflection C1 digest is invalid");
     NSDictionary* profile = object(root[@"profile"], "profile");
     exact(profile, {"identity","version"}, "profile");
-    if (string(profile[@"identity"], "profile identity") != admitted_v2_profile_identity ||
-        integer(profile[@"version"], "profile version", 0xffffffff) !=
-            (v3 ? admitted_v3_profile_version : admitted_v2_profile_version))
+    const auto profile_identity = string(profile[@"identity"], "profile identity");
+    const auto profile_version = integer(profile[@"version"], "profile version", 0xffffffff);
+    const bool native_profile = v3 && entry.variant == "runtime" &&
+        (profile_identity == admitted_native_profile_identity ||
+         profile_identity == admitted_native_disabled_rate_profile_identity) &&
+        profile_version == admitted_native_profile_version;
+    if (!native_profile && (profile_identity != admitted_v2_profile_identity ||
+        profile_version != (v3 ? admitted_v3_profile_version : admitted_v2_profile_version)))
         reflection_error("Reflection host profile is outside the admitted runtime subset");
 
     std::set<unsigned> slots, attributes, guests, metals;
@@ -887,7 +972,7 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
         NSDictionary* border = object(root[@"custom_border"], "custom_border");
         exact(border, {"abi", "buffer_index", "pairs"}, "custom_border");
         const auto index = integer(border[@"buffer_index"], "buffer_index", 30);
-        if ((entry.stage != Stage::Fragment && entry.stage != Stage::Vertex) ||
+        if ((entry.stage != Stage::Fragment && entry.stage != Stage::Vertex && !mesh_launched(entry.stage)) ||
             string(border[@"abi"], "abi") != "coverage-v1" ||
             !metals.insert(index).second)
             reflection_error("Custom border support ABI or buffer index is invalid");
@@ -911,14 +996,33 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
         exact(support, {"schema","version","byte_extent","alignment","metal_buffer_index"},
               "draw_support");
         const auto index = integer(support[@"metal_buffer_index"], "draw support index", 30);
-        if (entry.stage != Stage::Vertex ||
+        // Version 1 (first instance) serves a vertex stage; version 2 adds the
+        // render-target height and serves a fragment stage.
+        const bool fragment = entry.stage == Stage::Fragment;
+        if ((entry.stage != Stage::Vertex && !mesh_launched(entry.stage) && !fragment) ||
             string(support[@"schema"], "draw support schema") != "armigo-draw-parameters" ||
-            integer(support[@"version"], "draw support version", 1) != 1 ||
-            integer(support[@"byte_extent"], "draw support extent", 4) != 4 ||
+            integer(support[@"version"], "draw support version", 2) != (fragment ? 2u : 1u) ||
+            integer(support[@"byte_extent"], "draw support extent", 8) != (fragment ? 8u : 4u) ||
             integer(support[@"alignment"], "draw support alignment", 4) != 4 ||
             !metals.insert(index).second)
             reflection_error("Draw-parameter support reflection is invalid");
         stage.draw_support_buffer_index = static_cast<std::uint8_t>(index);
+    }
+    if (v3 && root[@"guest_memory"] != nil) {
+        NSDictionary* table = object(root[@"guest_memory"], "guest_memory");
+        exact(table, {"schema","version","byte_extent","alignment","metal_buffer_index","tag","writes"}, "guest_memory");
+        const auto index = integer(table[@"metal_buffer_index"], "guest memory index", 30);
+        // armigo-guest-memory v3: an eight-word header, 8,192 pool entries and
+        // the 1,024-byte write log.
+        if (string(table[@"schema"], "guest memory schema") != "armigo-guest-memory" ||
+            integer(table[@"version"], "guest memory version", 3) != 3 ||
+            integer(table[@"byte_extent"], "guest memory extent", 263200) != 263200 ||
+            integer(table[@"alignment"], "guest memory alignment", 8) != 8 ||
+            !metals.insert(index).second)
+            reflection_error("Guest-memory window table reflection is invalid");
+        stage.guest_memory = CompiledGuestMemory{static_cast<std::uint8_t>(index),
+            static_cast<std::uint32_t>(integer(table[@"tag"], "guest memory tag", 0xffffffffu)),
+            boolean(table[@"writes"], "guest memory writes")};
     }
     if (v3 && root[@"vertex_fetch"] != nil) {
         NSDictionary* fetch = object(root[@"vertex_fetch"], "vertex_fetch");
@@ -950,6 +1054,19 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
             1, static_cast<std::uint8_t>(buffer), extent, 8};
     } else if (v3 && root[@"argument_buffer"] == nil) {
         reflection_error("Argument-buffer layout is required");
+    }
+    if (root[@"handle_programs"] != nil) {
+        constexpr auto program_limit = armigo::shader::pipeline::Limits{}.resources;
+        NSArray* programs = array(root[@"handle_programs"], "handle_programs", program_limit);
+        stage.handle_programs.reserve(programs.count);
+        for (id raw in programs) {
+            NSArray* words = array(raw, "handle program", program_limit);
+            std::vector<std::uint32_t> code;
+            code.reserve(words.count);
+            for (id word in words)
+                code.push_back(integer(word, "handle program word", 0xffffffffu));
+            stage.handle_programs.push_back(std::move(code));
+        }
     }
     // Bound resources name the handle words they were proven from. V3 retains
     // each texture and sampler independently; older schemas require paired
@@ -983,8 +1100,8 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
                       "location"}, "texture entry");
             const auto resource_id = integer(item[@"resource_id"], "resource_id", 0xffffffffu);
             const auto length = integer(item[@"array_length"], "array_length", 0xffffffffu);
-            const auto slot = integer(item[@"cbuf_slot"], "cbuf_slot", 17);
             const auto offset = integer(item[@"handle_byte_offset"], "handle_byte_offset", 65532);
+            const auto slot = handle_or_constant_slot(item[@"cbuf_slot"], "cbuf_slot", stage, offset, length);
             const auto provenance_end = static_cast<std::uint64_t>(offset) +
                                         static_cast<std::uint64_t>(length) * 4;
             if (!resource_ids.insert(resource_id).second || !length ||
@@ -1130,8 +1247,8 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
             : std::initializer_list<const char*>{"cbuf_slot", "handle_byte_offset", "kind",
                   "comparison", "normalized_coordinates", "sampler_index"},
             "texture entry");
-        const auto slot = integer(item[@"cbuf_slot"], "cbuf_slot", 17);
         const auto offset = integer(item[@"handle_byte_offset"], "handle_byte_offset", 32764);
+        const auto slot = handle_or_constant_slot(item[@"cbuf_slot"], "cbuf_slot", stage, offset, 1);
         auto& metal_indices = is_texture ? texture_indices : sampler_indices;
         if (offset & 3u || !metal_indices.emplace(offset, 0).second)
             reflection_error("Texture reflection is invalid");
@@ -1316,22 +1433,26 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
             string(item[@"origin"], "dependency origin") != "derived")
             reflection_error("Dependency origin is unsupported");
         if (!admitted_v2_dependency(kind) && !(v3 && kind == "texture_array_length") &&
-            !(entry.stage == Stage::Compute &&
+            !((entry.stage == Stage::Compute || mesh_launched(entry.stage)) &&
               (kind == "compute_local_size" || kind == "compute_shared_memory_bytes")))
             reflection_error("Consumed fact " + kind + " is outside the admitted runtime subset");
+        // A task or mesh stage's body is compute code: its local size is its
+        // launch's threads, and its stage memory is static in the function.
+        const auto* mesh_launch = stage.task ? &*stage.task : stage.mesh ? &*stage.mesh : nullptr;
         if (kind == "compute_local_size") {
             NSArray* value = array(item[@"value"], "compute_local_size value", 3);
             if (value.count != 3) reflection_error("Compute local size dependency is invalid");
+            const auto& expected = mesh_launch ? mesh_launch->local_size : stage.compute_local_size;
             for (unsigned axis = 0; axis < 3; ++axis)
-                if (integer(value[axis], "compute_local_size value", 1024) != stage.compute_local_size[axis])
+                if (integer(value[axis], "compute_local_size value", 1024) != expected[axis])
                     reflection_error("Compute local size dependency disagrees with the launch reflection");
         }
-        if (kind == "compute_shared_memory_bytes" &&
+        if (kind == "compute_shared_memory_bytes" && !mesh_launch &&
             integer(item[@"value"], "compute_shared_memory_bytes value", 49152) !=
                 stage.compute_shared_memory_bytes)
             reflection_error("Compute shared memory dependency disagrees with the launch reflection");
         if (kind == "depth_convention") {
-            if (entry.stage != Stage::Vertex || stage.vertex_depth == gm::VertexDepthConvention::Unspecified)
+            if (!vertex_like(entry.stage) || stage.vertex_depth == gm::VertexDepthConvention::Unspecified)
                 reflection_error("Depth dependency requires a vertex stage with an explicit convention");
         }
         if (kind == "vertex_attribute_format" &&
@@ -1388,8 +1509,8 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
             exact(value, {"dimension","array","multisample","scalar","component_format",
                           "normalized_coordinates","comparison"},
                   "texture_descriptor value");
-            const auto slot = integer(item[@"index"], "dependency index", 17);
             const auto offset = integer(item[@"byte_offset"], "dependency byte_offset", v3 ? 65532 : 32764);
+            const auto slot = handle_or_constant_slot(item[@"index"], "dependency index", stage, offset, 1);
             if (offset & 3u || !recorded_fact_offsets.emplace(slot, offset).second)
                 reflection_error("Texture descriptor dependency is invalid");
             // The fact must name a reflected bound handle at its recorded slot
@@ -1442,9 +1563,12 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
     // handles resolve through it, so it must match the reflected provenance.
     if (!v3 && proven_slot && recorded_handle_slot && *recorded_handle_slot != *proven_slot)
         reflection_error("Texture provenance differs from the consumed texture_handle_cbuf fact");
-    if (!v3 && (recorded_handle_slot || proven_slot))
-        stage.texture_handle_cbuf =
-            static_cast<std::uint8_t>(recorded_handle_slot ? *recorded_handle_slot : *proven_slot);
+    if (!v3 && (recorded_handle_slot || proven_slot)) {
+        const auto selected = recorded_handle_slot ? *recorded_handle_slot : *proven_slot;
+        // Slot 31 names a handle program, not the selector register's buffer.
+        if (selected != armigo::shader::pipeline::handle_program_slot)
+            stage.texture_handle_cbuf = static_cast<std::uint8_t>(selected);
+    }
     if (v3) {
         // Independent resource provenance does not erase a consumed selector fact.
         if (recorded_handle_slot)
@@ -1465,21 +1589,52 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
             stage.writes_fragment_depth || stage.writes_sample_mask ||
             stage.custom_border || stage.draw_support_buffer_index || stage.vertex_fetch_buffer_index)
             reflection_error("Compute reflection is outside the supported profile");
+    } else if (entry.stage == Stage::TessellationControl) {
+        // A task stage has no graphics interface; it may read its first
+        // workgroup from the draw-parameter record.
+        if (stage.vertex_depth != gm::VertexDepthConvention::Unspecified ||
+            stage.fragment_position != gm::FragmentPositionConvention::Unspecified ||
+            !stage.vertex_attributes.empty() || !stage.vertex_class_inputs.empty() ||
+            stage.interface.position_input_mask || stage.interface.position_output_mask ||
+            stage.interface.color_output_mask || !stage.color_outputs.empty() ||
+            !stage.interface.generic_inputs.empty() || !stage.interface.generic_outputs.empty() ||
+            stage.writes_fragment_depth || stage.writes_sample_mask || stage.vertex_fetch_buffer_index)
+            reflection_error("Task reflection is outside the supported profile");
+    } else if (entry.stage == Stage::TessellationEvaluation) {
+        // A mesh stage writes clip positions as a vertex stage does and reads
+        // no vertex input. Its outputs leave through its mesh output struct,
+        // which the interface record does not describe.
+        if (stage.vertex_depth == gm::VertexDepthConvention::Unspecified ||
+            (stage.interface.position_output_mask & ~15u) ||
+            stage.fragment_position != gm::FragmentPositionConvention::Unspecified ||
+            stage.interface.position_input_mask || stage.interface.color_output_mask ||
+            !stage.color_outputs.empty() || stage.writes_fragment_depth || stage.writes_sample_mask ||
+            !stage.vertex_attributes.empty() || !stage.vertex_class_inputs.empty() ||
+            !stage.interface.generic_inputs.empty() || stage.vertex_fetch_buffer_index)
+            reflection_error("Mesh reflection is outside the supported profile");
     } else if (entry.stage == Stage::Vertex) {
         // Vertex stages admit the same texture provenance facts as fragment
         // stages: the draw backend resolves and verifies both stages through
         // one binding path. Generic input and output interpolation is drawn
         // from the translation and matched at link time, so every parsed
-        // interpolation is admissible here.
-        if (stage.vertex_depth == gm::VertexDepthConvention::Unspecified ||
+        // interpolation is admissible here. A position output may declare
+        // only some components; the translation gives the rest the hardware
+        // default (0, 0, 0, 1). A stage that requires rasterizer discard
+        // writes no output at all, so it carries neither a position nor a
+        // clip-depth dependency.
+        const bool discard = stage.requires_rasterizer_discard;
+        if ((discard ? stage.interface.position_output_mask || !stage.interface.generic_outputs.empty() ||
+                           stage.writes_point_size
+                     : stage.vertex_depth == gm::VertexDepthConvention::Unspecified ||
+                           !stage.interface.position_output_mask || (stage.interface.position_output_mask & ~15u) ||
+                           dependencies == 0) ||
             stage.fragment_position != gm::FragmentPositionConvention::Unspecified ||
-            stage.interface.position_input_mask || stage.interface.position_output_mask != 15 ||
+            stage.interface.position_input_mask ||
             stage.interface.color_output_mask || !stage.color_outputs.empty() ||
             stage.writes_fragment_depth || stage.writes_sample_mask ||
             (!stage.vertex_class_inputs.empty() && !stage.vertex_attributes.empty()) ||
             (stage.vertex_class_inputs.empty() &&
-             stage.interface.generic_inputs.size() != stage.vertex_attributes.size()) ||
-            dependencies == 0)
+             stage.interface.generic_inputs.size() != stage.vertex_attributes.size()))
             reflection_error("Vertex reflection is outside the supported profile");
         if (!stage.vertex_class_inputs.empty()) {
             if (stage.interface.generic_inputs.size() != stage.vertex_class_inputs.size())
@@ -1662,7 +1817,8 @@ CompiledGraphicsStage parse_reflection(std::span<const std::byte> bytes, const E
 }
 
 std::string identity_key(Stage stage, const Digest& digest_value, std::size_t size) {
-    const char* prefix = stage == Stage::Vertex ? "v:" : stage == Stage::Compute ? "c:" : "f:";
+    const char* prefix = stage == Stage::Vertex ? "v:" : stage == Stage::Compute ? "c:"
+        : stage == Stage::TessellationControl ? "t:" : stage == Stage::TessellationEvaluation ? "m:" : "f:";
     return std::string(prefix) + hex(digest_value) + ':' + std::to_string(size);
 }
 
@@ -1671,7 +1827,7 @@ std::string identity_key(Stage stage, const Digest& digest_value, std::size_t si
 // valid when the shader source version changes the package variant IDs.
 std::string stage_identity_text(const Entry& entry) {
     std::string text = std::to_string(static_cast<unsigned>(entry.stage)) + '.' + hex(entry.full) + '.';
-    if (entry.stage == Stage::Vertex)
+    if (vertex_like(entry.stage))
         text += std::to_string(static_cast<unsigned>(entry.metadata.vertex_depth));
     else if (entry.stage == Stage::Compute)
         text += std::to_string(entry.metadata.compute_local_size[0]) + 'x' +
@@ -1853,6 +2009,7 @@ struct MetalShaderPackage::Impl {
     bool by_digest_built = false;
     std::string chain;
     std::string content;
+    bool hoists_implicit_samples = false;
     // Lazy packages parse an entry's reflection on first use, so opening does
     // not touch the stage directories of stages the title never draws with.
     // prepared[i] is published with release once entry i has its metadata,
@@ -2505,7 +2662,12 @@ MetalShaderPackage::OpenResult MetalShaderPackage::open(const fs::path& director
         auto manifest_bytes = read_file(package_file(root, root, "manifest.json"),
                                         manifest_limit, "package manifest");
         const auto manifest_digest = hex(digest(manifest_bytes));
-        NSDictionary* manifest = object(json(manifest_bytes, "package manifest"), "package manifest");
+        NSDictionary* manifest_object = object(json(manifest_bytes, "package manifest"), "package manifest");
+        NSMutableDictionary* manifest = [manifest_object mutableCopy];
+        // Optional. Present only when the package recorded sample hoisting.
+        // Removing it before exact keeps any other unknown key a manifest failure.
+        id sample_hoisting = manifest[@"sample_hoisting"];
+        [manifest removeObjectForKey:@"sample_hoisting"];
         exact(manifest, {"schema","source_version","chain_id","platform","profile_text",
                          "complete_inventory","runnable","entries"}, "package manifest");
         const auto source = string(manifest[@"source_version"], "source_version");
@@ -2545,6 +2707,14 @@ MetalShaderPackage::OpenResult MetalShaderPackage::open(const fs::path& director
             string(profile[@"platform"], "profile platform") != platform)
             fail(MetalShaderPackageError::Code::Compatibility,
                  "Profile text is noncanonical or disagrees with package compatibility fields");
+        bool hoists_implicit_samples = false;
+        if (sample_hoisting) {
+            NSString* text = [sample_hoisting isKindOfClass:[NSString class]] ? (NSString*)sample_hoisting : nil;
+            if (text == nil || ![text isEqualToString:@"implicit"])
+                fail(MetalShaderPackageError::Code::Compatibility,
+                     "Package sample hoisting is unsupported");
+            hoists_implicit_samples = true;
+        }
         std::string chain_input = "armigo-metal-chain-v1\n" + profile_text;
         if (hex(digest(std::as_bytes(std::span(chain_input.data(), chain_input.size())))) != chain)
             fail(MetalShaderPackageError::Code::Integrity,
@@ -2681,6 +2851,7 @@ MetalShaderPackage::OpenResult MetalShaderPackage::open(const fs::path& director
         auto impl = std::make_unique<Impl>(root, std::move(entries), std::move(index), std::move(mapped));
         impl->chain = chain;
         impl->content = manifest_digest;
+        impl->hoists_implicit_samples = hoists_implicit_samples;
         impl->source = source;
         impl->defer_unsupported = options.defer_unsupported_entries;
         impl->prepared = std::make_unique<std::atomic<bool>[]>(impl->entries.size());
@@ -2769,7 +2940,9 @@ std::shared_ptr<const CompiledGraphicsStage> MetalShaderPackage::stage_by_identi
 }
 
 const std::string& MetalShaderPackage::chain_id() const noexcept { return impl_->chain; }
+bool MetalShaderPackage::hoists_implicit_samples() const noexcept { return impl_->hoists_implicit_samples; }
 const std::string& MetalShaderPackage::content_id() const noexcept { return impl_->content; }
+const std::filesystem::path& MetalShaderPackage::directory() const noexcept { return impl_->root; }
 
 CompiledComputeStageResult MetalShaderPackage::lookup_stage_at(
     Stage stage, std::uint64_t program,

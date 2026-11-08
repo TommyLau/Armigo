@@ -782,9 +782,11 @@ void single_register_loads_and_stores() {
     }
     EXPECT_STATUS(ls_unsigned(2, 0, 3, 1, 7, 5), reserved);
     EXPECT_STATUS(ls_unsigned(3, 0, 3, 1, 7, 5), reserved);
-    // Atomic memory operations and pointer-authenticated loads share the
-    // class space but are not decoded.
-    EXPECT_STATUS(ls_register(3, 0, 0, 9, 0, 0, 7, 5) & ~0x800u, unknown);  // LDADD
+    // Atomic memory operations share the class space (see
+    // atomic_memory_and_compare_and_swap); pointer-authenticated loads are
+    // not decoded.
+    CHECK(decode_register_effects(ls_register(3, 0, 0, 9, 0, 0, 7, 5) & ~0x800u).operation ==
+          Operation::ldadd);
     EXPECT_STATUS(0xF8200425u, unknown);  // LDRAA x5, [x1]
 }
 
@@ -1198,6 +1200,115 @@ void register_pairs() {
     EXPECT_STATUS(ls_pair(3, 1, 2, 1, 1, 11, 7, 5), unknown);
 }
 
+// Atomic memory operations (FEAT_LSE): size 111 V=0 00 A R 1 Rs o3 opc 00 Rn Rt.
+std::uint32_t atomic(unsigned size, unsigned a, unsigned r, unsigned rs, unsigned o3, unsigned opc,
+                     unsigned rn, unsigned rt) {
+    return size << 30 | 0b111u << 27 | a << 23 | r << 22 | 1u << 21 | rs << 16 | o3 << 15 | opc << 12 |
+           rn << 5 | rt;
+}
+
+void atomic_memory_and_compare_and_swap() {
+    // Words produced by the system assembler from the quoted mnemonics.
+    CHECK_EQ(atomic(2, 0, 0, 14, 0, 0, 18, 18), 0xB82E0252u);  // ldadd w14, w18, [x18]
+    CHECK_EQ(atomic(3, 1, 1, 2, 0, 0, 3, 18), 0xF8E20072u);    // ldaddal x2, x18, [x3]
+    CHECK_EQ(atomic(2, 1, 0, 2, 1, 0, 31, 18), 0xB8A283F2u);   // swpa w2, w18, [sp]
+    CHECK_EQ(atomic(3, 1, 0, 31, 1, 4, 3, 18), 0xF8BFC072u);   // ldapr x18, [x3]
+    CHECK_EQ(atomic(3, 0, 0, 18, 0, 0, 3, 31), 0xF832007Fu);   // stadd x18, [x3]
+
+    static constexpr Operation operations[] = {Operation::ldadd, Operation::ldclr, Operation::ldeor,
+                                               Operation::ldset, Operation::ldsmax, Operation::ldsmin,
+                                               Operation::ldumax, Operation::ldumin};
+    for (unsigned size = 0; size < 4; ++size) {
+        const auto bits = static_cast<std::uint8_t>(size == 3 ? 64 : 32);
+        for (unsigned opc = 0; opc < 8; ++opc) {
+            for (unsigned ordering = 0; ordering < 4; ++ordering) {
+                const unsigned a = ordering >> 1, r = ordering & 1;
+                auto e = EXPECT_EFFECTS(atomic(size, a, r, 9, 0, opc, 7, 5), operations[opc],
+                                        Op{16, 9, ZR, bits, R, Role::source},
+                                        Op{0, 5, ZR, bits, W, Role::transfer},
+                                        Op{5, 7, SP, 64, R, Role::base});
+                CHECK(e.memory.operation == MemoryOperation::atomic);
+                CHECK(e.memory.addressing == AddressingMode::base_register);
+                CHECK_EQ(e.memory.element_bytes, 1u << size);
+                CHECK_EQ(e.memory.elements, 1);
+                CHECK_EQ(has(e.memory.attributes, MemoryAttribute::acquire), a == 1);
+                CHECK_EQ(has(e.memory.attributes, MemoryAttribute::release), r == 1);
+                CHECK(!has(e.memory.attributes, MemoryAttribute::exclusive));
+                CHECK(!proven_free_of(e, 5) && proven_free_of(e, 8));
+            }
+        }
+        EXPECT_EFFECTS(atomic(size, 1, 1, 9, 1, 0, 6, 4), Operation::swp,
+                       Op{16, 9, ZR, bits, R, Role::source}, Op{0, 4, ZR, bits, W, Role::transfer},
+                       Op{5, 6, SP, 64, R, Role::base});
+        // ST<op> aliases: the loaded value goes to the zero register.
+        EXPECT_EFFECTS(atomic(size, 0, 1, 9, 0, 3, 3, 31), Operation::ldset,
+                       Op{16, 9, ZR, bits, R, Role::source}, Op{0, 31, ZR, bits, W, Role::transfer},
+                       Op{5, 3, SP, 64, R, Role::base});
+        // LDAPR: Rs = 31, A = 1, R = 0; other values are not LDAPR.
+        auto e = EXPECT_EFFECTS(atomic(size, 1, 0, 31, 1, 4, 3, 5), Operation::ldapr,
+                                Op{0, 5, ZR, bits, W, Role::transfer}, Op{5, 3, SP, 64, R, Role::base});
+        CHECK(e.memory.operation == MemoryOperation::load);
+        EXPECT_STATUS(atomic(size, 1, 0, 18, 1, 4, 3, 5), unknown);
+        EXPECT_STATUS(atomic(size, 0, 0, 31, 1, 4, 3, 5), unknown);
+    }
+    // SP base, and the LD64B family stays unknown.
+    auto e = decode_register_effects(0xB8A283F2u);
+    CHECK(e.decoded() && has(e.notes, EffectNote::stack_pointer_base));
+    EXPECT_STATUS(0xF83FD052u, unknown);  // ld64b x18, [x2]
+
+    // CAS: Rs is compared and receives the old value; Rt is stored.
+    CHECK_EQ(exclusive(3, 1, 1, 1, 18, 1, 31, 3, 2), 0xC8F2FC62u);  // casal x18, x2, [x3]
+    for (unsigned size = 0; size < 4; ++size) {
+        const auto bits = static_cast<std::uint8_t>(size == 3 ? 64 : 32);
+        for (unsigned ordering = 0; ordering < 4; ++ordering) {
+            const unsigned l = ordering >> 1, o0 = ordering & 1;
+            e = EXPECT_EFFECTS(exclusive(size, 1, l, 1, 9, o0, 31, 7, 2), Operation::cas,
+                               Op{16, 9, ZR, bits, RW, Role::transfer}, Op{0, 2, ZR, bits, R, Role::transfer},
+                               Op{5, 7, SP, 64, R, Role::base});
+            CHECK(e.memory.operation == MemoryOperation::atomic && e.memory.element_bytes == 1u << size);
+            CHECK_EQ(has(e.memory.attributes, MemoryAttribute::acquire), l == 1);
+            CHECK_EQ(has(e.memory.attributes, MemoryAttribute::release), o0 == 1);
+        }
+        e = decode_register_effects(exclusive(size, 1, 0, 1, 18, 0, 5, 7, 2));
+        CHECK(e.status == EffectStatus::unpredictable && has(e.notes, EffectNote::should_be_one_field));
+    }
+
+    // CASP: even Rs and Rt; the odd registers of each pair are implicit.
+    CHECK_EQ(exclusive(1, 0, 0, 1, 18, 0, 31, 4, 2), 0x48327C82u);  // casp x18, x19, x2, x3, [x4]
+    CHECK_EQ(exclusive(0, 0, 0, 1, 2, 1, 31, 4, 18), 0x0822FC92u);  // caspl w2, w3, w18, w19, [x4]
+    for (unsigned sz = 0; sz < 2; ++sz) {
+        const auto bits = static_cast<std::uint8_t>(sz ? 64 : 32);
+        // Checked directly: the shared helper's register-31 probe does not
+        // apply to pair registers, which must be even.
+        e = decode_register_effects(exclusive(sz, 0, 1, 1, 8, 1, 31, 4, 2));
+        const Op pair_operands[] = {Op{16, 8, ZR, bits, RW, Role::transfer},
+                                    Op{implicit_operand, 9, ZR, bits, RW, Role::transfer},
+                                    Op{0, 2, ZR, bits, R, Role::transfer},
+                                    Op{implicit_operand, 3, ZR, bits, R, Role::transfer},
+                                    Op{5, 4, SP, 64, R, Role::base}};
+        CHECK(e.decoded() && e.operation == Operation::casp && e.operand_count == std::size(pair_operands));
+        for (std::size_t i = 0; i < std::size(pair_operands) && i < e.operand_count; ++i)
+            CHECK(same_operand(e.operands[i], pair_operands[i]));
+        CHECK_EQ(e.reads, register_bit(8) | register_bit(9) | register_bit(2) | register_bit(3) | register_bit(4));
+        CHECK_EQ(e.writes, register_bit(8) | register_bit(9));
+        CHECK(e.memory.operation == MemoryOperation::atomic && e.memory.elements == 2 &&
+              e.memory.element_bytes == bits / 8);
+        CHECK(has(e.memory.attributes, MemoryAttribute::acquire) &&
+              has(e.memory.attributes, MemoryAttribute::release));
+        CHECK(!proven_free_of(e, 9) && !register_fields(e, 9).has_value());
+        // A pair at x18 has guest x19 as its implicit second register.
+        const auto pair18 = decode_register_effects(exclusive(sz, 0, 1, 1, 18, 1, 31, 4, 2));
+        // A pair field cannot be renamed alone: it also names the implicit
+        // partner. The base field can.
+        CHECK(pair18.decoded() && !proven_free_of(pair18, 19) && !register_fields(pair18, 19).has_value() &&
+              !register_fields(pair18, 18).has_value());
+        CHECK(register_fields(decode_register_effects(exclusive(sz, 0, 1, 1, 8, 1, 31, 18, 2)), 18) ==
+              std::optional<std::uint32_t>{std::uint32_t{0x1F} << 5});
+        EXPECT_STATUS(exclusive(sz, 0, 0, 1, 17, 0, 31, 4, 2), reserved);  // odd Rs
+        EXPECT_STATUS(exclusive(sz, 0, 0, 1, 2, 0, 31, 4, 19), reserved);  // odd Rt
+    }
+}
+
 void exclusive_and_ordered() {
     const auto exclusive_attribute = static_cast<MemoryAttributes>(MemoryAttribute::exclusive);
     const auto acquire = static_cast<MemoryAttributes>(MemoryAttribute::acquire);
@@ -1305,8 +1416,9 @@ void exclusive_and_ordered() {
         CHECK(!proven_free_of(e, 18) && !proven_free_of(e, 3));
     }
 
-    EXPECT_STATUS(exclusive(3, 1, 0, 1, 1, 0, 31, 3, 2), unknown);  // CAS
-    EXPECT_STATUS(exclusive(1, 0, 0, 1, 0, 0, 31, 4, 2), unknown);  // CASP
+    // CAS and CASP: see atomic_memory_and_compare_and_swap.
+    CHECK(decode_register_effects(exclusive(3, 1, 0, 1, 1, 0, 31, 3, 2)).operation == Operation::cas);
+    CHECK(decode_register_effects(exclusive(1, 0, 0, 1, 0, 0, 31, 4, 2)).operation == Operation::casp);
     EXPECT_STATUS(exclusive(3, 1, 1, 0, 31, 0, 31, 2, 1), unknown); // LDLAR
     EXPECT_STATUS(exclusive(3, 1, 0, 0, 31, 0, 31, 2, 1), unknown); // STLLR
 }
@@ -1498,6 +1610,12 @@ void random_word_properties() {
             for (unsigned value : {0u, 18u, 30u, 31u}) {
                 const auto changed =
                     decode_register_effects(with_field(word, operand.field, value));
+                // CASP pairs start at an even register; an odd Rs or Rt,
+                // including 31, is UNDEFINED.
+                if (e.operation == Operation::casp && (value & 1) && operand.role == Role::transfer) {
+                    CHECK(changed.status == EffectStatus::reserved);
+                    continue;
+                }
                 // Structure post-index Rm=31 selects an immediate increment,
                 // rather than a zero-register operand. Substitution never emits 31.
                 if (value == 31 && operand.role == Role::index &&
@@ -1989,6 +2107,7 @@ int main() {
     writeback_hazards();
     register_pairs();
     exclusive_and_ordered();
+    atomic_memory_and_compare_and_swap();
     simd_vector_groups();
     scalar_simd_fp_groups();
     simd_coverage_properties();

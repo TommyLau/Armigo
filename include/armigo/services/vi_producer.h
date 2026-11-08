@@ -49,6 +49,9 @@ public:
         std::function<bool(std::uint64_t)> wait_fence,
         std::array<std::int32_t, 4> crop, int interval) = 0;
     virtual std::shared_ptr<horizon::Event> free_event() const = 0;
+    // Dequeues only the first count registered textures from now on (NVN
+    // window active textures); false when unsupported or out of range.
+    virtual bool set_active_textures(std::size_t count) { (void)count; return false; }
     // Host pacing period for scheduling graphics workers. This query does not
     // wait, advance presentation, or alter guest-visible refresh events.
     virtual std::chrono::nanoseconds scheduling_period(int) const { return {}; }
@@ -59,5 +62,12 @@ public:
 
 std::shared_ptr<NativeWindowProducer> find_native_window(void* native_window);
 void unbind_native_window(void* native_window);
+
+// Called on the guest's thread at the start of every present through a native
+// window producer, before the frame is queued: a test driver that steps input
+// with the guest's own frames. An empty function clears it.
+void set_guest_present_observer(std::function<void()> observer);
+// Runs the observer, if any (the producer's present calls it).
+void notify_guest_present();
 
 }  // namespace armigo::services::vi

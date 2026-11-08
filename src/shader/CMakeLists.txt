@@ -156,6 +156,7 @@ add_library(armigo_shader_pipeline STATIC
     pipeline/validation.cpp
     pipeline/decoder.h
     pipeline/resources.h
+    pipeline/handle_program.h
     pipeline/structured.h
     pipeline/emitter_context.h
     pipeline/phases.h
@@ -555,6 +556,8 @@ target_sources(armigo_shader_pipeline PRIVATE
     pipeline/msl/stage_internal.h
     pipeline/msl/custom_border.h
     pipeline/msl/stage_emit.cpp
+    pipeline/msl/matrix_plan.h
+    pipeline/msl/matrix_plan.cpp
     pipeline/msl/resources_declarations.cpp
     pipeline/msl/resources_memory.cpp
     pipeline/msl/resources_texture.cpp
@@ -617,7 +620,8 @@ target_sources(armigo_shader_pipeline PRIVATE
     pipeline/passes/internal.h
     pipeline/passes/folding.cpp
     pipeline/passes/cleanup.cpp
-    pipeline/passes/nontexture.cpp)
+    pipeline/passes/nontexture.cpp
+    pipeline/passes/hoist.cpp)
 if(BUILD_TESTING)
     add_executable(armigo_pipeline_passes_tests
         "${ARMIGO_SHADER_TEST_DIR}/pipeline/passes_tests.cpp")
@@ -722,6 +726,11 @@ if(BUILD_TESTING)
     target_link_libraries(armigo_pipeline_bindless_tests PRIVATE armigo_shader_pipeline)
     add_test(NAME shader.pipeline_bindless COMMAND armigo_pipeline_bindless_tests)
     set_tests_properties(shader.pipeline_bindless PROPERTIES LABELS "shader" TIMEOUT 30)
+    add_executable(armigo_pipeline_guarded_sample_tests
+        "${ARMIGO_SHADER_TEST_DIR}/pipeline/guarded_sample_tests.cpp")
+    target_link_libraries(armigo_pipeline_guarded_sample_tests PRIVATE armigo_shader_pipeline)
+    add_test(NAME shader.pipeline_guarded_sample COMMAND armigo_pipeline_guarded_sample_tests)
+    set_tests_properties(shader.pipeline_guarded_sample PROPERTIES LABELS "shader" TIMEOUT 30)
 endif()
 
 target_sources(armigo_shader_pipeline PRIVATE pipeline/ssa/guard_paths.cpp)
@@ -903,6 +912,21 @@ if(BUILD_TESTING AND APPLE AND ARMIGO_ENABLE_GPU_TESTS)
     set_tests_properties(shader.pipeline_local_memory_gpu PROPERTIES LABELS "gpu;metal4;shader" TIMEOUT 60)
 endif()
 
+# Predicated filtered samples hoisted out of their guard, and a predicated
+# texel fetch that stays inside it, executed on Metal 4.
+if(BUILD_TESTING AND APPLE AND ARMIGO_ENABLE_GPU_TESTS)
+    find_library(ARMIGO_FOUNDATION_FRAMEWORK Foundation REQUIRED)
+    find_library(ARMIGO_METAL_FRAMEWORK Metal REQUIRED)
+    add_executable(armigo_pipeline_guarded_sample_gpu_tests
+        "${ARMIGO_SHADER_TEST_DIR}/pipeline/guarded_sample_gpu.mm")
+    target_compile_options(armigo_pipeline_guarded_sample_gpu_tests PRIVATE -fobjc-arc)
+    target_include_directories(armigo_pipeline_guarded_sample_gpu_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(armigo_pipeline_guarded_sample_gpu_tests PRIVATE armigo_shader_pipeline
+        "${ARMIGO_FOUNDATION_FRAMEWORK}" "${ARMIGO_METAL_FRAMEWORK}")
+    add_test(NAME shader.pipeline_guarded_sample_gpu COMMAND armigo_pipeline_guarded_sample_gpu_tests)
+    set_tests_properties(shader.pipeline_guarded_sample_gpu PROPERTIES LABELS "gpu;metal4;shader" TIMEOUT 60)
+endif()
+
 if(BUILD_TESTING)
     add_executable(armigo_pipeline_global_memory_tests
         "${ARMIGO_SHADER_TEST_DIR}/pipeline/global_memory_tests.cpp")
@@ -917,6 +941,13 @@ if(BUILD_TESTING AND APPLE AND ARMIGO_ENABLE_GPU_TESTS)
         "${ARMIGO_FOUNDATION_FRAMEWORK}" "${ARMIGO_METAL_FRAMEWORK}")
     add_test(NAME shader.pipeline_global_memory_gpu COMMAND armigo_pipeline_global_memory_gpu_tests)
     set_tests_properties(shader.pipeline_global_memory_gpu PROPERTIES LABELS "gpu;metal4;shader" TIMEOUT 120)
+    add_executable(armigo_pipeline_guest_memory_gpu_tests
+        "${ARMIGO_SHADER_TEST_DIR}/pipeline/guest_memory_gpu.mm")
+    target_compile_options(armigo_pipeline_guest_memory_gpu_tests PRIVATE -fobjc-arc)
+    target_link_libraries(armigo_pipeline_guest_memory_gpu_tests PRIVATE armigo_shader_pipeline
+        "${ARMIGO_FOUNDATION_FRAMEWORK}" "${ARMIGO_METAL_FRAMEWORK}")
+    add_test(NAME shader.pipeline_guest_memory_gpu COMMAND armigo_pipeline_guest_memory_gpu_tests)
+    set_tests_properties(shader.pipeline_guest_memory_gpu PROPERTIES LABELS "gpu;metal4;shader" TIMEOUT 120)
 endif()
 
 # Consolidated fingerprint refresh (keep last): every armigo_shader_pipeline

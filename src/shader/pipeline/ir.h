@@ -101,6 +101,9 @@ struct TextureInfo {
     std::vector<InputIndex> coordinates, gradients_x, gradients_y, offsets, data;
     std::optional<InputIndex> array_layer, array_index, level_or_bias, compare,
                               sample_index, lod_clamp;
+    // A pool read (the project documentation): the handle words whose
+    // texture ID (bits 0-19) and sampler ID (bits 20-31) index the pools.
+    std::optional<InputIndex> pool_texture, pool_sampler;
     std::uint8_t component_mask{1};
     std::uint8_t gather_component{};
     // Scalar query selection, independent of component_mask: query_size uses
@@ -135,7 +138,13 @@ struct IoInfo {
 };
 struct CallInfo { FunctionId target; };
 enum class ShuffleKind : std::uint8_t { index, up, down, butterfly };
-struct SubgroupInfo { ShuffleKind shuffle{ShuffleKind::index}; std::uint8_t width{32}; };
+// A subgroup reduction names its kind: add, minimum, maximum, bit_or or
+// bit_xor.
+struct SubgroupInfo {
+    ShuffleKind shuffle{ShuffleKind::index};
+    std::uint8_t width{32};
+    std::optional<AtomicKind> reduction;
+};
 using OperationInfo = std::variant<std::monostate, ConversionInfo, ComparisonInfo,
                                    MemoryInfo, TextureInfo, IoInfo, CallInfo, SubgroupInfo>;
 static_assert(std::variant_size_v<OperationInfo> == static_cast<std::size_t>(InfoKind::subgroup) + 1);

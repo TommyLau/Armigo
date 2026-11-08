@@ -81,6 +81,29 @@ std::vector<PsoRow> merge_pso_manifests(const std::vector<PsoRow>& seed, const s
     return rows;
 }
 
+std::string compute_stage_manifest(const std::vector<std::string>& identities) {
+    std::string text;
+    std::unordered_set<std::string> seen;
+    for (const std::string& identity : identities) {
+        if (identity.empty() || identity.find_first_of("\t\r\n") != std::string::npos) continue;
+        if (!seen.insert(identity).second) continue;
+        text += 'C';
+        text += '\t';
+        text += identity;
+        text += '\n';
+    }
+    return text;
+}
+
+std::vector<std::string> select_pipeline_manifests(std::string_view title_list,
+                                                   std::string_view compute_list,
+                                                   bool compute_list_exists) {
+    std::vector<std::string> manifests;
+    if (!title_list.empty()) manifests.emplace_back(title_list);
+    if (compute_list_exists && !compute_list.empty()) manifests.emplace_back(compute_list);
+    return manifests;
+}
+
 std::string pso_hex_encode(const void* bytes, std::size_t size) {
     static constexpr char digits[] = "0123456789abcdef";
     std::string text;

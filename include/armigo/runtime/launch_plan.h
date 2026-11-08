@@ -24,7 +24,7 @@
 
 namespace armigo::runtime {
 
-// The original executable bootstrap follows the verified firmware-20.5.0
+// The original executable bootstrap follows the verified firmware
 // process entry and guest-loader ownership contract. No fixed SDK export
 // sequence, duplicated relocation/constructors or guessed TLS structures are
 // permitted. Lane F creates stack/TLS/handles; this plan identifies code and

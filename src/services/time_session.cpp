@@ -10,6 +10,10 @@
 
 #include <armigo/services/time_session.h>
 
+#include <algorithm>
+#include <array>
+#include <cstring>
+
 #include <limits>
 #include <new>
 
@@ -23,6 +27,10 @@ constexpr std::uint32_t sfci = 0x49434653;
 constexpr std::uint32_t sfco = 0x4f434653;
 constexpr std::uint32_t control_interface = 0xec6be3ff;
 constexpr std::uint32_t static_time_interface = 0x0920b7a6;
+// Large enough for every pointer buffer the served commands use (the 0xd0-byte
+// clock snapshot); the firmware's own size is not established here.
+constexpr std::uint16_t pointer_buffer_size = 0x1000;
+constexpr std::size_t clock_snapshot_bytes = 0xd0;
 
 std::uint32_t read(const IpcMessage& bytes, std::size_t offset, unsigned count = 4) {
     std::uint32_t value = 0;
@@ -61,9 +69,11 @@ IpcReply control_reply(std::uint32_t value, unsigned width) {
 
 TimeServiceSession::TimeServiceSession(
     std::uint64_t process_id, horizon::HandleTable& handles,
-    std::shared_ptr<horizon::ReadOnlySharedMemory> shared_memory)
+    std::shared_ptr<horizon::ReadOnlySharedMemory> shared_memory,
+    std::function<std::optional<std::int64_t>()> counter_nanoseconds)
     : process_id_(process_id), handles_(handles),
-      root_(std::make_shared<RootObject>(std::move(shared_memory))) {
+      root_(std::make_shared<RootObject>(std::move(shared_memory))),
+      counter_nanoseconds_(std::move(counter_nanoseconds)) {
     if (!root_->shared_memory || root_->shared_memory->bytes().size() != 0x1000)
         throw std::invalid_argument("Time service requires one initialized 4096-byte shared-memory page");
 }
@@ -74,6 +84,16 @@ IpcReply TimeServiceSession::unsupported(const char* detail) {
 }
 
 IpcReply TimeServiceSession::request(const IpcMessage& message, std::uint64_t sender_pid) {
+    return dispatch(message, sender_pid, nullptr);
+}
+
+IpcReply TimeServiceSession::request_with_buffers(const IpcMessage& message, std::uint64_t sender_pid,
+                                                  const horizon::GuestBuffers& buffers) {
+    return dispatch(message, sender_pid, &buffers);
+}
+
+IpcReply TimeServiceSession::dispatch(const IpcMessage& message, std::uint64_t sender_pid,
+                                      const horizon::GuestBuffers* buffers) {
     const std::lock_guard lock(mutex_);
     diagnostic_ = nullptr;
     if (sender_pid != process_id_)
@@ -81,7 +101,7 @@ IpcReply TimeServiceSession::request(const IpcMessage& message, std::uint64_t se
     try {
         const auto type = read(message, 0);
         if (type == 5 || type == 7) return control(message);
-        if (type == 4 || type == 6) return domain_request(message);
+        if (type == 4 || type == 6) return domain_request(message, buffers);
         return unsupported("Time-service HIPC message type or descriptors are unsupported");
     } catch (const std::bad_alloc&) {
         return unsupported("Time-service host allocation failed; error reply is unsupported");
@@ -96,7 +116,7 @@ IpcReply TimeServiceSession::control(const IpcMessage& message) {
     // Context-bearing forms select the same methods. Their request context
     // does not alter these responses or replace the fixed interface tag.
     const auto command = read(message, 24);
-    if (command == 3) return control_reply(0, 2);
+    if (command == 3) return control_reply(pointer_buffer_size, 2);
     if (command != 0) return unsupported("Time-service control command is unsupported");
     if (!objects_.empty()) return unsupported("Repeated time-service domain conversion is unsupported");
     auto reply = control_reply(1, 4);
@@ -104,14 +124,18 @@ IpcReply TimeServiceSession::control(const IpcMessage& message) {
     return reply;
 }
 
-IpcReply TimeServiceSession::domain_request(const IpcMessage& message) {
+IpcReply TimeServiceSession::domain_request(const IpcMessage& message, const horizon::GuestBuffers* buffers) {
     if (objects_.empty()) return unsupported("Non-domain time-service requests are unsupported");
-    if (!no_descriptors(message, 12))
+    // Only a receive list (an output pointer buffer) may accompany a request.
+    const auto header = read(message, 4);
+    const bool receive_list = buffers && (read(message, 0) & 0xffff0000U) == 0 && !(header >> 31) &&
+                              ((header >> 10) & 0xfU) >= 2 && (header & 0x3ffU) >= 12;
+    if (!receive_list && !no_descriptors(message, 12))
         return unsupported("Time-service startup requires no PID, handles or buffer descriptors");
     if (read(message, 16, 1) != 1 || read(message, 17, 1) != 0)
         return unsupported("Time-service domain operation or input objects are unsupported");
     const auto data_size = read(message, 18, 2);
-    const auto raw_end = 8 + 4 * read(message, 4);
+    const auto raw_end = 8 + 4 * (read(message, 4) & 0x3ffU);
     if (data_size < 16 || data_size > raw_end - 32)
         return unsupported("Time-service domain payload length is unsupported");
     const auto object_id = read(message, 20);
@@ -141,6 +165,7 @@ IpcReply TimeServiceSession::domain_request(const IpcMessage& message) {
         objects_.push_back(child);
         return reply;
     }
+    if (command == 400) return clock_snapshot(message, buffers);
     if (command == 20) {
         IpcReply reply;
         reply.disposition = IpcDisposition::handled;
@@ -190,6 +215,36 @@ unsigned day_of_year(std::int64_t year, unsigned month, unsigned day) {
         result += lengths[index] + (index == 1 && leap ? 1 : 0);
     return result + day - 1;
 }
+
+void put_bytes(std::span<std::byte> out, std::size_t offset, std::uint64_t value, unsigned count) {
+    for (unsigned i = 0; i < count; ++i) out[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
+}
+
+// `time` as a UTC calendar time (8 bytes) and its additional information (24
+// bytes): weekday, day of the year, zone name, no daylight saving, offset 0.
+void utc_calendar(std::int64_t time, std::span<std::byte> calendar, std::span<std::byte> info) {
+    auto days = time / 86400;
+    auto remainder = time % 86400;
+    if (remainder < 0) {
+        remainder += 86400;
+        --days;
+    }
+    std::int64_t year = 0;
+    unsigned month = 0, day = 0;
+    civil_from_days(days, year, month, day);
+    put_bytes(calendar, 0, static_cast<std::uint64_t>(year), 2);
+    calendar[2] = static_cast<std::byte>(month);
+    calendar[3] = static_cast<std::byte>(day);
+    calendar[4] = static_cast<std::byte>(remainder / 3600);
+    calendar[5] = static_cast<std::byte>((remainder % 3600) / 60);
+    calendar[6] = static_cast<std::byte>(remainder % 60);
+    put_bytes(info, 0, static_cast<std::uint32_t>((days % 7 + 11) % 7), 4);  // 0 = Sunday
+    put_bytes(info, 4, day_of_year(year, month, day), 4);
+    const char zone[] = "UTC";
+    for (std::size_t index = 0; index < sizeof(zone); ++index) info[8 + index] = static_cast<std::byte>(zone[index]);
+    put_bytes(info, 16, 0, 4);  // not daylight saving time
+    put_bytes(info, 20, 0, 4);  // UTC offset in seconds
+}
 }  // namespace
 
 IpcReply TimeServiceSession::time_zone_command(std::uint32_t command, const IpcMessage& message) {
@@ -226,38 +281,66 @@ IpcReply TimeServiceSession::time_zone_command(std::uint32_t command, const IpcM
     case 100:  // ToCalendarTime
     case 101: {  // ToCalendarTimeWithMyRule
         const auto time = read_s64(message, 48);
-        auto days = time / 86400;
-        auto remainder = time % 86400;
-        if (remainder < 0) {
-            remainder += 86400;
-            --days;
-        }
-        std::int64_t year = 0;
-        unsigned month = 0, day = 0;
-        civil_from_days(days, year, month, day);
         reply.size = 48 + 0x20;
         write(reply.bytes, 4, static_cast<std::uint32_t>((reply.size - 8) / 4));
         write(reply.bytes, 16, 1);
         cmif_header(reply.bytes, 32, static_time_interface);
-        write(reply.bytes, 48, static_cast<std::uint32_t>(year), 2);
-        reply.bytes[50] = static_cast<std::byte>(month);
-        reply.bytes[51] = static_cast<std::byte>(day);
-        reply.bytes[52] = static_cast<std::byte>(remainder / 3600);
-        reply.bytes[53] = static_cast<std::byte>((remainder % 3600) / 60);
-        reply.bytes[54] = static_cast<std::byte>(remainder % 60);
-        const auto weekday = static_cast<std::uint32_t>((days % 7 + 11) % 7); // 0 = Sunday
-        write(reply.bytes, 56, weekday);
-        write(reply.bytes, 60, day_of_year(year, month, day));
-        const char zone[] = "UTC";
-        for (std::size_t index = 0; index < sizeof(zone); ++index)
-            reply.bytes[64 + index] = static_cast<std::byte>(zone[index]);
-        write(reply.bytes, 72, 0);  // not daylight saving time
-        write(reply.bytes, 76, 0);  // UTC offset in seconds
+        const std::span<std::byte> out(reply.bytes.data() + 48, 0x20);
+        utc_calendar(time, out.first(8), out.subspan(8));
         return reply;
     }
     default:
         return unsupported("Time-zone command is outside the initial startup implementation");
     }
+}
+
+IpcReply TimeServiceSession::clock_snapshot(const IpcMessage& message, const horizon::GuestBuffers* buffers) {
+    // GetClockSnapshot(type) -> ClockSnapshot in one fixed 0xd0-byte output
+    // pointer buffer: user and network contexts, their current times, UTC
+    // calendars and additional information, the steady time point, the
+    // location name, automatic correction and the type.
+    if (!buffers || buffers->size() != 1 || !(*buffers)[0].output || (*buffers)[0].size < clock_snapshot_bytes)
+        return unsupported("Time GetClockSnapshot needs one 0xd0-byte output buffer");
+    const auto counter = counter_nanoseconds_ ? counter_nanoseconds_() : std::nullopt;
+    if (!counter) return unsupported("Time GetClockSnapshot has no guest counter");
+    // The page's current slots: the steady clock {offset ns, source} at 0x08,
+    // the user and network contexts {offset s, steady s, source} at 0x40 and
+    // 0x88, and automatic correction at 0xcc.
+    const auto page = root_->shared_memory->bytes();
+    const auto s64_at = [&](std::size_t offset) {
+        std::int64_t value = 0;
+        std::memcpy(&value, page.data() + offset, sizeof value);
+        return value;
+    };
+    const auto steady_seconds = (*counter + s64_at(0x08)) / 1'000'000'000;
+    const auto follows_steady = [&](std::size_t context) {
+        return std::equal(page.begin() + 0x10, page.begin() + 0x20, page.begin() + context + 16);
+    };
+    if (!follows_steady(0x40)) return unsupported("Time user clock does not follow the steady clock");
+    const auto user = s64_at(0x40) + steady_seconds;
+    // Without a network clock its time is zero, as the console reports it.
+    const auto network = follows_steady(0x88) ? s64_at(0x88) + steady_seconds : 0;
+    std::array<std::byte, clock_snapshot_bytes> snapshot{};
+    const std::span<std::byte> out(snapshot);
+    std::copy_n(page.begin() + 0x40, 32, out.begin());
+    std::copy_n(page.begin() + 0x88, 32, out.begin() + 0x20);
+    put_bytes(out, 0x40, static_cast<std::uint64_t>(user), 8);
+    put_bytes(out, 0x48, static_cast<std::uint64_t>(network), 8);
+    utc_calendar(user, out.subspan(0x50, 8), out.subspan(0x60, 0x18));
+    utc_calendar(network, out.subspan(0x58, 8), out.subspan(0x78, 0x18));
+    put_bytes(out, 0x90, static_cast<std::uint64_t>(steady_seconds), 8);
+    std::copy_n(page.begin() + 0x10, 16, out.begin() + 0x98);
+    const char name[] = "UTC";
+    for (std::size_t index = 0; index < sizeof(name); ++index) out[0xa8 + index] = static_cast<std::byte>(name[index]);
+    out[0xcc] = page[0xcc];
+    out[0xcd] = message[48];
+    if (!buffers->write(0, snapshot)) return unsupported("Time GetClockSnapshot buffer is not writable");
+    IpcReply reply;
+    reply.disposition = IpcDisposition::handled;
+    reply.size = 48;
+    write(reply.bytes, 4, 10);
+    cmif_header(reply.bytes, 32, static_time_interface);
+    return reply;
 }
 
 std::size_t TimeServiceSession::domain_object_count() const {

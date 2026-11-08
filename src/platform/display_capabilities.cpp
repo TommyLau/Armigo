@@ -15,7 +15,7 @@
 namespace armigo::platform {
 
 double DisplayCapabilities::guest_refresh_hz() const noexcept {
-    // The guest's display policy is a nominal 60 Hz mode (firmware 20.5.0 admits
+    // The guest's display policy is a nominal 60 Hz mode (firmware admits
     // only matching 60 Hz modes), so the rate the guest's vsync event and its
     // swap interval refer to is the largest even division of the panel's refresh
     // that is not below 60 Hz: 60 on a 60 or 120 Hz panel, 72 on 144 Hz. The host

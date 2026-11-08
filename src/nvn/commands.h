@@ -53,7 +53,7 @@ enum class Op : std::uint32_t {
     rasterizer_discard, conservative_raster, conservative_raster_dilate, subpixel_precision_bias,
     shader_scratch_memory, zcull_data, copy_image_stride, draw_texture, program_subroutines,
     coverage_modulation_table, resolve_depth_buffer, debug_marker, clear_color_integer, dispatch_indirect,
-    sampler_registrations,
+    sampler_registrations, push_constants, draw_mesh_tasks, draw_mesh_tasks_indirect,
     count
 };
 
@@ -115,6 +115,28 @@ struct BindBuffer {
 // Sampler registrations made before the next draw or dispatch was recorded.
 struct SamplerRegistrations {
     std::uint64_t value;
+};
+// Words written at a byte offset into a graphics stage's push-constant block,
+// which shaders read as hardware constant buffer `bank`. API 231 pushes name
+// constant buffer 16, which is also NVN uniform slot 13; the replay reports
+// which of the two each stage's reads meet.
+inline constexpr std::uint32_t push_constant_bytes = 256;
+inline constexpr std::uint32_t push_constant_bank = 16;
+// Compute's push block, as the practical reference binds it (provisional: no
+// translated compute stage reads it yet).
+inline constexpr std::uint32_t compute_push_constant_bank = 24;
+struct PushConstants {
+    std::int32_t stage;
+    std::uint32_t bank, offset, size;
+    std::byte data[push_constant_bytes];
+};
+// Mesh draws: the title driver's (first, count) arguments, or the address of
+// the indirect arguments in GPU memory.
+struct DrawMeshTasks {
+    std::int32_t first, count;
+};
+struct DrawMeshTasksIndirect {
+    std::uint64_t address;
 };
 struct BindHandles {
     std::int32_t stage, first, count;
@@ -393,9 +415,24 @@ struct CommandSubmission;
 [[nodiscard]] CommandWalkStatus walk_commands(
     const CommandSubmission& submission, CommandVisitor visitor, void* context) noexcept;
 void fence_commands(const CommandSubmission& submission, std::uint64_t fence) noexcept;
+// Whether a list of the submission records an event wait.
+[[nodiscard]] bool submission_has_event_waits(const CommandSubmission& submission) noexcept;
 
 void register_state_entries() noexcept;
 void register_program_entries() noexcept;
 void register_command_entries() noexcept;
+
+// Reports `detail` for `operation` and fails the recording.
+void command_refuse(NVNcommandBuffer* command_buffer, const char* operation, const char* detail) noexcept;
+void command_draw_mesh_tasks(NVNcommandBuffer* command_buffer, int first, int count) noexcept;
+void command_draw_mesh_tasks_indirect(NVNcommandBuffer* command_buffer, NVNbufferAddress address) noexcept;
+
+// Records `size` bytes of push constants for a graphics stage (vertex through
+// tessellation evaluation slots) or compute at byte `offset` of its block.
+// Offset and size are whole words within the block; anything else fails the
+// recording.
+void command_push_constants(NVNcommandBuffer* command_buffer, NVNshaderStage stage, std::uint32_t bank,
+                            std::uint32_t offset, std::uint32_t size, const void* data,
+                            const char* operation) noexcept;
 
 } // namespace armigo::nvn

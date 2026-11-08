@@ -102,6 +102,8 @@ void test_two_profiles_admit_with_different_settings() {
     const LaunchProfile b = expect_success(fixture::profile_image_b().bytes);
 
     ARMIGO_CHECK(a.process.platform == armigo::GuestPlatform::switch1);
+    ARMIGO_CHECK(a.process.baseline == armigo::horizon::Baseline::horizon_23_0_1);
+    ARMIGO_CHECK(b.process.baseline == armigo::horizon::Baseline::horizon_23_0_1);
     ARMIGO_CHECK(a.origin == armigo::runtime::ProfileOrigin::npdm);
     ARMIGO_CHECK(b.origin == armigo::runtime::ProfileOrigin::npdm);
     ARMIGO_CHECK(a.permissions.intended_kernel_version == fixture::cap_kernel_version(20, 5));
@@ -266,12 +268,13 @@ void test_file_system_access_version_semantics() {
     expect_success(image.bytes);
 }
 
-void test_file_system_access_content_owners_are_unsupported() {
+void test_file_system_access_owner_payload_shapes() {
     for (std::size_t pair : {0xCu, 0x14u}) {
         fixture::NpdmImage image = fixture::profile_image_a();
+        // One byte is never a whole count field.
         fixture::put_u32(image.bytes, 0xC0 + pair, 0);
         fixture::put_u32(image.bytes, 0xC0 + pair + 4, 1);
-        ARMIGO_CHECK(expect_failure(image.bytes, LaunchError::unsupported).operation ==
+        ARMIGO_CHECK(expect_failure(image.bytes, LaunchError::invalid_input).operation ==
                      "npdm.file_system_access");
         fixture::put_u32(image.bytes, 0xC0 + pair, 0x1C);
         expect_failure(image.bytes, LaunchError::invalid_input);
@@ -282,6 +285,59 @@ void test_file_system_access_content_owners_are_unsupported() {
         fixture::put_u32(image.bytes, 0xC0 + pair, 0xFFFFFFFFu);
         expect_failure(image.bytes, LaunchError::invalid_input);
     }
+}
+
+void test_file_system_access_owner_grants() {
+    fixture::Parts parts;
+    parts.aci0_content_owners = {0x0100000000001000, 0x0100000000002000};
+    parts.aci0_save_owners = {{0x0100000000003000, 1}, {0x0100000000004000, 3}};
+    // An ACID without owner lists and a zero range admits every request.
+    auto profile = expect_success(fixture::build_npdm(parts).bytes);
+    ARMIGO_CHECK(profile.permissions.content_owner_ids == parts.aci0_content_owners);
+    ARMIGO_CHECK(profile.permissions.save_data_owners.size() == 2);
+    if (profile.permissions.save_data_owners.size() == 2) {
+        ARMIGO_CHECK(profile.permissions.save_data_owners[0].id == 0x0100000000003000);
+        ARMIGO_CHECK(profile.permissions.save_data_owners[0].accessibility == 1);
+        ARMIGO_CHECK(profile.permissions.save_data_owners[1].accessibility == 3);
+    }
+    ARMIGO_CHECK(profile.permissions.file_system_access_control.size() == 0x1C);
+    // A range admits ids inside it; explicit lists admit only listed ids and
+    // take precedence over the range.
+    parts.acid_owner_ranges = {0x0100000000002000, 0x01000000000020FF, 0x0100000000004000,
+                               0x0100000000004000};
+    profile = expect_success(fixture::build_npdm(parts).bytes);
+    ARMIGO_CHECK(profile.permissions.content_owner_ids ==
+                 std::vector<std::uint64_t>{0x0100000000002000});
+    ARMIGO_CHECK(profile.permissions.save_data_owners.size() == 1 &&
+                 profile.permissions.save_data_owners[0].id == 0x0100000000004000);
+    parts.acid_content_owners = {0x0100000000001000};
+    parts.acid_save_owners = {0x0100000000003000};
+    profile = expect_success(fixture::build_npdm(parts).bytes);
+    ARMIGO_CHECK(profile.permissions.content_owner_ids ==
+                 std::vector<std::uint64_t>{0x0100000000001000});
+    ARMIGO_CHECK(profile.permissions.save_data_owners.size() == 1 &&
+                 profile.permissions.save_data_owners[0].id == 0x0100000000003000 &&
+                 profile.permissions.save_data_owners[0].accessibility == 1);
+    // Unequal versions give empty access, owners included.
+    auto image = fixture::build_npdm(parts);
+    fixture::put_u8(image.bytes, 0xC0, 2);
+    profile = expect_success(image.bytes);
+    ARMIGO_CHECK(profile.permissions.content_owner_ids.empty() &&
+                 profile.permissions.save_data_owners.empty());
+}
+
+void test_file_system_access_owner_payload_lengths() {
+    fixture::Parts parts;
+    parts.aci0_save_owners = {{0x0100000000003000, 1}};
+    auto image = fixture::build_npdm(parts);
+    // The payload is count, one byte, padding, one id: 16 bytes.
+    fixture::put_u32(image.bytes, 0xC0 + 0x18, 12);
+    expect_failure(image.bytes, LaunchError::invalid_input);
+    parts.aci0_save_owners.clear();
+    parts.aci0_content_owners = {0x0100000000001000};
+    image = fixture::build_npdm(parts);
+    fixture::put_u32(image.bytes, 0xC0 + 0x1C, 2); // count 2, one id present
+    expect_failure(image.bytes, LaunchError::invalid_input);
 }
 
 void test_file_system_access_owner_offset_bounds() {
@@ -710,7 +766,9 @@ int main() {
     test_size_admission();
     test_file_system_access_restriction();
     test_file_system_access_version_semantics();
-    test_file_system_access_content_owners_are_unsupported();
+    test_file_system_access_owner_payload_shapes();
+    test_file_system_access_owner_grants();
+    test_file_system_access_owner_payload_lengths();
     test_file_system_access_owner_offset_bounds();
     test_acid_file_system_header_minimum_size();
     test_acid_file_system_owner_grants();

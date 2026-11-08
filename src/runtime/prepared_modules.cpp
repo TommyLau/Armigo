@@ -523,7 +523,7 @@ LaunchResult<PreparedModuleArtifacts> prepare_modules(
             // execution contract for both synthetic and original exact-SP entry.
             // Reservation clearance and whole-window x18 transfers are proved
             // per site, retaining all whole-program ingress boundaries.
-            image_options.scalar_x18_policy = {false, true, true};
+            image_options.scalar_x18_policy = {false, true, true, true};
             image_options.function_entries = analyzed.function_entries;
             image_options.external_entries = analyzed.external_entries;
             auto prepared = execution::prepare_image(linked[i].size(), words, image_options);

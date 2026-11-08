@@ -24,7 +24,7 @@
 
 namespace armigo::services::fs {
 
-// One firmware-20.5.0 `fsp-srv` client session. The original SDK connects to
+// One firmware `fsp-srv` client session. The original SDK connects to
 // this port during nnMain startup. This increment serves the CMIF controls the
 // generated clients always request and reports every other command as an
 // explicit unsupported operation, so the next required command is observable
@@ -73,6 +73,12 @@ public:
                                            std::uint64_t sender_pid,
                                            const horizon::GuestBuffers& buffers) override;
 
+    // The application's own program id. A save-data attribute naming it, like
+    // one naming program zero, opens this application's save; the host keeps
+    // no other program's saves, so naming any other program finds none.
+    // Shared by clones.
+    void set_application_program_id(std::uint64_t program_id);
+
     std::size_t domain_object_count() const;
     // Object 1 is the service root; later objects are mounted file systems.
     static constexpr std::uint32_t root_object_id = 1;
@@ -97,6 +103,7 @@ private:
         std::map<std::uint32_t, std::string> file_objects;
         std::map<std::uint32_t, std::string> directory_objects;
         std::shared_ptr<SaveStore> save = std::make_shared<SaveStore>();
+        std::uint64_t application_program_id = 0;
         std::uint32_t released_objects = 0;
         std::string last_path;
         const char* diagnostic = nullptr;

@@ -52,6 +52,9 @@ struct ServiceRegistryDependencies {
     // The application's installed add-on content (aoc:u lists it, fsp-srv
     // opens its data storage). Null behaves as none installed, with no base id.
     std::shared_ptr<const services::AddOnContentCatalog> addon_content;
+    // The display version the application reports when its package has no
+    // control data (a NUP), derived from the package version.
+    std::optional<std::string> display_version;
     std::filesystem::path shader_package_directory;
     // The package from shader_package_directory, when already opening; the
     // registry waits for it instead of opening the directory itself.

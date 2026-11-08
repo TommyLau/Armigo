@@ -57,7 +57,7 @@ struct DispatchResult {
     const char* detail = nullptr;
 };
 
-// Initial firmware 20.5.0 TIPC RegisterClient/GetService session for ordinary
+// Initial firmware TIPC RegisterClient/GetService session for ordinary
 // configured processes. Caller serializes dispatch/retry/destruction and
 // backend calls; no scheduler or service registry is owned here.
 class Session final {

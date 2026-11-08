@@ -11,7 +11,10 @@
 #include <armigo/common/diagnostics.h>
 
 #include <atomic>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -19,6 +22,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <mach-o/dyld.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace {
 
@@ -211,6 +218,88 @@ void test_last_run_log() {
     std::filesystem::remove_all(directory);
 }
 
+void write_exit_hits() {
+    armigo::diag::write(armigo::diag::Level::info,
+                        "Armigo NVN 231.40: native shader package hits %zu, misses %zu\n",
+                        static_cast<std::size_t>(32), static_cast<std::size_t>(1));
+}
+
+void print_exit_buffer() {
+    std::fprintf(stderr, "exit-buffer=%llu\n",
+                 static_cast<unsigned long long>(armigo::diag::testing_exit_pending_appends()));
+}
+
+// The child returns into exit(). That destroys the main thread's diagnostic
+// buffer before atexit, which is where the package hit line is written.
+int run_exit_diagnostic() {
+    unsetenv("ARMIGO_LOG");
+    unsetenv("ARMIGO_FRAME_STATS");
+    armigo::diag::use_development_defaults();
+    std::string warmup(180, 'w');
+    armigo::diag::info("Armigo NVN 231.40: warmup %s\n", warmup.c_str());
+    std::atexit(print_exit_buffer);
+    std::atexit(write_exit_hits);
+    return 0;
+}
+
+std::string current_executable() {
+    std::uint32_t size = 1024;
+    std::string path(size, '\0');
+    if (_NSGetExecutablePath(path.data(), &size) != 0) {
+        path.assign(size, '\0');
+        if (_NSGetExecutablePath(path.data(), &size) != 0) return {};
+    }
+    path.resize(std::strlen(path.c_str()));
+    return path;
+}
+
+void test_exit_diagnostic() {
+    const std::string executable = current_executable();
+    check(!executable.empty(), "this test binary has a path");
+    if (executable.empty()) return;
+
+    int pipe_fds[2] = {-1, -1};
+    check(::pipe(pipe_fds) == 0, "stderr pipe opens");
+    if (pipe_fds[0] < 0) return;
+
+    const pid_t child = ::fork();
+    check(child >= 0, "exit diagnostic child forks");
+    if (child < 0) {
+        ::close(pipe_fds[0]);
+        ::close(pipe_fds[1]);
+        return;
+    }
+    if (child == 0) {
+        ::dup2(pipe_fds[1], STDERR_FILENO);
+        ::close(pipe_fds[0]);
+        ::close(pipe_fds[1]);
+        char* args[] = {const_cast<char*>(executable.c_str()), const_cast<char*>("--exit-diagnostic"), nullptr};
+        ::execv(executable.c_str(), args);
+        std::fprintf(stderr, "execv failed\n");
+        _exit(127);
+    }
+
+    ::close(pipe_fds[1]);
+    std::string output;
+    char buffer[512];
+    while (true) {
+        const ssize_t count = ::read(pipe_fds[0], buffer, sizeof buffer);
+        if (count < 0) break;
+        if (count == 0) break;
+        output.append(buffer, static_cast<std::size_t>(count));
+    }
+    ::close(pipe_fds[0]);
+
+    int status = 0;
+    check(::waitpid(child, &status, 0) == child, "exit diagnostic child is reaped");
+    check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "exit diagnostic child exits 0");
+    constexpr std::string_view hits = "Armigo NVN 231.40: native shader package hits 32, misses 1\n";
+    check(output.find(hits) != std::string::npos, "the exit hit line is written whole");
+    // A freed buffer can still accept the write on a non-checking allocator.
+    // The counter is what shows the write used the buffer that outlives exit.
+    check(output.find("exit-buffer=1\n") != std::string::npos, "the exit write used the surviving buffer");
+}
+
 void test_threads() {
     clear_environment();
     armigo::diag::testing_reset();
@@ -237,13 +326,15 @@ void test_threads() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && std::strcmp(argv[1], "--exit-diagnostic") == 0) return run_exit_diagnostic();
     test_parse();
     test_filtering();
     test_fragments();
     test_environment();
     test_last_run_log();
     test_threads();
+    test_exit_diagnostic();
     if (failures) {
         std::cerr << failures << " diagnostics check(s) failed\n";
         return 1;

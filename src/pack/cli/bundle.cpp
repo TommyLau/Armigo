@@ -11,7 +11,9 @@
 #include "bundle.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <string_view>
 #include <system_error>
@@ -384,6 +386,17 @@ std::variant<std::string, std::filesystem::path> assemble_application(const Bund
         return std::string("Cannot copy title settings into the app.");
     }
     return spec.app_path;
+}
+
+std::filesystem::path assembly_path(const std::filesystem::path& app_path, std::uint64_t unique) {
+    return app_path.parent_path() / ("." + app_path.filename().string() + "." + std::to_string(unique) + ".partial");
+}
+
+std::string publish_application(const std::filesystem::path& assembled, const std::filesystem::path& app_path) {
+    if (renamex_np(assembled.c_str(), app_path.c_str(), RENAME_EXCL) == 0) return {};
+    const int error = errno;
+    if (error == EEXIST) return "The packed app already exists: " + app_path.string() + ".";
+    return "Cannot move the assembled app to " + app_path.string() + ": " + std::strerror(error) + ".";
 }
 
 } // namespace armigo::pack

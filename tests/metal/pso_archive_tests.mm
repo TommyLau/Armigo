@@ -19,6 +19,8 @@
 #include <string>
 #include <unistd.h>
 
+#import <objc/runtime.h>
+
 namespace {
 
 using namespace armigo::platform::metal::nvn_driver;
@@ -46,12 +48,81 @@ MTL4RenderPipelineDescriptor* descriptor(id<MTLDevice> device, int salt) {
     return result;
 }
 
+struct RecordedRead {
+    NSUInteger options = 0;
+    int calls = 0;
+};
+
+RecordedRead recorded_read;
+
+extern "C" id armigo_record_archive_read(id, SEL, NSString*, NSUInteger options, NSUInteger, NSError**) {
+    recorded_read.options = options;
+    ++recorded_read.calls;
+    return nil;
+}
+
+// The mapped-read swap is restored on every exit, including a failed check.
+struct NsDataReadSlot {
+    Method method = nullptr;
+    IMP original = nullptr;
+    NsDataReadSlot() {
+        method = class_getInstanceMethod([NSData class],
+            sel_registerName("initWithContentsOfFile:options:maxLength:error:"));
+        if (method) original = method_getImplementation(method);
+    }
+    ~NsDataReadSlot() {
+        if (method && original) method_setImplementation(method, original);
+    }
+};
+
+int check_mapped_archive_reads() {
+    NsDataReadSlot slot;
+    CHECK(slot.method != nullptr);
+    if (!slot.method) return failures;
+    method_setImplementation(slot.method, reinterpret_cast<IMP>(armigo_record_archive_read));
+    const NSUInteger asked = NSDataReadingMappedIfSafe | NSDataReadingUncached;
+    const SEL selector = method_getName(slot.method);
+    auto read = [&](NSString* path) {
+        NSError* error = nil;
+        auto invoke = reinterpret_cast<ArchiveFileRead>(method_getImplementation(slot.method));
+        invoke([NSData alloc], selector, path, asked, 0, &error);
+    };
+    begin_mapped_archive_reads();
+    read(@"sample.marchive");
+    CHECK(recorded_read.calls == 1);
+    CHECK((recorded_read.options & NSDataReadingMappedAlways) == NSDataReadingMappedAlways);
+    CHECK((recorded_read.options & NSDataReadingMappedIfSafe) == 0);
+    CHECK((recorded_read.options & NSDataReadingUncached) == NSDataReadingUncached);
+    read(@"sample.bin");
+    CHECK(recorded_read.calls == 2);
+    CHECK(recorded_read.options == asked);
+    read(@"sample.Marchive");
+    CHECK(recorded_read.calls == 3);
+    CHECK(recorded_read.options == asked);
+    read(@"dir.marchive/file");
+    CHECK(recorded_read.calls == 4);
+    CHECK(recorded_read.options == asked);
+    end_mapped_archive_reads();
+    read(@"sample.marchive");
+    CHECK(recorded_read.calls == 5);
+    CHECK(recorded_read.options == asked);
+    CHECK(method_getImplementation(slot.method) == reinterpret_cast<IMP>(armigo_record_archive_read));
+    return failures;
+}
+
 } // namespace
 
 int main() {
+    if (check_mapped_archive_reads()) {
+        std::printf("pso archive failures: %d\n", failures);
+        return 1;
+    }
     @autoreleasepool {
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         if (!device) { std::printf("no Metal device\n"); return 77; }
+        Method read_method = class_getInstanceMethod([NSData class],
+            sel_registerName("initWithContentsOfFile:options:maxLength:error:"));
+        const IMP read_before = read_method ? method_getImplementation(read_method) : nullptr;
         const auto dir = std::filesystem::temp_directory_path() / ("pso_archive_tests." + std::to_string(getpid()));
         std::filesystem::remove_all(dir);
         std::filesystem::create_directories(dir);
@@ -150,6 +221,7 @@ int main() {
         // Nothing but damaged files: no archives, so compiles carry no lookup list.
         std::filesystem::remove(good);
         CHECK(open_archives(device, dir).archives.count == 0);
+        CHECK(read_method && method_getImplementation(read_method) == read_before);
         std::filesystem::remove_all(dir);
     }
     std::printf("pso archive failures: %d\n", failures);

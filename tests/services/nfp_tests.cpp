@@ -107,6 +107,9 @@ int main() {
     reply = manager.request(domain(2, 23), 17);
     CHECK(reply.disposition == IpcDisposition::handled && reply.transferred_count == 1);
     CHECK(std::dynamic_pointer_cast<armigo::horizon::Event>(reply.transferred[0]) != nullptr);
+    // The domain reply keeps its domain header: the CMIF header follows at 32.
+    CHECK(reply.transferred_as_copy && get(reply.bytes, 32) == 0x4f434653 && get(reply.bytes, 40) == 0 &&
+          reply.size == 48);
 
     // A domain object release (type 6, nonzero object count, no CMIF header) is
     // answered with a plain success.

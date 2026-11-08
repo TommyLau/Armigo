@@ -9,7 +9,9 @@
 // ============================================================================
 
 #include "detail.h"
+#include "../handle_program.h"
 #include <algorithm>
+#include <bit>
 #include <limits>
 #include <set>
 
@@ -186,11 +188,9 @@ Status check_texture(const Operation& op, const TextureDescriptor& d, const Meta
     if (t.gradients_x.size() != gradients || t.gradients_y.size() != gradients) return fail("Texture gradient roles disagree with mode");
     if (t.lod_clamp) return fail("Texture LOD clamp has no proven lowering");
     // Outside the fragment stage the resolver has already rewritten implicit
-    // and bias sampling into explicit level sampling, and a Metal gather always
-    // reads the base level without derivatives, so gather is the only
-    // derivative-sensitive mode still admissible here.
-    if (stage != Stage::fragment && includes(required_effects(op), Effects::derivative) &&
-        t.mode != TextureMode::gather)
+    // and bias sampling into explicit level sampling; a gather reads the base
+    // level without derivatives and is admissible in every stage.
+    if (stage != Stage::fragment && includes(required_effects(op), Effects::derivative))
         return fail("Derivative-sensitive texture operation requires fragment stage", DiagnosticCode::unsupported_capability);
     if (!t.offsets.empty()) {
         // One offset per axis is the common literal-offset form. A gather
@@ -205,6 +205,12 @@ Status check_texture(const Operation& op, const TextureDescriptor& d, const Meta
         for (auto index : t.offsets) {
             if (index.value >= op.inputs.size()) return fail("Texture offset input is out of range", DiagnosticCode::invalid_ir);
             const auto* bits = std::get_if<LiteralBits>(&op.inputs[index.value]);
+            // A sampled texel fetch may offset each axis by a value the
+            // shader computes. A 2D per-texel gather may do the same for
+            // each texel's offset. An image, a single-offset gather, a
+            // sample and a query keep a literal in [-8, 7].
+            if (!bits && ((t.mode == TextureMode::fetch && !image) ||
+                          (per_texel && d.shape.dimension == TextureDimension::d2))) continue;
             if (!bits || bits->type != ValueType::word32 ||
                 (bits->bits > 7 && bits->bits < UINT32_MAX - 7))
                 return fail("Texture offsets require a literal in the supported signed range");
@@ -252,7 +258,7 @@ Status check_requirements(const Program& p, const ResourceRequirements& requirem
     BoundProof bounds(p, work);
     std::set<std::uint16_t> streams;
     std::set<std::uint8_t> constant_buffers;
-    std::uint32_t constant_buffer_supports = 0;
+    std::uint32_t constant_buffer_supports = 0, guest_windows = 0;
     for (const auto& use : requirements.uses) {
         if (!charge()) return fail("Resource validation work exceeds limit", {}, DiagnosticCode::limit_exceeded);
         if (const auto* b = std::get_if<BufferUse>(&use)) {
@@ -277,6 +283,13 @@ Status check_requirements(const Program& p, const ResourceRequirements& requirem
                      storage->descriptor.handle_byte_offset > constant_buffer_window_bytes - 12 ||
                      b->size.bytes != 4 || b->size.alignment != 4))
                     return fail("Invalid runtime storage descriptor requirement");
+            } else if (const auto* support = std::get_if<SupportBufferSource>(&b->source);
+                       support && support->schema == guest_memory_schema) {
+                if (support->version != guest_memory_version || b->access != Access::read_write ||
+                    b->size.kind != SizeKind::accessed_extent || b->size.bytes != guest_memory_bytes ||
+                    b->size.alignment != guest_memory_alignment || b->size.constant_buffer_policy != ConstantBufferPolicy::none ||
+                    guest_windows++)
+                    return fail("Guest-memory window table has an invalid ABI");
             } else if (const auto* support = std::get_if<SupportBufferSource>(&b->source)) {
                 ++constant_buffer_supports;
                 if (support->schema != constant_buffer_support_schema ||
@@ -292,7 +305,12 @@ Status check_requirements(const Program& p, const ResourceRequirements& requirem
                     return fail("Invalid or duplicate vertex stream requirement");
             }
         } else if (const auto* t = std::get_if<TextureUse>(&use)) {
-            if (!valid_fact_key(fact_query::texture(t->key).key()) || !valid_descriptor(t->descriptor) ||
+            // A pool names no constant-buffer word (the project documentation).
+            if (t->pool && (!profile.texture_pools || t->key != TextureKey{texture_pool_slot, 0} ||
+                            t->kind != ResourceTextureKind::sampled || t->array_length != 1 || t->dynamically_indexed ||
+                            t->descriptor.shape.dimension == TextureDimension::buffer))
+                return fail("Invalid texture pool requirement");
+            if ((!t->pool && !valid_fact_key(fact_query::texture(t->key).key())) || !valid_descriptor(t->descriptor) ||
                 t->kind > ResourceTextureKind::storage_image || t->access > Access::read_write || t->array_length == 0 ||
                 (t->kind == ResourceTextureKind::sampled && (t->access != Access::read || t->atomic || t->coherent)) ||
                 (t->atomic && t->access != Access::read_write) || t->modes.empty() ||
@@ -301,7 +319,8 @@ Status check_requirements(const Program& p, const ResourceRequirements& requirem
                 return fail("Invalid texture requirement");
         } else {
             const auto& s = std::get<SamplerUse>(use);
-            if (!valid_fact_key(fact_query::texture(s.key).key()) || s.array_length == 0)
+            if (s.pool ? !profile.texture_pools || s.key != TextureKey{texture_pool_slot, 0} || s.array_length != 1
+                       : !valid_fact_key(fact_query::texture(s.key).key()) || s.array_length == 0)
                 return fail("Invalid sampler requirement");
         }
     }
@@ -310,7 +329,7 @@ Status check_requirements(const Program& p, const ResourceRequirements& requirem
         return fail("Exactly one constant-buffer support table is required with constant-buffer resources");
     for (const auto& io : requirements.io) {
         if (!charge()) return fail("IO validation work exceeds limit", {}, DiagnosticCode::limit_exceeded);
-        if (io.semantic > IoSemantic::quad_lane_id || io.access > Access::read_write || io.mask == 0 || io.mask > 15 ||
+        if (io.semantic > IoSemantic::render_target_height || io.access > Access::read_write || io.mask == 0 || io.mask > 15 ||
             io.type.scalar > ScalarType::boolean || io.type.components == 0 || io.type.components > 4 ||
             io.interpolation.mode > InterpolationMode::linear || io.interpolation.location > InterpolationLocation::offset)
             return fail("Invalid IO reflection");
@@ -335,7 +354,7 @@ Status check_requirements(const Program& p, const ResourceRequirements& requirem
         };
         if (const auto* m = std::get_if<MemoryInfo>(&op.info)) {
             if (!std::has_single_bit(m->element_bytes) || m->element_bytes > 8 || m->elements == 0 || m->elements > 4 ||
-                !std::has_single_bit(m->alignment) || m->space > AddressSpace::shared || m->access > Access::read_write ||
+                !std::has_single_bit(m->alignment) || m->space > AddressSpace::guest || m->access > Access::read_write ||
                 m->order > MemoryOrder::sequential || m->scope > MemoryScope::device)
                 return fail("Memory width, alignment or access metadata is invalid", op.source);
             std::vector<bool> referenced(op.inputs.size());
@@ -358,7 +377,8 @@ Status check_requirements(const Program& p, const ResourceRequirements& requirem
                 for (auto index : {target.address.base_low, target.address.base_high, target.address.byte_size})
                     if (!m->storage_address || !role(index) || type(op.inputs[index.value]) != ValueType::word32)
                         return fail("Storage alternative descriptor role is invalid", op.source);
-            if ((m->global_address_high || m->storage_address) && m->space != AddressSpace::storage)
+            if ((m->storage_address && m->space != AddressSpace::storage) ||
+                (m->global_address_high && m->space != AddressSpace::storage && m->space != AddressSpace::guest))
                 return fail("Global address metadata is attached to nonstorage memory", op.source);
             const auto data_type = m->element_bytes == 8 ? ValueType::word64 : ValueType::word32;
             for (auto index : m->data) if (!role(index) || type(op.inputs[index.value]) != data_type)
@@ -404,10 +424,21 @@ Status check_requirements(const Program& p, const ResourceRequirements& requirem
                     std::uint64_t(m->element_bytes) * m->elements;
                 if (extent > requirements.compute->shared_memory_bytes) return fail("Shared access exceeds allocation", op.source);
             }
-            if (m->space != AddressSpace::constant_buffer && m->space != AddressSpace::storage) continue;
+            if (m->space != AddressSpace::constant_buffer && m->space != AddressSpace::storage &&
+                m->space != AddressSpace::guest) continue;
             if (op.opcode == Opcode::barrier || op.opcode == Opcode::memory_barrier) continue;
             const auto* use = resource(m->resource);
             const auto* b = use ? std::get_if<BufferUse>(use) : nullptr;
+            if (m->space == AddressSpace::guest) {
+                // The window table is read and records misses; the windows
+                // themselves are reached through its device addresses.
+                const auto* support = b ? std::get_if<SupportBufferSource>(&b->source) : nullptr;
+                if (!support || support->schema != guest_memory_schema || support->version != guest_memory_version ||
+                    b->access != Access::read_write) return fail("Guest memory access has no window table", op.source);
+                if (!std::has_single_bit(unsigned(m->elements)) || m->alignment != m->element_bytes * m->elements)
+                    return fail("Guest memory access is not a naturally aligned whole access", op.source);
+                continue;
+            }
             if (!b || !covers(b->access, m->access)) return fail("Memory resource is missing or has incompatible access", op.source);
             if (m->space == AddressSpace::constant_buffer) {
                 const auto* cb = std::get_if<ConstantBufferSource>(&b->source);
@@ -477,7 +508,8 @@ Status check_requirements(const Program& p, const ResourceRequirements& requirem
             };
             for (const auto* list : {&t->coordinates, &t->gradients_x, &t->gradients_y, &t->offsets, &t->data})
                 for (auto index : *list) role(index);
-            for (auto index : {t->array_layer, t->array_index, t->level_or_bias, t->compare, t->sample_index, t->lod_clamp}) if (index) role(*index);
+            for (auto index : {t->array_layer, t->array_index, t->level_or_bias, t->compare, t->sample_index, t->lod_clamp,
+                               t->pool_texture, t->pool_sampler}) if (index) role(*index);
             if (!roles_valid || std::find(referenced.begin(), referenced.end(), false) != referenced.end())
                 return fail("Texture input roles are invalid or incomplete", op.source);
             for (const auto& input : op.inputs) {
@@ -495,7 +527,8 @@ Status check_requirements(const Program& p, const ResourceRequirements& requirem
             if (!texture || !key || *key != texture->key || !t->descriptor || *t->descriptor != texture->descriptor ||
                 texture->kind != (is_image(op) ? ResourceTextureKind::storage_image : ResourceTextureKind::sampled) ||
                 !covers(texture->access, access) || (t->coherent && !texture->coherent) || (t->atomic && !texture->atomic) ||
-                !std::binary_search(texture->modes.begin(), texture->modes.end(), t->mode))
+                !std::binary_search(texture->modes.begin(), texture->modes.end(), t->mode) ||
+                texture->pool != t->pool_texture.has_value())
                 return fail("Texture resource does not cover operation requirements", op.source);
             if (auto status = check_texture(op, *t->descriptor, profile, p.stage, phase); std::holds_alternative<Diagnostic>(status)) return status;
             if (t->array_index) {
@@ -508,12 +541,17 @@ Status check_requirements(const Program& p, const ResourceRequirements& requirem
                 const auto* sampler_use = resource(t->sampler_resource);
                 const auto* sampler = sampler_use ? std::get_if<SamplerUse>(sampler_use) : nullptr;
                 const auto* sampler_key = t->sampler ? std::get_if<TextureKey>(&*t->sampler) : key;
+                // A pool sampler is one binding for the stage. Its comparison
+                // and normalized-coordinate flags are not the texture
+                // descriptor's: comparison is the sampler state an ID names,
+                // and pooled sampling already requires normalized coordinates
+                // on the texture descriptor.
                 if (!sampler || !sampler_key || sampler->key != *sampler_key ||
-                    sampler->comparison != t->descriptor->comparison ||
-                    sampler->normalized_coordinates != t->descriptor->normalized_coordinates ||
-                    sampler->array_length != texture->array_length)
+                    sampler->array_length != texture->array_length || sampler->pool != t->pool_sampler.has_value() ||
+                    (!sampler->pool && (sampler->comparison != t->descriptor->comparison ||
+                                        sampler->normalized_coordinates != t->descriptor->normalized_coordinates)))
                     return fail("Sampler resource does not match the texture operation", op.source);
-            } else if (t->sampler_resource || t->sampler) return fail("Sampler is present on an operation that does not use one", op.source);
+            } else if (t->sampler_resource || t->sampler || t->pool_sampler) return fail("Sampler is present on an operation that does not use one", op.source);
         }
         if (const auto* io = std::get_if<IoInfo>(&op.info)) {
             if (io->component_mask == 0 || io->component_mask > 15 || io->type.components == 0 || io->type.components > 4 ||

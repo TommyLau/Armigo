@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <future>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #if defined(__APPLE__)
 #include <pthread/qos.h>
@@ -68,6 +69,16 @@ public:
   std::uint64_t submit(std::span<const NVNcommandHandle>) override {
     return ++submitted;
   }
+  // The queue identity the latest submission named, and the latest one
+  // finalized.
+  std::atomic<std::uintptr_t> submitted_queue{0}, forgotten_queue{0};
+  std::uint64_t submit_from(std::uintptr_t queue, std::span<const NVNcommandHandle> handles) override {
+    submitted_queue = queue;
+    return submit(handles);
+  }
+  void forget_queue(std::uintptr_t queue) override { forgotten_queue = queue; }
+  // A queued wait takes the next fence and leaves it incomplete.
+  std::optional<std::uint64_t> queue_wait_fence(std::uintptr_t, std::uint64_t) override { return ++submitted; }
   void flush() override {}
   std::uint64_t completed_fence() const override { return completed; }
   bool wait_fence(std::uint64_t fence, std::uint64_t timeout) override {
@@ -405,6 +416,33 @@ int main() {
   CHECK(!call<Entry::nvnWindowInitialize>(&window, &builder));
   armigo::services::vi::unbind_native_window(&failure_token);
   CHECK(weak_producer.expired());
+  // Replay knows a queue by an identity of each initialization: finalizing
+  // names it to replay, and a queue initialized again in the same storage
+  // submits under a new one.
+  call<Entry::nvnQueueSubmitCommands>(&queue, 0, nullptr);
+  const auto identity = replay.submitted_queue.load();
+  // nvnQueueWaitSync becomes the queue's latest fence: a queue fence sync
+  // after it takes the wait's fence, which is not complete yet.
+  {
+    alignas(8) NVNsync fenced{}, after{};
+    CHECK(call<Entry::nvnSyncInitialize>(&fenced, &device) && call<Entry::nvnSyncInitialize>(&after, &device));
+    auto &fenced_state = *reinterpret_cast<SyncState *>(&fenced);
+    fenced_state.fenced = 1;
+    fenced_state.fence = replay.submitted + 1000;
+    CHECK(call<Entry::nvnQueueWaitSync>(&queue, &fenced) == 1);
+    const auto wait_fence = replay.submitted.load();
+    call<Entry::nvnQueueFenceSync>(&queue, &after, NVN_SYNC_CONDITION_ALL_GPU_COMMANDS_COMPLETE, 0);
+    CHECK(reinterpret_cast<const SyncState *>(&after)->fence == wait_fence);
+    CHECK(call<Entry::nvnSyncWait>(&after, std::uint64_t{0}) == NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED);
+    call<Entry::nvnSyncFinalize>(&fenced);
+    call<Entry::nvnSyncFinalize>(&after);
+  }
+  CHECK(identity != 0);
+  call<Entry::nvnQueueFinalize>(&queue);
+  CHECK(replay.forgotten_queue == identity);
+  CHECK(call<Entry::nvnQueueInitialize>(&queue, &qb));
+  call<Entry::nvnQueueSubmitCommands>(&queue, 0, nullptr);
+  CHECK(replay.submitted_queue != 0 && replay.submitted_queue != identity);
   call<Entry::nvnQueueFinalize>(&queue);
   call<Entry::nvnSyncFinalize>(&sync);
   set_texture_exporter({});

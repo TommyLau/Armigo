@@ -55,11 +55,20 @@ _armigo_process_fixture_original:
     mrs x21, TPIDRRO_EL0
     cbz x21, 90f
 
-    // Check every kernel-provided TLR byte before any IPC or SDK writes.
+    // Check every kernel-provided TLR byte before any IPC or SDK writes: all
+    // clear except the thread's own handle at 0x110.
     mov x9, #0
 1:
     ldr x10, [x21, x9]
+    cmp x9, #0x110
+    b.ne 3f
+    mov w11, w1
+    cmp x10, x11
+    b.ne 90f
+    b 4f
+3:
     cbnz x10, 90f
+4:
     add x9, x9, #8
     cmp x9, #0x200
     b.ne 1b
@@ -206,6 +215,12 @@ _armigo_process_fixture_original_worker:
     mov x9, #0
 1:
     ldr x11, [x10, x9]
+    cmp x9, #0x110
+    b.ne 3f
+    // The worker's own handle: a 32-bit handle, not a pointer.
+    cbz w11, 91f
+    lsr x11, x11, #32
+3:
     cbnz x11, 91f
     add x9, x9, #8
     cmp x9, #0x200

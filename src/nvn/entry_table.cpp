@@ -16,11 +16,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 namespace armigo::nvn {
@@ -129,11 +131,14 @@ struct KnownPackage {
     std::string_view package;
     ApiVersion version;
 };
-// NVN driver packages and the API version each reports. The entry points are
-// the same for both; the device reports the selected version.
+// NVN driver packages and the API version each reports. The API 55 packages
+// share their entry points; the device reports the selected version.
 constexpr std::array known_packages{
     KnownPackage{"20_5_22", {55, 15}},
+    KnownPackage{"16_2_4", {55, 15}},
     KnownPackage{"13_3_2", {55, 12}},
+    // The Switch 2 package: API 231, served by the 231 table.
+    KnownPackage{"22_2_8", {231, 40}},
 };
 
 } // namespace
@@ -158,6 +163,16 @@ void install_entry(Entry entry, GenericFunction function) noexcept {
 
 GenericFunction installed_entry(Entry entry) noexcept {
     return armigo_nvn_entry_slots[static_cast<std::size_t>(entry)].target.load(std::memory_order_acquire);
+}
+
+GenericFunction implemented_entry(Entry entry) noexcept {
+    const auto index = static_cast<std::size_t>(entry);
+    const auto target = armigo_nvn_entry_slots[index].target.load(std::memory_order_acquire);
+    return target == stubs[index] ? nullptr : target;
+}
+
+BootstrapLoader bootstrap_loader_for(ApiVersion version) noexcept {
+    return version.major == 231 ? &armigo_nvn231_bootstrap_loader : &armigo_nvn_bootstrap_loader;
 }
 
 std::optional<std::string_view> driver_package(std::span<const std::byte> image) noexcept {
@@ -193,6 +208,29 @@ void select_api_version(ApiVersion version) noexcept {
                    std::memory_order_release);
 }
 
+namespace {
+std::atomic<bool> policy_cpu_cached_texture_writes{false};
+std::atomic<TitlePolicy::Timestamps> policy_timestamps{TitlePolicy::Timestamps::report};
+std::atomic<TitlePolicy::Barriers> policy_barriers{TitlePolicy::Barriers::full};
+std::atomic<bool> policy_hoist_implicit_samples{false};
+} // namespace
+
+void set_title_policy(const TitlePolicy& policy) noexcept {
+    policy_cpu_cached_texture_writes.store(policy.cpu_cached_texture_writes, std::memory_order_release);
+    policy_timestamps.store(policy.timestamps, std::memory_order_release);
+    policy_barriers.store(policy.barriers, std::memory_order_release);
+    policy_hoist_implicit_samples.store(policy.hoist_implicit_samples, std::memory_order_release);
+}
+
+TitlePolicy title_policy() noexcept {
+    TitlePolicy policy;
+    policy.cpu_cached_texture_writes = policy_cpu_cached_texture_writes.load(std::memory_order_acquire);
+    policy.timestamps = policy_timestamps.load(std::memory_order_acquire);
+    policy.barriers = policy_barriers.load(std::memory_order_acquire);
+    policy.hoist_implicit_samples = policy_hoist_implicit_samples.load(std::memory_order_acquire);
+    return policy;
+}
+
 std::optional<ApiVersion> selected_api_version() noexcept {
     const auto packed = selected.load(std::memory_order_acquire);
     if (!packed) return std::nullopt;
@@ -200,7 +238,7 @@ std::optional<ApiVersion> selected_api_version() noexcept {
 }
 
 extern "C" GenericFunction armigo_nvn_bootstrap_loader(const char* name) {
-    if (!name || !selected.load(std::memory_order_acquire)) return nullptr;
+    if (!name || (selected.load(std::memory_order_acquire) >> 16) != 55) return nullptr;
     const auto entry = find_entry(name);
     if (!entry) {
         armigo::diag::write(armigo::diag::Level::error,  "Armigo NVN: unknown entry point %s\n", name);
@@ -213,7 +251,27 @@ extern "C" GenericFunction armigo_nvn_bootstrap_loader(const char* name) {
 
 namespace {
 Backends installed_backends;
+
+struct UnsupportedReport {
+    UnsupportedHandler handler;
+    void* context;
+};
+std::atomic<UnsupportedReport> unsupported_report{};
 } // namespace
+
+void set_unsupported_handler(UnsupportedHandler handler, void* context) noexcept {
+    unsupported_report.store({handler, handler ? context : nullptr}, std::memory_order_release);
+}
+
+void report_unsupported(const char* detail, std::uint64_t guest_return) noexcept {
+    armigo::diag::write(armigo::diag::Level::error, "%s\n", detail);
+    const auto report = unsupported_report.load(std::memory_order_acquire);
+    if (!report.handler) return;
+    report.handler(report.context, detail, guest_return);
+    // The run is stopping with this result. Returning would hand the game a
+    // value no driver produced, so the thread stays here until process exit.
+    for (;;) std::this_thread::sleep_for(std::chrono::hours(1));
+}
 
 void set_backends(Backends backends) noexcept { installed_backends = backends; }
 

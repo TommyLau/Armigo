@@ -640,12 +640,11 @@ class PortedTranslationTests(unittest.TestCase):
         self.assertIn('emit_ir code=', result.stderr)
         self.assertIn('fact=', result.stderr)
         self.assertFalse(output.exists())
-        # Vertex stages need their slot formats and a depth convention.
-        for options in (('--vertex-float3', '0:2', '--vertex-float3', '1:3'),
-                        ('--vertex-depth', 'minus-one-to-one')):
-            result, output = self.run_ported(0, [ported_exit()], *options)
-            self.assertNotEqual(result.returncode, 0, result.stderr)
-            self.assertFalse(output.exists())
+        # A vertex stage that exports a position needs a depth convention.
+        result, output = self.run_ported(0, [ported_position_store(0), ported_exit()],
+                                         '--vertex-float3', '0:2', '--vertex-float3', '1:3')
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(output.exists())
 
     def test_ported_constant_buffer_windows_and_support_reflection(self):
         # A synthetic U32 LDC writes the sole exported color component. No
@@ -950,21 +949,22 @@ class PortedTranslationTests(unittest.TestCase):
                 self.assertEqual(method in source, method in methods)
 
     def test_ported_vertex_io_and_position_requirements(self):
-        # A vertex program that loads an attribute but exports no position now
-        # reaches MSL emission and fails there with a structured diagnostic.
-        # Replace with a success reflection check once a complete synthetic
-        # vertex program translates.
-        result, output = self.run_ported(0, [ported_attribute_load(1, 0x80), ported_exit()],
+        # A vertex program without outputs emits a void vertex function whose
+        # reflection requires rasterizer discard.
+        for words in ([ported_attribute_load(1, 0x80), ported_exit()], [ported_exit()]):
+            result, output = self.run_ported(0, words, *self.vertex_options)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            metadata = json.loads((output / 'reflection.json').read_text())
+            self.assertEqual(metadata.get('rasterizer_discard'), 'required-v1')
+            self.assertIn('vertex void', (output / 'source.metal').read_text())
+        # Outputs without a position fail late, at emission: a program-wide
+        # emit_msl diagnostic.
+        result, output = self.run_ported(0, [ported_attribute_load(1, 0x80),
+                                             ported_attribute_store(1, 0x80), ported_exit()],
                                          *self.vertex_options)
         self.assertNotEqual(result.returncode, 0)
         self.assertTrue(result.stderr.startswith('armigo-shader-translate: emit_msl code='),
                         result.stderr)
-        self.assertFalse(output.exists())
-        # The empty vertex program fails late, at emission, because no position
-        # is exported: a program-wide emit_msl diagnostic.
-        result, output = self.run_ported(0, [ported_exit()], *self.vertex_options)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('emit_msl code=', result.stderr)
         self.assertIn('position', result.stderr)
         self.assertFalse(output.exists())
 
@@ -974,7 +974,7 @@ class PortedTranslationTests(unittest.TestCase):
         # vertex_attribute_format fact) and the program reaches MSL emission,
         # which stops on the synthetic program's missing position export
         # instead. Supplying the option keeps the explicit-format path.
-        program = [ported_attribute_load(1, 0x80), ported_exit()]
+        program = [ported_attribute_load(1, 0x80), ported_attribute_store(1, 0x80), ported_exit()]
         result, _ = self.run_ported(0, program, '--vertex-depth', 'minus-one-to-one')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('emit_msl code=', result.stderr, result.stderr)

@@ -13,6 +13,7 @@
 #include "entry_table.h"
 #include "present_internal.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -33,6 +34,9 @@ constexpr std::uint64_t queue_memory_alignment = 4'096;
 
 struct QueueStorage {
     QueueState state{};
+    // The identity replay orders and keeps this queue's state under; a queue
+    // initialized again in the same storage takes a new one.
+    std::uint64_t identity = 0;
     NVNqueueGetErrorResult error = NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR;
     std::uint32_t reserved = 0;
     std::uint64_t command_memory_used = 0;
@@ -135,16 +139,20 @@ NVNboolean queue_initialize(NVNqueue *queue, const NVNqueueBuilder *builder) {
         return 0;
     }
 
+    static std::atomic<std::uint64_t> identities{0};
     QueueStorage initialized{};
     initialized.state.tag = queue_tag;
     initialized.state.device = source.device;
     initialized.state.submits = 0;
+    initialized.identity = ++identities;
     *queue_storage(queue) = initialized;
     return 1;
 }
 
 void queue_finalize(NVNqueue *queue) {
-    if (queue) *queue_storage(queue) = QueueStorage{};
+    if (!queue) return;
+    if (queue_valid(queue) && backends().replay) backends().replay->forget_queue(queue_storage(queue)->identity);
+    *queue_storage(queue) = QueueStorage{};
 }
 
 void queue_set_debug_label(NVNqueue *, const char *) {}
@@ -168,7 +176,8 @@ void queue_submit_commands(NVNqueue *queue, int count, const NVNcommandHandle *h
     try {
         const auto commands = std::span<const NVNcommandHandle>(handles, static_cast<std::size_t>(count));
         // This field is the most recent backend fence, not a submission count.
-        queue_storage(queue)->state.submits = replay->submit(commands);
+        queue_storage(queue)->state.submits =
+            replay->submit_from(queue_identity(queue), commands);
     } catch (const std::exception &exception) {
         report_queue_failure(queue, NVN_QUEUE_GET_ERROR_RESULT_GPU_ERROR_UNKNOWN, exception.what());
     } catch (...) {
@@ -203,7 +212,7 @@ void queue_finish(NVNqueue *queue) {
     const std::uint64_t fence = queue_last_fence(queue);
     try {
         replay->flush();
-        if (fence && replay->completed_fence() < fence &&
+        if (fence && !replay->fence_completed(fence) &&
             !blocking_wait([replay, fence] { return replay->wait_fence(fence, UINT64_MAX); }, "queue_wait")) {
             report_queue_failure(queue, NVN_QUEUE_GET_ERROR_RESULT_GPU_ERROR_TIMEOUT,
                                  "replay backend did not complete queue finish");
@@ -248,6 +257,14 @@ bool queue_valid(const NVNqueue *queue) noexcept { return queue && queue_storage
 
 std::uint64_t queue_last_fence(const NVNqueue *queue) noexcept {
     return queue_valid(queue) ? queue_storage(queue)->state.submits : 0;
+}
+
+void queue_set_last_fence(NVNqueue *queue, std::uint64_t fence) noexcept {
+    if (queue_valid(queue)) queue_storage(queue)->state.submits = fence;
+}
+
+std::uintptr_t queue_identity(const NVNqueue *queue) noexcept {
+    return queue_valid(queue) ? static_cast<std::uintptr_t>(queue_storage(queue)->identity) : 0;
 }
 
 void queue_error(NVNqueue *queue, const char *message) noexcept {

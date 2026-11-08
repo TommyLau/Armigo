@@ -71,6 +71,15 @@ public:
     [[nodiscard]] virtual std::string take_texture_failure() { return {}; }
     [[nodiscard]] virtual BufferSpan
     buffer_at(std::uint64_t address, std::uint64_t size) = 0;
+    // Leases the GPU-accessible pools for a submission's guest-memory table
+    // (Resources::claim_guest_memory_pools): the pool-set generation, with
+    // `pools` replaced when it differs from `known`. 0 when the provider lists
+    // no pools; the replay refuses stages that read guest memory then, and
+    // when the set is empty.
+    virtual std::uint64_t claim_guest_memory_pools(std::uint64_t, std::vector<Resources::GuestMemoryPool>& pools) {
+        pools.clear();
+        return 0;
+    }
     // The same range by raw pointers; the buffer must outlive the binding
     // that uses it, as a registered pool's buffer does.
     [[nodiscard]] virtual BufferAddress
@@ -95,6 +104,11 @@ public:
     [[nodiscard]] virtual bool texture_stamp_current(std::int32_t id, const DescriptorStamp& stamp) const {
         (void)id; (void)stamp;
         return false;
+    }
+    // Resources::upgrade_for_image_write; providers without it cannot.
+    [[nodiscard]] virtual id<MTLTexture> upgrade_for_image_write(std::uint64_t, __strong id<MTLTexture>& previous) {
+        previous = nil;
+        return nil;
     }
     [[nodiscard]] virtual id<MTLSamplerState> sampler_for_id(std::int32_t id) = 0;
     // The sampler as registered when a binding was recorded after
@@ -143,6 +157,11 @@ public:
         return false;
     }
     virtual void note_gpu_write(const nvn::TextureState& state) = 0;
+    // Resources::note_completed_gpu_write and backing_feeds_texture; a
+    // provider without texture storage of its own has nothing to update, and
+    // an unclassified one waits for every guest-memory store.
+    virtual void note_completed_gpu_write(std::uint64_t, std::uint64_t) {}
+    [[nodiscard]] virtual bool backing_feeds_texture(std::uint64_t, std::uint64_t) { return true; }
     virtual void note_gpu_write(std::uint64_t address, std::uint64_t size) = 0;
     // Generation of the newest noted GPU write, and completion of every write
     // noted up to a generation once the submissions that made it retired.
@@ -187,7 +206,13 @@ struct ReplayError {
 struct ReplayStatistics {
     std::uint64_t report_fast = 0, report_ordered = 0;
     std::uint64_t submissions = 0;
+    // Earlier submissions not yet retired that the latest encode ordered
+    // against.
+    std::uint64_t unretired_history = 0;
     std::uint64_t render_passes = 0;
+    // Render passes that began after only the previous pass's fragment work
+    // (game barrier policy).
+    std::uint64_t relaxed_pass_barriers = 0;
     std::uint64_t draws = 0;
     std::uint64_t dispatches = 0;
     std::uint64_t copies = 0;
@@ -225,6 +250,8 @@ struct ReplayStatistics {
     std::uint64_t upload_arena_reuses = 0;
     std::uint64_t upload_bytes = 0;
     std::uint64_t synchronize_gpu_waits = 0;
+    // Texture uses that first waited for guest-memory stores to be published.
+    std::uint64_t guest_write_texture_waits = 0;
     std::uint64_t uniform_versions = 0;
     std::uint64_t uniform_version_bytes = 0;
     std::uint64_t compute_passes = 0;
@@ -328,6 +355,9 @@ struct ReplaySchedulingPolicy {
     // They must not call back into replay; joined may be observed on retries.
     void (*observe_shutdown_workers_joined)(void*) = nullptr;
     void (*observe_retired_log)(void*, std::uint64_t fence) = nullptr;
+    // Test seam: called while a submission's unmet event waits were read and
+    // its parts' holds are not registered yet (queue and hold locks held).
+    void (*observe_split)(void*) = nullptr;
 };
 
 // The queue must belong to device and both objects must outlive the backend.

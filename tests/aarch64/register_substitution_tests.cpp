@@ -58,6 +58,10 @@ constexpr std::uint32_t ldr_q(unsigned qt, unsigned rn) { return 0x3DC00000u | (
 constexpr std::uint32_t ldadd(unsigned rs, unsigned rt, unsigned rn) {
     return 0xF8200000u | (rs << 16) | (rn << 5) | rt;
 }
+// LD64B Xt, [Xn]: not decoded.
+constexpr std::uint32_t ld64b(unsigned rt, unsigned rn) {
+    return 0xF83FD000u | (rn << 5) | rt;
+}
 // ORR (shifted register) X with Rn = XZR: MOV Xd, Xm.
 constexpr std::uint32_t mov_register(unsigned rd, unsigned rm) {
     return 0xAA0003E0u | (rm << 16) | rd;
@@ -117,14 +121,17 @@ void test_register_numbers() {
     // Register-31 operands are never renamed: MOV X18, SP and MOV X18, XZR.
     expect_rewrite(add_immediate(true, 18, 31, 0), 18, 9, add_immediate(true, 9, 31, 0), RD);
     expect_rewrite(mov_register(18, 31), 18, 9, mov_register(9, 31), RD);
+    // Atomic memory operations rename their transfer, operand and base fields.
+    expect_rewrite(ldadd(1, 18, 2), 18, 9, ldadd(1, 9, 2), RD);
+    expect_rewrite(ldadd(18, 3, 18), 18, 9, ldadd(9, 3, 9), RM | RN);
     expect_unchanged(add_immediate(true, 31, 31, 16), 18, 9, SubstitutionError::register_absent);
 }
 
 void test_input_status() {
     for (UnchangedWord unchanged : {reject, accept}) {
-        expect_error(ldadd(1, 18, 2), 18, 9, unchanged, SubstitutionError::unknown_encoding);
+        expect_error(ld64b(18, 2), 18, 9, unchanged, SubstitutionError::unknown_encoding);
         // Unknown words are refused even when the field pattern holds no 18.
-        expect_error(ldadd(1, 3, 2), 18, 9, unchanged, SubstitutionError::unknown_encoding);
+        expect_error(ld64b(3, 2), 18, 9, unchanged, SubstitutionError::unknown_encoding);
         expect_error(0x00000000u, 0, 9, unchanged, SubstitutionError::unknown_encoding);
         expect_error(reserved_logical, 18, 9, unchanged, SubstitutionError::reserved_encoding);
         // LDR X18, [X18, #8]! is CONSTRAINED UNPREDICTABLE.

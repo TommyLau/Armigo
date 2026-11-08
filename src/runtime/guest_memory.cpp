@@ -30,9 +30,11 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace armigo::runtime {
 namespace {
@@ -236,6 +238,11 @@ struct State : std::enable_shared_from_this<State> {
     std::vector<SharedMapping> shared;
     std::vector<StackAliasRecord> aliases;
     std::vector<std::weak_ptr<Pin>> pins;
+    // Transfer-memory ranges whose last reference went while this thread held
+    // `mutex` in a memory dispatch; that dispatch unlocks them before it returns.
+    // Its capacity always covers every live record, so deferring never allocates.
+    std::vector<AddressRange> deferred_transfer_unlocks;
+    std::size_t transfer_records = 0;
     bool poisoned = false;
 
     // Whether native pages in `range` alias a writable object's sub-page
@@ -577,8 +584,10 @@ private:
     LaunchResult<QueryDisposition> physical(QueryRegisters& r, bool unmap);
     LaunchResult<QueryDisposition> protect(QueryRegisters& r);
     LaunchResult<QueryDisposition> attribute(QueryRegisters& r);
+    LaunchResult<QueryDisposition> gpu_attribute(QueryRegisters& r);
     LaunchResult<QueryDisposition> stack(QueryRegisters& r, bool unmap);
     LaunchResult<QueryDisposition> shared(QueryRegisters& r, bool unmap);
+    LaunchResult<QueryDisposition> transfer(QueryRegisters& r);
     std::shared_ptr<State> state_;
     // Kept outside State: service mapper pins may outlive this dispatcher and
     // must not retain the handle table containing their own service.
@@ -724,6 +733,9 @@ LaunchStatus NativeGuestMemory::release(AddressRange range) {
 LaunchResult<QueryDisposition> NativeGuestMemory::physical(QueryRegisters& r, bool unmap) {
     auto& s = *state_;
     const auto& config = s.process->configuration();
+    // The Switch 1 23.0.1 kernel has these calls as well (0x59380, 0x594d0);
+    // they stay unsupported there only because no Switch 1 process is admitted
+    // with private system resources.
     if (config.platform != GuestPlatform::switch2) return QueryDisposition::unsupported_operation;
     const auto operation = unmap ? "UnmapPhysicalMemory" : "MapPhysicalMemory";
     const AddressRange range{r[0], r[1]};
@@ -997,6 +1009,72 @@ LaunchResult<QueryDisposition> NativeGuestMemory::protect(QueryRegisters& r) {
     return finish(r, 0);
 }
 
+// The state whose mutex this thread holds inside NativeGuestMemory::dispatch.
+thread_local const State* dispatching_state = nullptr;
+
+// Clears the Locked attribute CreateTransferMemory set on a still-uniform owner
+// range, as the kernel's transfer-memory finalizer does. The caller holds the
+// state mutex.
+void unlock_transfer(State& s, AddressRange range) {
+    if (s.poisoned) return;
+    const auto block = s.uniform(range);
+    if (!block || !(block->attributes & pm::locked_attribute)) return;
+    auto restored = *block;
+    restored.attributes &= static_cast<std::uint8_t>(~pm::locked_attribute);
+    (void)s.transaction(s.replace(range, restored), s.accounting, "UnlockTransferMemory",
+        [] { return platform::ProcessMemoryStatus{}; }, [] { return platform::ProcessMemoryStatus{}; });
+}
+
+// CreateTransferMemory(out handle, address, size, permission): the kernel's
+// argument checks in order, then the owner's read-write data range is locked
+// (the Locked attribute) until the object's last reference unlocks it, so the
+// owner cannot reprotect, alias, transfer or free it meanwhile. The owner's
+// permission and native access stay unchanged: host services read and write
+// transfer memory through the owner's mapping, in place of the receiving
+// process's own mapping.
+LaunchResult<QueryDisposition> NativeGuestMemory::transfer(QueryRegisters& r) {
+    auto& s = *state_;
+    const AddressRange range{r[1], r[2]};
+    if (const auto result = pm::validate_transfer(range, r[3])) return finish(r, result);
+    const auto block = s.uniform(range);
+    if (!block || !pm::transferable(*block)) return finish(r, pm::invalid_memory);
+    // Every allocation precedes the lock, so a failure cannot leave the range
+    // locked: the record, and a deferred-unlock slot for a release that may
+    // come while this thread holds the state mutex.
+    auto record = std::make_shared<TransferMemoryRecord>(range, static_cast<std::uint32_t>(r[3]),
+        [weak = std::weak_ptr<State>(state_), range] {
+            const auto owner = weak.lock();
+            if (!owner) return;
+            if (dispatching_state == owner.get()) {
+                --owner->transfer_records;
+                owner->deferred_transfer_unlocks.push_back(range);
+                return;
+            }
+            std::lock_guard lock(owner->mutex);
+            --owner->transfer_records;
+            unlock_transfer(*owner, range);
+        });
+    s.deferred_transfer_unlocks.reserve(s.deferred_transfer_unlocks.size() + s.transfer_records + 1);
+    auto locked = *block;
+    locked.attributes |= pm::locked_attribute;
+    auto status = s.transaction(s.replace(range, locked), s.accounting, "CreateTransferMemory",
+        [] { return platform::ProcessMemoryStatus{}; }, [] { return platform::ProcessMemoryStatus{}; });
+    if (const auto* f = std::get_if<LaunchFailure>(&status)) {
+        record->disarm();
+        return *f;
+    }
+    const auto handle = handles_->insert(record);
+    if (!handle) {
+        record->disarm();
+        unlock_transfer(s, range);
+        return finish(r, pm::out_of_handles);
+    }
+    ++s.transfer_records;
+    finish(r, 0);
+    r[1] = *handle;
+    return QueryDisposition::handled;
+}
+
 // SetMemoryAttribute(address, size, mask, value) for the uncached (8) and
 // permission-locked (16) attributes. Both live in the guest memory map: the
 // host has no uncached guest memory, and a permission-locked block refuses
@@ -1006,19 +1084,51 @@ LaunchResult<QueryDisposition> NativeGuestMemory::attribute(QueryRegisters& r) {
     const AddressRange range{r[0], r[1]};
     const auto mask = static_cast<std::uint32_t>(r[2]);
     const auto value = static_cast<std::uint32_t>(r[3]);
-    constexpr std::uint32_t uncached = 8, permission_locked = 16;
+    constexpr std::uint32_t uncached = 8, permission_locked = 16, gpu_accessible = 32;
     if (const auto result = pm::validate_range(range)) return finish(r, result);
-    if ((mask & ~(uncached | permission_locked)) || (value & ~mask)) return finish(r, pm::invalid_combination);
+    // Every mask and value check precedes the memory-state lookup. A permission
+    // lock can only be set, never cleared.
+    if ((mask & ~(uncached | permission_locked)) || (value & ~mask) ||
+        ((mask ^ value) & permission_locked))
+        return finish(r, pm::invalid_combination);
     const auto block = s.uniform(range);
     if (!block || (block->type != MemoryType::normal && block->type != MemoryType::code_data) ||
-        (block->attributes & ~(uncached | permission_locked)) || block->ipc_references || block->device_references)
+        (block->attributes & ~(uncached | permission_locked | gpu_accessible)) || block->ipc_references ||
+        block->device_references)
         return finish(r, pm::invalid_memory);
-    // A permission lock can only be set, never cleared.
-    if ((mask & permission_locked) && !(value & permission_locked)) return finish(r, pm::invalid_combination);
     auto changed = *block;
     changed.attributes = static_cast<std::uint8_t>((block->attributes & ~mask) | value);
     if (changed.attributes == block->attributes) return finish(r, 0);
     auto status = s.transaction(s.replace(range, changed), s.accounting, "SetMemoryAttribute",
+        [] { return platform::ProcessMemoryStatus{}; }, [] { return platform::ProcessMemoryStatus{}; });
+    if (const auto* f = std::get_if<LaunchFailure>(&status)) return *f;
+    return finish(r, 0);
+}
+
+// SetGpuMemoryAttribute(address, size, mask, value), Switch 2 only: the
+// GPU-accessible attribute (32) with SetMemoryAttribute's checks and results
+// (0xe801 for a bit outside the mask). The title SDK sets it on memory before
+// registering that memory with the GPU and clears it on destruction;
+// QueryMemory reports it. Provisional: the Switch 2 kernel is not part of the
+// supplied dump, so this follows the practical reference.
+LaunchResult<QueryDisposition> NativeGuestMemory::gpu_attribute(QueryRegisters& r) {
+    auto& s = *state_;
+    if (s.process->configuration().platform != GuestPlatform::switch2) return QueryDisposition::unsupported_operation;
+    const AddressRange range{r[0], r[1]};
+    const auto mask = static_cast<std::uint32_t>(r[2]);
+    const auto value = static_cast<std::uint32_t>(r[3]);
+    constexpr std::uint32_t uncached = 8, permission_locked = 16, gpu_accessible = 32;
+    if (const auto result = pm::validate_range(range)) return finish(r, result);
+    if ((mask & ~gpu_accessible) || (value & ~mask)) return finish(r, pm::invalid_combination);
+    const auto block = s.uniform(range);
+    if (!block || (block->type != MemoryType::normal && block->type != MemoryType::code_data) ||
+        (block->attributes & ~(uncached | permission_locked | gpu_accessible)) || block->ipc_references ||
+        block->device_references)
+        return finish(r, pm::invalid_memory);
+    auto changed = *block;
+    changed.attributes = static_cast<std::uint8_t>((block->attributes & ~mask) | value);
+    if (changed.attributes == block->attributes) return finish(r, 0);
+    auto status = s.transaction(s.replace(range, changed), s.accounting, "SetGpuMemoryAttribute",
         [] { return platform::ProcessMemoryStatus{}; }, [] { return platform::ProcessMemoryStatus{}; });
     if (const auto* f = std::get_if<LaunchFailure>(&status)) return *f;
     return finish(r, 0);
@@ -1416,6 +1526,22 @@ LaunchResult<QueryDisposition> NativeGuestMemory::dispatch(std::uint16_t svc, Qu
         try {
             std::lock_guard lock(state_->mutex);
             if (state_->poisoned) return host_failure("memory dispatch");
+            // A transfer-memory record dropped while this thread holds the
+            // mutex unlocks its range here instead of locking it again.
+            struct Dispatching {
+                State& s;
+                explicit Dispatching(State& state) : s(state) { dispatching_state = &s; }
+                ~Dispatching() {
+                    dispatching_state = nullptr;
+                    try {
+                        while (!s.deferred_transfer_unlocks.empty()) {
+                            const auto range = s.deferred_transfer_unlocks.back();
+                            s.deferred_transfer_unlocks.pop_back();
+                            unlock_transfer(s, range);
+                        }
+                    } catch (...) { s.poisoned = true; }
+                }
+            } dispatching(*state_);
             switch (svc) {
             case 0x2c: return physical(r, false);
             case 0x2d: return physical(r, true);
@@ -1426,8 +1552,8 @@ LaunchResult<QueryDisposition> NativeGuestMemory::dispatch(std::uint16_t svc, Qu
             case 0x13: return shared(r, false);
             case 0x14: return shared(r, true);
             case 3: return attribute(r);
-            // CreateTransferMemory records the range and permission; the startup
-            // queries own that object. The owner's range is not locked meanwhile.
+            case 0x80: return gpu_attribute(r);
+            case 0x15: return transfer(r);
             default: return QueryDisposition::unsupported_operation;
             }
         } catch (const std::bad_alloc&) {
@@ -1445,6 +1571,17 @@ LaunchResult<QueryDisposition> NativeGuestMemory::dispatch(std::uint16_t svc, Qu
 }
 } // namespace
 
+std::vector<std::uint64_t> alias_window_sizes(std::uint64_t requested, bool switch2) {
+    std::vector<std::uint64_t> sizes{requested};
+    if (!switch2) return sizes;
+    for (auto size = requested; size > switch2_minimum_alias_window;) {
+        size = size - switch2_minimum_alias_window > alias_window_step ? size - alias_window_step
+                                                                       : switch2_minimum_alias_window;
+        sizes.push_back(size);
+    }
+    return sizes;
+}
+
 LaunchResult<std::shared_ptr<GuestMemory>> create_guest_memory(const LaunchProfile& profile,
     ProcessMemoryOptions options, std::shared_ptr<ModuleSet> modules,
     std::shared_ptr<HandleTable> handles) {
@@ -1452,12 +1589,13 @@ LaunchResult<std::shared_ptr<GuestMemory>> create_guest_memory(const LaunchProfi
         if (!handles || !options.resource_limit_bytes ||
             options.resource_limit_bytes > ProcessRecord::application_capacity(profile.process.platform))
             return failure(LaunchError::invalid_input, "create_guest_memory", "A bounded memory budget and handle table are required.");
-        const bool extended = profile.process.platform == GuestPlatform::switch2 &&
-                              profile.process.baseline == Baseline::horizon_23_0_1;
-        const bool legacy = profile.process.platform == GuestPlatform::switch1 &&
-                            profile.process.baseline == Baseline::horizon_20_5_0;
-        if (!profile.is_64_bit || profile.process.address_bits != 39 || (!legacy && !extended) ||
-            (profile.process.private_system_resource_bytes && !extended) || !profile.process.allowed_core_mask)
+        // Horizon 23.0.1 is the only accepted release. The remote reservation,
+        // alias fallback and private resources stay Switch 2 platform policy.
+        const bool switch2 = profile.process.platform == GuestPlatform::switch2;
+        if ((!switch2 && profile.process.platform != GuestPlatform::switch1) ||
+            !profile.is_64_bit || profile.process.address_bits != 39 ||
+            profile.process.baseline != Baseline::horizon_23_0_1 ||
+            (profile.process.private_system_resource_bytes && !switch2) || !profile.process.allowed_core_mask)
             return unsupported("create_guest_memory", "The process profile is not supported by native memory.");
         const auto system_bytes = profile.process.private_system_resource_bytes;
         if (system_bytes > options.resource_limit_bytes)
@@ -1478,7 +1616,7 @@ LaunchResult<std::shared_ptr<GuestMemory>> create_guest_memory(const LaunchProfi
         // Initial measurement capacity, not a claimed console size. The reference
         // workload demand exceeds 7 GiB; retain later observed requests before
         // finalizing this unverified Switch 2 compatibility policy.
-        const std::uint64_t remote_size = extended ? 8ull << 30 : 0;
+        const std::uint64_t remote_size = switch2 ? 8ull << 30 : 0;
         constexpr std::uint64_t remote_alignment = 0x10000;
         const auto reserve = [&](std::uint64_t size, std::uint64_t& address, std::shared_ptr<Region>& owner) {
             auto result = Region::reserve(size, address);
@@ -1493,47 +1631,82 @@ LaunchResult<std::shared_ptr<GuestMemory>> create_guest_memory(const LaunchProfi
             // there. The general allocation range is therefore one host arena:
             // mappable space, then alias, stack and heap. The independent remote
             // reservation and the host-loaded modules are outside this arena.
+            // A Switch 2 arena that the host cannot place with the profile's
+            // alias window is retried with smaller windows, down to the minimum.
             const auto page = platform::native_page_size();
             constexpr std::uint64_t mappable_size = 1ull << 30;
-            const auto arena_size = mappable_size + config.base_alias_size + config.stack_size + config.heap_size;
-            bool placed = false;
-            for (int attempt = 0; attempt < 4 && !placed; ++attempt) {
-                std::uint64_t arena = 0;
-                {
-                    const auto reserved_size = (arena_size + page - 1) & ~(page - 1);
-                    auto probe = remote_size ? Region::reserve_low_aligned(reserved_size, remote_alignment)
-                                             : Region::reserve(reserved_size);
-                    if (!std::holds_alternative<Region>(probe)) {
-                        auto error = host_failure("create_guest_memory arena");
-                        error.detail += " Reservation error=" + std::to_string(static_cast<unsigned>(
-                            std::get<platform::ProcessMemoryError>(probe))) + " bytes=" +
-                            std::to_string(reserved_size) + ". " + platform::describe_guest_address_space() + ".";
-                        return error;
+            const auto alias_sizes = alias_window_sizes(config.base_alias_size, switch2);
+            std::optional<LaunchFailure> failed;
+            for (const auto alias_size : alias_sizes) {
+                failed.reset();
+                config.base_alias_size = alias_size;
+                const auto arena_size = mappable_size + config.base_alias_size + config.stack_size + config.heap_size;
+                bool placed = false;
+                for (int attempt = 0; attempt < 4 && !placed; ++attempt) {
+                    std::uint64_t arena = 0;
+                    {
+                        const auto reserved_size = (arena_size + page - 1) & ~(page - 1);
+                        auto probe = remote_size ? Region::reserve_low_aligned(reserved_size, remote_alignment)
+                                                 : Region::reserve(reserved_size);
+                        if (!std::holds_alternative<Region>(probe)) {
+                            auto error = host_failure("create_guest_memory arena");
+                            error.detail += " Reservation error=" + std::to_string(static_cast<unsigned>(
+                                std::get<platform::ProcessMemoryError>(probe))) + " bytes=" +
+                                std::to_string(reserved_size) + ".";
+                            failed = std::move(error);
+                            break;
+                        }
+                        arena = std::get<Region>(probe).address();
+                        // ARMIGO_TRACE_RESERVATION=1 shows the host address space the arena was placed in.
+                        static const bool trace = std::getenv("ARMIGO_TRACE_RESERVATION") != nullptr;
+                        if (trace)
+                            armigo::diag::opt_in("Armigo memory: arena %#llx + %llu bytes; %s\n",
+                                static_cast<unsigned long long>(arena), static_cast<unsigned long long>(reserved_size),
+                                platform::describe_guest_address_space().c_str());
                     }
-                    arena = std::get<Region>(probe).address();
-                    // ARMIGO_TRACE_RESERVATION=1 shows the host address space the arena was placed in.
-                    static const bool trace = std::getenv("ARMIGO_TRACE_RESERVATION") != nullptr;
-                    if (trace)
-                        armigo::diag::opt_in("Armigo memory: arena %#llx + %llu bytes; %s\n",
-                            static_cast<unsigned long long>(arena), static_cast<unsigned long long>(reserved_size),
-                            platform::describe_guest_address_space().c_str());
+                    config.allocation_region = {arena, arena_size};
+                    auto cursor = arena;
+                    std::uint64_t mappable_address = cursor;
+                    cursor += mappable_size;
+                    config.alias_address = cursor;
+                    cursor += config.base_alias_size;
+                    config.stack_address = cursor;
+                    cursor += config.stack_size;
+                    config.heap_address = cursor;
+                    placed = reserve(mappable_size, mappable_address, s->mappable) &&
+                        reserve(config.base_alias_size, config.alias_address, s->alias) &&
+                        reserve(config.stack_size, config.stack_address, s->stack) &&
+                        reserve(config.heap_size, config.heap_address, s->heap);
+                    if (!placed) s->mappable.reset(), s->alias.reset(), s->stack.reset(), s->heap.reset();
                 }
-                config.allocation_region = {arena, arena_size};
-                auto cursor = arena;
-                std::uint64_t mappable_address = cursor;
-                cursor += mappable_size;
-                config.alias_address = cursor;
-                cursor += config.base_alias_size;
-                config.stack_address = cursor;
-                cursor += config.stack_size;
-                config.heap_address = cursor;
-                placed = reserve(mappable_size, mappable_address, s->mappable) &&
-                    reserve(config.base_alias_size, config.alias_address, s->alias) &&
-                    reserve(config.stack_size, config.stack_address, s->stack) &&
-                    reserve(config.heap_size, config.heap_address, s->heap);
-                if (!placed) s->mappable.reset(), s->alias.reset(), s->stack.reset(), s->heap.reset();
+                if (failed) continue;
+                if (!placed) {
+                    failed = host_failure("create_guest_memory reservations");
+                    continue;
+                }
+                // A larger arena can leave no gap for the remote window.
+                if (remote_size) {
+                    auto reserved = Region::reserve_low_aligned(remote_size, remote_alignment);
+                    if (!std::holds_alternative<Region>(reserved)) {
+                        failed = host_failure("create_guest_memory remote region");
+                        s->mappable.reset(), s->alias.reset(), s->stack.reset(), s->heap.reset();
+                        continue;
+                    }
+                    s->remote = std::make_shared<Region>(std::move(std::get<Region>(reserved)));
+                    config.remote_region = range_of(*s->remote);
+                }
+                break;
             }
-            if (!placed) return host_failure("create_guest_memory reservations");
+            if (failed) {
+                // Describe the searched address space once, for the last failure.
+                failed->detail += " " + platform::describe_guest_address_space() + ".";
+                return *failed;
+            }
+            if (switch2)
+                armigo::diag::write(armigo::diag::Level::info, "Armigo memory: alias window %llu MiB%s\n",
+                    static_cast<unsigned long long>(config.base_alias_size >> 20),
+                    config.base_alias_size < alias_sizes.front()
+                        ? " (reduced: the host address space has no gap for a larger arena)" : "");
         } else if (!reserve(config.heap_size, config.heap_address, s->heap) ||
             !reserve(config.base_alias_size, config.alias_address, s->alias) ||
             !reserve(config.stack_size, config.stack_address, s->stack))

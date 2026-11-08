@@ -17,6 +17,7 @@
 #include <chrono>
 #include <new>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 namespace armigo::horizon {
@@ -300,6 +301,18 @@ bool Event::reset() noexcept {
     return was_signaled;
 }
 
+WritableEvent::WritableEvent(std::shared_ptr<Event> event, std::function<void()> observer)
+    : event_(std::move(event)), observer_(std::move(observer)) {
+    if (!event_) throw std::invalid_argument("A writable event needs its readable end.");
+}
+
+void WritableEvent::signal() {
+    event_->signal();
+    if (observer_) observer_();
+}
+
+void WritableEvent::clear() noexcept { (void)event_->reset(); }
+
 bool Event::wait(std::int64_t timeout_nanoseconds) {
     return wait(timeout_nanoseconds, {}) == WaitOutcome::signaled;
 }
@@ -376,6 +389,8 @@ EventResult wait_event(HandleTable& table, std::span<const Handle> handles,
             return cancelled();
         }
     }
+    // A writable event end is not a synchronization object.
+    if (std::dynamic_pointer_cast<WritableEvent>(object)) return handled(0xe401);
     return unsupported("Waiting on this kernel object type is not implemented");
 }
 
@@ -416,11 +431,17 @@ EventResult cancel_synchronization(HandleTable& table, Handle handle, ThreadReco
 }
 
 EventResult reset_event(HandleTable& table, Handle handle) {
+    // The kernel looks for a readable event, then for a process (including the
+    // current-process pseudo-handle). Anything else is an invalid handle.
+    if (handle == current_process_handle)
+        return unsupported("ResetSignal for a process is not implemented");
     const auto object = table.lookup(handle);
     if (!object) return handled(0xe401);
-    const auto event = std::dynamic_pointer_cast<Event>(object);
-    if (!event) return unsupported("ResetSignal for this kernel object type is not implemented");
-    return handled(event->reset() ? 0 : 0xfa01);
+    if (const auto event = std::dynamic_pointer_cast<Event>(object))
+        return handled(event->reset() ? 0 : 0xfa01);
+    if (std::dynamic_pointer_cast<ProcessRecord>(object))
+        return unsupported("ResetSignal for a process is not implemented");
+    return handled(0xe401);
 }
 
 }  // namespace armigo::horizon

@@ -269,6 +269,29 @@ void test_note_store_across_registrations() {
     unmap_pages(p, 2);
 }
 
+void test_note_store_over_overlapping_registrations() {
+    auto* p = static_cast<std::uint8_t*>(map_pages(4));
+    const auto pg = page_size();
+    // Two registrations share page 1; page 3 belongs to neither.
+    memory::WriteTracker::add_range(p, 2 * pg);
+    memory::WriteTracker::add_range(p + pg, 2 * pg);
+    const auto stamp = memory::WriteTracker::now();
+    CHECK(memory::WriteTracker::protect_checked(p, 2 * pg));
+    CHECK(memory::WriteTracker::protect_checked(p + pg, 2 * pg));
+
+    // One store over all four pages publishes every registered page,
+    // whichever registration a page is reached through.
+    memory::WriteTracker::note_store(p, 4 * pg);
+    for (std::size_t index = 0; index != 3; ++index)
+        CHECK(memory::WriteTracker::written_since(p + index * pg, pg, stamp));
+    CHECK(protected_store(p));
+    CHECK(protected_store(p + 2 * pg));
+
+    memory::WriteTracker::remove_range(p + pg);
+    memory::WriteTracker::remove_range(p);
+    unmap_pages(p, 4);
+}
+
 std::atomic<int> g_alias_copy_gate{0};
 std::uint8_t* g_alias_copy_source = nullptr;
 struct sigaction g_alias_copy_bus{}, g_alias_copy_segv{};
@@ -846,6 +869,7 @@ int main() {
     test_reregistration_bumps_generation();
     test_note_store_publication();
     test_note_store_across_registrations();
+    test_note_store_over_overlapping_registrations();
     test_alias_store_pending_clock();
     test_writable_alias_store_and_lifetime();
     test_prepare_host_write_after_registration_changes();

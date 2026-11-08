@@ -14,6 +14,7 @@
 #include <armigo/platform/host_module.h>
 #include <armigo/platform/thread_slot.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -24,7 +25,7 @@
 namespace {
 using namespace armigo;
 using namespace armigo::execution;
-constexpr ScalarX18Policy contract{true, true, true};
+constexpr ScalarX18Policy contract{true, true, true, true};
 
 struct Image {
     std::uint64_t x[31]{};
@@ -48,8 +49,10 @@ struct Refusal {
 static_assert(sizeof(Refusal) == 8);
 extern "C" {
 void armigo_test_x18_forms_run(Image*, std::uint64_t);
+void armigo_test_x18_forms_run_on(Image*, std::uint64_t, std::byte* stack_top);
 extern const Form armigo_test_x18_forms[], armigo_test_x18_forms_end[];
 extern const Refusal armigo_test_x18_refusals[], armigo_test_x18_refusals_end[];
+extern const Form armigo_test_x18_swap_forms[], armigo_test_x18_swap_forms_end[];
 }
 
 bool expect(bool value, const char* message) {
@@ -136,6 +139,121 @@ bool execute(Form form, std::uint32_t slot, GuestThreadContext& context) {
     return true;
 }
 
+// One compare-and-swap form (kind 1: a CASP pair at x18:x19, renamed to
+// x28:x29 in the reference), with a compare value that matches memory and one
+// that differs. The base is x4. Guest x18 and x19 are compared with the
+// reference's x28 and x29. Both run on a guarded stack: only the declared
+// scratch below entry SP (32 bytes for a pair, 16 otherwise) may change.
+bool execute_swap(Form form, std::uint32_t slot, GuestThreadContext& context) {
+    const bool pair = form.kind == 1;
+    const auto effects = aarch64::decode_register_effects(form.original);
+    if (!expect(effects.decoded() &&
+                    effects.operation == (pair ? aarch64::Operation::casp : aarch64::Operation::cas),
+                "A swap form does not decode as compare and swap.")) return false;
+    constexpr std::uint64_t stub = 64;
+    auto narrow = contract;
+    narrow.pair_stack_scratch_available = false;
+    const auto without_pair_scratch = make_scalar_x18_patch(form.original, 0, stub, slot, narrow);
+    if (!expect(pair ? without_pair_scratch.error == ScalarX18PatchError::missing_execution_contract
+                     : without_pair_scratch.ok(),
+                "Only a CASP pair at x18 requires 32 bytes of stack scratch.")) return false;
+    const auto plan = make_scalar_x18_patch(form.original, 0, stub, slot, contract);
+    if (!expect(plan.ok(), "An authored swap form was not prepared.")) return false;
+    const auto& patch = *plan.patch;
+    for (std::size_t i = 0; i < patch.trampoline_word_count; ++i) {
+        if (!expect(aarch64::proven_free_of(aarch64::decode_register_effects(patch.trampoline[i]), 18),
+                    "Prepared swap form uses hardware x18 or has incomplete effects.")) return false;
+    }
+    std::vector<std::byte> bytes(128);
+    const std::uint32_t ret = aarch64::encode_ret().word;
+    std::memcpy(bytes.data(), &patch.replacement_instruction, 4);
+    std::memcpy(bytes.data() + 4, &ret, 4);
+    std::memcpy(bytes.data() + 16, &form.reference, 4);
+    std::memcpy(bytes.data() + 20, &ret, 4);
+    std::memcpy(bytes.data() + stub, patch.trampoline.data(), patch.trampoline_word_count * 4);
+    const std::array regions = {platform::ModuleRegion{
+        0, bytes.size(), memory::Permission::read | memory::Permission::execute}};
+    auto mapped = platform::HostModule::create(bytes, regions);
+    if (!expect(mapped.ok() && mapped.module->seal().ok(), "Swap form mapping or sealing failed.")) return false;
+    const auto prepared_entry = mapped.module->executable_address(0);
+    const auto reference_entry = mapped.module->executable_address(16);
+    if (!expect(prepared_entry && reference_entry, "Swap form executable entry is absent.")) return false;
+    const unsigned rs = (form.original >> 16) & 31u;
+    const unsigned bytes_per = pair ? ((form.original >> 30) & 1u ? 8u : 4u) : 1u << (form.original >> 30);
+    alignas(16) std::array<std::byte, 256> memory{};
+    std::array<std::byte, 256> initial_memory{}, reference_memory{};
+    for (std::size_t i = 0; i < memory.size(); ++i) initial_memory[i] = std::byte((37 * i + 91) & 255);
+    const auto element = [&](unsigned index) {
+        std::uint64_t value = 0;
+        std::memcpy(&value, initial_memory.data() + 64 + index * bytes_per, bytes_per);
+        return value;
+    };
+    // The runner's 256-byte frame sits at the top of the stack; entry SP is
+    // just below it.
+    alignas(16) std::array<std::byte, 1024> stack{};
+    constexpr std::size_t entry_sp = stack.size() - 256;
+    const std::size_t scratch = pair ? 32 : 16;
+    constexpr auto guard = std::byte{0xa5};
+    const auto run = [&](Image& image, std::uint64_t function) {
+        stack.fill(guard);
+        armigo_test_x18_forms_run_on(&image, function, stack.data() + stack.size());
+    };
+    const auto untouched = [&](std::size_t end) {
+        return std::all_of(stack.begin(), stack.begin() + static_cast<std::ptrdiff_t>(end),
+                           [&](std::byte value) { return value == guard; });
+    };
+    for (const bool match : {true, false}) {
+        Image initial{};
+        for (unsigned reg = 0; reg < 31; ++reg) initial.x[reg] = 0x9876543210000000ull + reg;
+        initial.x[4] = reinterpret_cast<std::uintptr_t>(memory.data() + 64);
+        for (unsigned reg = 0; reg < 32; ++reg)
+            initial.q[reg] = {0xc129e1808000ff81ull + reg, 0xc0298000ff800081ull + reg};
+        initial.nzcv = 0x60000000;
+        // The compare register (pair) holds memory's value(s), plus one when
+        // the compare must fail. Guest x18 lives in the cell.
+        std::uint64_t guest_x18 = 0x5a5a5a5a00000018ull;
+        const auto set = [&](unsigned reg, std::uint64_t value) {
+            if (reg == 18) guest_x18 = value;
+            else initial.x[reg] = value;
+        };
+        set(rs, element(0) + (match ? 0 : 1));
+        if (pair) set(rs + 1, element(1));
+        Image reference = initial;
+        reference.x[28] = guest_x18;
+        if (pair) reference.x[29] = initial.x[19];
+        memory = initial_memory;
+        run(reference, *reference_entry);
+        if (!expect(untouched(entry_sp), "The native reference wrote below its stack pointer.")) return false;
+        reference_memory = memory;
+        Image actual = initial;
+        memory = initial_memory;
+        context.set_guest_x18(guest_x18);
+        run(actual, *prepared_entry);
+        // The spill holds the first scratch at the bottom of the declared
+        // area, so it shows the area was used, and nothing below it changed.
+        if (!expect(untouched(entry_sp - scratch) &&
+                        !untouched(entry_sp - scratch + 8),
+                    "The prepared form used stack outside its declared scratch.")) return false;
+        // A match stores Rt; when Rt is the compare register itself the
+        // stored value equals memory, so only the reference decides.
+        const unsigned rt = form.original & 31u;
+        if (!expect(memory == reference_memory && (rs == rt || (memory != initial_memory) == match),
+                    "Prepared compare and swap differs from the reference in memory or outcome.")) return false;
+        if (!expect(actual.q == reference.q && actual.nzcv == reference.nzcv && actual.sp == reference.sp &&
+                        actual.fpcr == reference.fpcr && actual.fpsr == reference.fpsr &&
+                        actual.x[18] == actual.hardware_x18_before && context.guest_x18() == reference.x[28] &&
+                        actual.x[28] == initial.x[28] && actual.x[29] == initial.x[29] &&
+                        actual.x[19] == (pair ? reference.x[29] : reference.x[19]),
+                    "Prepared compare and swap differs from the reference state.")) return false;
+        for (unsigned reg = 0; reg < 31; ++reg) {
+            if (reg == 18 || reg == 19 || reg == 28 || reg == 29) continue;
+            if (!expect(actual.x[reg] == reference.x[reg],
+                        "Prepared compare and swap changed a guest-visible general register.")) return false;
+        }
+    }
+    return true;
+}
+
 bool stack_arithmetic(std::uint32_t slot, GuestThreadContext& context) {
     // All ADD/SUB immediate variants, zero and maximum imm12, both shifts and
     // W/X views. Flag-setting forms must get carry/overflow from guest SP.
@@ -188,6 +306,15 @@ int main() {
         }
     }
     if (!stack_arithmetic(slot, context)) return 1;
-    std::printf("%zu assembler forms and 48 SP arithmetic forms matched native execution.\n", count);
+    const auto swaps = (reinterpret_cast<std::uintptr_t>(armigo_test_x18_swap_forms_end) -
+                        reinterpret_cast<std::uintptr_t>(armigo_test_x18_swap_forms)) / sizeof(Form);
+    for (std::size_t i = 0; i < swaps; ++i) {
+        if (!execute_swap(armigo_test_x18_swap_forms[i], slot, context)) {
+            std::fprintf(stderr, "Synthetic swap form %zu failed.\n", i);
+            return 1;
+        }
+    }
+    std::printf("%zu assembler forms, %zu compare-and-swap forms and 48 SP arithmetic forms matched native "
+                "execution.\n", count, swaps);
     return 0;
 }

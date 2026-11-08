@@ -336,6 +336,9 @@ public:
         return inner_->sample();
     }
     execution::GuestCounter counter() noexcept override { return inner_->counter(); }
+    execution::GuestCounter counter(horizon::CounterRate rate) noexcept override {
+        return inner_->counter(rate);
+    }
     LaunchResult<std::chrono::nanoseconds> ticks_to_nanoseconds(
         std::uint64_t ticks) const override {
         return inner_->ticks_to_nanoseconds(ticks);

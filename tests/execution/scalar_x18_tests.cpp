@@ -36,6 +36,9 @@ extern "C" const std::uint32_t armigo_test_sp_x18_offsets[6];
 extern "C" const std::byte armigo_test_sp_pair_x18_begin[];
 extern "C" const std::byte armigo_test_sp_pair_x18_end[];
 extern "C" const std::uint32_t armigo_test_sp_pair_x18_offsets[8];
+extern "C" const std::byte armigo_test_sp_far_pair_x18_begin[];
+extern "C" const std::byte armigo_test_sp_far_pair_x18_end[];
+extern "C" const std::uint32_t armigo_test_sp_far_pair_x18_offsets[4];
 
 namespace {
 using namespace armigo;
@@ -156,20 +159,76 @@ bool test_sp_boundaries() {
         if (!rejected(word + (1u << 10), 0, 4096, 0, contract,
                       ScalarX18PatchError::substitution_failed)) return false;
     }
-    // Signed pair offsets keep their scaled imm7 and move by two elements.
-    for (const auto opcode : {0x29000000u, 0x29400000u, 0xa9000000u, 0xa9400000u}) {
+    // Signed pair offsets keep their scaled imm7 and move by two elements; the
+    // lowest imm7 stays in range after the move.
+    for (const auto opcode : {0x29000000u, 0x29400000u, 0xa9000000u, 0xa9400000u, 0x69400000u}) {
         const unsigned scale = (opcode >> 31) ? 8 : 4;
-        const auto word = opcode | ((63u - 16 / scale) << 15) | (10u << 10) | (31u << 5) | 18;
-        const auto result = make_scalar_x18_patch(word, 0, 4096, 0, contract);
-        if (!expect(result.ok() && result.patch->trampoline_word_count == 8,
-                    "An in-range pair offset was rejected.")) return false;
-        const auto after = aarch64::decode_register_effects(result.patch->trampoline[4]);
-        if (!expect(after.memory.offset == 63 * scale && after.memory.elements == 2 &&
-                        after.memory.addressing == aarch64::AddressingMode::signed_offset,
-                    "Pair offset compensation changed the access.")) return false;
-        if (!rejected(word + (1u << 15), 0, 4096, 0, contract,
-                      ScalarX18PatchError::substitution_failed)) return false;
+        for (const unsigned immediate : {63u - 16 / scale, 64u}) {  // 64: imm7 -64
+            const auto word = opcode | ((immediate & 0x7fu) << 15) | (10u << 10) | (31u << 5) | 18;
+            const auto result = make_scalar_x18_patch(word, 0, 4096, 0, contract);
+            if (!expect(result.ok() && result.patch->trampoline_word_count == 8,
+                        "An in-range pair offset was rejected.")) return false;
+            const auto after = aarch64::decode_register_effects(result.patch->trampoline[4]);
+            const std::int64_t expected = immediate == 64u ? -64 * std::int64_t{scale} + 16 : 63 * std::int64_t{scale};
+            if (!expect(after.memory.offset == expected && after.memory.elements == 2 &&
+                            after.memory.addressing == aarch64::AddressingMode::signed_offset,
+                        "Pair offset compensation changed the access.")) return false;
+        }
     }
+    // Past the top of imm7 (0x1f0 and 0x1f8 for X pairs, 0xf0 and 0xfc for W
+    // pairs and LDPSW) a pair becomes two single-register transfers at the same
+    // addresses, each register as the pair moved it; x18 only in its own half.
+    for (const auto opcode : {0x29000000u, 0x29400000u, 0xa9000000u, 0xa9400000u, 0x69400000u, 0xa8000000u,
+                              0xa8400000u, 0x28000000u, 0x28400000u}) {
+        const unsigned scale = (opcode >> 31) ? 8 : 4;
+        for (const unsigned immediate : {64u - 16 / scale, 63u})
+            for (const bool second : {false, true}) {
+                const unsigned rt = second ? 10 : 18, rt2 = second ? 18 : 10;
+                const auto word = opcode | (immediate << 15) | (rt2 << 10) | (31u << 5) | rt;
+                const auto result = make_scalar_x18_patch(word, 0, 4096, 0, contract);
+                if (!expect(result.ok() && result.patch->trampoline_word_count == 9,
+                            "A pair past the top of imm7 was not split.")) return false;
+                const auto& patch = *result.patch;
+                const auto original = aarch64::decode_register_effects(word);
+                for (unsigned half = 0; half != 2; ++half) {
+                    const auto access = aarch64::decode_register_effects(patch.trampoline[4 + half]);
+                    const unsigned reg = (half == 0) == !second ? patch.value_register : 10;
+                    const auto bit = aarch64::register_bit(reg);
+                    if (!expect(access.memory.elements == 1 &&
+                                    access.memory.element_bytes == original.memory.element_bytes &&
+                                    access.memory.operation == original.memory.operation &&
+                                    access.memory.offset == immediate * scale + 16 + half * scale &&
+                                    access.memory.addressing == aarch64::AddressingMode::unsigned_offset &&
+                                    !access.memory.writeback &&
+                                    has(access.memory.attributes, aarch64::MemoryAttribute::sign_extend) ==
+                                        has(original.memory.attributes, aarch64::MemoryAttribute::sign_extend) &&
+                                    ((access.reads | access.writes) & bit) != 0 &&
+                                    aarch64::proven_free_of(access, 18),
+                                "A split pair half transfers the wrong register, width or address.")) return false;
+                }
+            }
+    }
+    // A pre-index pair past the top splits too; its epilogue still applies the
+    // guest's SP update.
+    {
+        const auto result = make_scalar_x18_patch(0xa99f2bf2u, 0, 4096, 0, contract); // STP X18,X10,[SP,#0x1f0]!
+        if (!expect(result.ok() && result.patch->trampoline_word_count == 10,
+                    "A pre-index pair past the top of imm7 was not split.")) return false;
+        const auto& patch = *result.patch;
+        const auto first = aarch64::decode_register_effects(patch.trampoline[4]);
+        const auto second = aarch64::decode_register_effects(patch.trampoline[5]);
+        const auto restore = aarch64::decode_register_effects(patch.trampoline[7]);
+        // ADD SP, SP, #0x200: the spill's 16 bytes plus the guest's 0x1f0.
+        if (!expect(first.memory.offset == 0x200 && first.memory.elements == 1 && !first.memory.writeback &&
+                        second.memory.offset == 0x208 && second.memory.elements == 1 && !second.memory.writeback &&
+                        ((second.reads & aarch64::register_bit(10)) != 0) &&
+                        restore.operation == aarch64::Operation::ldp && !restore.memory.writeback &&
+                        patch.trampoline[8] == 0x910803ffu,
+                    "A pre-index pair past the top of imm7 lost its halves or its exact SP update.")) return false;
+    }
+    // A load into one register twice (CONSTRAINED UNPREDICTABLE) is refused.
+    if (!rejected(0xa95fcbf2u, 0, 4096, 0, contract,  // LDP X18,X18,[SP,#0x1f8]
+                  ScalarX18PatchError::unsupported_instruction)) return false;
     // An unscaled offset moves the access but not SP, so the plain epilogue
     // still restores the spilled frame.
     const auto unscaled = make_scalar_x18_patch(0xf84043f2u, 0, 4096, 0, contract); // LDUR X18,[SP,#4]
@@ -356,6 +415,44 @@ bool test_native_sp(platform::ThreadSlotKey& key, GuestThreadContext& context) {
     }
     return true;
 }
+// Runs the split pairs: stored values read back natively, loaded values in
+// their registers (LDPSW sign-extended), guest x18 and SP as without the
+// trampolines.
+bool test_native_sp_far_pair(platform::ThreadSlotKey& key, GuestThreadContext& context) {
+    const auto begin = reinterpret_cast<std::uintptr_t>(armigo_test_sp_far_pair_x18_begin);
+    const auto end = reinterpret_cast<std::uintptr_t>(armigo_test_sp_far_pair_x18_end);
+    if (!expect(end > begin && end - begin < 1024, "Invalid far SP pair fixture extent.")) return false;
+    std::vector<std::byte> code(4096);
+    std::memcpy(code.data(), armigo_test_sp_far_pair_x18_begin, end - begin);
+    for (unsigned i = 0; i != 4; ++i) {
+        const auto offset = armigo_test_sp_far_pair_x18_offsets[i];
+        if (!expect(offset % 4 == 0 && offset + 4 <= end - begin, "Invalid far SP pair fixture offset.")) return false;
+        std::uint32_t original;
+        std::memcpy(&original, code.data() + offset, 4);
+        const auto result = make_scalar_x18_patch(original, offset, 2048 + 48 * i,
+                                                  key.native_access()->tsd_byte_offset, contract);
+        if (!expect(result.ok() && result.patch->trampoline_word_count == 9, "A far stack pair was not split."))
+            return false;
+        const auto& patch = *result.patch;
+        std::memcpy(code.data() + offset, &patch.replacement_instruction, 4);
+        std::memcpy(code.data() + patch.trampoline_address, patch.trampoline.data(), patch.trampoline_word_count * 4);
+    }
+    const std::array regions = {platform::ModuleRegion{
+        0, code.size(), memory::Permission::read | memory::Permission::execute}};
+    auto mapped = platform::HostModule::create(code, regions);
+    if (!expect(mapped.ok() && mapped.module->seal().ok(), "Far SP pair fixture mapping failed.")) return false;
+    const auto entry = mapped.module->executable_address(0);
+    if (!expect(entry.has_value(), "Far SP pair fixture has no entry.")) return false;
+    constexpr std::uint64_t guest = 0x0123456789abcdefull, x5 = 0x8000000180000002ull;
+    context.set_guest_x18(guest);
+    std::array<std::uint64_t, 8> output{};
+    reinterpret_cast<void (*)(std::uint64_t*, std::uint64_t)>(*entry)(output.data(), 1);
+    return expect(output[0] == x5 && output[1] == guest && output[2] == guest && output[3] == 0x80000002u &&
+                      output[4] == 0x7ffffffeu && output[5] == 0xffffffff80000002ull && output[6] == output[7] &&
+                      context.guest_x18() == 0x7ffffffeu,
+                  "Split stack pairs changed data, sign extension, SP or guest x18.");
+}
+
 bool test_native_sp_pair(platform::ThreadSlotKey& key, GuestThreadContext& context) {
     const auto begin = reinterpret_cast<std::uintptr_t>(armigo_test_sp_pair_x18_begin);
     const auto end = reinterpret_cast<std::uintptr_t>(armigo_test_sp_pair_x18_end);
@@ -500,7 +597,8 @@ int main() {
                     output == std::array<std::uint64_t, 6>{8, 3, 4, 0x1234, 0x5678, 0},
                 "Prepared scalar x18 code changed data, scratch registers, or flags.")) return 1;
     if (!test_native_adrp(key, context) || !test_native_adr(key, context) ||
-        !test_native_sp(key, context) || !test_native_sp_pair(key, context)) return 1;
+        !test_native_sp(key, context) || !test_native_sp_pair(key, context) ||
+        !test_native_sp_far_pair(key, context)) return 1;
     std::puts("Scalar, ADRP and unsigned SP accesses executed through native x18 trampolines.");
     return 0;
 }

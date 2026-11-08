@@ -583,6 +583,9 @@ void test_missing_keys() {
         CHECK(failure != nullptr && failure->code == loader::ContainerError::key_missing);
         CHECK(failure != nullptr &&
               failure->detail.find("key_area_key_application_00") != std::string::npos);
+        // It says the keys predate the content and names the generation it needs.
+        CHECK(failure != nullptr && failure->detail.find("keys older than firmware") != std::string::npos);
+        CHECK(failure != nullptr && failure->detail.find("key generation 00") != std::string::npos);
         CHECK(failure != nullptr && failure->detail.find(to_hex(keys.area_key)) ==
                                           std::string::npos);
     }

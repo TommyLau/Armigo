@@ -10,6 +10,7 @@
 // Armigo uses owned C++ values and checked contracts rather than managed nodes.
 
 #pragma once
+#include "handle_program.h"
 #include "types.h"
 
 #include <array>
@@ -103,8 +104,9 @@ struct FactKey {
 [[nodiscard]] constexpr bool valid_fact_key(FactKey key) {
     if (key.component > 3 || (key.kind != FactKind::input_interpolation && key.component != 0)) return false;
     switch (key.kind) {
-    case FactKind::constant_buffer_word: case FactKind::texture_descriptor:
-    case FactKind::texture_array_length: return key.index < 18 && key.byte_offset % 4 == 0;
+    case FactKind::constant_buffer_word: case FactKind::texture_array_length: return key.index < 18 && key.byte_offset % 4 == 0;
+    // A texture keyed at handle_program_slot takes its handle from a program.
+    case FactKind::texture_descriptor: return (key.index < 18 || key.index == handle_program_slot) && key.byte_offset % 4 == 0;
     case FactKind::constant_buffer_size: return key.index < 18 && key.byte_offset == 0;
     case FactKind::vertex_attribute_format: case FactKind::fragment_output_type:
     case FactKind::input_interpolation: return key.index <= 65535 && key.byte_offset == 0;

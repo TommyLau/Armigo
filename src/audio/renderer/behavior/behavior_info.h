@@ -69,6 +69,11 @@ public:
     // Set the user revision.
     void set_user_lib_revision(u32 user_revision);
 
+    // Whether the user library tags its revisions as a Switch 2 library ('REv').
+    bool is_native_platform() const {
+        return native_platform;
+    }
+
     // Clear the current error count.
     void clear_error();
 
@@ -231,6 +236,8 @@ public:
     u32 process_revision;
     // User version
     u32 user_revision{};
+    // The user library tags its revisions as a Switch 2 library ('REv').
+    bool native_platform{};
     // Behaviour flags
     Flags flags{};
     // Errors generated and reported during Update

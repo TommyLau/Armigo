@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "patches": [
+    {
+      "title_id": "0x010054B01AD92000",
+      "main_build_id": "9c3116f0333ea157526612d17354b3755737c4f2000000000000000000000000",
+      "nvn_driver": true,
+      "pipelines": "pipelines.tsv",
+      "nvn_policy": {
+        "hoist_implicit_samples": true
+      },
+      "shader_inputs": {
+        "containers": "glslc",
+        "vertex_depth": "zero-to-one"
+      },
+      "note": "Update 1.05; GLSLC shaders in main. Pool words stand in until pools get 64 KB-aligned GPU addresses. Bloom taps hoist from their guards; split quads take whole-quad LOD.",
+      "words": [
+        {
+          "offset": "0x5e2dc0",
+          "expected_instruction": "0x321402c0",
+          "replacement_instruction": "0x114042c0",
+          "nvn_driver_only": true,
+          "note": "Allocates the ring-heap pool's storage with 64 KB of slack instead of 4 KB, so it can start on a 64 KB boundary."
+        },
+        {
+          "offset": "0x5e2dd0",
+          "expected_instruction": "0x913ffea8",
+          "replacement_instruction": "0xb2403ea8",
+          "nvn_driver_only": true,
+          "note": "Rounds the storage start up to 64 KB (with the next word): Armigo's pool GPU address is its guest address, which the console driver keeps 64 KB-aligned."
+        },
+        {
+          "offset": "0x5e2dd8",
+          "expected_instruction": "0x9274cd08",
+          "replacement_instruction": "0x91000508",
+          "nvn_driver_only": true,
+          "note": "Completes the 64 KB round-up; the engine carves its ring heaps from this pool at 64 KB GPU alignment, sized exactly."
+        }
+      ]
+    }
+  ]
+}

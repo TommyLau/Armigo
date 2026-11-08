@@ -102,7 +102,9 @@ static_assert(!valid_numeric_mode({Domain::bits, ScalarType::f32}));
 static_assert(valid_numeric_mode({Domain::floating, ScalarType::f32, Rounding::nearest_even}));
 
 enum class Access : std::uint8_t { read, write, read_write };
-enum class AddressSpace : std::uint8_t { constant_buffer, local, storage, shared };
+// Append-only. guest addresses GPU-visible guest memory directly by its
+// 64-bit guest address, translated through the guest-memory pool table.
+enum class AddressSpace : std::uint8_t { constant_buffer, local, storage, shared, guest };
 enum class MemoryOrder : std::uint8_t { relaxed, acquire, release, acquire_release, sequential };
 enum class MemoryScope : std::uint8_t { invocation, subgroup, workgroup, device };
 enum class TextureDimension : std::uint8_t { d1, d2, d3, cube, buffer };
@@ -134,7 +136,13 @@ enum class IoSemantic : std::uint8_t {
     // Fragment-stage quad position 0..3 within the 2x2 pixel quad, the
     // fragment counterpart of the SIMD lane index. FSWZADD reads it to select
     // its per-lane operation; the host declares it as a builtin attribute.
-    quad_lane_id
+    quad_lane_id,
+    // The render-target height in pixels, a per-draw fragment input the host
+    // writes into the draw-parameter record (version 2, word 1). A front end
+    // that lowers PositionY under a negated guest Y origin reads it to form
+    // height - y; the native front end does, the Maxwell front end refuses
+    // that case.
+    render_target_height
 };
 enum class InterpolationMode : std::uint8_t { flat, perspective, linear };
 enum class InterpolationLocation : std::uint8_t { center, centroid, sample, offset };

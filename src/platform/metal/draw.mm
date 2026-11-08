@@ -307,7 +307,7 @@ void reflection(const CompiledGraphicsPair& pair,std::uint32_t texture_selector)
             (f.fragment_position == gm::FragmentPositionConvention::MetalPositionWMatchesGuestPositionW ||
              (f.fragment_position == gm::FragmentPositionConvention::Unspecified && !f.interface.position_input_mask)),
             "Metal draw compiled coordinate variant does not match guest state");
-    require(v.interface.position_input_mask == 0 && v.interface.position_output_mask == 15 &&
+    require(v.interface.position_input_mask == 0 && v.interface.position_output_mask && !(v.interface.position_output_mask & ~15u) &&
             v.interface.color_output_mask == 0 && !v.writes_fragment_depth &&
             !v.writes_sample_mask && f.interface.position_output_mask == 0 &&
             !(f.interface.position_input_mask & ~15u) &&

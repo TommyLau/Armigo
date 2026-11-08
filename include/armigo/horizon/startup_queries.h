@@ -23,6 +23,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -39,7 +40,7 @@ inline constexpr std::uint64_t guest_page_size = 4096;
 // map/unmap checks share this value; a console capture may establish 64 KiB.
 inline constexpr std::uint64_t switch2_physical_mapping_granule = guest_page_size;
 
-enum class Baseline { horizon_20_5_0, horizon_23_0_1 };
+enum class Baseline { horizon_23_0_1 };
 
 struct AddressRange {
     std::uint64_t address = 0;
@@ -83,13 +84,13 @@ struct MemoryMapUpdate {
 using MemoryInfo = MemoryBlock;
 std::array<std::byte, 40> encode_memory_info(const MemoryInfo& info) noexcept;
 
-// Supported process profiles use 64-bit, 39-bit address space. The Switch 1
-// profile has no private system resource; the selected 23.0.1 reference also
-// admits an application-owned resource pool. Placement and resource budgets
-// are supplied by the runtime, never selected by a game name.
+// Supported process profiles use 64-bit, 39-bit address space. Both platforms
+// select Horizon 23.0.1. Private system resources and the remote window are
+// Switch 2 platform policy, not a release difference. Placement and resource
+// budgets are supplied by the runtime, never selected by a game name.
 struct ProcessConfiguration {
     GuestPlatform platform = GuestPlatform::switch1;
-    Baseline baseline = Baseline::horizon_20_5_0;
+    Baseline baseline = Baseline::horizon_23_0_1;
     unsigned address_bits = 39;
     std::uint64_t heap_address = 0;
     std::uint64_t alias_address = 0;
@@ -365,6 +366,17 @@ struct GuestCopyOut {
 // guest memory the caller reads separately.
 std::size_t describe_break(std::uint64_t reason, std::uint64_t address, std::uint64_t size,
                            char* buffer, std::size_t capacity) noexcept;
+// The timeout WaitSynchronization, WaitProcessWideKeyAtomic and WaitForAddress
+// pass to their waits: a positive guest timeout converted once with the
+// process's counter rate (Switch 1 without a process); zero and negative
+// values pass through. The waits below take it as raw nanoseconds.
+std::int64_t svc_wait_timeout(const ProcessRecord* process, std::int64_t timeout) noexcept;
+
+// Bit 31 of svcBreak's 32-bit reason marks a notification the kernel returns
+// from when no debugger is attached, instead of ending the process.
+constexpr bool break_is_notification(std::uint64_t reason) noexcept {
+    return (static_cast<std::uint32_t>(reason) & 0x80000000u) != 0;
+}
 
 enum class QueryDisposition {
     handled,
@@ -376,16 +388,26 @@ enum class QueryDisposition {
 // through a handle. The owner keeps the range but the object carries the
 // permission other mappings will use, which is what the guest hands to another
 // process later. No second mapping exists until one is requested.
+// A transfer memory object. CreateTransferMemory locks the owner's range;
+// `release` unlocks it when the last reference goes, as the kernel's
+// finalizer restores the owner's pages. It must not throw and must not need a
+// lock its creator holds while the record could be dropped.
 class TransferMemoryRecord final : public KernelObject {
 public:
-    TransferMemoryRecord(AddressRange range, std::uint32_t permission)
-        : range_(range), permission_(permission) {}
+    TransferMemoryRecord(AddressRange range, std::uint32_t permission, std::function<void()> release = {})
+        : range_(range), permission_(permission), release_(std::move(release)) {}
+    ~TransferMemoryRecord() override {
+        if (release_) try { release_(); } catch (...) {}
+    }
     AddressRange range() const noexcept { return range_; }
     std::uint32_t permission() const noexcept { return permission_; }
+    // Drops the release hook when the creator unwinds the lock itself.
+    void disarm() noexcept { release_ = nullptr; }
 
 private:
     AddressRange range_;
     std::uint32_t permission_;
+    std::function<void()> release_;
 };
 
 // Implements only the current startup queries. A handled call may return a

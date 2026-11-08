@@ -10,7 +10,7 @@
 
 // NPDM admission and launch profile derivation.
 //
-// Admission follows Horizon 20.5.0. It validates META/ACID/ACI0 and the
+// Admission follows the Horizon loader. It validates META/ACID/ACI0 and the
 // program-id interval before checking requested capabilities against the ACID
 // catalogue. Capability descriptors identify core/priority, syscall, range,
 // I/O-page, region and interrupt permissions. Duplicate singleton kinds are
@@ -524,7 +524,7 @@ struct ServiceAccessEntry {
     return entry.length != 0 && entry.name[entry.length - 1] == '*';
 }
 
-// SM 20.5.0 0x1880/0x1AC0: a request entry is covered when a restriction entry
+// The service manager: a request entry is covered when a restriction entry
 // with the same host flag matches it exactly, or fuzzy-matches it with a
 // wildcard whose prefix agrees (the '*' byte itself excluded).
 [[nodiscard]] bool service_allowed_by(const std::vector<ServiceAccessEntry>& restrictions,
@@ -554,17 +554,43 @@ struct ServiceAccessEntry {
 struct FsAccessBlock {
     std::uint8_t version = 0;
     std::uint64_t permissions = 0;
+    std::vector<std::uint64_t> content_owner_ids;
+    std::vector<ProcessPermissions::SaveDataOwner> save_data_owners;
 };
 
-// FS 20.5.0 0x76EC0 consumes both records. Version is one byte; unequal or
-// zero versions produce empty access (0x76F14..0x76F28). Permissions intersect
-// at 0x76F70. Armigo selects the non-debug access configuration, masking bits
-// 62 and 63 (0x76F34..0x76F78, 0xA43D0). The external configuration value and
+// One ACID owner restriction: its explicit list, or else its inclusive id
+// range, where a zero range admits every id (the FS module, for content
+// owners and for save-data owners).
+struct OwnerRestriction {
+    std::span<const std::byte> ids;
+    std::uint64_t minimum = 0;
+    std::uint64_t maximum = 0;
+
+    [[nodiscard]] bool admits(std::uint64_t id) const {
+        if (ids.empty()) {
+            return (minimum == 0 && maximum == 0) || (minimum <= id && id <= maximum);
+        }
+        for (std::size_t offset = 0; offset < ids.size(); offset += 8) {
+            std::uint64_t listed = 0;
+            static_cast<void>(RangeReader(ids).read_u64(offset, listed));
+            if (listed == id) return true;
+        }
+        return false;
+    }
+};
+
+// The FS module consumes both records. Version is one byte; unequal or
+// zero versions produce empty access. Permissions intersect.
+// Armigo selects the non-debug access configuration, masking bits
+// 62 and 63. The external configuration value and
 // privileged internal registration are outside this profile's verified scope.
 // ACI0 owner payload pairs are offset/size at +0xC/+0x10 and +0x14/+0x18.
 // ACID counts at +1/+2 describe lists after +0x2C; its four qwords at +0xC
-// are owner ID range restrictions. Unrequested owner grants need no profile
-// state. Requested owner payloads require a future owner-aware FS contract.
+// are the content and save-data owner id ranges. A content payload is a u32
+// count and that many u64 ids; a save-data payload is a u32 count,
+// one accessibility byte per id, padding to four bytes, then the u64 ids.
+// Each payload must be exactly that long. Requested ids the ACID
+// admits are kept in request order; the rest are dropped.
 [[nodiscard]] std::optional<LaunchFailure> derive_fs_access(
     std::span<const std::byte> request, std::span<const std::byte> restriction,
     FsAccessBlock& out) {
@@ -577,13 +603,22 @@ struct FsAccessBlock {
         return std::nullopt;
     }
     RangeReader reader(request);
-    const std::size_t owner_count = static_cast<std::uint8_t>(restriction[1]) +
-                                    static_cast<std::uint8_t>(restriction[2]);
-    if (owner_count > (restriction.size() - kFsRestrictionHeaderSize) / 8) {
+    const RangeReader limits(restriction);
+    const std::size_t content_count = static_cast<std::uint8_t>(restriction[1]);
+    const std::size_t save_count = static_cast<std::uint8_t>(restriction[2]);
+    if (content_count + save_count > (restriction.size() - kFsRestrictionHeaderSize) / 8) {
         return failure(LaunchError::invalid_input, "npdm.file_system_access",
                        "the ACID owner lists extend past their access record");
     }
-    for (const std::size_t field : {0xCu, 0x14u}) {
+    OwnerRestriction content{restriction.subspan(kFsRestrictionHeaderSize, content_count * 8)};
+    OwnerRestriction save{restriction.subspan(kFsRestrictionHeaderSize + content_count * 8, save_count * 8)};
+    static_cast<void>(limits.read_u64(0x0C, content.minimum));
+    static_cast<void>(limits.read_u64(0x14, content.maximum));
+    static_cast<void>(limits.read_u64(0x1C, save.minimum));
+    static_cast<void>(limits.read_u64(0x24, save.maximum));
+    std::array<std::span<const std::byte>, 2> payloads;
+    for (std::size_t index = 0; index < payloads.size(); ++index) {
+        const std::size_t field = index == 0 ? 0xCu : 0x14u;
         std::uint32_t offset = 0;
         std::uint32_t size = 0;
         static_cast<void>(reader.read_u32(field, offset));
@@ -592,15 +627,40 @@ struct FsAccessBlock {
             return failure(LaunchError::invalid_input, "npdm.file_system_access",
                            "an ACI0 owner payload extends past its access record");
         }
-        if (size != 0) {
-            return failure(LaunchError::unsupported, "npdm.file_system_access",
-                           "owner payloads require an owner-aware file-system profile");
+        payloads[index] = request.subspan(offset, size);
+    }
+    if (!payloads[0].empty()) {
+        std::uint32_t count = 0;
+        static_cast<void>(RangeReader(payloads[0]).read_u32(0, count));
+        if (payloads[0].size() < 4 || (payloads[0].size() - 4) / 8 != count || (payloads[0].size() - 4) % 8 != 0) {
+            return failure(LaunchError::invalid_input, "npdm.file_system_access",
+                           "the ACI0 content owner payload does not match its count");
+        }
+        for (std::uint32_t index = 0; index < count; ++index) {
+            std::uint64_t id = 0;
+            static_cast<void>(RangeReader(payloads[0]).read_u64(4 + 8 * std::size_t{index}, id));
+            if (content.admits(id)) out.content_owner_ids.push_back(id);
+        }
+    }
+    if (!payloads[1].empty()) {
+        std::uint32_t count = 0;
+        static_cast<void>(RangeReader(payloads[1]).read_u32(0, count));
+        const std::uint64_t ids_at = (std::uint64_t{4} + count + 3) & ~std::uint64_t{3};
+        if (payloads[1].size() < 4 || ids_at + std::uint64_t{8} * count != payloads[1].size()) {
+            return failure(LaunchError::invalid_input, "npdm.file_system_access",
+                           "the ACI0 save-data owner payload does not match its count");
+        }
+        for (std::uint32_t index = 0; index < count; ++index) {
+            ProcessPermissions::SaveDataOwner owner;
+            owner.accessibility = static_cast<std::uint8_t>(payloads[1][4 + index]);
+            static_cast<void>(RangeReader(payloads[1]).read_u64(ids_at + 8 * std::size_t{index}, owner.id));
+            if (save.admits(owner.id)) out.save_data_owners.push_back(owner);
         }
     }
     std::uint64_t requested = 0;
     std::uint64_t granted = 0;
     static_cast<void>(reader.read_u64(4, requested));
-    static_cast<void>(RangeReader(restriction).read_u64(4, granted));
+    static_cast<void>(limits.read_u64(4, granted));
     out.permissions = requested & granted & 0x3FFFFFFFFFFFFFFFULL;
     return std::nullopt;
 }
@@ -767,7 +827,9 @@ LaunchResult<LaunchProfile> derive_launch_profile(std::span<const std::byte> npd
     profile.title_id = meta.aci0_program_id;
     profile.is_64_bit = true;
     profile.process.platform = meta.platform;
-    if (meta.platform == GuestPlatform::switch2) profile.process.baseline = horizon::Baseline::horizon_23_0_1;
+    // Both platforms select Horizon 23.0.1. Hardware and service policy stay
+    // on the platform; the NPDM does not name the release.
+    profile.process.baseline = horizon::Baseline::horizon_23_0_1;
     profile.process.address_bits = 39;
     profile.process.alias_extra_enabled =
         (meta.meta_flags & kMetaFlagAliasRegionExtraSize) != 0;
@@ -816,6 +878,8 @@ LaunchResult<LaunchProfile> derive_launch_profile(std::span<const std::byte> npd
     write_u32(0x10, 0);
     write_u32(0x14, static_cast<std::uint32_t>(kFsAccessBlockSize));
     profile.permissions.file_system_access_control.assign(fs_block.begin(), fs_block.end());
+    profile.permissions.content_owner_ids = std::move(aci0_fs.content_owner_ids);
+    profile.permissions.save_data_owners = std::move(aci0_fs.save_data_owners);
 
     profile.permissions.handle_table_capacity = aci0_capabilities.handle_table_size;
     profile.permissions.intended_kernel_version = aci0_capabilities.kernel_version;

@@ -63,12 +63,30 @@ public:
   Resources &operator=(const Resources &) = delete;
 
   void set_completion_hook(CompletionHook hook);
+  // How long a pool release waits for the submissions that leased
+  // guest-memory tables over its range (CPU reconciliation does not wait for
+  // leases: the guest's own sync waits order its reads).
+  void set_lease_wait_timeout(std::chrono::nanoseconds timeout);
 
   // Moves whenever a pool, texture, sampler or descriptor registration changes,
   // so a cached binding that resolved a handle or address can tell that it must
   // be resolved again.
   [[nodiscard]] std::uint64_t registration_generation() const;
   [[nodiscard]] bool overlaps_texture_backing(std::uint64_t address, std::uint64_t size) const;
+
+  // A registered pool as shaders' guest-memory table lists it: its guest
+  // range, its zero-copy buffer and the buffer's device address of `begin`.
+  struct GuestMemoryPool {
+    std::uint64_t begin = 0, end = 0, gpu = 0;
+    id<MTLBuffer> buffer = nil;
+  };
+  // Leases the pools a submission's guest-memory table names until the
+  // submission retires: a pool released meanwhile waits for it. Returns the
+  // pool-set generation, which moves whenever a pool is registered or starts
+  // its release; when it differs from `known`, `pools` is replaced with that
+  // set's GPU-accessible pools.
+  std::uint64_t claim_guest_memory_pools(std::uint64_t known, std::vector<GuestMemoryPool> &pools);
+  [[nodiscard]] std::uint64_t pool_generation() const noexcept;
 
   [[nodiscard]] BufferSpan buffer_at(std::uint64_t gpu_address,
                                      std::uint64_t size);
@@ -94,6 +112,15 @@ public:
                   const armigo::nvn::TextureViewState *view);
   // Descriptor sampling applies the selected component mapping and depth/stencil aspect.
   [[nodiscard]] id<MTLTexture> texture_for_id(std::int32_t texture_id);
+  // Gives the storage of texture `serial` shader-write usage for a storage
+  // image write (a texture registered as an image without the IMAGE flag):
+  // new storage with that usage replaces it for every alias, and its cached
+  // views and descriptor lookups resolve again. The serial stamp and the rare
+  // stamp both move with that replacement. `previous` is the storage
+  // replaced, whose contents the caller copies before any use of the new
+  // one; nil when the storage was writable already. Nil when no such
+  // texture has storage.
+  [[nodiscard]] id<MTLTexture> upgrade_for_image_write(std::uint64_t serial, __strong id<MTLTexture> &previous);
   // What a descriptor lookup depended on: the registrations of its ID, the
   // descriptor pools, its texture's storage entry. A caller that kept the
   // result may use it again while texture_stamp_current holds, without the
@@ -138,6 +165,16 @@ public:
   [[nodiscard]] bool texture_is_in_place(const armigo::nvn::TextureState &texture);
   void note_gpu_write(const armigo::nvn::TextureState &texture);
   void note_gpu_write(std::uint64_t gpu_address, std::uint64_t size);
+  // A GPU write found once the work that made it completed (a guest-memory
+  // write log names whole pools): CPU snapshots see the range changed, and
+  // textures with storage of their own over it compare their backing with the
+  // bytes of their last upload at their next use, uploading again only when
+  // they differ. A texture the GPU wrote keeps its storage.
+  void note_completed_gpu_write(std::uint64_t gpu_address, std::uint64_t size);
+  // Whether a texture's data over the range comes from guest memory at its
+  // next use: a texture there has storage of its own the GPU has not written,
+  // or none is registered yet.
+  [[nodiscard]] bool backing_feeds_texture(std::uint64_t gpu_address, std::uint64_t size);
   // The generation of the newest GPU write noted so far, and the completion
   // of every GPU write noted up to a generation once its work has finished.
   [[nodiscard]] std::uint64_t gpu_write_generation() const;
@@ -175,6 +212,8 @@ public:
 
   bool register_pool(const armigo::nvn::MemoryPoolState &pool) override;
   void release_pool(const armigo::nvn::MemoryPoolState &pool) override;
+  void prepare_pool_write(const armigo::nvn::MemoryPoolState &pool,
+                          std::uint64_t offset, std::uint64_t size) override;
   void flush_pool(const armigo::nvn::MemoryPoolState &pool,
                   std::uint64_t offset, std::uint64_t size) override;
   void invalidate_pool(const armigo::nvn::MemoryPoolState &pool,

@@ -355,7 +355,40 @@ def validate_storage_buffers_v3(items, constant_buffers):
     return metals
 
 
-def validate_textures_v2(items):
+# Slot 31 names handle program (offset / 4), not a constant buffer. Slots 18
+# through 30 stay outside the constant-buffer range. The stage loader admits
+# the same optional root field and the same index rule.
+HANDLE_PROGRAM_SLOT = 31
+HANDLE_PROGRAM_LIMIT = 4096
+
+
+def validate_handle_programs(metadata):
+    if "handle_programs" not in metadata:
+        return 0
+    programs = metadata["handle_programs"]
+    require(isinstance(programs, list), "handle_programs must be an array")
+    require(len(programs) <= HANDLE_PROGRAM_LIMIT,
+            "handle_programs exceeds its count policy")
+    for program in programs:
+        require(isinstance(program, list), "handle program must be an array")
+        require(len(program) <= HANDLE_PROGRAM_LIMIT,
+                "handle program exceeds its count policy")
+        for word in program:
+            require(is_uint(word, 0xffffffff), "handle program word is invalid")
+    return len(programs)
+
+
+def admits_texture_slot(slot, offset, elements, programs):
+    if not is_uint(slot, HANDLE_PROGRAM_SLOT):
+        return False
+    if slot != HANDLE_PROGRAM_SLOT:
+        return slot <= 17
+    if offset % 4 != 0 or elements <= 0:
+        return False
+    return offset // 4 + elements <= programs
+
+
+def validate_textures_v2(items, programs):
     require(isinstance(items, list) and len(items) <= 32,
             "textures must be an array of at most 32 entries")
     # A texture and its sampler come from the same handle word, so the offset
@@ -375,8 +408,9 @@ def validate_textures_v2(items):
                                 "normalized_coordinates", "sampler_index"), "sampler")
         handle = item["handle_byte_offset"]
         handles = texture_handles if kind == "texture" else sampler_handles
-        require(is_uint(item["cbuf_slot"], 17) and is_uint(handle, 32764) and
-                handle % 4 == 0 and handle not in handles,
+        require(is_uint(handle, 32764) and handle % 4 == 0 and
+                admits_texture_slot(item["cbuf_slot"], handle, 1, programs) and
+                handle not in handles,
                 "texture provenance reflection is invalid")
         handles.add(handle)
         if kind == "texture":
@@ -414,7 +448,7 @@ def validate_argument_buffer_v3(value):
     return value["buffer_index"]
 
 
-def validate_textures_v3(items, argument_buffer):
+def validate_textures_v3(items, argument_buffer, programs):
     require(isinstance(items, list) and len(items) <= 4096,
             "textures must be an array of at most 4096 entries")
     resource_ids = [item.get("resource_id") if isinstance(item, dict) else None
@@ -438,9 +472,10 @@ def validate_textures_v3(items, argument_buffer):
             require_keys(item, common + ("comparison", "normalized_coordinates"), "sampler")
         length = item["array_length"]
         offset = item["handle_byte_offset"]
-        require(is_uint(item["cbuf_slot"], 17) and is_uint(offset, 65532) and
-                offset % 4 == 0 and is_uint(length, 0xffffffff) and length > 0 and
-                offset + length * 4 <= 65536,
+        require(is_uint(offset, 65532) and offset % 4 == 0 and
+                is_uint(length, 0xffffffff) and length > 0 and
+                offset + length * 4 <= 65536 and
+                admits_texture_slot(item["cbuf_slot"], offset, length, programs),
                 "texture provenance reflection is invalid")
         require(isinstance(item["comparison"], bool) and
                 isinstance(item["normalized_coordinates"], bool),
@@ -519,7 +554,7 @@ def validate_vertex_streams(items):
         attributes.add(item["attribute_index"])
 
 
-def validate_dependencies(items):
+def validate_dependencies(items, programs):
     require(isinstance(items, list) and len(items) <= 1024,
             "dependencies must be an array of at most 1024 entries")
     keys = set()
@@ -531,8 +566,9 @@ def validate_dependencies(items):
                 is_uint(item["byte_offset"], 0xffffffff) and
                 is_uint(item["component"], 3), "dependency reflection is invalid")
         if item["kind"] == "texture_descriptor":
-            require(is_uint(item["index"], 17) and is_uint(item["byte_offset"], 32764) and
-                    item["byte_offset"] % 4 == 0 and item["component"] == 0,
+            require(is_uint(item["byte_offset"], 32764) and
+                    item["byte_offset"] % 4 == 0 and item["component"] == 0 and
+                    admits_texture_slot(item["index"], item["byte_offset"], 1, programs),
                     "texture descriptor dependency key is invalid")
             texture_descriptor_value(item["value"], "texture descriptor dependency")
         identity = (item["kind"], item["index"], item["byte_offset"], item["component"])
@@ -655,7 +691,9 @@ def validate_interface_v2(value, stage, streams, textures, dependencies,
         # The runtime binds vertex-stage texture/sampler pairs like fragment
         # ones, and links every generic output against the consuming fragment
         # inputs, so flat, perspective and linear outputs are all admissible.
-        require(value["position_input_mask"] == 0 and value["position_output_mask"] == 15 and
+        # A position output may declare only some components; the stage gives
+        # the rest the hardware default (0, 0, 0, 1).
+        require(value["position_input_mask"] == 0 and value["position_output_mask"] != 0 and
                 value["color_output_mask"] == 0 and not value["color_outputs"] and
                 not value["writes_fragment_depth"] and not value["writes_sample_mask"] and
                 len(value["generic_inputs"]) == len(streams),
@@ -703,7 +741,8 @@ def validate_reflection_v2(metadata, program, source):
             "support_buffers", "textures", "vertex_streams", "vertex_inputs", "interface",
             "dependencies")
     required = set(keys) | ({"argument_buffer"} if v3 else set())
-    optional = {"fragment_output_mode", "depth_bias_mode", "y_direction", "point_size", "point_coord"} | (
+    optional = {"fragment_output_mode", "depth_bias_mode", "y_direction", "point_size",
+                "point_coord", "handle_programs"} | (
         {"storage_buffers", "custom_border", "draw_support", "vertex_fetch", "compute"} if v3 else set())
     require(isinstance(metadata, dict) and required <= set(metadata) and
             set(metadata) <= required | optional,
@@ -788,10 +827,11 @@ def validate_reflection_v2(metadata, program, source):
         if v3 else set())
     argument_buffer_index = (validate_argument_buffer_v3(metadata["argument_buffer"])
                              if v3 else None)
+    programs = validate_handle_programs(metadata)
     if v3:
-        validate_textures_v3(metadata["textures"], metadata["argument_buffer"])
+        validate_textures_v3(metadata["textures"], metadata["argument_buffer"], programs)
     else:
-        validate_textures_v2(metadata["textures"])
+        validate_textures_v2(metadata["textures"], programs)
     validate_vertex_streams(metadata["vertex_streams"])
     validate_vertex_inputs_v2(metadata["vertex_inputs"], metadata["vertex_streams"], stage)
     vertex_buffer_indices = set(range(18, 18 + len(metadata["vertex_streams"])))
@@ -876,7 +916,7 @@ def validate_reflection_v2(metadata, program, source):
     require(not vertex_buffer_indices.intersection(
                 constant_buffer_indices | support_buffer_indices),
             "constant/support buffer indices overlap vertex streams")
-    validate_dependencies(metadata["dependencies"])
+    validate_dependencies(metadata["dependencies"], programs)
     for item in metadata["dependencies"]:
         # Launch facts belong to compute stages and restate their launch reflection.
         if item["kind"] == "compute_local_size":
@@ -1039,6 +1079,8 @@ def variant_data(metadata):
             result["vertex_fetch"] = metadata["vertex_fetch"]
         if "compute" in metadata:
             result["compute"] = metadata["compute"]
+        if "handle_programs" in metadata:
+            result["handle_programs"] = metadata["handle_programs"]
         if metadata["schema"] == "armigo-shader-stage-v3":
             result["argument_buffer"] = metadata["argument_buffer"]
             result["storage_buffers"] = metadata.get("storage_buffers", [])

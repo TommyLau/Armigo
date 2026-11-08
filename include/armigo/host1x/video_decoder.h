@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -32,5 +33,23 @@ public:
 
 // The platform's VP9 decoder, or null with `failure` set.
 std::unique_ptr<Vp9Decoder> make_vp9_decoder(std::string& failure);
+
+// An AV1 decoder of one stream. Each call takes one temporal unit (OBUs with
+// size fields, as in an MP4 sample) and appends the frames it shows; the first
+// unit must carry the sequence header.
+class Av1Decoder {
+public:
+    virtual ~Av1Decoder() = default;
+    virtual bool decode(std::span<const std::uint8_t> temporal_unit,
+                        std::vector<std::shared_ptr<const DecodedFrame>>& shown, std::string& failure) = 0;
+};
+// Null, with `failure` naming the reason, when the host has no hardware AV1
+// decoder.
+std::unique_ptr<Av1Decoder> make_av1_decoder(std::string& failure);
+
+// The AV1 codec configuration record (av1C) for the sequence header OBU among
+// `obus`, which follows it as its configuration OBU; nothing when there is no
+// well-formed sequence header.
+std::optional<std::vector<std::uint8_t>> av1_configuration_record(std::span<const std::uint8_t> obus);
 
 } // namespace armigo::host1x

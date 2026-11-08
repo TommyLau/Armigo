@@ -53,7 +53,10 @@ struct Location {
     std::string member;
     std::uint64_t offset = 0;
 };
-enum class ContainerKind { bnsh, bahs };
+// A runtime record is the control and code an NVN driver receives from the
+// title (the 0xe0 control bytes its version-20 reader consumes, and the code
+// at the program's data address); it carries no container extents.
+enum class ContainerKind { bnsh, bahs, runtime };
 struct Record {
     ContainerKind kind{};
     std::vector<Location> ancestry;
@@ -77,6 +80,10 @@ private:
     void scan_inner(Bytes bytes, std::vector<Location>& ancestry, unsigned depth);
     void bnsh(Bytes bytes, const std::vector<Location>& ancestry, std::size_t offset);
     void bahs(Bytes bytes, const std::vector<Location>& ancestry, std::size_t offset);
+    // True when the span is an NDVE container whose pack or network tables hold shaders.
+    bool ndve(Bytes bytes, std::vector<Location>& ancestry, std::size_t offset);
+    // True when the span is an NDSR pack and at least one shader record was emitted.
+    bool ndsr(Bytes bytes, const std::vector<Location>& ancestry, std::size_t offset);
     void emit(Record record);
     Visitor visitor_;
     Limits limits_;

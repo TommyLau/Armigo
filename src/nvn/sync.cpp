@@ -9,6 +9,7 @@
 // ============================================================================
 
 #include <armigo/common/diagnostics.h>
+#include <armigo/execution/guest_timeline.h>
 #include "backend.h"
 #include "entry_table.h"
 #include "present_internal.h"
@@ -23,10 +24,17 @@
 #include <exception>
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <thread>
 
 namespace armigo::nvn {
 namespace {
+
+// The callback runs under the registration lock, so clearing waits for a
+// callback in progress and the context cannot be destroyed under it.
+std::mutex event_observer_mutex;
+EventSignalObserver event_observer = nullptr;
+void* event_observer_context = nullptr;
 
 constexpr std::uint32_t sync_tag = object_tag('S', 'Y', 'N', 'C');
 constexpr std::uint32_t event_tag = object_tag('E', 'V', 'N', 'T');
@@ -111,7 +119,7 @@ NVNsyncWaitResult sync_wait(const NVNsync *sync, std::uint64_t timeout) {
 
   ReplayBackend *replay = backends().replay;
   try {
-    if (replay->completed_fence() >= state.fence)
+    if (replay->fence_completed(state.fence))
       return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
     if (!timeout)
       return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
@@ -139,12 +147,20 @@ NVNboolean queue_wait_sync(NVNqueue *queue, const NVNsync *sync) {
   ReplayBackend *replay = backends().replay;
   const std::uint64_t fence = sync_state(sync)->fence;
   try {
-    if (replay->completed_fence() >= fence)
+    if (replay->fence_completed(fence))
       return 1;
     replay->flush();
-    if (blocking_wait(
-            [replay, fence] { return replay->wait_fence(fence, UINT64_MAX); }, "queue_wait_sync"))
+    // The queue's later work waits for the fence; a backend that orders
+    // queues itself returns at once.
+    std::optional<std::uint64_t> tail;
+    if (blocking_wait([replay, fence, identity = queue_identity(queue), &tail] {
+          tail = replay->queue_wait_fence(identity, fence);
+          return tail.has_value();
+        }, "queue_wait_sync")) {
+      // Finish, fence syncs and presents of the queue follow the wait.
+      if (*tail) queue_set_last_fence(queue, *tail);
       return 1;
+    }
     queue_error(queue, "replay backend did not complete queue wait sync");
   } catch (const std::exception &exception) {
     queue_error(queue, exception.what());
@@ -224,8 +240,12 @@ void event_signal(NVNevent *event, NVNeventSignalMode mode,
     report_sync_failure("event signal", "event is invalid");
     return;
   }
-  if (!event_signal_value(event_storage(event)->state, mode, signal))
+  std::uint32_t left = 0;
+  if (!event_signal_value(event_storage(event)->state, mode, signal, &left)) {
     report_sync_failure("event signal", "signal mode is invalid");
+    return;
+  }
+  notify_event_signal_observer(event_storage(event)->state.value, left);
 }
 
 std::uint64_t device_get_current_timestamp(const NVNdevice *) {
@@ -238,6 +258,26 @@ std::uint64_t device_get_timestamp(const NVNdevice *,
 }
 
 } // namespace
+
+void set_event_signal_observer(EventSignalObserver observer, void *context) noexcept {
+  const std::lock_guard lock(event_observer_mutex);
+  event_observer = observer;
+  event_observer_context = context;
+}
+
+void notify_event_signal_observer(const volatile std::uint32_t *event, std::uint32_t value) noexcept {
+  const std::lock_guard lock(event_observer_mutex);
+  if (event_observer)
+    event_observer(event_observer_context, event, value);
+}
+
+void clear_event_signal_observer(void *context) noexcept {
+  const std::lock_guard lock(event_observer_mutex);
+  if (event_observer_context == context) {
+    event_observer = nullptr;
+    event_observer_context = nullptr;
+  }
+}
 
 void set_blocking_wait_hook(BlockingWaitHook hook) noexcept {
   wait_hook.store(hook, std::memory_order_release);
@@ -265,17 +305,20 @@ bool blocking_wait(const std::function<bool()> &wait, const char *tag) {
 }
 
 bool event_signal_value(const EventState &event, NVNeventSignalMode mode,
-                        std::uint32_t signal) noexcept {
+                        std::uint32_t signal, std::uint32_t *result) noexcept {
   if (event.tag != event_tag || !event.value)
     return false;
   std::atomic_ref<std::uint32_t> value(
       *const_cast<std::uint32_t *>(event.value));
+  std::uint32_t left = signal;
   if (mode == NVN_EVENT_SIGNAL_MODE_WRITE)
     value.store(signal, std::memory_order_release);
   else if (mode == NVN_EVENT_SIGNAL_MODE_ADD)
-    value.fetch_add(signal, std::memory_order_acq_rel);
+    left = value.fetch_add(signal, std::memory_order_acq_rel) + signal;
   else
     return false;
+  if (result)
+    *result = left;
   return true;
 }
 
@@ -336,12 +379,20 @@ std::uint64_t timestamp_nanoseconds_from_ticks(std::uint64_t ticks) noexcept {
              timestamp_nanoseconds_per_period / timestamp_ticks_per_period;
 }
 
+// GPU time runs on the guest clock, the timeline the guest counter reads, so
+// the game can compare a GPU timestamp with its own CPU ticks. Without a
+// running process (unit tests) the host steady clock stands in.
 std::uint64_t current_timestamp_ticks() noexcept {
-  const auto now = std::chrono::steady_clock::now().time_since_epoch();
-  const auto nanoseconds =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+  std::int64_t nanoseconds = 0;
+  if (const auto guest = execution::guest_timeline_now()) {
+    nanoseconds = guest->count();
+  } else {
+    nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count();
+  }
   return timestamp_ticks_from_nanoseconds(
-      static_cast<std::uint64_t>(nanoseconds));
+      static_cast<std::uint64_t>(nanoseconds > 0 ? nanoseconds : 0));
 }
 
 void register_sync_entries() noexcept {

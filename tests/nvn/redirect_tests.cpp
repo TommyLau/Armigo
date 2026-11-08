@@ -57,9 +57,27 @@ int main() {
     std::memcpy(&address, keys.data() + 16, 8);
     CHECK(address == reinterpret_cast<std::uintptr_t>(&nvn::armigo_nvn_bootstrap_loader));
     const auto first_code = appendix;
+    // An API 231 selection redirects to its own loader, in either form.
     bytes = original;
     keys = {};
     appendix = {};
+    CHECK(nvn::redirect_bootstrap_loader(view, prepared, 0, 64, 0,
+                                         nvn::bootstrap_loader_for({231, 40})).ok());
+    std::memcpy(&address, keys.data() + 16, 8);
+    CHECK(address == reinterpret_cast<std::uintptr_t>(&nvn::armigo_nvn231_bootstrap_loader));
+    CHECK(appendix == first_code);
+    bytes = original;
+    keys = {};
+    appendix = {};
+    view.appended_data = {};
+    view.appended_code = {};
+    CHECK(nvn::redirect_bootstrap_loader(view, prepared, 0, 64, std::nullopt,
+                                         nvn::bootstrap_loader_for({231, 40})).ok());
+    std::memcpy(&address, bytes.data() + 40, 8);
+    CHECK(address == reinterpret_cast<std::uintptr_t>(&nvn::armigo_nvn231_bootstrap_loader));
+    bytes = original;
+    view.appended_data = keys;
+    view.appended_code = appendix;
     view.base_address += 0x100000000ull;
     CHECK(nvn::redirect_bootstrap_loader(view, prepared, 0, 64, 0).ok());
     CHECK(appendix == first_code);

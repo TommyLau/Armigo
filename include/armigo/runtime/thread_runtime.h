@@ -32,7 +32,7 @@ namespace armigo::runtime {
 // masks and bindings are coherent query/per-core-lane state, not host CPU pinning
 // or mutual exclusion. Priority scheduling and native preemption are not provided.
 // The entry bridge calls prepared code on an owned stack; it is not the full
-// 20.5.0 launch ABI. Handles are slot-and-serial values. Startup queries report
+// launch ABI. Handles are slot-and-serial values. Startup queries report
 // configured state and do not allocate memory or start threads. Special
 // core values and unsupported scheduling/termination requests need evidenced
 // handling or structured errors, never fabricated scheduling success.

@@ -164,6 +164,45 @@ void structured_tests() {
         compile_with_metal("output_init_split_path", artifact.source);
     }
 
+    // A position output that declares only X/Y/Z (GLSLC drops a constant W of
+    // 1) gets the hardware default for W at entry; X/Y/Z stay as written.
+    Fixture partial(Stage::vertex);
+    partial.plan.io[0].mask = 7;
+    partial.p.requirements.io[0].mask = 7;
+    partial.store(IoSemantic::position, {fp(0.25f), fp(0.5f), fp(0.75f)});
+    const auto partial_result = partial.emit();
+    if (const auto* d = std::get_if<Diagnostic>(&partial_result)) {
+        check(false, std::string("partial_position: ") + d->message);
+    } else {
+        const auto& artifact = std::get<MslArtifact>(partial_result);
+        check(artifact.source.find("out.position.w = 1.0f;") != std::string::npos,
+            "Undeclared position W takes the hardware default");
+        compile_with_metal("output_init_partial_position", artifact.source);
+    }
+    // A vertex stage that writes outputs but no position still rejects; one
+    // that writes no output at all is a void vertex for rasterizer-discard
+    // draws.
+    Fixture no_position(Stage::vertex);
+    no_position.plan.io.clear();
+    no_position.p.requirements.io.clear();
+    no_position.io(IoSemantic::generic, Access::write, 15, {ScalarType::f32, 4}, 3);
+    no_position.store(IoSemantic::generic, {fp(0.75f)}, 3);
+    check(std::holds_alternative<Diagnostic>(no_position.emit()), "Vertex stage without position rejects");
+    // A void vertex records no clip-depth convention.
+    Fixture no_output(Stage::vertex);
+    no_output.plan.io.clear();
+    no_output.p.requirements.io.clear();
+    no_output.plan.dependencies.clear();
+    no_output.p.ir.dependencies.clear();
+    const auto void_result = no_output.emit();
+    if (const auto* d = std::get_if<Diagnostic>(&void_result)) {
+        check(false, std::string("void_vertex: ") + d->message);
+    } else {
+        const auto& artifact = std::get<MslArtifact>(void_result);
+        check(artifact.reflection.requires_rasterizer_discard && artifact.source.find("vertex void ") != std::string::npos,
+            "Vertex stage without outputs is a void vertex that requires rasterizer discard");
+    }
+
     // The policy covers writes on live paths only: a store under a literal
     // false guard writes nothing, so the completeness check still rejects.
     Fixture infeasible(Stage::vertex);

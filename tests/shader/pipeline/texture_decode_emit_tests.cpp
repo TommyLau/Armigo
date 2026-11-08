@@ -609,8 +609,10 @@ Word txd_word(unsigned dimension, bool offset, bool clamp) {
 }
 
 void test_txd() {
-    for (unsigned dimension : {0, 1, 2, 3, 4}) {
-        const auto decoded = decode_word(txd_word(dimension, true, false));
+    // Cube and cube-array words (6, 7) carry no offsets.
+    for (unsigned dimension : {0, 1, 2, 3, 4, 6, 7}) {
+        const bool offset = dimension < 6;
+        const auto decoded = decode_word(txd_word(dimension, offset, false));
         if (!decoded) { check(false, "TXD row decodes"); continue; }
         Facts facts;
         facts.descriptor.shape = {static_cast<TextureDimension>(dimension / 2), bool(dimension & 1), false};
@@ -622,9 +624,9 @@ void test_txd() {
         check(t.mode == TextureMode::sample_gradients, "TXD decodes to explicit gradients");
         check(t.gradients_x.size() == count && t.gradients_y.size() == count, "TXD gradient counts follow the shape");
         for (unsigned n = 0; n < count; ++n)
-            check(reads(e.program, op, t.gradients_x[n], aux_reg + n) &&
-                      reads(e.program, op, t.gradients_y[n], aux_reg + count + n), "TXD gradient vector order");
-        check(t.offsets.size() == count, "TXD offsets follow the Toff flag");
+            check(reads(e.program, op, t.gradients_x[n], aux_reg + 2 * n) &&
+                      reads(e.program, op, t.gradients_y[n], aux_reg + 2 * n + 1), "TXD gradient pairs per coordinate");
+        check(t.offsets.size() == (offset ? count : 0u), "TXD offsets follow the Toff flag");
         if (dimension & 1) {
             const auto* layer = definition(e.program, std::get<ValueId>(op.inputs[t.array_layer->value]));
             check(layer && layer->opcode == Opcode::bit_and, "TXD array layer unwraps the packed parameter");
@@ -741,8 +743,10 @@ void test_bindless() {
                 "TXDB coordinates shift past the handle");
             check(t.gradients_x.size() == 2 && t.gradients_y.size() == 2 &&
                       reads(e.program, op, t.gradients_x[0], aux_reg) &&
+                      reads(e.program, op, t.gradients_y[0], aux_reg + 1) &&
+                      reads(e.program, op, t.gradients_x[1], aux_reg + 2) &&
                       reads(e.program, op, t.gradients_y[1], aux_reg + 3),
-                "TXDB gradients follow the coordinate count");
+                "TXDB gradients pair up per coordinate");
         }
     }
     const auto decoded_txqb = decode_word(txqb);

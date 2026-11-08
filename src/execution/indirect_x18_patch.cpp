@@ -101,7 +101,7 @@ IndirectX18PatchResult make_indirect_x18_table_patch(
     using namespace aarch64;
     using Error = IndirectX18PatchError;
     constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
-    if (entries == 0 || entries > 4096 || (entries & (entries - 1)) != 0) return {.error = Error::missing_targets};
+    if (entries == 0 || entries > 65536 || (entries & (entries - 1)) != 0) return {.error = Error::missing_targets};
     const std::size_t word_count = indirect_x18_table_words(entries);
     const std::uint64_t bytes = std::uint64_t{word_count} * 4;
     if (address % 4 != 0 || trampoline % 4 != 0 || address > maximum - 7 ||

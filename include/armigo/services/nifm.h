@@ -27,14 +27,18 @@ namespace armigo::services::nifm {
 // CreateGeneralService (5, reserved u64 and the sender PID) hand out an
 // IGeneralService. IGeneralService: GetClientId (1) writes the client's id,
 // unique within the process, to its output buffer; CreateRequest (4,
-// requirement preset) hands out an IRequest. IRequest: GetRequestState (0),
+// requirement preset) hands out an IRequest; IsAnyInternetRequestAccepted (21,
+// client id in an input pointer buffer) answers false. IRequest: GetRequestState (0),
 // GetSystemEventReadableHandles (2) copies the request's two readable events,
 // Submit (4) evaluates the request at once: with no network profile it fails
 // with no candidate (0x8986e), the state returns to free and the first event
 // is signaled. GetResult (1) answers that result as the reply's result, and
 // GetAppletInfo (21, theme color) names the network-connection applet (15,
-// mode 0) with its argument records for that result. Every other method is an
-// explicit unsupported diagnostic.
+// mode 0) with its argument records for that result. Switch 2 adds
+// IGeneralService 101 (no input, one 436-byte output pointer buffer), which
+// reports the current connection's profile; with no connected interface the
+// 23.0.1 service answers 0xd46e and writes nothing, as here. Every other method
+// is an explicit unsupported diagnostic.
 //
 // A session serves one object until ConvertToDomain; a converted session
 // serves the port object as domain object 1 and hands out further objects as
@@ -52,16 +56,18 @@ struct Object {
 };
 
 struct ProcessState {
-    explicit ProcessState(std::uint64_t id) : process_id(id) {}
+    ProcessState(std::uint64_t id, bool is_switch2) : process_id(id), switch2(is_switch2) {}
     const std::uint64_t process_id;
+    const bool switch2;
     std::mutex mutex;
     std::uint32_t next_client_id = 1;
 };
 
 class Session final : public horizon::ClientSession {
 public:
-    // The port session of `nifm:u` for one process.
-    explicit Session(std::uint64_t process_id);
+    // The port session of `nifm:u` for one process, a Switch 2 one when
+    // `switch2` is set.
+    explicit Session(std::uint64_t process_id, bool switch2 = false);
     Session(std::shared_ptr<ProcessState> process, std::shared_ptr<Object> object);
     horizon::IpcReply request(const horizon::IpcMessage&, std::uint64_t sender_pid) override;
     horizon::IpcReply request_with_buffers(const horizon::IpcMessage&, std::uint64_t sender_pid,

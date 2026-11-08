@@ -11,6 +11,7 @@
 #include "input_script.h"
 
 #include <armigo/runtime/host_controller.h>
+#include <armigo/services/vi_producer.h>
 #include <algorithm>
 #include <charconv>
 #include <cmath>
@@ -64,19 +65,40 @@ public:
                       InputDeliveryObserver observe_delivery, InputDeliveryFlush flush_delivery)
         : presenter_(std::move(presenter)), script_(std::move(script)),
           publish_input_(std::move(publish_input)), now_(std::move(now)),
-          observe_delivery_(std::move(observe_delivery)), flush_delivery_(std::move(flush_delivery)) { publish(); }
+          observe_delivery_(std::move(observe_delivery)), flush_delivery_(std::move(flush_delivery)) {
+        const std::lock_guard lock(mutex_);
+        publish();
+    }
+    ~ScriptedPresenter() override {
+        if (script_.clock == InputScript::Clock::guest_presents) services::vi::set_guest_present_observer({});
+    }
     platform::PresenterStatus delivery_status() const {
+        const std::lock_guard lock(mutex_);
         if (delivery_failure_) return *delivery_failure_;
         return std::monostate{};
+    }
+    // Runs on the guest's thread as a guest present starts (guest-present clock).
+    void guest_present() {
+        const std::lock_guard lock(mutex_);
+        if (delivery_failure_) return;
+        ++completed_;
+        publish();
     }
     platform::PresentationMode mode() const noexcept override { return presenter_->mode(); }
     std::uint64_t presented_count() const noexcept override { return presenter_->presented_count(); }
     platform::PresentResult present(const platform::PresentationFrame& frame,
         std::optional<std::chrono::steady_clock::time_point> deadline,
         std::stop_token stop) override {
-        if (delivery_failure_) return *delivery_failure_;
+        if (const auto status = delivery_status(); std::holds_alternative<platform::PresentationFailure>(status))
+            return std::get<platform::PresentationFailure>(status);
         auto result = presenter_->present(frame, deadline, stop);
+        if (script_.clock == InputScript::Clock::guest_presents) {
+            if (const auto status = delivery_status(); std::holds_alternative<platform::PresentationFailure>(status))
+                return std::get<platform::PresentationFailure>(status);
+            return result;
+        }
         if (std::holds_alternative<platform::PresentedFrame>(result)) {
+            const std::lock_guard lock(mutex_);
             if (script_.clock == InputScript::Clock::milliseconds) {
                 const auto current = now_();
                 if (!started_) started_ = current;
@@ -122,6 +144,8 @@ private:
     std::function<std::chrono::steady_clock::time_point()> now_;
     InputDeliveryObserver observe_delivery_;
     InputDeliveryFlush flush_delivery_;
+    // Guards delivery: the guest-present clock delivers on the guest's thread.
+    mutable std::mutex mutex_;
     std::optional<platform::PresentationFailure> delivery_failure_;
     std::optional<std::chrono::steady_clock::time_point> started_;
     std::size_t next_ = 0;
@@ -172,11 +196,14 @@ std::variant<InputScript, std::string> parse_input_script(std::istream& source) 
             return "Input script line " + std::to_string(line_number) + ": " + detail;
         };
         if (frame_text == "clock") {
-            if (clock_seen || !events.empty() || !(fields >> action) ||
-                (action != "presents" && action != "milliseconds") || (fields >> extra))
-                return error("expected one clock presents|milliseconds directive before events.");
-            script.clock = action == "milliseconds" ? InputScript::Clock::milliseconds
-                                                   : InputScript::Clock::presents;
+            constexpr InputScript::Clock clocks[] = {InputScript::Clock::presents, InputScript::Clock::milliseconds,
+                                                     InputScript::Clock::guest_presents};
+            const bool read = !clock_seen && events.empty() && static_cast<bool>(fields >> action);
+            const auto named = std::find_if(std::begin(clocks), std::end(clocks),
+                                            [&](auto clock) { return action == input_clock_name(clock); });
+            if (!read || named == std::end(clocks) || (fields >> extra))
+                return error("expected one clock presents|milliseconds|guest-presents directive before events.");
+            script.clock = *named;
             clock_seen = true;
             continue;
         }
@@ -226,6 +253,15 @@ std::variant<InputScript, std::string> parse_input_script(std::istream& source) 
     return script;
 }
 
+const char* input_clock_name(InputScript::Clock clock) noexcept {
+    switch (clock) {
+    case InputScript::Clock::presents: return "presents";
+    case InputScript::Clock::milliseconds: return "milliseconds";
+    case InputScript::Clock::guest_presents: return "guest-presents";
+    }
+    return "presents";
+}
+
 std::shared_ptr<platform::Presenter> scripted_presenter(
     std::shared_ptr<platform::Presenter> presenter, InputScript script,
     std::function<void(const platform::HostInputSnapshot&)> publish,
@@ -233,11 +269,19 @@ std::shared_ptr<platform::Presenter> scripted_presenter(
     InputDeliveryObserver observe_delivery, InputDeliveryFlush flush_delivery,
     platform::PresenterStatus* initial_delivery_status) {
     if (!now) now = [] { return std::chrono::steady_clock::now(); };
+    const bool guest_clock = script.clock == InputScript::Clock::guest_presents;
+    if (!publish && guest_clock) publish = [](const platform::HostInputSnapshot& input) {
+        services::hid::publish_host_full_key_input_now(runtime::full_key_input(input));
+    };
     if (!publish) publish = [](const platform::HostInputSnapshot& input) {
         services::hid::set_host_full_key_input(runtime::full_key_input(input));
     };
     auto result = std::make_shared<ScriptedPresenter>(std::move(presenter), std::move(script),
         std::move(publish), std::move(now), std::move(observe_delivery), std::move(flush_delivery));
+    if (guest_clock)
+        services::vi::set_guest_present_observer([weak = std::weak_ptr(result)] {
+            if (const auto self = weak.lock()) self->guest_present();
+        });
     if (initial_delivery_status) *initial_delivery_status = result->delivery_status();
     return result;
 }

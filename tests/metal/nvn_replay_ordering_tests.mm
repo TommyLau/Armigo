@@ -15,8 +15,10 @@
 #include "entry_table.h"
 #include "nvn_replay.h"
 #include "nvn_submission_segments.h"
+#include "nvn_primitive_expansion.h"
 #include "nvn_gpu_frame_work.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -48,6 +50,48 @@ unsigned failures = 0;
 template <Entry E> typename EntrySignature<E>::type load() {
   return reinterpret_cast<typename EntrySignature<E>::type>(
       armigo_nvn_bootstrap_loader(entry_name(E).data()));
+}
+
+// Quads and fans become one triangle list; restarts end a quad or fan and
+// a trailing partial quad draws nothing.
+void test_primitive_expansion() {
+  using replay::expand_triangles;
+  using replay::expanded_capacity;
+  std::array<std::uint32_t, 32> out{};
+  // Two quads of 16-bit indices with a restart between them and a partial
+  // quad cut short by the restart.
+  const std::array<std::uint16_t, 11> quads{0, 1, 2, 3, 9, 0xffff, 4, 5, 6, 7, 8};
+  CHECK(expanded_capacity(false, quads.size()) == 12);
+  auto used = expand_triangles(out.data(), reinterpret_cast<const std::uint8_t*>(quads.data()), 2, 0,
+                               quads.size(), false, true, 0xffff);
+  const std::array<std::uint32_t, 12> quad_triangles{0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7};
+  CHECK(used == quad_triangles.size());
+  CHECK(std::equal(quad_triangles.begin(), quad_triangles.end(), out.begin()));
+  // Without restart 0xffff is an ordinary index.
+  const std::array<std::uint16_t, 4> plain{0xffff, 1, 2, 3};
+  used = expand_triangles(out.data(), reinterpret_cast<const std::uint8_t*>(plain.data()), 2, 0, plain.size(),
+                          false, false, 0);
+  CHECK(used == 6 && out[0] == 0xffff && out[4] == 2 && out[5] == 3);
+  // A byte-index fan restarted after two triangles, then a fan of one.
+  const std::array<std::uint8_t, 8> fan{10, 11, 12, 13, 0xff, 20, 21, 22};
+  CHECK(expanded_capacity(true, fan.size()) == 18);
+  used = expand_triangles(out.data(), fan.data(), 1, 0, fan.size(), true, true, 0xff);
+  const std::array<std::uint32_t, 9> fan_triangles{10, 11, 12, 10, 12, 13, 20, 21, 22};
+  CHECK(used == fan_triangles.size());
+  CHECK(std::equal(fan_triangles.begin(), fan_triangles.end(), out.begin()));
+  // A non-indexed quad draw numbers its vertices from `first`.
+  used = expand_triangles(out.data(), nullptr, 4, 100, 9, false, false, 0);
+  CHECK(used == 12 && out[0] == 100 && out[5] == 103 && out[6] == 104 && out[11] == 107);
+  // Fewer than three fan vertices or four quad vertices draw nothing.
+  CHECK(expanded_capacity(true, 2) == 0 && expanded_capacity(false, 3) == 0);
+  // The largest fan one Metal draw can take, and the first that is refused.
+  CHECK(expanded_capacity(true, 1'431'655'767) == replay::max_expanded_indices);
+  CHECK(expanded_capacity(true, 1'431'655'768) > replay::max_expanded_indices);
+  CHECK(expanded_capacity(false, 0x7fffffff) <= replay::max_expanded_indices);
+  // Metal's own restart value cannot be drawn.
+  const std::array<std::uint32_t, 4> sentinel{0, 1, 2, 0xffffffffu};
+  CHECK(expand_triangles(out.data(), reinterpret_cast<const std::uint8_t*>(sentinel.data()), 4, 0,
+                         sentinel.size(), false, true, 7) == replay::expansion_collision);
 }
 
 // Feedback may precede worker publication or arrive out of commit order.
@@ -750,6 +794,7 @@ void test_gpu_frame_work_feedback(id<MTLDevice> device, id<MTL4CommandQueue> que
 
 int main() {
   test_segment_lifecycle();
+  test_primitive_expansion();
   test_completed_frame_work();
   @autoreleasepool {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();

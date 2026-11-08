@@ -21,6 +21,14 @@ struct EmitOptions {
     bool fragment_output_types_from_render_targets{};
     FragmentPositionConvention fragment_position{FragmentPositionConvention::unspecified};
     bool emulate_depth_bias{};
+    // Marks a vertex stage's position [[invariant]]: stages computing it with
+    // the same operations from the same inputs then agree to the bit (a depth
+    // pre-pass and a later depth-equal pass), when the library is compiled
+    // with preserveInvariance.
+    bool invariant_position{};
+    // Recorded in the guest-memory pool table by the first access outside
+    // every pool, so the host can name the program that missed.
+    std::uint32_t guest_memory_tag{};
 };
 struct MslArtifact {
     std::string source;

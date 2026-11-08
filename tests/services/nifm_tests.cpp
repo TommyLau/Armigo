@@ -223,10 +223,55 @@ void test_two_copied_events() {
 }
 } // namespace
 
+// Switch 2 IGeneralService 101 asks for the current connection's profile into a
+// 436-byte buffer; with no connected interface it fails with 0xd46e and leaves
+// the buffer alone. A Switch 1 process has no command 101.
+void test_switch2_current_profile() {
+    for (const bool switch2 : {true, false}) {
+        Session root(pid, switch2);
+        auto created = root.request(command(5, reserved), pid);
+        auto general = std::dynamic_pointer_cast<Session>(created.transferred[0]);
+        CHECK(general != nullptr);
+        if (!general) return;
+        struct Profile {
+            std::array<std::byte, 436> bytes{};
+            static bool read(void*, std::uint64_t, std::span<std::byte>) noexcept { return false; }
+            static bool write(void* context, std::uint64_t address, std::span<const std::byte> value) noexcept {
+                auto& self = *static_cast<Profile*>(context);
+                if (address + value.size() > self.bytes.size()) return false;
+                for (std::size_t i = 0; i < value.size(); ++i) self.bytes[address + i] = value[i];
+                return true;
+            }
+        } profile;
+        profile.bytes.fill(std::byte{0x5a});
+        GuestBuffers out(Profile::read, Profile::write, &profile);
+        out.add({0, 436, false, true});
+        // IsAnyInternetRequestAccepted: never, without a network.
+        GuestBuffers id(Profile::read, Profile::write, &profile);
+        id.add({0, 4, true, false});
+        auto accepted = general->request_with_buffers(command(21), pid, id);
+        CHECK(accepted.disposition == IpcDisposition::handled && word(accepted.bytes, 24) == 0 &&
+              word(accepted.bytes, 32) == 0);
+        CHECK(general->request(command(21), pid).disposition == IpcDisposition::unsupported);
+        auto reply = general->request_with_buffers(command(101), pid, out);
+        if (switch2) {
+            CHECK(reply.disposition == IpcDisposition::handled && word(reply.bytes, 24) == 0xd46e);
+            CHECK(profile.bytes[0] == std::byte{0x5a} && profile.bytes[435] == std::byte{0x5a});
+            GuestBuffers small(Profile::read, Profile::write, &profile);
+            small.add({0, 16, false, true});
+            CHECK(general->request_with_buffers(command(101), pid, small).disposition == IpcDisposition::unsupported);
+            CHECK(general->request(command(101), pid).disposition == IpcDisposition::unsupported);
+        } else {
+            CHECK(reply.disposition == IpcDisposition::unsupported);
+        }
+    }
+}
+
 int main() {
     test_unconverted_sessions();
     test_domain();
     test_two_copied_events();
+    test_switch2_current_profile();
     if (failures) return 1;
     std::puts("Network interface service checks passed");
     return 0;

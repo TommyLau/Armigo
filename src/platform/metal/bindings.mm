@@ -17,6 +17,7 @@
 
 #include "bindings.h"
 #include <armigo/memory/write_tracker.h>
+#include "../../shader/pipeline/handle_program.h"
 #include "texture_format.h"
 #include "texture_fact.h"
 #include "texture_residency.h"
@@ -377,7 +378,9 @@ void validate_stage_resources(const CompiledGraphicsStage& stage,
         std::vector<std::pair<std::uint64_t, std::uint64_t>> members;
         for (const auto& resource : stage.resources) {
             require(ids.insert(resource.resource_id).second && resource.array_length &&
-                        resource.cbuf_slot < 18 && !(resource.handle_byte_offset & 3u) &&
+                        (resource.cbuf_slot < 18 ||
+                         resource.cbuf_slot == armigo::shader::pipeline::handle_program_slot) &&
+                        !(resource.handle_byte_offset & 3u) &&
                         std::uint64_t(resource.handle_byte_offset) +
                             std::uint64_t(resource.array_length) * 4 <= 65536 &&
                         resource.location.count == resource.array_length,
@@ -433,11 +436,12 @@ void validate_stage_resources(const CompiledGraphicsStage& stage,
     }
     std::set<std::uint32_t> facts;
     for (const auto& fact : stage.texture_facts) {
-        require(fact.cbuf_slot < 18 && !(fact.handle_byte_offset & 3u) &&
+        const bool handle_program = fact.cbuf_slot == armigo::shader::pipeline::handle_program_slot;
+        require((fact.cbuf_slot < 18 || handle_program) && !(fact.handle_byte_offset & 3u) &&
                     facts.insert(fact.handle_byte_offset).second &&
                     handles.contains(fact.handle_byte_offset) &&
-                    stage.texture_handle_cbuf &&
-                    fact.cbuf_slot == *stage.texture_handle_cbuf,
+                    (handle_program || (stage.texture_handle_cbuf &&
+                                        fact.cbuf_slot == *stage.texture_handle_cbuf)),
                 "texture descriptor fact is stale or inconsistent");
     }
     if (!stage.texture_facts.empty())
@@ -468,7 +472,7 @@ void validate_stage_interfaces(const AdmittedGraphicsStages& admitted,
                   !fragment.interface.position_input_mask)),
             "compiled coordinate variant does not match the renderer profile");
     require(vertex.interface.position_input_mask == 0 &&
-                vertex.interface.position_output_mask == 15 &&
+                vertex.interface.position_output_mask && !(vertex.interface.position_output_mask & ~15u) &&
                 vertex.interface.color_output_mask == 0 &&
                 !vertex.writes_fragment_depth && !vertex.writes_sample_mask &&
                 fragment.interface.position_output_mask == 0 &&

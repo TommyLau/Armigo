@@ -17,6 +17,7 @@
 #include <armigo/shader_input/archive.h>
 #include <armigo/shader_input/container.h>
 #include <armigo/shader_input/gfd_cache.h>
+#include <armigo/shader_input/glslc_output.h>
 #include <armigo/shader_input/shader_input.h>
 #include <armigo/shader_translation/stage_translation.h>
 #include "sha256.h"
@@ -483,6 +484,32 @@ void collect_cpk_archives(const fs::path& root, std::vector<fs::path>& archives,
     if (error) enumerator.fail("Cannot list " + root.string());
 }
 
+// The main module's flat image, or empty after recording why it cannot be read.
+std::vector<std::byte> read_main_image(const fs::path& exefs, Enumerator& enumerator) {
+    std::error_code error;
+    const fs::path main_file = fs::is_regular_file(exefs / "main", error) ? exefs / "main" : exefs / "main.nso";
+    if (!fs::is_regular_file(main_file, error)) {
+        enumerator.fail("The main module is missing from the extracted ExeFS.");
+        return {};
+    }
+    const auto size = fs::file_size(main_file, error);
+    if (error || size > kMemoryLimit) {
+        enumerator.fail(main_file.string() + " exceeds the in-memory limit.");
+        return {};
+    }
+    const auto data = read_file(main_file, size);
+    if (!starts_with(data, "NSO0")) {
+        enumerator.fail(main_file.string() + " is not an NSO module.");
+        return {};
+    }
+    auto module = armigo::loader::read_nso_module(data);
+    if (!module.ok()) {
+        enumerator.fail(main_file.string() + ": " + armigo::loader::to_string(module.error.code));
+        return {};
+    }
+    return std::move(module.image->bytes);
+}
+
 void enumerate_gfd(const fs::path& exefs, const fs::path& romfs, const std::vector<fs::path>& addons,
                    const ShaderPackInput& input, Enumerator& enumerator) {
     std::vector<fs::path> archives;
@@ -542,28 +569,9 @@ void enumerate_gfd(const fs::path& exefs, const fs::path& romfs, const std::vect
         }
     }
     if (enumerator.stopped()) return;
-    std::error_code error;
-    const fs::path main_file = fs::is_regular_file(exefs / "main", error) ? exefs / "main" : exefs / "main.nso";
-    if (!fs::is_regular_file(main_file, error)) {
-        enumerator.fail("The main module is missing from the extracted ExeFS.");
-        return;
-    }
-    const auto size = fs::file_size(main_file, error);
-    if (error || size > kMemoryLimit) {
-        enumerator.fail(main_file.string() + " exceeds the in-memory limit.");
-        return;
-    }
-    const auto data = read_file(main_file, size);
-    if (!starts_with(data, "NSO0")) {
-        enumerator.fail(main_file.string() + " is not an NSO module.");
-        return;
-    }
-    const auto module = armigo::loader::read_nso_module(data);
-    if (!module.ok()) {
-        enumerator.fail(main_file.string() + ": " + armigo::loader::to_string(module.error.code));
-        return;
-    }
-    const auto packages = si::scan_hhneedle(module.image->bytes, main_file.filename().string(),
+    const auto image = read_main_image(exefs, enumerator);
+    if (image.empty()) return;
+    const auto packages = si::scan_hhneedle(image, "main",
                                             input.ignored_needle_offsets);
     if (!packages.rejected.empty()) {
         enumerator.fail(packages.rejected.front());
@@ -582,6 +590,56 @@ void enumerate_gfd(const fs::path& exefs, const fs::path& romfs, const std::vect
     }
 }
 
+// The GLSLC compiler outputs compiled into the main module. Every shader
+// control in the image must belong to an output that validates.
+void enumerate_glslc(const fs::path& exefs, Enumerator& enumerator) {
+    const auto image = read_main_image(exefs, enumerator);
+    if (image.empty()) return;
+    const auto scan = si::scan_glslc_outputs(image, "main");
+    if (!scan.rejected.empty()) {
+        enumerator.fail("GLSLC output " + scan.rejected.front());
+        return;
+    }
+    if (!scan.uncovered_controls.empty()) {
+        enumerator.fail("Shader control at main image offset " + std::to_string(scan.uncovered_controls.front()) +
+                        " is not part of a GLSLC output.");
+        return;
+    }
+    if (scan.stages.empty()) {
+        enumerator.fail("The main module holds no GLSLC output.");
+        return;
+    }
+    armigo::diag::write(armigo::diag::Level::info, "GLSLC outputs in main: %zu outputs, %zu stages\n", scan.outputs,
+                        scan.stages.size());
+    std::fflush(stderr);
+    for (const auto& stage : scan.stages) {
+        enumerator.record(stage.stage, stage.control, stage.code);
+    }
+}
+
+// Every stage of the title's container set, recorded into the enumerator.
+void enumerate_containers(const fs::path& exefs, const fs::path& romfs, const std::vector<fs::path>& addons,
+                          const ShaderPackInput& input, Enumerator& enumerator) {
+    if (input.containers == ShaderPackInput::Containers::Glslc) {
+        enumerator.strict_stages = true;
+        enumerate_glslc(exefs, enumerator);
+    } else if (input.containers == ShaderPackInput::Containers::GfdCache) {
+        enumerator.strict_stages = true;
+        enumerate_gfd(exefs, romfs, addons, input, enumerator);
+    } else {
+        enumerate_tree(exefs, enumerator);
+        if (!enumerator.stopped()) {
+            enumerate_tree(romfs, enumerator);
+        }
+        for (const auto& addon : addons) {
+            if (enumerator.stopped()) {
+                break;
+            }
+            enumerate_tree(addon, enumerator);
+        }
+    }
+}
+
 std::uint32_t word_at(std::span<const std::byte> bytes, std::size_t offset) {
     std::uint32_t value = 0;
     std::memcpy(&value, bytes.data() + offset, sizeof value);
@@ -589,10 +647,11 @@ std::uint32_t word_at(std::span<const std::byte> bytes, std::size_t offset) {
 }
 
 tr::StageOptions stage_options(si::Stage stage, std::span<const std::byte> control,
-                               gm::VertexDepthConvention vertex_depth) {
+                               gm::VertexDepthConvention vertex_depth, bool hoist_implicit_samples) {
     tr::StageOptions options;
     options.texture_handle_cbuf = 2;
     options.texture_descriptors_derived = true;
+    options.hoist_implicit_samples = hoist_implicit_samples;
     if (stage == si::Stage::Vertex) {
         options.emission.vertex_depth = vertex_depth;
     } else if (stage == si::Stage::Compute) {
@@ -612,8 +671,9 @@ tr::StageOptions stage_options(si::Stage stage, std::span<const std::byte> contr
 }
 
 tr::TranslatedStage translate_with_retry(std::span<const std::byte> control, std::span<const std::byte> code,
-                                        si::Stage stage, gm::VertexDepthConvention vertex_depth) {
-    auto options = stage_options(stage, control, vertex_depth);
+                                        si::Stage stage, gm::VertexDepthConvention vertex_depth,
+                                        bool hoist_implicit_samples) {
+    auto options = stage_options(stage, control, vertex_depth, hoist_implicit_samples);
     try {
         return tr::translate_stage(control, code, options);
     } catch (const std::exception& first) {
@@ -629,7 +689,8 @@ tr::TranslatedStage translate_with_retry(std::span<const std::byte> control, std
     }
 }
 
-bool translate_directory(const fs::path& directory, gm::VertexDepthConvention vertex_depth, std::string& error) {
+bool translate_directory(const fs::path& directory, gm::VertexDepthConvention vertex_depth,
+                         bool hoist_implicit_samples, std::string& error) {
     try {
         const auto control_size = fs::file_size(directory / "control.bin");
         const auto code_size = fs::file_size(directory / "code.bin");
@@ -642,7 +703,7 @@ bool translate_directory(const fs::path& directory, gm::VertexDepthConvention ve
             return false;
         }
         const auto stage = std::get<si::ParsedShader>(parsed).stage;
-        const auto translated = translate_with_retry(control, code, stage, vertex_depth);
+        const auto translated = translate_with_retry(control, code, stage, vertex_depth, hoist_implicit_samples);
         const auto source = std::as_bytes(std::span<const char>(translated.source.data(), translated.source.size()));
         const auto reflection = std::as_bytes(
             std::span<const char>(translated.reflection.data(), translated.reflection.size()));
@@ -668,6 +729,7 @@ struct TranslateQueue {
     std::mutex mutex;
     std::vector<std::string> errors;
     gm::VertexDepthConvention vertex_depth = gm::VertexDepthConvention::NegativeOneToOne;
+    bool hoist_implicit_samples = false;
 };
 
 void* translate_worker(void* raw) {
@@ -678,7 +740,7 @@ void* translate_worker(void* raw) {
             return nullptr;
         }
         std::string error;
-        if (!translate_directory(queue.stages[index], queue.vertex_depth, error)) {
+        if (!translate_directory(queue.stages[index], queue.vertex_depth, queue.hoist_implicit_samples, error)) {
             queue.failed.fetch_add(1);
             const std::lock_guard lock(queue.mutex);
             if (queue.errors.size() < kMaxErrors) {
@@ -720,21 +782,7 @@ std::variant<std::string, ShaderReport> build_shader_package_impl(
     fs::remove_all(package, error);
     Enumerator enumerator;
     enumerator.stages = staging / "stages";
-    if (input.containers == ShaderPackInput::Containers::GfdCache) {
-        enumerator.strict_stages = true;
-        enumerate_gfd(exefs, romfs, addons, input, enumerator);
-    } else {
-        enumerate_tree(exefs, enumerator);
-        if (!enumerator.stopped()) {
-            enumerate_tree(romfs, enumerator);
-        }
-        for (const auto& addon : addons) {
-            if (enumerator.stopped()) {
-                break;
-            }
-            enumerate_tree(addon, enumerator);
-        }
-    }
+    enumerate_containers(exefs, romfs, addons, input, enumerator);
     if (enumerator.stopped()) {
         return enumerator.hard_error();
     }
@@ -751,6 +799,7 @@ std::variant<std::string, ShaderReport> build_shader_package_impl(
     queue.vertex_depth = input.vertex_depth == ShaderPackInput::VertexDepth::ZeroToOne
         ? gm::VertexDepthConvention::ZeroToOne
         : gm::VertexDepthConvention::NegativeOneToOne;
+    queue.hoist_implicit_samples = input.hoist_implicit_samples;
     for (const auto& entry : fs::directory_iterator(enumerator.stages)) {
         if (entry.is_directory()) {
             queue.stages.push_back(entry.path());
@@ -797,6 +846,7 @@ std::variant<std::string, ShaderReport> build_shader_package_impl(
     std::sort(options.stages.begin(), options.stages.end());
     options.translate_tool = translate_tool;
     options.output = package;
+    options.hoist_implicit_samples = input.hoist_implicit_samples;
     if (!compile_cache.empty()) options.compile_cache = compile_cache;
     options.jobs = worker_count(8);
     auto built = armigo::shader::package::build(options);
@@ -813,6 +863,23 @@ std::variant<std::string, ShaderReport> build_shader_package_impl(
 }
 
 } // namespace
+
+std::variant<std::string, ShaderEnumeration> enumerate_shader_stages(
+    const fs::path& exefs, const fs::path& romfs, const std::vector<fs::path>& addons, const fs::path& stages,
+    const ShaderPackInput& input) {
+    try {
+        Enumerator enumerator;
+        enumerator.stages = stages;
+        enumerate_containers(exefs, romfs, addons, input, enumerator);
+        if (enumerator.stopped()) return enumerator.hard_error();
+        return ShaderEnumeration{enumerator.unique, enumerator.unsupported, enumerator.structural_errors,
+                                 enumerator.errors};
+    } catch (const std::bad_alloc&) {
+        return std::string("Host memory for shader packing could not be allocated.");
+    } catch (const std::exception& failure) {
+        return std::string(failure.what());
+    }
+}
 
 std::variant<std::string, ShaderReport> build_shader_package(
     const fs::path& exefs, const fs::path& romfs, const std::vector<fs::path>& addons, const fs::path& staging,

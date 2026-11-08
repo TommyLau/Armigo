@@ -483,8 +483,8 @@ bool require_layout(const TextureLayoutDescription& layout,
         error = failure(TextureLayoutErrorCode::ExtentOverflow);
         return false;
     }
-    if (layout.total_size > max_texture_layout_size ||
-        layout.layer_stride > max_texture_layout_size) {
+    if (layout.total_size > max_texture_storage_size ||
+        layout.layer_stride > max_texture_storage_size) {
         error = failure(TextureLayoutErrorCode::ExtentLimit);
         return false;
     }
@@ -583,9 +583,9 @@ TextureLayoutResult<TextureLayoutDescription> calculate_texture_size(
         if (!checked_multiply(level_size, layout.layers, total)) {
             return failure(TextureLayoutErrorCode::ExtentOverflow);
         }
-        if (total > max_texture_layout_size) {
+        if (total > max_texture_storage_size) {
             return failure(TextureLayoutErrorCode::ExtentLimit, total,
-                           max_texture_layout_size);
+                           max_texture_storage_size);
         }
         TextureLevelLayout mip;
         mip.width = layout.width;
@@ -728,9 +728,9 @@ TextureLayoutResult<TextureLayoutDescription> calculate_texture_size(
     } else {
         total = layer_size;
     }
-    if (total > max_texture_layout_size) {
+    if (total > max_texture_storage_size) {
         return failure(TextureLayoutErrorCode::ExtentLimit, total,
-                       max_texture_layout_size);
+                       max_texture_storage_size);
     }
     layout.layer_stride = layer_size_aligned;
     layout.total_size = total;

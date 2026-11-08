@@ -19,59 +19,6 @@
 #include <vector>
 
 namespace armigo::pack {
-namespace {
-
-std::string read_text(const std::filesystem::path& path, std::string& error) {
-    std::ifstream stream(path, std::ios::binary | std::ios::ate);
-    if (!stream) {
-        error = "Cannot read " + path.string() + ".";
-        return {};
-    }
-    const auto size = stream.tellg();
-    if (size < 0 || static_cast<std::uint64_t>(size) > 1024ull * 1024ull) {
-        error = path.string() + " is empty or larger than 1 MiB.";
-        return {};
-    }
-    std::string text(static_cast<std::size_t>(size), '\0');
-    stream.seekg(0);
-    if (!stream.read(text.data(), static_cast<std::streamsize>(text.size()))) {
-        error = "Cannot read " + path.string() + ".";
-        return {};
-    }
-    return text;
-}
-
-std::vector<std::array<std::byte, 32>> profile_build_ids(std::string_view text) {
-    std::vector<std::array<std::byte, 32>> ids;
-    constexpr std::string_view kKey = "\"main_build_id\"";
-    for (std::size_t at = 0; (at = text.find(kKey, at)) != std::string_view::npos;) {
-        at += kKey.size();
-        while (at < text.size() && (text[at] == ' ' || text[at] == '\t' || text[at] == '\n' ||
-                                    text[at] == '\r')) {
-            ++at;
-        }
-        if (at >= text.size() || text[at] != ':') {
-            continue;
-        }
-        ++at;
-        while (at < text.size() && (text[at] == ' ' || text[at] == '\t' || text[at] == '\n' ||
-                                    text[at] == '\r')) {
-            ++at;
-        }
-        if (at >= text.size() || text[at] != '"') {
-            continue;
-        }
-        const auto value = text.substr(at + 1, 64);
-        std::array<std::byte, 32> build_id{};
-        if (value.size() == 64 && parse_build_id(value, build_id) &&
-            at + 65 < text.size() && text[at + 65] == '"') {
-            ids.push_back(build_id);
-        }
-    }
-    return ids;
-}
-
-} // namespace
 
 std::string format_build_id(const std::array<std::byte, 32>& build_id) {
     static constexpr char kDigits[] = "0123456789abcdef";
@@ -142,17 +89,14 @@ std::variant<std::string, TitleMatch> match_title_build(
     if (!std::filesystem::is_directory(folder, error)) {
         return "No title settings for " + identity + ".";
     }
-    const auto profile = folder / "profile.json";
-    std::string read_error;
-    const auto text = read_text(profile, read_error);
-    if (!read_error.empty()) {
-        return read_error;
+    auto read = compat::read_title_settings(folder, title_id);
+    if (auto* failure = std::get_if<std::string>(&read)) {
+        return std::move(*failure);
     }
-    const auto ids = profile_build_ids(text);
-    for (const auto& candidate : ids) {
-        if (candidate == build_id) {
-            return TitleMatch{folder};
-        }
+    TitleMatch match{folder, std::get<compat::TitleSettings>(std::move(read))};
+    if (const auto* description = compat::match_patch(match.settings.patches, {title_id, build_id})) {
+        match.index = static_cast<std::size_t>(description - match.settings.patches.data());
+        return match;
     }
     return "No title settings describe build id " + format_build_id(build_id) + ".";
 }

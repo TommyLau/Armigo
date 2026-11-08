@@ -72,9 +72,10 @@ public:
     }
 
     Builder& implicit_general(unsigned number, Register31 at_31, Access access,
-                              OperandRole role) noexcept {
+                              OperandRole role, unsigned bits = 64) noexcept {
         add(RegisterOperand{.field = implicit_operand, .number = static_cast<std::uint8_t>(number),
-            .file = RegisterFile::general, .at_31 = at_31, .bits = 64, .access = access, .role = role});
+            .file = RegisterFile::general, .at_31 = at_31, .bits = static_cast<std::uint8_t>(bits),
+            .access = access, .role = role});
         return *this;
     }
 
@@ -839,6 +840,108 @@ MemoryAttributes attributes_of(const DataForm& form) noexcept {
                             : MemoryAttributes{0};
 }
 
+// Atomic memory operations (bits 29..27 = 111, V = 0, bits 25..24 = 00,
+// bit 21 = 1, bits 11..10 = 00): size V A R 1 Rs o3 opc 00 Rn Rt. A orders
+// the load as an acquire, R the store as a release.
+RegisterEffects atomic_memory(std::uint32_t word) noexcept {
+    const std::uint32_t size = field(word, 30, 2);
+    const bool acquire = bit(word, 23);
+    const bool release = bit(word, 22);
+    const std::uint32_t rs = field(word, 16, 5);
+    const bool o3 = bit(word, 15);
+    const std::uint32_t opc = field(word, 12, 3);
+    const unsigned register_bits = size == 3 ? 64 : 32;
+
+    Operation operation = Operation::none;
+    bool load_only = false;
+    if (!o3) {
+        static constexpr Operation operations[] = {Operation::ldadd, Operation::ldclr, Operation::ldeor,
+                                                   Operation::ldset, Operation::ldsmax, Operation::ldsmin,
+                                                   Operation::ldumax, Operation::ldumin};
+        operation = operations[opc];
+    } else if (opc == 0) {
+        operation = Operation::swp;
+    } else if (opc == 4 && acquire && !release && rs == 31) {
+        operation = Operation::ldapr;
+        load_only = true;
+    } else {
+        return unknown(word);  // LD64B/ST64B family and unallocated forms
+    }
+
+    MemoryAttributes attributes = 0;
+    if (acquire) attributes |= static_cast<MemoryAttributes>(MemoryAttribute::acquire);
+    if (release) attributes |= static_cast<MemoryAttributes>(MemoryAttribute::release);
+    Builder builder(word);
+    builder.operation(operation);
+    if (!load_only) builder.general(rm_field, zr, register_bits, Access::read, OperandRole::source);
+    builder.general(rd_field, zr, register_bits, Access::write, OperandRole::transfer)
+        .general(rn_field, sp, 64, Access::read, OperandRole::base)
+        .memory(MemoryEffect{.operation = load_only ? MemoryOperation::load : MemoryOperation::atomic,
+                             .addressing = AddressingMode::base_register,
+                             .element_bytes = static_cast<std::uint8_t>(1u << size),
+                             .elements = 1,
+                             .attributes = attributes});
+    if (field(word, 5, 5) == 31) builder.note(EffectNote::stack_pointer_base);
+    return builder.decoded();
+}
+
+// Compare and swap (bits 29..23 = 0010001, bit 21 = 1): size 0010001 L 1 Rs
+// o0 11111 Rn Rt. L orders the load as an acquire, o0 the store as a release.
+RegisterEffects compare_and_swap(std::uint32_t word) noexcept {
+    const std::uint32_t size = field(word, 30, 2);
+    const unsigned register_bits = size == 3 ? 64 : 32;
+    MemoryAttributes attributes = 0;
+    if (bit(word, 22)) attributes |= static_cast<MemoryAttributes>(MemoryAttribute::acquire);
+    if (bit(word, 15)) attributes |= static_cast<MemoryAttributes>(MemoryAttribute::release);
+    Builder builder(word);
+    builder.operation(Operation::cas)
+        .general(rm_field, zr, register_bits, Access::read_write, OperandRole::transfer)
+        .general(rd_field, zr, register_bits, Access::read, OperandRole::transfer)
+        .general(rn_field, sp, 64, Access::read, OperandRole::base)
+        .memory(MemoryEffect{.operation = MemoryOperation::atomic,
+                             .addressing = AddressingMode::base_register,
+                             .element_bytes = static_cast<std::uint8_t>(1u << size),
+                             .elements = 1,
+                             .attributes = attributes});
+    if (field(word, 5, 5) == 31) builder.note(EffectNote::stack_pointer_base);
+    if (field(word, 10, 5) != 31) {
+        builder.note(EffectNote::should_be_one_field);
+        return builder.unpredictable();
+    }
+    return builder.decoded();
+}
+
+// Compare and swap pair (bit 31 = 0, bits 29..23 = 0010000, bit 21 = 1): 0 sz
+// 0010000 L 1 Rs o0 11111 Rn Rt. Rs and Rt name even registers; the pairs are
+// Rs, Rs+1 and Rt, Rt+1, and an odd Rs or Rt is UNDEFINED.
+RegisterEffects compare_and_swap_pair(std::uint32_t word) noexcept {
+    const std::uint32_t rs = field(word, 16, 5);
+    const std::uint32_t rt = field(word, 0, 5);
+    if ((rs & 1) || (rt & 1)) return reserved(word);
+    const unsigned register_bits = bit(word, 30) ? 64 : 32;
+    MemoryAttributes attributes = 0;
+    if (bit(word, 22)) attributes |= static_cast<MemoryAttributes>(MemoryAttribute::acquire);
+    if (bit(word, 15)) attributes |= static_cast<MemoryAttributes>(MemoryAttribute::release);
+    Builder builder(word);
+    builder.operation(Operation::casp)
+        .general(rm_field, zr, register_bits, Access::read_write, OperandRole::transfer)
+        .implicit_general(rs + 1, zr, Access::read_write, OperandRole::transfer, register_bits)
+        .general(rd_field, zr, register_bits, Access::read, OperandRole::transfer)
+        .implicit_general(rt + 1, zr, Access::read, OperandRole::transfer, register_bits)
+        .general(rn_field, sp, 64, Access::read, OperandRole::base)
+        .memory(MemoryEffect{.operation = MemoryOperation::atomic,
+                             .addressing = AddressingMode::base_register,
+                             .element_bytes = static_cast<std::uint8_t>(register_bits / 8),
+                             .elements = 2,
+                             .attributes = attributes});
+    if (field(word, 5, 5) == 31) builder.note(EffectNote::stack_pointer_base);
+    if (field(word, 10, 5) != 31) {
+        builder.note(EffectNote::should_be_one_field);
+        return builder.unpredictable();
+    }
+    return builder.decoded();
+}
+
 RegisterEffects load_store_single(std::uint32_t word) noexcept {
     const std::uint32_t size = field(word, 30, 2);
     const bool vector = bit(word, 26);
@@ -853,8 +956,10 @@ RegisterEffects load_store_single(std::uint32_t word) noexcept {
             kind = kinds[field(word, 10, 2)];
         } else if (field(word, 10, 2) == 2) {
             kind = SingleClass::register_offset;
+        } else if (field(word, 10, 2) == 0 && !vector) {
+            return atomic_memory(word);
         } else {
-            return unknown(word);  // atomic memory operations, pointer-authenticated loads
+            return unknown(word);  // pointer-authenticated loads, unallocated forms
         }
     }
 
@@ -1026,13 +1131,10 @@ RegisterEffects load_store_exclusive(std::uint32_t word) noexcept {
 
     bool pair = false;
     if (ordered) {
-        if (o1 || !o0) {
-            return unknown(word);  // CAS family, LDLAR/STLLR
-        }
+        if (o1) return compare_and_swap(word);
+        if (!o0) return unknown(word);  // LDLAR/STLLR
     } else if (o1) {
-        if (!bit(word, 31)) {
-            return unknown(word);  // CASP family
-        }
+        if (!bit(word, 31)) return compare_and_swap_pair(word);
         pair = true;
     }
 
@@ -2831,6 +2933,11 @@ std::optional<std::uint32_t> register_fields(const RegisterEffects& effects,
             continue;
         }
         if (operand.field == implicit_operand) {
+            return std::nullopt;
+        }
+        // A CASP pair field also names the pair's implicit second register,
+        // so renaming it alone is not a single-register substitution.
+        if (effects.operation == Operation::casp && operand.role == OperandRole::transfer) {
             return std::nullopt;
         }
         mask |= operand.field_mask();

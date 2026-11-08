@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <memory>
 #include <span>
+#include <vector>
 
 namespace armigo::runtime {
 
@@ -88,6 +89,19 @@ struct ProcessMemoryOptions {
     // published in process(); guessed private harness placements are forbidden.
     std::uint64_t resource_limit_bytes = 0;
 };
+// Switch 2 alias window. A title's resource heaps grow by mapping pages into
+// the alias region, so the window bounds them (the reference workload fills a
+// 2 GiB window and cannot create its larger resource heaps). The arena asks
+// for the console's 64 GiB window. Below the 39-bit limit the host keeps only
+// a few separate gaps free, so when it cannot place that arena it retries in
+// alias_window_step steps down to the largest window that fits, never below
+// the minimum.
+inline constexpr std::uint64_t switch2_alias_window = 64ull << 30;
+inline constexpr std::uint64_t switch2_minimum_alias_window = 2ull << 30;
+inline constexpr std::uint64_t alias_window_step = 256ull << 20;
+// The alias sizes the arena reservation tries, largest first: the requested
+// size alone for Switch 1; for Switch 2 smaller ones follow down to the minimum.
+std::vector<std::uint64_t> alias_window_sizes(std::uint64_t requested, bool switch2);
 // Registers every sealed module mapping/accounting entry without taking a second
 // allocation owner. Retains module owners and the handle table for memory SVCs;
 // creates ProcessRecord only after native reservation/metadata agree. Rollback

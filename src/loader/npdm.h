@@ -10,7 +10,7 @@
 
 // Structural NPDM (META) reader.
 //
-// Structural admission rules follow the Horizon 20.5.0 loader;
+// Structural admission rules follow the Horizon loader;
 // npdm.cpp implements the ordered validation stages.
 //
 // This unit validates magics, header fields, alignment and bounded section

@@ -1,5 +1,5 @@
 // ============================================================================
-// Armigo Titles - 01007EF00011E000 Internal Resolution
+// Armigo Titles - Internal Resolution Module
 // Copyright (c) 2026 Tommy Lau.
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Armigo-Proprietary
 //
@@ -8,7 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
-#include <armigo/titles/01007EF00011E000/resolution.h>
+#include <armigo/titles/resolution.h>
 #include <armigo/loader/nso_module.h>
 
 #include <algorithm>
@@ -20,7 +20,7 @@
 #include <optional>
 #include <string_view>
 
-namespace armigo::titles::title_01007ef00011e000 {
+namespace armigo::titles::resolution {
 using compat::ResolutionSites;
 
 std::optional<float> gpu_budget_scale(GpuBudgetState& state, std::uint64_t gpu_work_ns,
@@ -259,4 +259,4 @@ resolution_words(const ResolutionSites& sites, const ResolutionSettings& setting
     return plan;
 }
 
-} // namespace armigo::titles::title_01007ef00011e000
+} // namespace armigo::titles::resolution

@@ -26,6 +26,8 @@ kern_return_t mach_vm_remap(vm_map_t, mach_vm_address_t*, mach_vm_size_t, mach_v
     int, vm_map_t, mach_vm_address_t, boolean_t, vm_prot_t*, vm_prot_t*, vm_inherit_t);
 kern_return_t mach_vm_region(vm_map_read_t, mach_vm_address_t*, mach_vm_size_t*,
     vm_region_flavor_t, vm_region_info_t, mach_msg_type_number_t*, mach_port_t*);
+kern_return_t mach_vm_region_recurse(vm_map_read_t, mach_vm_address_t*, mach_vm_size_t*,
+    natural_t*, vm_region_recurse_info_t, mach_msg_type_number_t*);
 kern_return_t mach_vm_read_overwrite(vm_map_read_t, mach_vm_address_t, mach_vm_size_t,
     mach_vm_address_t, mach_vm_size_t*);
 }

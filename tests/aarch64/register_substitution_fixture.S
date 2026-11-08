@@ -134,9 +134,9 @@ _armigo_substitution_pairs:
     add     x18, x1, x2
     // Outside decoded coverage, or handler-defined registers.
     ldadd   x1, x18, [x2]                   // 48
-    ldadd   x1, x18, [x2]
+    ldadd   x1, x9, [x2]
     cas     x1, x18, [x2]                   // 49
-    cas     x1, x18, [x2]
+    cas     x1, x9, [x2]
     paciasp                                 // 50 x30
     paciasp
     fmov    d18, x18                        // 51

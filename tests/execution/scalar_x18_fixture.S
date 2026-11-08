@@ -212,6 +212,41 @@ Lpair_site7:
     ret
 _armigo_test_sp_pair_x18_end:
 
+// SP pairs at the top of imm7 that the 16-byte spill pushes out of range: the
+// trampoline transfers each register on its own. x0 receives the values read
+// back, the old SP and the SP after the sites; guest x18 ends sign-extended.
+    .globl _armigo_test_sp_far_pair_x18_begin
+    .globl _armigo_test_sp_far_pair_x18_end
+_armigo_test_sp_far_pair_x18_begin:
+    sub sp, sp, #0x220
+    stp x29, x30, [sp]
+    mov x16, sp
+    mov x5, #0x0002
+    movk x5, #0x8000, lsl #16
+    movk x5, #0x0001, lsl #32
+    movk x5, #0x8000, lsl #48
+    mov w9, #0xfffe
+    movk w9, #0x7fff, lsl #16
+Lfar_site0:
+    stp x5, x18, [sp, #0x1f0]
+    ldp x6, x7, [sp, #0x1f0]
+Lfar_site1:
+    ldp x18, x11, [sp, #0x1f0]
+Lfar_site2:
+    stp w18, w9, [sp, #0xf0]
+    ldp w12, w13, [sp, #0xf0]
+Lfar_site3:
+    ldpsw x14, x18, [sp, #0xf0]
+    stp x6, x7, [x0, #0]
+    stp x11, x12, [x0, #16]
+    stp x13, x14, [x0, #32]
+    mov x15, sp
+    stp x16, x15, [x0, #48]
+    ldp x29, x30, [sp]
+    add sp, sp, #0x220
+    ret
+_armigo_test_sp_far_pair_x18_end:
+
     .section __TEXT,__const
     .p2align 2
     .globl _armigo_test_sp_pair_x18_offsets
@@ -224,6 +259,12 @@ _armigo_test_sp_pair_x18_offsets:
     .long Lpair_site5 - _armigo_test_sp_pair_x18_begin
     .long Lpair_site6 - _armigo_test_sp_pair_x18_begin
     .long Lpair_site7 - _armigo_test_sp_pair_x18_begin
+    .globl _armigo_test_sp_far_pair_x18_offsets
+_armigo_test_sp_far_pair_x18_offsets:
+    .long Lfar_site0 - _armigo_test_sp_far_pair_x18_begin
+    .long Lfar_site1 - _armigo_test_sp_far_pair_x18_begin
+    .long Lfar_site2 - _armigo_test_sp_far_pair_x18_begin
+    .long Lfar_site3 - _armigo_test_sp_far_pair_x18_begin
 
 // ADR carries a byte displacement from its own address, so preparation has to
 // move the address calculation into the trampoline together with the result.

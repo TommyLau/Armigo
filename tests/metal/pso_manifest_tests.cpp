@@ -85,6 +85,30 @@ void hex() {
     CHECK(!pso_hex_decode("007fa5fg", back, sizeof back));
 }
 
+void compute_manifest() {
+    const std::string second(64, 'b');
+    const std::string first(64, 'a');
+    const auto text = compute_stage_manifest({"", first, "has\ttab", "has\nline", first, second});
+    CHECK(text == "C\t" + first + "\nC\t" + second + "\n");
+    const auto rows = parse_pso_manifest(text);
+    CHECK(rows.size() == 2);
+    CHECK(rows[0] == row('C', {first}));
+    CHECK(rows[1] == row('C', {second}));
+    CHECK(compute_stage_manifest({}).empty());
+    CHECK(compute_stage_manifest({"", " \t"}).empty());
+
+    const std::string title = "titles/pipelines.tsv";
+    const std::string compute = std::string("native/") + std::string(compute_pipeline_manifest_file);
+    const auto both = select_pipeline_manifests(title, compute, true);
+    CHECK(both.size() == 2 && both[0] == title && both[1] == compute);
+    const auto title_only = select_pipeline_manifests(title, compute, false);
+    CHECK(title_only.size() == 1 && title_only[0] == title);
+    const auto compute_only = select_pipeline_manifests({}, compute, true);
+    CHECK(compute_only.size() == 1 && compute_only[0] == compute);
+    CHECK(select_pipeline_manifests({}, compute, false).empty());
+    CHECK(select_pipeline_manifests({}, {}, true).empty());
+}
+
 void recording() {
     const auto dir = std::filesystem::temp_directory_path() / ("pso_manifest_tests." + std::to_string(getpid()));
     std::filesystem::remove_all(dir);
@@ -135,6 +159,7 @@ int main() {
     parsing();
     merging();
     hex();
+    compute_manifest();
     recording();
     std::printf("pso manifest failures: %d\n", failures);
     return failures ? 1 : 0;

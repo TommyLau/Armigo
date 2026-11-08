@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "patches": [
+    {
+      "title_id": "0x0400486024DEC000",
+      "main_build_id": "e0f3ccfaf50065ae4ea01eb5aeb13b1a45da3348000000000000000000000000",
+      "module": "frame-rate",
+      "calls": [
+        {
+          "offset": "0x6e6cc4",
+          "expected_instruction": "0x1e201828",
+          "note": "The frame ratio (base rate / the game's frame rate) gets the measured frame step, so game time follows real time below 60 fps.",
+          "frame_ratio": {
+            "divisor_register": 0
+          }
+        }
+      ],
+      "layout": {
+        "variant": "ratio-division"
+      },
+      "nvn_driver": true,
+      "startup_user": true,
+      "nvn_policy": {
+        "cpu_cached_texture_writes": true,
+        "timestamps": "segment",
+        "barriers": "game"
+      },
+      "note": "Switch 2 bring-up: NVN 231.40 driver; user preselected; cached-pool CPU writes reach textures; segment timestamps and game pass barriers are provisional until gameplay renders. No support claim."
+    }
+  ]
+}

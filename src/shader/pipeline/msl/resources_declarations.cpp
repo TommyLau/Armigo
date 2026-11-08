@@ -10,6 +10,7 @@
 
 #include "stage_internal.h"
 #include "../resources/detail.h"
+#include "../handle_program.h"
 #include <array>
 #include <tuple>
 
@@ -39,10 +40,11 @@ bool same_use(const ResourceUse& a, const ResourceUse& b) {
         const auto& y = std::get<TextureUse>(b);
         return x->kind == y.kind && x->coherent == y.coherent && x->atomic == y.atomic && x->key == y.key &&
             x->descriptor == y.descriptor && x->access == y.access && x->array_length == y.array_length &&
-            x->dynamically_indexed == y.dynamically_indexed && x->modes == y.modes;
+            x->dynamically_indexed == y.dynamically_indexed && x->modes == y.modes && x->pool == y.pool;
     }
     const auto& x = std::get<SamplerUse>(a); const auto& y = std::get<SamplerUse>(b);
-    return x.key == y.key && x.comparison == y.comparison && x.normalized_coordinates == y.normalized_coordinates && x.array_length == y.array_length;
+    return x.key == y.key && x.comparison == y.comparison && x.normalized_coordinates == y.normalized_coordinates &&
+        x.array_length == y.array_length && x.pool == y.pool;
 }
 std::string interpolation(Interpolation i, ScalarType scalar_type) {
     if (i.mode == InterpolationMode::flat) {
@@ -119,8 +121,19 @@ void validate_plan(const StructuredProgram& p, const ResourcePlan& plan, const E
             require(t->kind <= ResourceTextureKind::storage_image && t->access <= Access::read_write &&
                     std::all_of(t->modes.begin(), t->modes.end(), [](auto mode) { return mode <= TextureMode::query_samples; }), "Invalid texture requirement enum");
             require(t->descriptor.scalar != ScalarType::f16 || plan.profile.supports_fp16, "FP16 texture is not supported by profile", DiagnosticCode::unsupported_capability);
-            space = MetalNamespace::texture; count = t->array_length; capacity = plan.profile.texture_slots; texture_count += count; }
-        else if (auto* s = std::get_if<SamplerUse>(&r.use)) { space = MetalNamespace::sampler; count = s->array_length; capacity = plan.profile.sampler_slots; sampler_count += count; }
+            if (t->pool) {
+                require(plan.profile.texture_pools && t->kind == ResourceTextureKind::sampled && t->access == Access::read &&
+                        !t->coherent && !t->atomic && t->array_length == 1 && !t->dynamically_indexed &&
+                        t->key == TextureKey{texture_pool_slot, 0} && t->descriptor.shape.dimension != TextureDimension::buffer,
+                        "Invalid texture pool requirement");
+                space = MetalNamespace::buffer; capacity = plan.profile.buffer_slots;
+            } else { space = MetalNamespace::texture; count = t->array_length; capacity = plan.profile.texture_slots; texture_count += count; } }
+        else if (auto* s = std::get_if<SamplerUse>(&r.use)) {
+            if (s->pool) {
+                require(plan.profile.texture_pools && s->array_length == 1 && s->key == TextureKey{texture_pool_slot, 0},
+                        "Invalid sampler pool requirement");
+                space = MetalNamespace::buffer; capacity = plan.profile.buffer_slots;
+            } else { space = MetalNamespace::sampler; count = s->array_length; capacity = plan.profile.sampler_slots; sampler_count += count; } }
         else {
             const auto& buffer = std::get<BufferUse>(r.use);
             require(buffer.access <= Access::read_write && buffer.size.kind <= SizeKind::storage_descriptor, "Invalid buffer requirement enum");
@@ -140,12 +153,17 @@ void validate_plan(const StructuredProgram& p, const ResourcePlan& plan, const E
                         buffer.size.constant_buffer_policy == ConstantBufferPolicy::none,
                         "Constant-buffer policy on a non-constant buffer");
                 if (const auto* support = std::get_if<SupportBufferSource>(&buffer.source)) {
-                    ++support_buffers;
-                    require(support->schema == constant_buffer_support_schema &&
-                            support->version == constant_buffer_support_version &&
-                            buffer.access == Access::read && buffer.size.kind == SizeKind::accessed_extent &&
-                            buffer.size.bytes == constant_buffer_support_bytes && buffer.size.alignment == 4,
-                            "Unsupported constant-buffer support ABI", DiagnosticCode::unsupported_capability);
+                    const bool guest = support->schema == guest_memory_schema;
+                    if (!guest) ++support_buffers;
+                    require(guest ? support->version == guest_memory_version && buffer.size.bytes == guest_memory_bytes
+                                  : support->schema == constant_buffer_support_schema &&
+                                    support->version == constant_buffer_support_version &&
+                                    buffer.size.bytes == constant_buffer_support_bytes,
+                            "Unsupported support-buffer ABI", DiagnosticCode::unsupported_capability);
+                    require(buffer.access == (guest ? Access::read_write : Access::read) &&
+                            buffer.size.kind == SizeKind::accessed_extent &&
+                            buffer.size.alignment == (guest ? guest_memory_alignment : 4u),
+                            "Unsupported support-buffer ABI", DiagnosticCode::unsupported_capability);
                 }
             }
             space = MetalNamespace::buffer; capacity = plan.profile.buffer_slots;
@@ -192,8 +210,12 @@ void validate_plan(const StructuredProgram& p, const ResourcePlan& plan, const E
         std::any_of(plan.io.begin(), plan.io.end(), [](const auto& io) {
             return io.access == Access::read && io.semantic == IoSemantic::instance_id;
         });
-    require(plan.draw_support_buffer_index.has_value() == instance_id,
-            "Vertex InstanceId requires the draw-parameter support ABI");
+    const bool height = p.ir.stage == Stage::fragment &&
+        std::any_of(plan.io.begin(), plan.io.end(), [](const auto& io) {
+            return io.access == Access::read && io.semantic == IoSemantic::render_target_height;
+        });
+    require(plan.draw_support_buffer_index.has_value() == (instance_id || height),
+            "Vertex InstanceId and the fragment render-target height require the draw-parameter support ABI");
     if (plan.draw_support_buffer_index) {
         const auto index = *plan.draw_support_buffer_index;
         require(index < plan.profile.buffer_slots && !native_stream_index(index) &&
@@ -261,22 +283,73 @@ std::string resource_argument(const PlannedResource& r) {
             return "constant uint* " + name + " [[buffer(" + index + ")]]";
         }
         if (std::holds_alternative<SupportBufferSource>(b->source))
-            return "constant uint* " + name + " [[buffer(" + index + ")]]";
+            return std::string(b->access == Access::read ? "constant uint* " : "device uint* ") + name + " [[buffer(" + index + ")]]";
         require(std::holds_alternative<StorageBufferSource>(b->source),
                 "Vertex-stream resources require an explicit ABI adapter", DiagnosticCode::unsupported_capability);
         return std::string(b->access == Access::read ? "const device uint* " : "device uint* ") + name + " [[buffer(" + index + ")]]";
     }
     if (const auto* s = std::get_if<SamplerUse>(&r.use)) {
+        if (s->pool) {
+            require(direct && direct->space == MetalNamespace::buffer, "A sampler pool must use a direct buffer binding");
+            return "constant ArmigoPool" + number(r.resource.value) + "& " + name + " [[buffer(" + index + ")]]";
+        }
         std::string type = s->array_length == 1 ? "sampler" : "array<sampler, " + number(s->array_length) + ">";
         return type + " " + name + (direct ? " [[sampler(" + index + ")]]" : "");
     }
     const auto& t = std::get<TextureUse>(r.use);
+    if (t.pool) {
+        require(direct && direct->space == MetalNamespace::buffer, "A texture pool must use a direct buffer binding");
+        return "constant ArmigoPool" + number(r.resource.value) + "& " + name + " [[buffer(" + index + ")]]";
+    }
+    auto type = texture_type(t);
+    if (t.array_length > 1) type = "array<" + type + ", " + number(t.array_length) + ">";
+    return type + " " + name + (direct ? " [[texture(" + index + ")]]" : "");
+}
+// A pool table (the project documentation): n, a reserved word, the read
+// bitmap's address and one declared element; reads index past it through
+// the element's address, so Metal never encodes a whole ID range.
+std::string pool_declarations(const ResourcePlan& plan) {
+    std::string text;
+    bool marks = false;
+    for (const auto& r : plan.resources) {
+        const auto* t = std::get_if<TextureUse>(&r.use);
+        const auto* s = std::get_if<SamplerUse>(&r.use);
+        if (!(t && t->pool) && !(s && s->pool)) continue;
+        marks |= t != nullptr;
+        text += "struct ArmigoPool" + number(r.resource.value) + " {\n    uint n;\n    uint reserved;\n    ulong seen;\n    array<" +
+            (t ? texture_type(*t) : std::string("sampler")) + ", 1> e;\n};\n";
+    }
+    // Marks texture ID id read in the bitmap at seen, when there is one and
+    // the ID is inside the table. The word is loaded first: a bit is set
+    // once, so nearly every read costs a load rather than an atomic.
+    if (marks) text +=
+        "static inline __attribute__((always_inline)) uint armigo_pool_read(ulong seen, uint id, uint n) {\n"
+        "    if (seen != 0 && id < n) {\n"
+        "        device atomic_uint* word = reinterpret_cast<device atomic_uint*>(seen) + (id >> 5);\n"
+        "        const uint bit = 1u << (id & 31u);\n"
+        "        if ((atomic_load_explicit(word, memory_order_relaxed) & bit) == 0u)\n"
+        "            atomic_fetch_or_explicit(word, bit, memory_order_relaxed);\n"
+        "    }\n"
+        "    return min(id, n);\n"
+        "}\n";
+    return text;
+}
+std::string texture_type(const TextureUse& t) {
     const auto& d = t.descriptor; const auto shape = d.shape;
     require((d.format == ComponentFormat::unsigned_integer && d.scalar == ScalarType::u32) ||
             (d.format == ComponentFormat::signed_integer && d.scalar == ScalarType::s32) ||
             ((d.format == ComponentFormat::unorm || d.format == ComponentFormat::snorm || d.format == ComponentFormat::floating || d.format == ComponentFormat::depth) &&
              (d.scalar == ScalarType::f32 || d.scalar == ScalarType::f16)), "Texture format and component type disagree");
-    require(!t.coherent && !t.atomic, "Coherent/atomic image ABI is not supported", DiagnosticCode::unsupported_capability);
+    require(!t.coherent, "Coherent image ABI is not supported", DiagnosticCode::unsupported_capability);
+    // An atomic image is a 2D integer storage texture with read-write access.
+    // The atomic methods are members of that access, and there is no separate
+    // atomic access qualifier. A buffer or a float image has no atomic access
+    // of this form, and a coherent image stays refused.
+    if (t.atomic)
+        require(t.kind == ResourceTextureKind::storage_image && !shape.array && !shape.multisample &&
+                shape.dimension == TextureDimension::d2 &&
+                (d.scalar == ScalarType::u32 || d.scalar == ScalarType::s32),
+                "Atomic image ABI is only a 2D integer storage image", DiagnosticCode::unsupported_capability);
     require(d.scalar == ScalarType::f32 || d.scalar == ScalarType::s32 || d.scalar == ScalarType::u32 || d.scalar == ScalarType::f16,
             "Texture component type is not supported", DiagnosticCode::unsupported_capability);
     require(!d.comparison || (d.format == ComponentFormat::depth && d.scalar == ScalarType::f32), "Comparison texture must use depth float components");
@@ -297,20 +370,19 @@ std::string resource_argument(const PlannedResource& r) {
     if (t.kind == ResourceTextureKind::storage_image) {
         require(d.format != ComponentFormat::depth && shape.dimension != TextureDimension::cube && !shape.multisample,
                 "Storage image shape is unsupported", DiagnosticCode::unsupported_capability);
-        type += t.access == Access::read ? ", access::read" :
-            t.access == Access::write ? ", access::write" :
-            t.atomic ? ", access::atomic" : ", access::read_write";
+        if (t.atomic) type += ", access::read_write";
+        else type += t.access == Access::read ? ", access::read" :
+            t.access == Access::write ? ", access::write" : ", access::read_write";
     } else {
         require(t.access == Access::read, "Sampled texture cannot be writable");
         if (shape.multisample || shape.dimension == TextureDimension::buffer) type += ", access::read";
     }
     type += ">";
-    if (t.array_length > 1) type = "array<" + type + ", " + number(t.array_length) + ">";
-    return type + " " + name + (direct ? " [[texture(" + index + ")]]" : "");
+    return type;
 }
 std::string io_declarations(const ResourcePlan& plan, bool output,
                             bool fragment_output_types_from_render_targets,
-                            bool emulate_depth_bias, bool fixed_point_size) {
+                            bool emulate_depth_bias, bool fixed_point_size, bool invariant_position) {
     std::string text;
     if (output && fragment_output_types_from_render_targets) {
         std::set<std::uint16_t> locations;
@@ -362,7 +434,7 @@ std::string io_declarations(const ResourcePlan& plan, bool output,
         case IoSemantic::position: case IoSemantic::fragment_coord:
             require(io.type == IoType{ScalarType::f32, 4} && ((plan.stage == Stage::vertex && output && io.semantic == IoSemantic::position) ||
                     (plan.stage == Stage::fragment && !output)), "Invalid position IO");
-            field("float4", name, "position"); break;
+            field("float4", name, output && invariant_position ? "position, invariant" : "position"); break;
         case IoSemantic::color:
             require(plan.stage == Stage::fragment && output && io.location < 8 &&
                     (io.type.scalar == ScalarType::f32 || io.type.scalar == ScalarType::u32 || io.type.scalar == ScalarType::s32 || io.type.scalar == ScalarType::f16), "Invalid color output");
@@ -401,6 +473,12 @@ std::string io_declarations(const ResourcePlan& plan, bool output,
                     io.location == 0 && io.mask == 1 && io.type == IoType{ScalarType::u32, 1},
                     "Invalid y-direction input");
             require(names.insert(name).second, "Repeated y-direction input");
+            break;
+        case IoSemantic::render_target_height:
+            // A local the entry reads from the draw-parameter record.
+            require(!output && plan.stage == Stage::fragment && io.location == 0 && io.mask == 1 &&
+                    io.type == IoType{ScalarType::u32, 1}, "Invalid render-target height input");
+            require(names.insert(name).second, "Repeated render-target height input");
             break;
         case IoSemantic::vertex_id: case IoSemantic::instance_id:
             require(plan.stage == Stage::vertex && !output && io.type == IoType{ScalarType::u32, 1} &&

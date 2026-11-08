@@ -66,10 +66,13 @@ IpcMessage log_request(std::uint32_t logger, std::uint32_t data_size = 16) {
     IpcMessage message;
     message.fill(std::byte{0xa5});
     put(message, 0, 6);              // Context-bearing request.
-    put(message, 2, 0x11, 2);        // Legacy admitted X/A descriptor shape.
+    put(message, 2, 0x11, 2);        // One X and one A descriptor, both empty.
     put(message, 4, 12);             // Twelve raw words, no PID special header.
-    put(message, 8, 0x00bc1000);     // Input buffer extent and address.
-    put(message, 12, 0x08b625f8);
+    put(message, 8, 0, 4);
+    put(message, 12, 0, 4);
+    put(message, 16, 0, 4);
+    put(message, 20, 0, 4);
+    put(message, 24, 0, 4);
     put(message, 32, 1 | (data_size << 16)); // Domain type1, zero objects.
     put(message, 36, logger);
     put(message, 40, 0, 8);
@@ -89,7 +92,7 @@ struct Fixture {
     QueryRegisters registers{};
     IpcCallContext caller{71, message, nullptr, nullptr};
 
-    explicit Fixture(LogManagerContract contract = LogManagerContract::horizon_20_5_0)
+    explicit Fixture(LogManagerContract contract = LogManagerContract::switch1)
         : session(std::make_shared<LogManagerSession>(71, contract)) {}
 
     IpcDisposition send() {
@@ -175,7 +178,7 @@ void check_log_reply(const IpcMessage& actual) {
     IpcMessage expected{};
     put(expected, 4, 10);
     put(expected, 32, 0x4f434653);
-    put(expected, 44, 0xe1d7f748);
+    put(expected, 44, 0x3e81dad2);
     CHECK(std::equal(expected.begin(), expected.begin() + 48, actual.begin()));
     // The request still holds SFCI at byte48; only the admitted reply extent
     // is overwritten, so the untouched tail begins after the request payload.
@@ -192,8 +195,23 @@ void test_logger_log_command() {
     f.message = log_request(logger);
     CHECK(f.send() == IpcDisposition::handled);
     check_log_reply(f.message);
+    // Switch 1 keeps the 48-byte, 10-word reply and uses the shared logger word.
+    CHECK(get(f.message, 4) == 10 && get(f.message, 44) == 0x3e81dad2);
     CHECK(std::all_of(f.registers.begin(), f.registers.end(), [](auto v) { return v == 0; }));
     CHECK(f.session->domain_object_count() == 2 && f.session->diagnostic() == nullptr);
+    // The upper halfword counts descriptors on both platforms; it is not a
+    // length, so a longer raw-data area is still one X/A pair.
+    f.message = log_request(logger);
+    put(f.message, 4, 13);
+    CHECK(f.send() == IpcDisposition::handled && get(f.message, 44) == 0x3e81dad2);
+    f.message = log_request(logger);
+    put(f.message, 8, std::uint64_t{0x10} << 16); // Nonzero X size with a zero address.
+    f.expect_unsupported();
+    // Descriptor-count rejection stays on the Switch 2 platform contract.
+    f.message = control(3);
+    put(f.message, 0, 5u | (1u << 16));
+    CHECK(f.send() == IpcDisposition::handled);
+    check_control_reply(f.message, 0x400, 2);
     // Validation still applies: no oversized payload, foreign sender, input
     // objects, unknown command or missing magic reaches a success reply.
     f.message = log_request(logger, 24);
@@ -245,7 +263,7 @@ IpcMessage switch2_log_request(std::uint32_t logger, std::uint64_t address,
 }
 
 void test_switch2_logger_contract() {
-    Fixture f(LogManagerContract::switch2_23_0_1);
+    Fixture f(LogManagerContract::switch2);
     f.message = control(3);
     CHECK(f.send() == IpcDisposition::handled);
     check_control_reply(f.message, 0x400, 2);
@@ -309,13 +327,13 @@ void test_switch2_logger_contract() {
 
 void test_switch2_control_counts_and_close() {
     for (unsigned command : {0u, 3u}) {
-        Fixture f(LogManagerContract::switch2_23_0_1);
+        Fixture f(LogManagerContract::switch2);
         f.message = control(command);
         put(f.message, 0, 7u | (2u << 16));
         f.expect_unsupported();
         CHECK(f.session->domain_object_count() == 0);
     }
-    Fixture f(LogManagerContract::switch2_23_0_1);
+    Fixture f(LogManagerContract::switch2);
     const auto root = f.convert();
     f.message = open_logger(root);
     CHECK(f.send() == IpcDisposition::handled);
@@ -323,7 +341,7 @@ void test_switch2_control_counts_and_close() {
     CHECK(f.session->logger_process_id(logger) == 71);
     f.message = {}; put(f.message, 0, 2);
     const auto close_message = f.message;
-    CHECK(f.send() == IpcDisposition::handled && f.registers[0] == 0);
+    CHECK(f.send() == IpcDisposition::handled && f.registers[0] == 0xf601);
     CHECK(f.message == close_message && f.handles.lookup(f.handle) == f.session);
     CHECK(f.session->domain_object_count() == 0 && !f.session->logger_process_id(logger));
     for (auto request : {control(0), open_logger(root), switch2_log_request(logger, 0, 0, false)}) {
@@ -337,14 +355,13 @@ void test_switch2_control_counts_and_close() {
     f.message = control(3);
     CHECK(f.send() == IpcDisposition::handled && f.registers[0] == 0xe401);
 
-    // This targeted Switch 2 fix preserves the existing legacy close contract.
+    // A close is a close on both contracts: later requests are session-closed.
     Fixture legacy;
     const auto legacy_root = legacy.convert();
     legacy.message = close_message;
-    CHECK(legacy.send() == IpcDisposition::handled && legacy.registers[0] == 0);
-    CHECK(legacy.session->domain_object_count() == 1);
+    CHECK(legacy.send() == IpcDisposition::handled && legacy.registers[0] == 0xf601);
     legacy.message = open_logger(legacy_root);
-    CHECK(legacy.send() == IpcDisposition::handled);
+    CHECK(legacy.send() == IpcDisposition::handled && legacy.registers[0] == 0xf601);
 }
 
 void test_context_wire_types() {

@@ -13,6 +13,7 @@
 #include <armigo/horizon/startup_queries.h>
 
 #include <array>
+#include <atomic>
 #include <limits>
 #include <optional>
 #include <span>
@@ -135,10 +136,15 @@ struct GuestMemoryMapper {
 class ClientSession : public KernelObject {
 public:
     virtual ~ClientSession() = default;
-    // Retain the existing close acknowledgement for legacy contracts. Opted-in
-    // sessions release server state and reject subsequent requests; the client
-    // handle remains owned by its caller until CloseHandle.
+    // The server's side of a close request: sessions with server state
+    // release it here. The dispatcher then marks the session closed; the
+    // client handle remains owned by its caller until CloseHandle.
     virtual IpcReply close_server() { return {.disposition = IpcDisposition::handled}; }
+    // Once the server has closed, every request completes as session-closed.
+    bool server_closed() const noexcept { return server_closed_.load(std::memory_order_acquire); }
+    // Claims the close for exactly one caller, before its server hook runs;
+    // concurrent and later closes see the session already closed.
+    bool claim_server_close() noexcept { return !server_closed_.exchange(true, std::memory_order_acq_rel); }
     // Called before dispatch with the runtime's current mapping capability. The
     // default keeps it absent, so a service that needs it reports the gap.
     virtual void set_memory_mapper(GuestMemoryMapper) noexcept {}
@@ -174,6 +180,9 @@ public:
         // Descriptor-free operations can still access indirect guest backing.
         return request_with_buffers(message, sender_pid, buffers);
     }
+
+private:
+    std::atomic<bool> server_closed_{false};
 };
 
 // Base for diagnostic decorators. The wrapped session must be non-null.

@@ -47,8 +47,12 @@ Status legalize_nontexture(Program& program, FactReader& facts, const MetalProfi
             if ((op.opcode == Opcode::derivative_x || op.opcode == Opcode::derivative_y || op.opcode == Opcode::discard) &&
                 program.stage != Stage::fragment)
                 return unsupported("Derivative and discard operations require fragment stage");
+            // Guest-memory atomics address device memory directly, which
+            // every Metal stage can do.
+            const auto* access = std::get_if<MemoryInfo>(&op.info);
+            const bool guest_atomic = op.opcode == Opcode::atomic && access && access->space == AddressSpace::guest;
             if ((op.opcode == Opcode::barrier || op.opcode == Opcode::memory_barrier || op.opcode == Opcode::atomic) &&
-                program.stage != Stage::compute)
+                program.stage != Stage::compute && !guest_atomic)
                 return unsupported("Memory synchronization adapter requires compute stage");
             if (const auto* memory = std::get_if<MemoryInfo>(&op.info); memory && memory->space == AddressSpace::shared && program.stage != Stage::compute)
                 return unsupported("Shared memory requires compute stage");

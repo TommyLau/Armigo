@@ -9,8 +9,10 @@
 // ============================================================================
 
 // SaveReportWithUser (10107) shares command 10105's report path.
-// Validation and result propagation follow Horizon 20.5.0 firmware;
-// application reports return the validation result.
+// Validation and result propagation follow Horizon firmware;
+// application reports return the validation result. Switch 2's
+// SendReportWithUser (10500) carries its report in a transfer memory and
+// returns an async context; the offline host validates it the same way.
 
 #include <armigo/services/play_report.h>
 
@@ -19,6 +21,8 @@
 #include <algorithm>
 #include <array>
 #include <new>
+#include <span>
+#include <optional>
 #include <vector>
 
 namespace armigo::services::prepo {
@@ -126,6 +130,48 @@ std::optional<ReportPacket> report_packet(const IpcMessage& message, bool domain
                         map_alias_buffer(message, 28)};
 }
 
+// SendReportWithUser (10500), Switch 2 23.0.1: one X buffer (room), PID and
+// one copied transfer memory, so the raw data starts at byte 32. Its 0x28
+// bytes: opt-in check flag (u8, padded to four), transfer memory size, report
+// size, padding, user ID and PID.
+struct SendPacket {
+    std::size_t cmif;
+    InputBuffer room;
+};
+constexpr std::size_t send_data_size = 0x28;
+
+std::optional<SendPacket> send_packet(const IpcMessage& message, bool domain) {
+    const auto header = read(message, 0);
+    const auto second = read(message, 4);
+    if ((header & 0xffff0000u) != 0x00010000u || (second & ~0x3ffu) != 0x80000000u || read(message, 8) != 3)
+        return {};
+    constexpr std::size_t raw_start = 32;
+    const auto words = second & 0x3ffu;
+    if (words > (message.size() - raw_start) / 4) return {};
+    const auto end = raw_start + 4 * words;
+    const std::size_t cmif = domain ? 48 : 32;
+    if (end < cmif + 16 + send_data_size || read(message, cmif) != sfci) return {};
+    if (domain) {
+        const auto domain_header = read(message, 32);
+        if ((domain_header & 0xffffu) != 1 || read(message, 36) != 1 ||
+            (domain_header >> 16) < 16 + send_data_size || (domain_header >> 16) > end - cmif)
+            return {};
+    }
+    return SendPacket{cmif, pointer_buffer(message, 24)};
+}
+
+// A new domain object: the out header counts it and its id follows the result.
+IpcReply object_reply(std::uint32_t object) {
+    IpcReply reply{IpcDisposition::handled};
+    reply.size = 52;
+    write(reply.bytes, 4, (reply.size - 8) / 4);
+    write(reply.bytes, 16, 1);
+    write(reply.bytes, 32, sfco);
+    write(reply.bytes, 44, service_interface);
+    write(reply.bytes, 48, object);
+    return reply;
+}
+
 bool valid_room(std::span<const std::byte> room) {
     if (room.front() == std::byte{0}) return false;
     for (const auto byte : room) {
@@ -151,6 +197,70 @@ IpcReply PlayReportSession::request(const IpcMessage& message, std::uint64_t sen
 IpcReply PlayReportSession::request_with_buffers(const IpcMessage& message,
                                                 std::uint64_t sender_pid,
                                                 const horizon::GuestBuffers& buffers) {
+    return request_with_handles(message, sender_pid, buffers, {});
+}
+
+IpcReply PlayReportSession::send_report(const IpcMessage& message, const horizon::GuestBuffers& buffers,
+    std::span<const std::shared_ptr<horizon::KernelObject>> copied_objects) {
+    const auto packet = send_packet(message, domain_);
+    if (!packet)
+        return unsupported("Play-report send needs a PID, one X buffer, one copied transfer memory and its data");
+    if (!domain_) return unsupported("Play-report send returns an async context only to a domain session");
+    const auto data = packet->cmif + 16;
+    // The same validation order as SaveReportWithUser: room, user, report.
+    const auto& room = packet->room;
+    if (room.size == 0 || room.size > 32) return report_reply(domain_, invalid_argument);
+    std::array<std::byte, 32> room_bytes{};
+    const auto name = std::span{room_bytes}.first(static_cast<std::size_t>(room.size));
+    if (!buffers.read_memory(room.address, name))
+        return unsupported("Play-report room buffer is not readable");
+    const auto uid = std::span{message}.subspan(data + 0x10, 16);
+    if (name.back() != std::byte{0} ||
+        std::all_of(uid.begin(), uid.end(), [](std::byte value) { return value == std::byte{0}; }))
+        return report_reply(domain_, invalid_argument);
+    if (!valid_room(name)) return report_reply(domain_, invalid_room);
+
+    const auto memory = copied_objects.size() == 1
+        ? std::dynamic_pointer_cast<horizon::TransferMemoryRecord>(copied_objects.front()) : nullptr;
+    if (!memory) return unsupported("Play-report send needs one copied transfer memory");
+    const auto memory_size = read(message, data + 4);
+    const auto report_size = read(message, data + 8);
+    if (memory_size != memory->range().size) return report_reply(domain_, invalid_argument);
+    if (report_size == 0 || report_size > 0x10000 || report_size > memory_size)
+        return report_reply(domain_, invalid_report);
+    try {
+        std::vector<std::byte> report(report_size);
+        if (!buffers.read_memory(memory->range().address, report))
+            return unsupported("Play-report transfer memory is not readable");
+        if (!detail::valid_report(report)) return report_reply(domain_, invalid_report);
+        // The offline host accepts and discards the report, as for a save, and
+        // returns an async context that has already completed.
+        contexts_.push_back(std::make_shared<horizon::Event>(true));
+    } catch (const std::bad_alloc&) {
+        return unsupported("Play-report send storage could not be allocated");
+    } catch (const std::length_error&) {
+        return unsupported("Play-report send storage could not be allocated");
+    }
+    return object_reply(static_cast<std::uint32_t>(contexts_.size() + 1));
+}
+
+// IAsyncContext, Switch 2 23.0.1: 0 GetSystemEvent (a copied event handle),
+// 1 Cancel, 2 GetResult. An offline context completed when it was created.
+IpcReply PlayReportSession::context_request(std::uint32_t object, std::uint32_t command) {
+    if (object < 2 || object - 2 >= contexts_.size() || !contexts_[object - 2])
+        return unsupported("Play-report request names no open async context");
+    if (command > 2) return unsupported("Play-report async context command is not implemented");
+    auto reply = report_reply(true, 0);
+    if (command == 0) {
+        reply.transferred[0] = contexts_[object - 2];
+        reply.transferred_count = 1;
+        reply.transferred_as_copy = true;
+    }
+    return reply;
+}
+
+IpcReply PlayReportSession::request_with_handles(const IpcMessage& message, std::uint64_t sender_pid,
+    const horizon::GuestBuffers& buffers, std::span<const std::shared_ptr<horizon::KernelObject>> copied_objects) {
     const std::lock_guard lock(mutex_);
     diagnostic_ = nullptr;
     if (sender_pid != process_id_)
@@ -172,6 +282,25 @@ IpcReply PlayReportSession::request_with_buffers(const IpcMessage& message,
     }
     if (type != 4 && type != 6)
         return unsupported("Play-report HIPC message type is unsupported");
+    if (domain_ && read(message, 4) >= 6 && read(message, 4) < 12 && (read(message, 16) & 0xff) == 2) {
+        // A domain close releases one async context; its reply has no CMIF payload.
+        const auto id = read(message, 20);
+        if (id < 2 || id - 2 >= contexts_.size() || !contexts_[id - 2])
+            return unsupported("Play-report domain close names no open async context");
+        contexts_[id - 2].reset();
+        IpcReply reply{IpcDisposition::handled};
+        reply.size = 32;
+        write(reply.bytes, 4, 6);
+        write(reply.bytes, 16, sfco);
+        return reply;
+    }
+    // A domain request names its object in the domain header before the CMIF
+    // header. Object 1 is the service; later ones are async contexts.
+    if (const auto cmif = horizon::locate_cmif(message); cmif && *cmif + 12 <= message.size()) {
+        if (domain_ && *cmif >= 32 && read(message, *cmif - 12) != 1)
+            return context_request(read(message, *cmif - 12), read(message, *cmif + 8));
+        if (read(message, *cmif + 8) == 10500) return send_report(message, buffers, copied_objects);
+    }
     const auto packet = report_packet(message, domain_);
     if (!packet)
         return unsupported("Play-report request needs a PID, one X buffer and one A buffer");

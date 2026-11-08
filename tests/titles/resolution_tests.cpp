@@ -1,5 +1,5 @@
 // ============================================================================
-// Armigo Tests - 01007EF00011E000 Internal Resolution Words
+// Armigo Tests - Internal Resolution Module Words
 // Copyright (c) 2026 Tommy Lau.
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Armigo-Proprietary
 //
@@ -8,7 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
-#include <armigo/titles/01007EF00011E000/resolution.h>
+#include <armigo/titles/resolution.h>
 #include <armigo/loader/nso_module.h>
 
 #include <bit>
@@ -24,7 +24,7 @@ unsigned failures = 0;
 #define CHECK(value) do { if (!(value)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #value); ++failures; } } while (false)
 
 using namespace armigo;
-namespace title = titles::title_01007ef00011e000;
+namespace title = titles::resolution;
 
 std::uint32_t move(bool wide, bool keep, unsigned shift, std::uint16_t immediate, unsigned rd) {
     return (std::uint32_t(wide) << 31) | ((keep ? 3u : 2u) << 29) | (0b100101u << 23) |
@@ -334,6 +334,6 @@ int main() {
         std::fprintf(stderr, "%u resolution checks failed\n", failures);
         return 1;
     }
-    std::puts("01007EF00011E000 resolution word checks passed");
+    std::puts("resolution word checks passed");
     return 0;
 }

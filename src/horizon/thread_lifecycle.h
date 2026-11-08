@@ -15,7 +15,7 @@
 
 namespace armigo::horizon {
 
-// Pure firmware-20.5.0 argument normalization. Object lookup precedes the
+// Pure firmware argument normalization. Object lookup precedes the
 // SetThreadCoreMask checks. These helpers neither schedule nor mutate a thread.
 struct ThreadCoreRequest {
     std::uint32_t result = 0;

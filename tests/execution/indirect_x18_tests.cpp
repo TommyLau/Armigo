@@ -199,6 +199,24 @@ bool executes(bool call, bool reject_target = false) {
     return true;
 }
 
+// A table of `entries` words (8192 or 65536, a halfword's whole range) past
+// which the trampoline lies: its size, the bound check's shift and the last
+// entry's branch to the table's last word.
+bool large_table(std::uint32_t entries, unsigned shift) {
+    constexpr std::uint64_t at = 0x100, table = 0x1000, stub = 0x200000;
+    const auto result = make_indirect_x18_table_patch(aarch64::encode_br(18).word, at, stub, 0, table, entries, contract);
+    if (!expect(result.ok(), "A large table layout was rejected.")) return false;
+    const auto& words = result.patch->trampoline;
+    if (!expect(words.size() == indirect_x18_table_words(entries), "Large table trampoline size differs.")) return false;
+    const auto last_at = 16 + 2 * std::size_t{entries - 1} + 1;
+    const auto last = aarch64::decode(words[last_at]);
+    return expect(words[9] == (0xd340fc01u | (shift << 16)), "Large table bound shift differs.") &&
+           expect(last.opcode == aarch64::Opcode::b &&
+                      stub + 4 * last_at + static_cast<std::uint64_t>(last.displacement) ==
+                          table + 4 * std::uint64_t{entries - 1},
+                  "Large table last entry branches elsewhere.");
+}
+
 bool table_refusals() {
     using E = IndirectX18PatchError;
     const auto word = aarch64::encode_br(18).word;
@@ -210,7 +228,7 @@ bool table_refusals() {
     };
     return reject(word, 0x100, 0x2000, 0, contract, 0x1000, 0, E::missing_targets) &&
            reject(word, 0x100, 0x2000, 0, contract, 0x1000, 3, E::missing_targets) &&
-           reject(word, 0x100, 0x2000, 0, contract, 0x1000, 8192, E::missing_targets) &&
+           reject(word, 0x100, 0x2000, 0, contract, 0x1000, 131072, E::missing_targets) &&
            reject(word, 0x102, 0x2000, 0, contract, 0x1000, 4, E::invalid_layout) &&
            reject(word, 0x100, 0x2002, 0, contract, 0x1000, 4, E::invalid_layout) &&
            reject(word, 0x2000, 0x2000, 0, contract, 0x1000, 4, E::overlapping_regions) &&
@@ -227,7 +245,8 @@ bool table_refusals() {
            expect(make_indirect_x18_table_patch(word, 0x100, 0x2000, 32760, 0x1000, 256, contract).ok() &&
                   make_indirect_x18_table_patch(word, 0x100, 0x2000, 0, 0x1000, 256, contract).patch->trampoline.size() ==
                       indirect_x18_table_words(256),
-                  "A valid table layout was rejected.");
+                  "A valid table layout was rejected.") &&
+           large_table(8192, 15) && large_table(65536, 18);
 }
 
 // A switch table: BR X18 to one of four table words, each a branch to its own

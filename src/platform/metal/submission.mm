@@ -1005,6 +1005,8 @@ RendererStatus validate_draw(PacketLease& packet) {
     const auto& stages = draw.bindings.stages.stages;
     if (stages.fragment && stages.fragment->draw_support_buffer_index)
         return failure("Draw-parameter support requires a vertex stage");
+    if ((stages.vertex && stages.vertex->guest_memory) || (stages.fragment && stages.fragment->guest_memory))
+        return failure("Guest-memory window tables are supported by the NVN driver only");
     const auto draw_support_index = stages.vertex
         ? stages.vertex->draw_support_buffer_index : std::optional<std::uint8_t>{};
     if (draw_support_index) {

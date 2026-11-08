@@ -94,9 +94,11 @@ inline void plain_numeric(const Operation& op) {
             "Resource operation requires explicit lowering of numeric modifiers", DiagnosticCode::unsupported_modifier);
 }
 std::string resource_argument(const PlannedResource&);
+std::string texture_type(const TextureUse&);
+std::string pool_declarations(const ResourcePlan&);
 std::string io_declarations(const ResourcePlan&, bool output,
                             bool fragment_output_types_from_render_targets,
-                            bool emulate_depth_bias, bool fixed_point_size);
+                            bool emulate_depth_bias, bool fixed_point_size, bool invariant_position = false);
 void validate_plan(const StructuredProgram&, const ResourcePlan&, const EmitOptions&);
 ResourcePlan plan_custom_border(const StructuredProgram&, ResourcePlan, const EmitOptions&);
 } // namespace armigo::shader::pipeline::msl

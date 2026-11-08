@@ -24,7 +24,7 @@ constexpr std::uint32_t sfci = 0x49434653;
 constexpr std::uint32_t sfco = 0x4f434653;
 constexpr std::uint32_t control_interface = 0xec6be3ff;
 constexpr std::uint32_t log_service_interface = 0xe1d7f748;
-constexpr std::uint32_t switch2_logger_interface = 0x3e81dad2;
+constexpr std::uint32_t logger_interface = 0x3e81dad2;
 
 std::uint32_t read(const IpcMessage& message, std::size_t offset, unsigned size = 4) {
     std::uint32_t value = 0;
@@ -46,8 +46,8 @@ bool packet_shape(const IpcMessage& message, std::uint32_t type, bool pid,
     const auto second = read(message, 4);
     const auto words = second & 0x3ffu;
     const std::size_t raw_start = pid ? 20 : 8;
-    // The leading halfword is the wire type. Preserve the legacy checks here;
-    // Switch 2 callers validate the upper descriptor counts separately.
+    // The leading halfword is the wire type. The Switch 2 platform contract
+    // validates the upper descriptor counts separately.
     const auto actual_type = read(message, 0, 2);
     return (actual_type == type || actual_type == type + 2) &&
            (second & ~0x3ffu) == (pid ? 0x80000000u : 0u) &&
@@ -79,8 +79,8 @@ LogManagerSession::LogManagerSession(std::uint64_t process_id, LogManagerContrac
 
 horizon::IpcReply LogManagerSession::close_server() {
     const std::lock_guard lock(mutex_);
-    if (contract_ == LogManagerContract::horizon_20_5_0) return ClientSession::close_server();
-    if (contract_ != LogManagerContract::switch2_23_0_1)
+    if (contract_ == LogManagerContract::switch1) return ClientSession::close_server();
+    if (contract_ != LogManagerContract::switch2)
         return unsupported("Log-manager contract is unsupported");
     if (closed_) return {.disposition = IpcDisposition::handled,
                          .transport_result = horizon::session_closed_result};
@@ -110,8 +110,8 @@ horizon::IpcReply LogManagerSession::dispatch(const horizon::IpcMessage& message
     std::uint64_t sender_pid, const horizon::GuestBuffers* buffers) {
     const std::lock_guard lock(mutex_);
     diagnostic_ = nullptr;
-    if (contract_ != LogManagerContract::horizon_20_5_0 &&
-        contract_ != LogManagerContract::switch2_23_0_1)
+    if (contract_ != LogManagerContract::switch1 &&
+        contract_ != LogManagerContract::switch2)
         return unsupported("Log-manager contract is unsupported");
     if (closed_) return {.disposition = IpcDisposition::handled,
                          .transport_result = horizon::session_closed_result};
@@ -130,7 +130,7 @@ horizon::IpcReply LogManagerSession::dispatch(const horizon::IpcMessage& message
 }
 
 horizon::IpcReply LogManagerSession::control(const horizon::IpcMessage& message) {
-    if (contract_ == LogManagerContract::switch2_23_0_1 && read(message, 2, 2) != 0)
+    if (contract_ == LogManagerContract::switch2 && read(message, 2, 2) != 0)
         return unsupported("Switch 2 log-manager controls cannot carry buffer descriptors");
     if (!packet_shape(message, 5, false, 8) || read(message, 16) != sfci)
         return unsupported("Log-manager control packet is outside the supported wire format");
@@ -157,24 +157,26 @@ horizon::IpcReply LogManagerSession::domain(const horizon::IpcMessage& message,
     const auto input_objects = read(message, 33, 1);
     const auto data_size = read(message, 34, 2);
     const auto object_id = read(message, 36);
-    // The second word admits raw-data size and PID, but no receive list. The
-    // supported PID shape has a 20-byte header area; the X/A shape has 28 bytes.
+    // The second word admits raw-data size and the special header, but no
+    // receive list. The upper halfword of the first word counts X, A, B and W
+    // descriptors on both platforms. Two shapes are supported: the PID-only
+    // special header without descriptors (8 + 4 + 8 header bytes), and one X/A
+    // pair without a special header (8 + 8 + 12 header bytes); the logger
+    // method validates the X/A buffer itself.
     const auto second = read(message, 4);
     if ((second & ~0x800003ffu) != 0)
         return unsupported("Log-manager descriptors are unsupported");
     const auto descriptor_counts = read(message, 2, 2);
-    const bool switch2_buffer = contract_ == LogManagerContract::switch2_23_0_1 &&
-                               descriptor_counts == 0x11 && !(second >> 31);
-    const auto raw_end = (switch2_buffer ? 28 : 20) + 4 * (second & 0x3ffu);
-    // Preserve the legacy admission predicate. Switch 2 interprets the upper
-    // halfword as descriptor counts and validates the X/A pair explicitly.
-    if (contract_ == LogManagerContract::horizon_20_5_0) {
-        const auto length = descriptor_counts;
-        if (length != 0 && length * 4 != raw_end)
-            return unsupported("Log-manager HIPC length or descriptors are unsupported");
-    } else if (!switch2_buffer && (descriptor_counts != 0 || !(second >> 31))) {
-        return unsupported("Switch 2 log-manager descriptor shape is unsupported");
+    const bool special = (second >> 31) != 0;
+    std::uint32_t header_end = 0;
+    if (descriptor_counts == 0 && special && read(message, 8) == 1) {
+        header_end = 20;
+    } else if (descriptor_counts == 0x11 && !special) {
+        header_end = 28;
+    } else {
+        return unsupported("Log-manager descriptor shape is unsupported");
     }
+    const auto raw_end = header_end + 4 * (second & 0x3ffu);
     if (data_size < 16 || raw_end < 64 || raw_end > message.size())
         return unsupported("Log-manager domain packet is outside the supported wire format");
     // The firmware dispatcher reads the magic and command without choosing
@@ -196,51 +198,53 @@ horizon::IpcReply LogManagerSession::domain(const horizon::IpcMessage& message,
 
 horizon::IpcReply LogManagerSession::log(const horizon::IpcMessage& message,
     const horizon::GuestBuffers* buffers) {
-    // Both verified retail implementations return success without interpreting
-    // the log payload. Transport validation precedes the contract-specific reply.
+    // Both platforms return success without interpreting the log payload.
+    // Transport validation precedes the platform-specific reply extent.
     const auto data_size = read(message, 34, 2);
     if (data_size != 16)
         return unsupported("Log-manager logger payload size is unsupported");
-    const bool switch2 = contract_ == LogManagerContract::switch2_23_0_1;
-    if (switch2) {
-        // The verified metadata declares one input auto-select buffer (0x21).
-        // Admit one X/A pair with exactly one active descriptor, or both empty.
-        if (read(message, 2, 2) != 0x11 || (read(message, 4) & ~0x3ffu) != 0 ||
-            (read(message, 4) & 0x3ffu) < 12)
-            return unsupported("Switch 2 logger requires one input auto-select buffer");
-        const auto x = read(message, 8), x_low = read(message, 12);
-        const auto a_size = read(message, 16), a_low = read(message, 20), a = read(message, 24);
-        if ((x & 0x3fu) != 0 || (a & 0x00ffff03u) != 0)
-            return unsupported("Switch 2 logger buffer index or mode is unsupported");
-        const std::uint64_t x_size = x >> 16;
-        const std::uint64_t alias_size = std::uint64_t{a_size} | (std::uint64_t{(a >> 24) & 15u} << 32);
-        const auto wire_address = [](std::uint32_t low, unsigned high, unsigned mid) {
-            return std::uint64_t{low} | (std::uint64_t{mid} << 32) | (std::uint64_t{high} << 36);
-        };
-        const auto x_address = wire_address(x_low, (x >> 6) & 0x3fu, (x >> 12) & 15u);
-        const auto a_address = wire_address(a_low, (a >> 2) & 0x3fu, (a >> 28) & 15u);
-        if ((x_size && alias_size) || x_size > 0x400 || alias_size > 0x10000 ||
-            (!x_size && (x || x_low)) || (!alias_size && (a_size || a_low || a)))
-            return unsupported("Switch 2 logger buffer shape exceeds the supported bounds");
-        const auto size = x_size ? x_size : alias_size;
-        const auto address = x_size ? x_address : a_address;
-        if (size) {
-            if (!address || !buffers || buffers->size() != 1 ||
-                !(*buffers)[0].input || (*buffers)[0].address != address || (*buffers)[0].size != size)
-                return unsupported("Switch 2 logger buffer does not match the validated transport");
-            // Bound and validate the input copy before the retail no-op method.
-            // This temporary buffer is host overhead, never application backing.
-            std::vector<std::byte> input(static_cast<std::size_t>(size));
-            if (!buffers->read(0, input)) return unsupported("Switch 2 logger input buffer is unreadable");
-        } else if (buffers && !buffers->empty()) {
-            return unsupported("Switch 2 logger received an unexpected buffer");
-        }
+    // One input auto-select buffer (0x21): one X/A pair with exactly one
+    // active descriptor, or both empty. The 0x400 and 64 KiB caps are host
+    // admission shared by both platforms, not a recovered console policy.
+    if (read(message, 2, 2) != 0x11 || (read(message, 4) & ~0x3ffu) != 0 ||
+        (read(message, 4) & 0x3ffu) < 12)
+        return unsupported("Log-manager logger requires one input auto-select buffer");
+    const auto x = read(message, 8), x_low = read(message, 12);
+    const auto a_size = read(message, 16), a_low = read(message, 20), a = read(message, 24);
+    if ((x & 0x3fu) != 0 || (a & 0x00ffff03u) != 0)
+        return unsupported("Log-manager logger buffer index or mode is unsupported");
+    const std::uint64_t x_size = x >> 16;
+    const std::uint64_t alias_size = std::uint64_t{a_size} | (std::uint64_t{(a >> 24) & 15u} << 32);
+    const auto wire_address = [](std::uint32_t low, unsigned high, unsigned mid) {
+        return std::uint64_t{low} | (std::uint64_t{mid} << 32) | (std::uint64_t{high} << 36);
+    };
+    const auto x_address = wire_address(x_low, (x >> 6) & 0x3fu, (x >> 12) & 15u);
+    const auto a_address = wire_address(a_low, (a >> 2) & 0x3fu, (a >> 28) & 15u);
+    if ((x_size && alias_size) || x_size > 0x400 || alias_size > 0x10000 ||
+        (!x_size && (x || x_low)) || (!alias_size && (a_size || a_low || a)))
+        return unsupported("Log-manager logger buffer shape exceeds the supported bounds");
+    const auto size = x_size ? x_size : alias_size;
+    const auto address = x_size ? x_address : a_address;
+    if (size) {
+        if (!address || !buffers || buffers->size() != 1 ||
+            !(*buffers)[0].input || (*buffers)[0].address != address || (*buffers)[0].size != size)
+            return unsupported("Log-manager logger buffer does not match the validated transport");
+        // Bound and validate the input copy before the retail no-op method.
+        // This temporary buffer is host overhead, never application backing.
+        std::vector<std::byte> input(static_cast<std::size_t>(size));
+        if (!buffers->read(0, input)) return unsupported("Log-manager logger input buffer is unreadable");
+    } else if (buffers && !buffers->empty()) {
+        return unsupported("Log-manager logger received an unexpected buffer");
     }
+    // The 56-byte, 12-word extent is established only for the Switch 2
+    // platform contract. The Switch 1 platform contract keeps 48 bytes and
+    // 10 words. Both replies carry the logger interface word.
+    const bool switch2 = contract_ == LogManagerContract::switch2;
     IpcReply reply;
     reply.disposition = IpcDisposition::handled;
     reply.size = switch2 ? 56 : 48;
     write(reply.bytes, 4, switch2 ? 12 : 10);
-    cmif_header(reply.bytes, 32, switch2 ? switch2_logger_interface : log_service_interface);
+    cmif_header(reply.bytes, 32, logger_interface);
     return reply;
 }
 

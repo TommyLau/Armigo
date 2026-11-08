@@ -247,6 +247,203 @@ void test_deterministic_package(Fixture& fixture) {
     CHECK(read(fixture.log) == cold_commands);
 }
 
+// A v2 fragment whose texture, sampler and descriptor fact all name slot 31.
+// `programs` is the handle_programs JSON value, or null when the field is absent.
+fs::path write_handle_fragment(Fixture& fixture, std::string_view name, const char* programs,
+                               std::string_view descriptor_offset) {
+    const fs::path directory = fixture.inputs / name;
+    fs::create_directory(directory);
+    std::vector<std::byte> program(160);
+    for (std::size_t index = 0; index < program.size(); ++index)
+        program[index] = static_cast<std::byte>((index * 31 + 11) & 255);
+    const std::uint32_t sph = 5u << 10;
+    std::memcpy(program.data(), &sph, sizeof sph);
+    const std::string source = "#include <metal_stdlib>\n// " + std::string(name) + "\n";
+    const std::string version(64, 'a');
+    const std::string programs_field = programs ? ",\"handle_programs\":" + std::string(programs) : "";
+    const std::string metadata =
+        "{\"schema\":\"armigo-shader-stage-v2\",\"source_version\":\"" + version +
+        "\",\"program_key\":\"" + digest(std::span<const std::byte>(program)) + "\",\"program_size\":160,"
+        "\"program_file\":\"program.bin\",\"source_file\":\"source.metal\",\"source_digest\":\"" +
+        digest(source) + "\",\"stage\":\"fragment\",\"entry_point\":\"armigo_fragment_main\","
+        "\"vertex_depth\":\"unspecified\",\"fragment_position\":\"unspecified\",\"c1_digest\":null,"
+        "\"profile\":{\"identity\":\"armigo-macos-metal4\",\"version\":1},"
+        "\"constant_buffers\":[],\"support_buffers\":[],\"textures\":["
+        "{\"cbuf_slot\":31,\"handle_byte_offset\":0,\"kind\":\"texture\",\"dimension\":\"d2\","
+        "\"array\":false,\"multisample\":false,\"scalar\":\"f32\",\"component_format\":\"unorm\","
+        "\"normalized_coordinates\":true,\"comparison\":false,\"texture_index\":0},"
+        "{\"cbuf_slot\":31,\"handle_byte_offset\":0,\"kind\":\"sampler\",\"comparison\":false,"
+        "\"normalized_coordinates\":true,\"sampler_index\":0}],"
+        "\"vertex_streams\":[],\"vertex_inputs\":[],"
+        "\"interface\":{\"position_input_mask\":0,\"position_output_mask\":0,\"color_output_mask\":15,"
+        "\"color_outputs\":[{\"location\":0,\"component_mask\":15,\"scalar\":\"f32\",\"components\":4}],"
+        "\"writes_fragment_depth\":false,\"writes_sample_mask\":false,\"generic_inputs\":[],"
+        "\"generic_outputs\":[]},\"dependencies\":[{\"kind\":\"fragment_output_type\",\"index\":0,"
+        "\"byte_offset\":0,\"component\":0,\"origin\":\"derived\",\"value\":{\"scalar\":\"f32\","
+        "\"components\":4}},{\"kind\":\"texture_descriptor\",\"index\":31,\"byte_offset\":" +
+        std::string(descriptor_offset) + ",\"component\":0,\"origin\":\"derived\",\"value\":{"
+        "\"dimension\":\"d2\",\"array\":false,\"multisample\":false,\"scalar\":\"f32\","
+        "\"component_format\":\"unorm\",\"normalized_coordinates\":true,\"comparison\":false}}]" +
+        programs_field + "}\n";
+    write(directory / "program.bin", program);
+    write(directory / "source.metal", source);
+    write(directory / "reflection.json", metadata);
+    return directory;
+}
+
+void expect_package_refusal(Fixture& fixture, const fs::path& stage, std::string_view output,
+                            std::string_view message) {
+    auto options = fixture.options(std::string(output));
+    options.stages = {stage};
+    const auto built = package::build(options);
+    const auto* error = std::get_if<std::string>(&built);
+    if (!error || error->find(message) == std::string::npos) {
+        std::printf("FAIL package %s: expected \"%s\" in \"%s\"\n", std::string(output).c_str(),
+                    std::string(message).c_str(), error ? error->c_str() : "<build succeeded>");
+        ++failures;
+    }
+    CHECK(!fs::exists(options.output));
+}
+
+void test_handle_program_packages(Fixture& fixture) {
+    // A v1 reflection has no handle_programs field. Its variant id stays the
+    // one pinned before that field existed.
+    const fs::path vertex = fixture.stage("vertex");
+    CHECK(read(vertex / "reflection.json").find("handle_programs") == std::string::npos);
+    auto identity = fixture.options("handle-identity");
+    identity.stages = {vertex};
+    const auto identity_built = package::build(identity);
+    if (const auto* error = std::get_if<std::string>(&identity_built))
+        std::printf("identity build: %s\n", error->c_str());
+    CHECK(std::holds_alternative<package::BuildReport>(identity_built));
+    const std::string variant = "1cd06a449ca44560d3f15f646a5aeb3a8c3a2d40637f57e2016291bb2043e57c";
+    CHECK(read(identity.output / "manifest.json").find("\"variant_id\":\"" + variant + "\"") != std::string::npos);
+
+    const fs::path valid = write_handle_fragment(fixture, "handle-valid", "[[4294967295,0]]", "0");
+    auto accepted = fixture.options("handle-valid-out");
+    accepted.stages = {valid};
+    const auto built = package::build(accepted);
+    if (const auto* error = std::get_if<std::string>(&built))
+        std::printf("handle program build: %s\n", error->c_str());
+    CHECK(std::holds_alternative<package::BuildReport>(built));
+    if (std::holds_alternative<package::BuildReport>(built)) {
+        std::string packaged;
+        for (const auto& entry : fs::recursive_directory_iterator(accepted.output)) {
+            if (entry.path().filename() == "reflection.json") packaged = read(entry.path());
+        }
+        const std::string reflection = read(valid / "reflection.json");
+        CHECK(packaged == reflection);
+        CHECK(packaged.find("\"cbuf_slot\":31") != std::string::npos);
+        CHECK(packaged.find("\"handle_programs\":[[4294967295,0]]") != std::string::npos);
+        CHECK(packaged.find("\"kind\":\"texture_descriptor\"") != std::string::npos);
+    }
+
+    expect_package_refusal(fixture, write_handle_fragment(fixture, "handle-missing", nullptr, "0"),
+                           "handle-missing-out", "texture provenance reflection is invalid");
+    expect_package_refusal(fixture, write_handle_fragment(fixture, "handle-empty", "[]", "0"),
+                           "handle-empty-out", "texture provenance reflection is invalid");
+    expect_package_refusal(fixture, write_handle_fragment(fixture, "handle-range", "[[4294967295,0]]", "4"),
+                           "handle-range-out", "texture descriptor dependency key is invalid");
+    expect_package_refusal(fixture, write_handle_fragment(fixture, "handle-object", "{}", "0"),
+                           "handle-object-out", "handle_programs must be an array");
+    expect_package_refusal(fixture, write_handle_fragment(fixture, "handle-element", "[1]", "0"),
+                           "handle-element-out", "handle program must be an array");
+    expect_package_refusal(fixture, write_handle_fragment(fixture, "handle-word", "[[-1]]", "0"),
+                           "handle-word-out", "handle program word is invalid");
+}
+
+std::string profile_text_of(std::string_view manifest) {
+    constexpr std::string_view marker = "\"profile_text\":\"";
+    const auto start = manifest.find(marker);
+    CHECK(start != std::string_view::npos);
+    std::string result;
+    if (start == std::string_view::npos) return result;
+    for (std::size_t index = start + marker.size(); index < manifest.size(); ++index) {
+        const char character = manifest[index];
+        if (character == '\\') {
+            if (++index >= manifest.size()) break;
+            result += manifest[index];
+            continue;
+        }
+        if (character == '"') break;
+        result += character;
+    }
+    return result;
+}
+
+std::size_t profile_key_count(std::string_view profile) {
+    std::size_t count = 0;
+    for (std::size_t index = 0; index + 1 < profile.size(); ++index) {
+        if (profile[index] == '"' && profile[index + 1] == ':') ++count;
+    }
+    return count;
+}
+
+// The profile keys every package records. Sample hoisting is manifest metadata
+// and must not change this set or the chain id.
+constexpr std::string_view baseline_profile_keys[] = {
+    "compile_options",
+    "deployment_target",
+    "identity",
+    "metal_binary_sha256",
+    "metal_language",
+    "metal_version",
+    "metallib_binary_sha256",
+    "platform",
+    "sdk_build",
+    "sdk_version",
+    "source_version",
+    "translation_profile",
+};
+
+void test_sample_hoisting_manifest(Fixture& fixture) {
+    const fs::path stage = fixture.stage("hoist-vertex");
+    auto plain = fixture.options("hoist-off");
+    plain.stages = {stage};
+    plain.hoist_implicit_samples = false;
+    const auto plain_built = package::build(plain);
+    if (const auto* error = std::get_if<std::string>(&plain_built))
+        std::printf("hoist-off build: %s\n", error->c_str());
+    CHECK(std::holds_alternative<package::BuildReport>(plain_built));
+    const std::string plain_manifest = read(plain.output / "manifest.json");
+    const std::string plain_profile = profile_text_of(plain_manifest);
+    CHECK(plain_manifest.find("sample_hoisting") == std::string::npos);
+    CHECK(plain_profile.find("sample_hoisting") == std::string::npos);
+    CHECK(profile_key_count(plain_profile) == std::size(baseline_profile_keys));
+    for (const std::string_view key : baseline_profile_keys) {
+        CHECK(plain_profile.find(std::string("\"") + std::string(key) + "\":") != std::string::npos);
+    }
+
+    auto hoisted = fixture.options("hoist-on");
+    hoisted.stages = {stage};
+    hoisted.hoist_implicit_samples = true;
+    const auto hoisted_built = package::build(hoisted);
+    if (const auto* error = std::get_if<std::string>(&hoisted_built))
+        std::printf("hoist-on build: %s\n", error->c_str());
+    CHECK(std::holds_alternative<package::BuildReport>(hoisted_built));
+    const std::string hoisted_manifest = read(hoisted.output / "manifest.json");
+    const std::string hoisted_profile = profile_text_of(hoisted_manifest);
+    if (hoisted_profile != plain_profile)
+        std::printf("hoisted profile: %s\n", hoisted_profile.c_str());
+    CHECK(hoisted_profile == plain_profile);
+    CHECK(profile_key_count(hoisted_profile) == std::size(baseline_profile_keys));
+    CHECK(hoisted_manifest.find("\"sample_hoisting\":\"implicit\"") != std::string::npos);
+    constexpr std::string_view hoisting_needle = "sample_hoisting";
+    std::size_t occurrences = 0;
+    for (std::size_t at = 0; (at = hoisted_manifest.find(hoisting_needle, at)) != std::string::npos;
+         at += hoisting_needle.size())
+        ++occurrences;
+    CHECK(occurrences == 1);
+    const auto chain_of = [](const std::string& manifest) {
+        constexpr std::string_view marker = "\"chain_id\":\"";
+        const auto start = manifest.find(marker);
+        return start == std::string::npos ? std::string() : manifest.substr(start + marker.size(), 64);
+    };
+    // The field is outside the profile, so both packages keep the chain the plain profile always had.
+    CHECK(chain_of(plain_manifest) == "239cb9f212404965aa640e5ab22406012d8777a211ccada708cac17be5afabcf");
+    CHECK(chain_of(hoisted_manifest) == "239cb9f212404965aa640e5ab22406012d8777a211ccada708cac17be5afabcf");
+}
+
 void test_failures(Fixture& fixture) {
     const fs::path stage = fixture.stage("invalid");
     write(stage / "reflection.json", "{\"schema\":1,\"schema\":2}\n");
@@ -290,6 +487,14 @@ int main() {
     {
         Fixture fixture;
         test_failures(fixture);
+    }
+    {
+        Fixture fixture;
+        test_handle_program_packages(fixture);
+    }
+    {
+        Fixture fixture;
+        test_sample_hoisting_manifest(fixture);
     }
     if (failures != 0) {
         std::printf("%d checks failed\n", failures);

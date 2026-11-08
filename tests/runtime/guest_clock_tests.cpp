@@ -11,17 +11,23 @@
 #include <armigo/runtime/guest_clock.h>
 
 #include <armigo/execution/guest_dispatch.h>
+#include <armigo/execution/guest_timeline.h>
+#include <armigo/platform/presentation_thread.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stop_token>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace {
 using namespace armigo;
@@ -235,6 +241,44 @@ void test_regression_latches_and_freezes_the_counter() {
     CHECK(counter.read_ticks(counter.context) == 1);
 }
 
+void test_platform_counter_rates() {
+    ManualClock manual;
+    manual.now_ns.store(1'000);
+    auto clock = manual_clock(manual);
+    manual.now_ns.store(1'000 + 1'000);
+    auto switch1 = clock->counter();
+    auto rated1 = clock->counter(horizon::switch1_counter);
+    CHECK(execution::validate(switch1) == execution::GuestCounterError::none);
+    CHECK(execution::validate(rated1) == execution::GuestCounterError::none);
+    CHECK(switch1.frequency == 19'200'000);
+    CHECK(rated1.frequency == 19'200'000);
+    const auto sampled = std::get<ClockSample>(clock->sample());
+    CHECK(switch1.read_ticks(switch1.context) == sampled.ticks);
+    CHECK(rated1.read_ticks(rated1.context) == sampled.ticks);
+
+    auto rated2 = clock->counter(horizon::switch2_counter);
+    CHECK(execution::validate(rated2) == execution::GuestCounterError::none);
+    CHECK(rated2.frequency == 31'250'000);
+    CHECK(rated2.read_ticks(rated2.context) == 1'000 / 32);
+
+    manual.now_ns.store(1'000 + 32'000);
+    CHECK(rated2.read_ticks(rated2.context) == 32'000 / 32);
+    const auto at_32us = std::get<ClockSample>(clock->sample());
+    CHECK(switch1.read_ticks(switch1.context) == at_32us.ticks);
+    CHECK(at_32us.ticks != 32'000 / 32);
+
+    horizon::CounterRate other{1, 1, 1};
+    auto empty = clock->counter(other);
+    CHECK(execution::validate(empty) == execution::GuestCounterError::missing_tick_source);
+
+    const auto frozen2 = rated2.read_ticks(rated2.context);
+    const auto frozen19 = switch1.read_ticks(switch1.context);
+    manual.now_ns.store(500);
+    CHECK(rated2.read_ticks(rated2.context) == frozen2);
+    CHECK(switch1.read_ticks(switch1.context) == frozen19);
+    CHECK(std::holds_alternative<LaunchFailure>(clock->sample()));
+}
+
 void test_wait_failure_latches_and_the_counter_stays_at_zero() {
     ManualClock manual;
     manual.fail_waits.store(1);
@@ -308,17 +352,180 @@ void test_production_sources() {
               std::stop_token{})) == ClockWait::reached);
 }
 
+#if defined(__APPLE__)
+// The period of the calling thread's time-constraint policy, if it has one.
+std::optional<std::uint32_t> constraint_period() {
+    thread_time_constraint_policy_data_t policy{};
+    mach_msg_type_number_t count = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+    boolean_t get_default = FALSE;
+    if (thread_policy_get(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
+                          reinterpret_cast<thread_policy_t>(&policy), &count, &get_default) != KERN_SUCCESS ||
+        get_default)
+        return std::nullopt;
+    return policy.period;
+}
+#endif
+
+#if defined(__APPLE__)
+// How many threads of this process carry the clock alarm's name.
+int alarm_threads() {
+    thread_act_array_t threads = nullptr;
+    mach_msg_type_number_t count = 0;
+    if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) return -1;
+    int found = 0;
+    for (mach_msg_type_number_t i = 0; i < count; ++i) {
+        char name[64] = {};
+        if (const pthread_t thread = pthread_from_mach_thread_np(threads[i]);
+            thread && pthread_getname_np(thread, name, sizeof name) == 0 &&
+            std::string_view(name) == "armigo-clock-alarm")
+            ++found;
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads), count * sizeof(thread_act_t));
+    return found;
+}
+#endif
+
+bool reached(const LaunchResult<ClockWait>& result) {
+    return std::holds_alternative<ClockWait>(result) && std::get<ClockWait>(result) == ClockWait::reached;
+}
+
+// The waiting thread's scheduling is never changed by a wait: an interactive
+// thread keeps its QoS class without a time constraint, and a thread that
+// holds its own constraint (the guest-present thread) keeps that one.
+void test_production_waits_leave_the_waiter_scheduling() {
+#if defined(__APPLE__)
+    auto clock = std::get<std::shared_ptr<GuestClock>>(create_guest_clock());
+    std::thread([&] {
+        CHECK(pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) == 0);
+        for (int i = 0; i < 3; ++i)
+            CHECK(reached(clock->wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds{2},
+                                            std::stop_token{})));
+        CHECK(qos_class_self() == QOS_CLASS_USER_INTERACTIVE);
+        CHECK(!constraint_period());
+    }).join();
+    std::thread([&] {
+        CHECK(platform::declare_periodic_thread(std::chrono::nanoseconds{8'333'333},
+                                                std::chrono::nanoseconds{1'000'000}));
+        const auto before = constraint_period();
+        CHECK(before.has_value());
+        CHECK(reached(clock->wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds{2},
+                                        std::stop_token{})));
+        CHECK(constraint_period() == before);
+    }).join();
+#endif
+}
+
+// Concurrent waiters are each woken at or after their own deadline, never
+// before; a cancelled waiter's far deadline does not hold the clock.
+void test_production_deadlines_wake_each_waiter() {
+    auto clock = std::get<std::shared_ptr<GuestClock>>(create_guest_clock());
+    std::atomic<int> early{0};
+    std::atomic<int> done{0};
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<std::thread> waiters;
+    for (int i = 4; i >= 1; --i)
+        waiters.emplace_back([&, i] {
+            const auto deadline = start + std::chrono::milliseconds{5 * i};
+            const auto result = clock->wait_until(deadline, std::stop_token{});
+            if (std::chrono::steady_clock::now() < deadline) early.fetch_add(1);
+            if (reached(result)) done.fetch_add(1);
+        });
+    for (auto& waiter : waiters) waiter.join();
+    CHECK(early.load() == 0);
+    CHECK(done.load() == 4);
+
+    std::stop_source stop;
+    std::thread far([&] {
+        CHECK(std::get<ClockWait>(clock->wait_until(std::chrono::steady_clock::now() + std::chrono::hours{1},
+                                                    stop.get_token())) == ClockWait::cancelled);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    stop.request_stop();
+    far.join();
+    const auto destroyed = std::chrono::steady_clock::now();
+    clock.reset();
+    CHECK(std::chrono::steady_clock::now() - destroyed < std::chrono::seconds{1});
+}
+
+// Waits of at most 500 us end at the host's own wake-up and never start the
+// alarm; a longer wait starts one alarm thread, which ends with its clock.
+void test_short_waits_leave_the_alarm_idle() {
+#if defined(__APPLE__)
+    CHECK(alarm_threads() == 0);
+    auto clock = std::get<std::shared_ptr<GuestClock>>(create_guest_clock());
+    for (int i = 0; i < 20; ++i)
+        CHECK(reached(clock->wait_until(std::chrono::steady_clock::now() + std::chrono::microseconds{200},
+                                        std::stop_token{})));
+    CHECK(alarm_threads() == 0);
+    CHECK(reached(clock->wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds{5},
+                                    std::stop_token{})));
+    CHECK(alarm_threads() == 1);
+    clock.reset();
+    CHECK(alarm_threads() == 0);
+#endif
+}
+
+// A frame-length wait on an interactive thread ends at its deadline. Without
+// the alarm the host ended such waits 5 to 8 ms late (median above 5 ms).
+void test_production_waits_end_on_time() {
+#if defined(__APPLE__)
+    auto clock = std::get<std::shared_ptr<GuestClock>>(create_guest_clock());
+    std::vector<double> late;
+    std::thread([&] {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        for (int i = 0; i < 12; ++i) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds{16'666'667};
+            CHECK(reached(clock->wait_until(deadline, std::stop_token{})));
+            late.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - deadline).count());
+        }
+    }).join();
+    std::sort(late.begin(), late.end());
+    std::fprintf(stderr, "16.7 ms waits ended late by median %.3f ms, max %.3f ms\n", late[late.size() / 2], late.back());
+    CHECK(late[late.size() / 2] < 3.0);
+#endif
+}
+
 } // namespace
 
+// The published guest timeline answers from its source until that source is
+// withdrawn; withdrawing another context leaves it in place.
+void test_guest_timeline_publication() {
+    using armigo::execution::GuestTimelineSource;
+    CHECK(!armigo::execution::guest_timeline_now() && !armigo::execution::guest_timeline_origin());
+    static std::int64_t elapsed = 5000;
+    int first_context = 0, second_context = 0;
+    const auto origin = std::chrono::steady_clock::time_point(std::chrono::seconds(7));
+    const auto read = [](void* context) noexcept -> std::optional<std::chrono::nanoseconds> {
+        return std::chrono::nanoseconds(elapsed + (context ? 0 : 1));
+    };
+    armigo::execution::publish_guest_timeline(GuestTimelineSource{read, &first_context, origin});
+    CHECK(armigo::execution::guest_timeline_now() == std::chrono::nanoseconds(5000));
+    CHECK(armigo::execution::guest_timeline_origin() == origin);
+    armigo::execution::publish_guest_timeline(GuestTimelineSource{read, &second_context, origin + std::chrono::seconds(1)});
+    armigo::execution::withdraw_guest_timeline(&first_context);
+    CHECK(armigo::execution::guest_timeline_origin() == origin + std::chrono::seconds(1));
+    elapsed = 6000;
+    CHECK(armigo::execution::guest_timeline_now() == std::chrono::nanoseconds(6000));
+    armigo::execution::withdraw_guest_timeline(&second_context);
+    CHECK(!armigo::execution::guest_timeline_now() && !armigo::execution::guest_timeline_origin());
+}
+
 int main() {
+    test_guest_timeline_publication();
     test_creation_rejects_half_configured_sources();
     test_origin_and_sample_rounding();
     test_deadline_conversion_rounds_up();
     test_sample_conversion_rounds_down();
     test_conversion_overflow_is_per_call();
     test_regression_latches_and_freezes_the_counter();
+    test_platform_counter_rates();
     test_wait_failure_latches_and_the_counter_stays_at_zero();
     test_injected_wait_passthrough();
     test_production_sources();
+    test_production_waits_leave_the_waiter_scheduling();
+    test_production_deadlines_wake_each_waiter();
+    test_short_waits_leave_the_alarm_idle();
+    test_production_waits_end_on_time();
     return failures == 0 ? 0 : 1;
 }

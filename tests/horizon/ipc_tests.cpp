@@ -11,6 +11,7 @@
 #include <armigo/horizon/ipc.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -35,6 +36,11 @@ struct SyntheticSession : ClientSession {
     std::uint64_t buffer_address = 0;
     std::uint32_t buffer_size = 0;
     std::string buffer_path;
+    std::atomic<unsigned> closes{0};
+    IpcReply close_server() override {
+        ++closes;
+        return {.disposition = IpcDisposition::handled};
+    }
     IpcReply request_with_buffers(const IpcMessage& input, std::uint64_t caller,
                                   const GuestBuffers& buffers) override {
         buffer_count = buffers.size();
@@ -133,7 +139,7 @@ void connection_tests() {
     f.name.fill(std::byte{});
     r = f.registers();
     CHECK(f.dispatcher.dispatch(0x1f, r, f.caller) == IpcDisposition::handled);
-    CHECK(r[0] == 0xf201); // Port lookup precedes handle-capacity failure.
+    CHECK(r[0] == 0xd201); // The handle is reserved before the port lookup.
 }
 
 void request_tests() {
@@ -171,8 +177,9 @@ void request_tests() {
     r[0] = handle;
     CHECK(f.dispatcher.dispatch(0x21, r, f.caller) == IpcDisposition::handled);
     CHECK(r[0] == 0xe401 && r[1] == 0);
-    // HIPC Close (type 2) tears down the server side without reaching the service. The
-    // client's own handle stays open until it closes it with svcCloseHandle.
+    // HIPC Close (type 2) tears down the server side without reaching the service and
+    // completes as session-closed. The client's own handle stays open until it closes
+    // it with svcCloseHandle.
     const auto closing = *f.handles.insert(f.session);
     const auto received = f.session->received;
     f.message.fill(std::byte{});
@@ -180,9 +187,25 @@ void request_tests() {
     r = f.registers();
     r[0] = closing;
     CHECK(f.dispatcher.dispatch(0x21, r, f.caller) == IpcDisposition::handled);
-    CHECK(r[0] == 0 && r[1] == 0);
+    CHECK(r[0] == session_closed_result && r[1] == 0);
     CHECK(f.handles.lookup(closing) == f.session);
     CHECK(f.session->received == received);
+    // A later request never reaches the closed server.
+    f.message.fill(std::byte{});
+    r = f.registers();
+    r[0] = closing;
+    CHECK(f.dispatcher.dispatch(0x21, r, f.caller) == IpcDisposition::handled);
+    CHECK(r[0] == session_closed_result && f.session->received == received);
+    // TIPC CloseSession (method 15) closes the same way and completes as
+    // session-closed.
+    std::memcpy(f.message.data(), "\x0f\x00\x00\x00", 4);
+    r = f.registers();
+    r[0] = closing;
+    CHECK(f.dispatcher.dispatch(0x21, r, f.caller) == IpcDisposition::handled);
+    CHECK(r[0] == session_closed_result);
+    CHECK(f.handles.lookup(closing) == f.session && f.session->received == received);
+    // Only the first close runs the server's close hook.
+    CHECK(f.session->closes == 1);
     CHECK(f.handles.close(closing));
     r = f.registers();
     r[0] = closing;

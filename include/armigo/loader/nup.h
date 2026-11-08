@@ -71,6 +71,12 @@ public:
     std::variant<NupFailure, std::size_t> read(
         std::uint32_t file, std::uint64_t offset, std::span<std::byte> output) const;
     std::optional<NupFailure> verify(std::uint32_t file) const;
+    // Nonempty selected RomFS members whose final component ends in ".zs" must
+    // start with a zstd frame, standard or skippable. Empty members are left
+    // out. The result lists the mismatch paths. A member that cannot be read
+    // fails the call; a matching member hash does not prove the frame.
+    std::variant<NupFailure, std::vector<std::string>> zs_frame_mismatches(
+        const NupSelection& selection) const;
     // Collects and verifies only selected executable members, under the usual limits.
     std::variant<NupFailure, ExeFsDirectoryInput> read_exefs(
         const NupSelection& selection, const ExeFsReadLimits& limits = {}) const;

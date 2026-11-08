@@ -109,7 +109,7 @@ int main(int argc, char** argv) {
                 audit = opcode_inventory.inspect(program);
                 if (opcode_inventory.programs() != before && !audit->refused) ++fully_decoded_images;
             }
-            records << current << '\t' << expanded_hash << '\t' << (r.kind == sn::ContainerKind::bnsh ? "BNSH" : "BAHS") << '\t';
+            records << current << '\t' << expanded_hash << '\t' << (r.kind == sn::ContainerKind::bnsh ? "BNSH" : r.kind == sn::ContainerKind::bahs ? "BAHS" : "RUNTIME") << '\t';
             for (auto& location : r.ancestry) records << label(location.member) << ':' << location.offset << '/';
             records << '\t' << r.container_offset << '\t' << r.descriptor_offset << '\t' << r.control_offset << '\t' << r.code_offset << '\t';
             if (r.variation) records << *r.variation;

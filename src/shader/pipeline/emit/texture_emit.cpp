@@ -367,8 +367,12 @@ void TextureEmitter::gradients() {
                                                             unsigned_mode, ValueType::word32)));
         if (offset) offsets(packed, count, 4, 4, 16);
     }
-    for (unsigned i = 0; i < count; ++i) info.gradients_x.push_back(input(rb()));
-    for (unsigned i = 0; i < count; ++i) info.gradients_y.push_back(input(rb()));
+    // The B registers hold, for each coordinate in turn, its derivative along
+    // the first screen axis and then along the second.
+    for (unsigned i = 0; i < count; ++i) {
+        info.gradients_x.push_back(input(rb()));
+        info.gradients_y.push_back(input(rb()));
+    }
     emit_sample();
 }
 

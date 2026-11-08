@@ -13,12 +13,14 @@
 
 #include <armigo/graphics/texflush.h>
 #include <armigo/memory/write_tracker.h>
+#include <armigo/nvn/driver.h>
 
 #include "nvn/resource_layout.h"
 #include "nvn_deswizzle.h"
 #include "texture_format.h"
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <atomic>
 #include <array>
@@ -54,6 +56,9 @@ using namespace armigo::nvn::api;
 // cost the encoder more than the work they describe.
 namespace {
 constexpr unsigned report_repeat = 4;
+// The largest backing a texture keeps a copy of to compare after guest-memory
+// stores reach its pool; a larger one uploads again after each of them.
+constexpr std::size_t guest_snapshot_limit = 16u << 20;
 struct ReportOnce {
   const char *message = nullptr;
   unsigned shown = 0, suppressed = 0;
@@ -324,6 +329,9 @@ struct Resources::Impl {
     std::uint32_t flags = 0;
     id<MTLBuffer> buffer = nil;
     bool owns_tracking = false;
+    // Its release has begun: guest-memory tables leased from now on leave it
+    // out, and the release waits for the tables leased before.
+    bool releasing = false;
     // Textures registered over this pool's bytes. A range lookup walks only
     // these instead of an index over every texture in the process; the
     // reference keeps the same per-pool ownership records.
@@ -362,6 +370,12 @@ struct Resources::Impl {
     bool cpu_snapshot_valid = false;
     bool backing_conflict = false;
     bool host_copy_stale = false;
+    // Guest-memory stores reached the backing's pool (its write log names
+    // pools, not bytes): the next use compares the backing with guest_snapshot,
+    // the bytes taken just before the last upload through this check, and
+    // uploads only when they differ. Any other upload drops the snapshot.
+    bool guest_maybe_written = false;
+    std::vector<std::byte> guest_snapshot;
     // Listed in dirty_storages; cleared when retirement drops the entry.
     bool retire_queued = false;
   };
@@ -873,6 +887,40 @@ struct Resources::Impl {
   std::vector<Range> pending_buffer_writes;
   std::uint64_t gpu_write_generation = 0;
   std::uint64_t completed_write_generation = 0;
+  // Guest-memory table leases: the write generation the leasing
+  // submission's retirement completes, and the guest addresses its table
+  // covers (sorted disjoint ranges, shared by the leases of one pool set).
+  struct GuestLease {
+    std::uint64_t generation = 0;
+    std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> ranges;
+  };
+  std::vector<GuestLease> guest_leases;
+  std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> guest_ranges;
+  std::uint64_t guest_ranges_generation = 0;
+  std::condition_variable lease_retired;
+  std::chrono::nanoseconds lease_wait_timeout = std::chrono::seconds(10);
+
+  bool lease_pending_locked(Range range) const {
+    return std::ranges::any_of(guest_leases, [&](const GuestLease &lease) {
+      return lease.generation > completed_write_generation &&
+             std::ranges::any_of(*lease.ranges, [&](const auto &covered) {
+               return overlaps(range.begin, range.size, covered.first, covered.second - covered.first);
+             });
+    });
+  }
+
+  // Waits until no submission whose table covers the range is outstanding.
+  // Retirement completes leases fence by fence, past held queues, so this
+  // does not wait for unrelated work.
+  bool await_leases(Range range, const char *operation) {
+    std::unique_lock lock(mutex);
+    if (lease_retired.wait_for(lock, lease_wait_timeout, [&] { return !lease_pending_locked(range); }))
+      return true;
+    armigo::diag::write(armigo::diag::Level::error,
+                        "nvn_resources: %s gave up waiting for guest-memory submissions that did not retire\n",
+                        operation);
+    return false;
+  }
 
   explicit Impl(id<MTLDevice> supplied) : device(supplied) {
     if (!device) {
@@ -1612,6 +1660,7 @@ struct Resources::Impl {
   }
 
   bool upload_texture_locked(Texture &texture) {
+    texture->guest_snapshot.clear();
     if (texture->in_place) {
       record_cpu_snapshot_locked(texture);
       return true;
@@ -1780,14 +1829,39 @@ struct Resources::Impl {
     }
     const bool backing_changed =
         texture->backing_write_generation > texture->uploaded_backing_generation;
+    // A CPU-cached pool's writes reach the GPU through flush calls, unless the
+    // title flushes natively, without the driver (its title policy).
     const bool cpu_changed =
-        !cpu_cached_locked(texture) && cpu_changed_locked(texture);
-    if (!backing_changed && !cpu_changed && !texture->host_copy_stale)
+        (!cpu_cached_locked(texture) || nvn::title_policy().cpu_cached_texture_writes) &&
+        cpu_changed_locked(texture);
+    const bool guest_written = std::exchange(texture->guest_maybe_written, false);
+    if (!backing_changed && !cpu_changed && !texture->host_copy_stale && !guest_written)
       return true;
+    // After guest-memory stores, which reach the write tracker as stores over
+    // whole pools, a backing still equal to the bytes this comparison last
+    // uploaded needs no upload. The CPU stamp is taken first, so a store
+    // during the comparison shows at the next use.
+    std::vector<std::byte> snapshot;
+    if ((guest_written || !texture->guest_snapshot.empty()) && !backing_changed &&
+        !texture->host_copy_stale) {
+      const auto *bytes = reinterpret_cast<const std::byte *>(texture.state.memory);
+      const auto size = static_cast<std::size_t>(texture.state.size);
+      std::uint64_t stamp = 0;
+      if (texture->guest_snapshot.size() == size && begin_cpu_snapshot_locked(texture, stamp) &&
+          std::memcmp(texture->guest_snapshot.data(), bytes, size) == 0) {
+        finish_cpu_snapshot_locked(texture, stamp);
+        return true;
+      }
+      // Taken before the upload: a store landing meanwhile makes the next
+      // comparison differ, never match a texture that missed it.
+      if (size <= guest_snapshot_limit)
+        snapshot.assign(bytes, bytes + size);
+    }
     if (!upload_texture_locked(texture)) {
       report_serial("failed to refresh texture serial", texture.state.serial);
       return false;
     }
+    texture->guest_snapshot = std::move(snapshot);
     return true;
   }
 
@@ -2491,6 +2565,11 @@ void Resources::set_completion_hook(CompletionHook hook) {
   impl_->completion_hook = std::move(hook);
 }
 
+void Resources::set_lease_wait_timeout(std::chrono::nanoseconds timeout) {
+  std::lock_guard lock(impl_->mutex);
+  impl_->lease_wait_timeout = timeout;
+}
+
 // Pool generations come from one counter for every instance, and descriptor
 // generations stay below 2^40: each state has its own value, so a cache
 // stamped with one can never match a later state.
@@ -2859,8 +2938,14 @@ std::uint64_t Resources::gpu_write_generation() const {
 }
 
 void Resources::complete_gpu_writes(std::uint64_t generation) {
-  std::lock_guard lock(impl_->mutex);
-  impl_->complete_writes_locked(generation);
+  {
+    std::lock_guard lock(impl_->mutex);
+    impl_->complete_writes_locked(generation);
+    std::erase_if(impl_->guest_leases, [&](const Impl::GuestLease &lease) {
+      return lease.generation <= impl_->completed_write_generation;
+    });
+  }
+  impl_->lease_retired.notify_all();
 }
 
 void Resources::note_gpu_write(std::uint64_t gpu_address, std::uint64_t size) {
@@ -2886,10 +2971,122 @@ void Resources::note_gpu_write(std::uint64_t gpu_address, std::uint64_t size) {
   });
 }
 
+void Resources::note_completed_gpu_write(std::uint64_t gpu_address, std::uint64_t size) {
+  std::uint64_t end = 0;
+  if (!size || add_overflow(gpu_address, size, end))
+    return;
+  memory::WriteTracker::note_store(reinterpret_cast<const void *>(gpu_address), size);
+  std::lock_guard lock(impl_->mutex);
+  const auto *pool = impl_->find_pool(gpu_address, end);
+  if (pool && !pool->has_separate_textures) return;
+  bool kept = false;
+  // The write has completed, so no write generation is pending for it: the
+  // texture only compares its backing with its last upload at its next use.
+  impl_->visit_texture_ranges_locked(gpu_address, end, [&](Impl::Texture &texture) {
+    if (texture->in_place) return;
+    if (texture->dirty) {
+      kept = true;
+      return;
+    }
+    texture->guest_maybe_written = true;
+  });
+  static std::atomic<bool> reported{false};
+  if (kept && !reported.exchange(true))
+    armigo::diag::write(armigo::diag::Level::warning,
+                        "nvn_resources: guest-memory stores reached a pool holding textures the GPU wrote; "
+                        "those textures keep their storage\n");
+}
+
+bool Resources::backing_feeds_texture(std::uint64_t gpu_address, std::uint64_t size) {
+  std::uint64_t end = 0;
+  if (!size || add_overflow(gpu_address, size, end))
+    return true;
+  std::lock_guard lock(impl_->mutex);
+  bool registered = false, feeds = false;
+  impl_->visit_texture_ranges_locked(gpu_address, end, [&](Impl::Texture &texture) {
+    registered = true;
+    feeds = feeds || (!texture->in_place && !texture->dirty);
+  });
+  return feeds || !registered;
+}
+
 bool Resources::texture_is_in_place(const nvn::TextureState &texture) {
   const std::lock_guard lock(impl_->mutex);
   const auto entry = impl_->textures.find(texture.serial);
   return entry != impl_->textures.end() && entry->second->in_place;
+}
+
+std::uint64_t Resources::claim_guest_memory_pools(std::uint64_t known, std::vector<GuestMemoryPool> &pools) {
+  std::lock_guard lock(impl_->mutex);
+  const auto generation = impl_->pool_generation.load(std::memory_order_acquire);
+  const auto eligible = [](const Impl::Pool &pool) {
+    return !pool.releasing && !(pool.flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS);
+  };
+  if (impl_->guest_ranges_generation != generation || !impl_->guest_ranges) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    for (const auto &pool : impl_->pools)
+      if (eligible(pool)) ranges.emplace_back(pool.begin, pool.end);
+    std::ranges::sort(ranges);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    for (const auto &range : ranges)
+      if (!merged.empty() && range.first <= merged.back().second)
+        merged.back().second = std::max(merged.back().second, range.second);
+      else
+        merged.push_back(range);
+    impl_->guest_ranges =
+        std::make_shared<const std::vector<std::pair<std::uint64_t, std::uint64_t>>>(std::move(merged));
+    impl_->guest_ranges_generation = generation;
+  }
+  impl_->guest_leases.push_back({++impl_->gpu_write_generation, impl_->guest_ranges});
+  if (generation == known) return generation;
+  pools.clear();
+  pools.reserve(impl_->pools.size());
+  for (const auto &pool : impl_->pools)
+    if (eligible(pool))
+      pools.push_back({pool.begin, pool.end, pool.gpu + (pool.begin - pool.buffer_begin), pool.buffer});
+  return generation;
+}
+
+id<MTLTexture> Resources::upgrade_for_image_write(std::uint64_t serial, __strong id<MTLTexture> &previous) {
+  previous = nil;
+  std::lock_guard lock(impl_->mutex);
+  const auto found = impl_->textures.find(serial);
+  if (found == impl_->textures.end() || !found->second->storage)
+    return nil;
+  auto &storage = *found->second.shared;
+  if (storage.storage.usage & MTLTextureUsageShaderWrite)
+    return storage.storage;
+  id<MTLTexture> old = storage.storage;
+  auto *descriptor = [MTLTextureDescriptor new];
+  descriptor.textureType = old.textureType;
+  descriptor.pixelFormat = old.pixelFormat;
+  descriptor.width = old.width;
+  descriptor.height = old.height;
+  descriptor.depth = old.depth;
+  descriptor.mipmapLevelCount = old.mipmapLevelCount;
+  descriptor.arrayLength = old.arrayLength;
+  descriptor.sampleCount = old.sampleCount;
+  descriptor.storageMode = old.storageMode;
+  // Guest images may be viewed as another format of the same size.
+  descriptor.usage = old.usage | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
+  id<MTLTexture> upgraded = [impl_->device newTextureWithDescriptor:descriptor];
+  if (!upgraded) {
+    report_serial("failed to allocate shader-writable storage for serial", serial);
+    return nil;
+  }
+  storage.storage = upgraded;
+  storage.views.clear();
+  ++impl_->texture_generation;
+  ++impl_->rare_stamp;
+  // Descriptor caches key this serial separately from the rare stamp. The
+  // replacement is a new storage object, so those caches resolve again.
+  impl_->touch_serial_locked(serial);
+  previous = old;
+  return upgraded;
+}
+
+std::uint64_t Resources::pool_generation() const noexcept {
+  return impl_->pool_generation.load(std::memory_order_acquire);
 }
 
 bool Resources::register_pool(const nvn::MemoryPoolState &pool) {
@@ -2928,7 +3125,8 @@ bool Resources::register_pool(const nvn::MemoryPoolState &pool) {
   std::lock_guard lock(impl_->mutex);
   for (const auto &existing : impl_->pools) {
     if (existing.begin == begin && existing.end == end) {
-      report("memory pool is already registered");
+      report(existing.releasing ? "memory pool is still being released after an unfinished GPU wait"
+                                : "memory pool is already registered");
       return false;
     }
   }
@@ -3050,14 +3248,24 @@ void Resources::release_pool(const nvn::MemoryPoolState &pool) {
   const auto end = range.begin + range.size;
   {
     std::lock_guard lock(impl_->mutex);
-    const bool registered = std::any_of(
-        impl_->pools.begin(), impl_->pools.end(), [&](const Impl::Pool &entry) {
-          return entry.begin == range.begin && entry.end == end;
+    const auto entry = std::find_if(
+        impl_->pools.begin(), impl_->pools.end(), [&](const Impl::Pool &pool) {
+          return pool.begin == range.begin && pool.end == end;
         });
-    if (!registered) {
+    if (entry == impl_->pools.end()) {
       report("released memory pool was not registered");
       return;
     }
+    // Tables leased from here on leave the pool out; those leased before
+    // may name it until their submissions retire.
+    entry->releasing = true;
+    impl_->pool_generation = Impl::next_pool_generation.fetch_add(1);
+  }
+  // A pool an outstanding table may still name stays registered: its no-copy
+  // buffer keeps the pages, and its range cannot be registered again.
+  if (!impl_->await_leases(range, "memory pool release")) {
+    report("memory pool stays registered: a guest-memory submission that may use it did not retire");
+    return;
   }
   const bool coherent = impl_->reconcile_range(range, "memory pool release");
   std::lock_guard lock(impl_->mutex);
@@ -3111,6 +3319,16 @@ void Resources::release_pool(const nvn::MemoryPoolState &pool) {
   }
   if (!coherent)
     report("memory pool released without authoritative GPU texture readback");
+}
+
+// Uploads deswizzled from pool storage read it when their batch runs: the
+// open batch and every committed one not yet waited for finish before the
+// driver replaces pool bytes, as before a texel write or a pool release.
+void Resources::prepare_pool_write(const nvn::MemoryPoolState &,
+                                   std::uint64_t, std::uint64_t) {
+  std::lock_guard lock(impl_->mutex);
+  if (impl_->uploads_read_pools_locked())
+    impl_->finish_uploads_locked();
 }
 
 void Resources::flush_pool(const nvn::MemoryPoolState &pool,

@@ -107,13 +107,60 @@ struct Fixture {
     }
 };
 
+// GetClockSnapshot (400): the user and network contexts from the page, the
+// user time on the steady clock, a zero network time without a network clock,
+// UTC calendars, the steady time point and the requested type.
+void test_clock_snapshot() {
+    HandleTable handles(16);
+    const auto page = clock_page();
+    auto memory = std::make_shared<ReadOnlySharedMemory>(page);
+    TimeServiceSession session(701, handles, memory, [] { return std::optional<std::int64_t>{10'000'000'000}; });
+    CHECK(session.request(control(7, 0), 701).disposition == IpcDisposition::handled);
+    auto request = domain(6, 400, 1);
+    put(request, 4, 12 | (2u << 10));
+    put(request, 48, 1, 1);
+    struct Output {
+        std::array<std::byte, 0xd0> bytes{};
+        static bool read(void*, std::uint64_t, std::span<std::byte>) noexcept { return false; }
+        static bool write(void* context, std::uint64_t address, std::span<const std::byte> in) noexcept {
+            auto& self = *static_cast<Output*>(context);
+            if (address + in.size() > self.bytes.size()) return false;
+            std::copy(in.begin(), in.end(), self.bytes.begin() + static_cast<std::ptrdiff_t>(address));
+            return true;
+        }
+    } output;
+    armigo::horizon::GuestBuffers buffers(Output::read, Output::write, &output);
+    buffers.add({0, 0xd0, false, true});
+    const auto reply = session.request_with_buffers(request, 701, buffers);
+    CHECK(reply.disposition == IpcDisposition::handled && reply.size == 48 && get(reply.bytes, 40) == 0);
+    const auto at64 = [&](std::size_t offset) {
+        std::int64_t value = 0;
+        std::memcpy(&value, output.bytes.data() + offset, 8);
+        return value;
+    };
+    CHECK(std::equal(page.begin() + 0x40, page.begin() + 0x60, output.bytes.begin()));
+    CHECK(at64(0x40) == 5002 && at64(0x48) == 0);
+    CHECK(output.bytes[0x50] == std::byte{0xb2} && output.bytes[0x51] == std::byte{0x07});  // 1970
+    CHECK(output.bytes[0x52] == std::byte{1} && output.bytes[0x53] == std::byte{1} &&
+          output.bytes[0x54] == std::byte{1} && output.bytes[0x55] == std::byte{23} &&
+          output.bytes[0x56] == std::byte{22});
+    CHECK(output.bytes[0x5c] == std::byte{0} && output.bytes[0x60] == std::byte{4});  // Thursday
+    CHECK(at64(0x90) == 9 && std::equal(page.begin() + 0x10, page.begin() + 0x20, output.bytes.begin() + 0x98));
+    CHECK(output.bytes[0xa8] == std::byte{'U'} && output.bytes[0xcd] == std::byte{1});
+    // A snapshot needs its output buffer and the guest counter.
+    CHECK(session.request(request, 701).disposition == IpcDisposition::unsupported);
+    TimeServiceSession no_counter(701, handles, memory);
+    CHECK(no_counter.request(control(7, 0), 701).disposition == IpcDisposition::handled);
+    CHECK(no_counter.request_with_buffers(request, 701, buffers).disposition == IpcDisposition::unsupported);
+}
+
 void test_control_and_child_reply() {
     Fixture f;
     for (const unsigned type : {5, 7}) {
         const auto reply = f.session->request(control(type, 3), 701);
         IpcMessage expected{};
         put(expected, 4, 9); put(expected, 16, 0x4f434653);
-        put(expected, 28, 0xec6be3ff); put(expected, 32, 0, 2);
+        put(expected, 28, 0xec6be3ff); put(expected, 32, 0x1000, 2);
         CHECK(reply.disposition == IpcDisposition::handled && reply.transport_result == 0);
         CHECK(reply.size == 44 && reply.bytes == expected);
     }
@@ -163,7 +210,7 @@ void test_control_and_child_reply() {
     other.convert();
     other.unsupported(domain(6, 20, previous));
     f.message = control(7, 3);
-    CHECK(f.send() == IpcDisposition::handled && get(f.message, 32, 2) == 0);
+    CHECK(f.send() == IpcDisposition::handled && get(f.message, 32, 2) == 0x1000);
 }
 
 void test_copy_handle_and_lifetime() {
@@ -258,6 +305,7 @@ void test_immutable_payload_and_constructor_validation() {
 
 int main() {
     test_control_and_child_reply();
+    test_clock_snapshot();
     test_copy_handle_and_lifetime();
     test_unsupported_preserves_state();
     test_immutable_payload_and_constructor_validation();

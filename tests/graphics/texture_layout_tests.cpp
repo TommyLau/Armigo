@@ -577,10 +577,17 @@ void test_error_rejections() {
     description = block_linear(64, 32, 1, 2, 1, 4, 0, 1, 2);
     CHECK(is_error(calculate_texture_size(description),
                    TextureLayoutErrorCode::InvalidDimensions));
-    // 4 GiB-wide rows exceed the 256 MiB policy, not arithmetic.
+    // 4 GiB-wide rows exceed the storage policy, not arithmetic.
     description = block_linear(0xfffffff0u, 1, 1, 1, 1, 16, 1, 1, 0);
     CHECK(is_error(calculate_texture_size(description),
                    TextureLayoutErrorCode::ExtentLimit));
+    // A 12288 x 12288 16-bit layout (288 MiB) is above the conversion limit
+    // and within the storage policy.
+    description = block_linear(12288, 12288, 1, 1, 1, 2, 1, 1, 4);
+    const auto atlas = calculate_texture_size(description);
+    CHECK(std::holds_alternative<TextureLayoutDescription>(atlas));
+    if (const auto* layout = std::get_if<TextureLayoutDescription>(&atlas))
+        CHECK(layout->total_size > max_texture_layout_size && layout->total_size <= max_texture_storage_size);
 
     // Conversion bounds: the guest span must cover the requested region.
     const TextureLayoutResult<TextureLayoutDescription> result =
@@ -839,7 +846,7 @@ void test_write_rejections_preserve_guest() {
     malformed.total_size = 1;
     reject(malformed);
     malformed = valid;
-    malformed.total_size = max_texture_layout_size + 1;
+    malformed.total_size = max_texture_storage_size + 1;
     reject(malformed);
     malformed = valid;
     malformed.storage = static_cast<TextureStorageLayout>(255);

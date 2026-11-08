@@ -394,7 +394,7 @@ std::variant<std::string, fs::path> prepare_ios_player_build(
     return build;
 }
 
-std::string create_ios_ipa(const fs::path& app_path) {
+std::string create_ios_ipa(const fs::path& assembled, const fs::path& app_path) {
     const fs::path output = app_path.parent_path() / (app_path.stem().string() + ".ipa");
     std::error_code error;
     if (fs::exists(output, error)) {
@@ -405,7 +405,7 @@ std::string create_ios_ipa(const fs::path& app_path) {
     const fs::path temporary = app_path.parent_path() / ("." + app_path.stem().string() + "-" + unique + ".ipa");
     RemoveOnFailure staging_cleanup{staging};
     RemoveOnFailure ipa_cleanup{temporary};
-    const std::string cloned = clone_directory(app_path, staging / "Payload" / app_path.filename());
+    const std::string cloned = clone_directory(assembled, staging / "Payload" / app_path.filename());
     if (!cloned.empty()) {
         return cloned;
     }

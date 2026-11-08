@@ -205,6 +205,32 @@ void test_command_memory_accounting(NVNdevice& device) {
     load<Entry::nvnCommandBufferFinalize>()(&reused);
 }
 
+// A command-memory range that starts inside its pool may run past the pool's
+// end, as a game's ring of chunks does; nothing is written there, so the range
+// only accounts for the game's position. A range that starts at or past the
+// end, or is larger than the pool, is refused.
+void test_command_memory_past_pool_end(NVNdevice& device) {
+    NVNcommandBuffer commands{};
+    CHECK(load<Entry::nvnCommandBufferInitialize>()(&commands, &device) == 1);
+    alignas(8) std::array<std::byte, 64> memory{};
+    NVNmemoryPool pool{};
+    initialize_pool(pool, memory.data(), 60);
+    load<Entry::nvnCommandBufferAddCommandMemory>()(&commands, &pool, 52, 12);
+    CHECK(load<Entry::nvnCommandBufferGetCommandMemorySize>()(&commands) == 12);
+    CHECK(record_draw(commands, 3) == reinterpret_cast<NVNcommandHandle>(memory.data() + 52));
+    // Recording past the logical end: the position stops at it (no callback),
+    // and the guard bytes past the pool stay untouched.
+    for (int first = 4; first != 9; ++first) record_draw(commands, first);
+    CHECK(load<Entry::nvnCommandBufferGetCommandMemoryUsed>()(&commands) == 12);
+    CHECK(load<Entry::nvnCommandBufferGetCommandMemoryFree>()(&commands) == 0);
+    CHECK(memory[60] == std::byte{} && memory[63] == std::byte{});
+    load<Entry::nvnCommandBufferAddCommandMemory>()(&commands, &pool, 60, 4);
+    CHECK(load<Entry::nvnCommandBufferGetCommandMemorySize>()(&commands) == 0);
+    load<Entry::nvnCommandBufferAddCommandMemory>()(&commands, &pool, 0, 64);
+    CHECK(load<Entry::nvnCommandBufferGetCommandMemorySize>()(&commands) == 0);
+    load<Entry::nvnCommandBufferFinalize>()(&commands);
+}
+
 // A recording that reuses command memory a registered list occupies replaces
 // that list: its handle stops resolving, as natively its commands have been
 // overwritten, and the host blocks behind it can be freed. Lists the new
@@ -673,6 +699,7 @@ int main() {
 
     test_command_memory_accounting(device);
     test_reused_memory_releases_lists(device);
+    test_command_memory_past_pool_end(device);
     test_sampler_stamps(device);
     test_control_memory_failure(device, recorded);
     test_call_depth_limit(device);

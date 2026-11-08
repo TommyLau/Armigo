@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace armigo::diag {
@@ -31,9 +32,44 @@ struct Pending {
     Channel channel = Channel::level;
 };
 
+// exit() destroys the calling thread's thread_locals before it runs atexit.
+// The native shader package emits its hit line from atexit on the main thread,
+// so that write must not touch the thread_local line buffer after its
+// destructor has freed it. Worker threads do not retire the main buffer.
+std::atomic<bool> main_pending_retired{false};
+std::atomic<std::uint64_t> exit_pending_appends{0};
+const std::thread::id process_main_thread = std::this_thread::get_id();
+
+Pending& exit_pending() noexcept {
+    static Pending* pending = new Pending;
+    return *pending;
+}
+
+struct PendingSlot {
+    Pending* pending = new Pending;
+    bool main = false;
+
+    PendingSlot() : main(std::this_thread::get_id() == process_main_thread) {}
+
+    ~PendingSlot() {
+        delete pending;
+        pending = nullptr;
+        if (main) main_pending_retired.store(true, std::memory_order_release);
+    }
+
+    PendingSlot(const PendingSlot&) = delete;
+    PendingSlot& operator=(const PendingSlot&) = delete;
+};
+
 Pending& pending_state() noexcept {
-    thread_local Pending pending;
-    return pending;
+    if (main_pending_retired.load(std::memory_order_acquire) &&
+        std::this_thread::get_id() == process_main_thread) {
+        auto& pending = exit_pending();
+        exit_pending_appends.fetch_add(1, std::memory_order_relaxed);
+        return pending;
+    }
+    thread_local PendingSlot slot;
+    return *slot.pending;
 }
 
 struct FileState {
@@ -379,6 +415,10 @@ std::uint64_t testing_last_run_bytes() noexcept {
     auto& state = files();
     std::lock_guard lock(state.mutex);
     return state.bytes;
+}
+
+std::uint64_t testing_exit_pending_appends() noexcept {
+    return exit_pending_appends.load(std::memory_order_relaxed);
 }
 
 } // namespace armigo::diag

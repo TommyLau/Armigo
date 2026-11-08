@@ -64,6 +64,44 @@ int main() {
         CHECK(std::holds_alternative<std::string>(parse("true", ",\"pipelines\":\"../x.tsv\"")));
         CHECK(std::holds_alternative<std::string>(parse("true", ",\"pso_manifest\":\"/a.tsv\"")));
     }
+    {
+        // The title's NVN policy: an object of known members (booleans and
+        // named modes); absent members keep the driver's default.
+        const auto set = parse("true", ",\"nvn_policy\":{\"cpu_cached_texture_writes\":true}");
+        const auto* descriptions = std::get_if<PatchDescriptions>(&set);
+        CHECK(descriptions && descriptions->front().nvn_policy.cpu_cached_texture_writes);
+        const auto empty = parse("true", ",\"nvn_policy\":{}");
+        const auto* defaults = std::get_if<PatchDescriptions>(&empty);
+        CHECK(defaults && !defaults->front().nvn_policy.cpu_cached_texture_writes);
+        CHECK(std::holds_alternative<std::string>(parse("true", ",\"nvn_policy\":{\"cpu_cached_texture_writes\":1}")));
+        CHECK(std::holds_alternative<std::string>(parse("true", ",\"nvn_policy\":{\"unknown\":true}")));
+        const auto segment = parse("true", ",\"nvn_policy\":{\"timestamps\":\"segment\"}");
+        const auto* segmented = std::get_if<PatchDescriptions>(&segment);
+        CHECK(segmented && segmented->front().nvn_policy.segment_timestamps &&
+              !segmented->front().nvn_policy.cpu_cached_texture_writes);
+        const auto report = parse("true", ",\"nvn_policy\":{\"timestamps\":\"report\"}");
+        const auto* reported = std::get_if<PatchDescriptions>(&report);
+        CHECK(reported && !reported->front().nvn_policy.segment_timestamps);
+        CHECK(defaults && !defaults->front().nvn_policy.segment_timestamps);
+        CHECK(std::holds_alternative<std::string>(parse("true", ",\"nvn_policy\":{\"timestamps\":\"frame\"}")));
+        CHECK(std::holds_alternative<std::string>(parse("true", ",\"nvn_policy\":{\"timestamps\":true}")));
+        const auto game = parse("true", ",\"nvn_policy\":{\"barriers\":\"game\"}");
+        const auto* gamed = std::get_if<PatchDescriptions>(&game);
+        CHECK(gamed && gamed->front().nvn_policy.game_barriers && !gamed->front().nvn_policy.segment_timestamps);
+        const auto full = parse("true", ",\"nvn_policy\":{\"barriers\":\"full\"}");
+        const auto* fulled = std::get_if<PatchDescriptions>(&full);
+        CHECK(fulled && !fulled->front().nvn_policy.game_barriers);
+        CHECK(defaults && !defaults->front().nvn_policy.game_barriers);
+        CHECK(std::holds_alternative<std::string>(parse("true", ",\"nvn_policy\":{\"barriers\":\"none\"}")));
+        const auto hoist = parse("true", ",\"nvn_policy\":{\"hoist_implicit_samples\":true}");
+        const auto* hoisted = std::get_if<PatchDescriptions>(&hoist);
+        CHECK(hoisted && hoisted->front().nvn_policy.hoist_implicit_samples &&
+              !hoisted->front().nvn_policy.game_barriers);
+        CHECK(defaults && !defaults->front().nvn_policy.hoist_implicit_samples);
+        CHECK(std::holds_alternative<std::string>(
+            parse("true", ",\"nvn_policy\":{\"hoist_implicit_samples\":\"yes\"}")));
+        CHECK(std::holds_alternative<std::string>(parse("true", ",\"nvn_policy\":true")));
+    }
     CHECK(std::holds_alternative<std::string>(parse("true", ",\"unknown\":0")));
     CHECK(std::holds_alternative<std::string>(parse("true", ",\"calls\":[]")));
     std::printf("NVN compatibility failures: %u\n", failures);

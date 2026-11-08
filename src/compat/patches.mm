@@ -13,7 +13,7 @@
 #include <atomic>
 
 #include <armigo/compat/patches.h>
-#include <armigo/titles/01007EF00011E000/resolution.h>
+#include <armigo/titles/resolution.h>
 #include <armigo/execution/gate_patch.h>
 #include <bit>
 #include <mutex>
@@ -22,6 +22,8 @@
 #import <Foundation/Foundation.h>
 #include <algorithm>
 #include <charconv>
+#include <chrono>
+#include <optional>
 #include <cstring>
 #include <fstream>
 #include <set>
@@ -136,8 +138,8 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                 require([entry isKindOfClass:[NSDictionary class]], "Compatibility record must be an object.");
                 const bool has_patch = entry[@"module"] != nil;
                 auto record = has_patch
-                    ? object(entry, {"title_id", "main_build_id", "module", "original_callee", "calls", "layout"}, {"nvn_driver", "startup_user", "pipelines", "words", "present_link", "resolution", "shader_inputs", "note", "frame_rate", "frame_rates"})
-                    : object(entry, {"title_id", "main_build_id"}, {"nvn_driver", "startup_user", "pipelines", "words", "present_link", "resolution", "shader_inputs", "note", "frame_rate", "frame_rates"});
+                    ? object(entry, {"title_id", "main_build_id", "module", "calls", "layout"}, {"original_callee", "nvn_driver", "startup_user", "nvn_policy", "pipelines", "words", "present_link", "resolution", "shader_inputs", "note", "frame_rate", "frame_rates"})
+                    : object(entry, {"title_id", "main_build_id"}, {"nvn_driver", "startup_user", "nvn_policy", "pipelines", "words", "present_link", "resolution", "shader_inputs", "note", "frame_rate", "frame_rates"});
                 PatchDescription patch;
                 patch.identity.title_id = hex(record[@"title_id"], 16);
                 auto build = string(record[@"main_build_id"]);
@@ -160,6 +162,32 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                             "Compatibility startup_user must be a JSON boolean.");
                     patch.startup_user = [required boolValue];
                 }
+                if (id policy = record[@"nvn_policy"]) {
+                    NSDictionary* fields = object(policy, {}, {"cpu_cached_texture_writes", "timestamps", "barriers",
+                                                               "hoist_implicit_samples"});
+                    if (id writes = fields[@"cpu_cached_texture_writes"]) {
+                        require(CFGetTypeID((__bridge CFTypeRef)writes) == CFBooleanGetTypeID(),
+                                "Compatibility nvn_policy.cpu_cached_texture_writes must be a JSON boolean.");
+                        patch.nvn_policy.cpu_cached_texture_writes = [writes boolValue];
+                    }
+                    if (id timestamps = fields[@"timestamps"]) {
+                        const auto mode = string(timestamps);
+                        require(mode == "report" || mode == "segment",
+                                "Compatibility nvn_policy.timestamps must be \"report\" or \"segment\".");
+                        patch.nvn_policy.segment_timestamps = mode == "segment";
+                    }
+                    if (id barriers = fields[@"barriers"]) {
+                        const auto mode = string(barriers);
+                        require(mode == "full" || mode == "game",
+                                "Compatibility nvn_policy.barriers must be \"full\" or \"game\".");
+                        patch.nvn_policy.game_barriers = mode == "game";
+                    }
+                    if (id hoist = fields[@"hoist_implicit_samples"]) {
+                        require(CFGetTypeID((__bridge CFTypeRef)hoist) == CFBooleanGetTypeID(),
+                                "Compatibility nvn_policy.hoist_implicit_samples must be a JSON boolean.");
+                        patch.nvn_policy.hoist_implicit_samples = [hoist boolValue];
+                    }
+                }
                 // The title's pipeline list: a file next to the profile.
                 if (id list = record[@"pipelines"]) {
                     require([list isKindOfClass:[NSString class]] && [list length] != 0,
@@ -179,7 +207,8 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                     const auto containers = string(selected[@"containers"]);
                     if (containers == "bnsh") patch.shader_inputs.containers = ShaderContainerSet::Bnsh;
                     else if (containers == "gfd-cache") patch.shader_inputs.containers = ShaderContainerSet::GfdCache;
-                    else require(false, "Compatibility shader containers are bnsh or gfd-cache.");
+                    else if (containers == "glslc") patch.shader_inputs.containers = ShaderContainerSet::Glslc;
+                    else require(false, "Compatibility shader containers are bnsh, gfd-cache or glslc.");
                     const auto depth = string(selected[@"vertex_depth"]);
                     if (depth == "minus-one-to-one") patch.shader_inputs.vertex_depth = ShaderVertexDepth::NegativeOneToOne;
                     else if (depth == "zero-to-one") patch.shader_inputs.vertex_depth = ShaderVertexDepth::ZeroToOne;
@@ -233,10 +262,10 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                             patch.shader_inputs.ignored_needle_offsets.push_back(offset);
                         }
                     }
-                    if (patch.shader_inputs.containers == ShaderContainerSet::Bnsh) {
+                    if (patch.shader_inputs.containers != ShaderContainerSet::GfdCache) {
                         require(patch.shader_inputs.caches.empty() && patch.shader_inputs.fallbacks.empty() &&
                                     patch.shader_inputs.ignored_needle_offsets.empty(),
-                                "bnsh shader input does not name caches or ignored offsets.");
+                                "Only gfd-cache shader input names caches or ignored offsets.");
                     }
                 }
                 if (id link = record[@"present_link"]) {
@@ -354,14 +383,14 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                 }
                 if (has_patch) {
                     patch.module = string(record[@"module"]);
-                    require(patch.module == "frame-rate", "Unknown compatibility module.");
-                    patch.original_callee = hex(record[@"original_callee"]);
+                    require(find_call_module(patch.module) != nullptr, "Unknown compatibility module.");
+                    if (id callee = record[@"original_callee"]) patch.original_callee = hex(callee);
                     id calls = record[@"calls"];
                     require([calls isKindOfClass:[NSArray class]] && [calls count] > 0 && [calls count] <= 64,
                             "Compatibility calls must be a nonempty bounded array.");
                     std::set<std::uint64_t> offsets;
                     for (id item in calls) {
-                        auto call = object(item, {"offset", "expected_instruction", "note"}, {"frame_rate", "nvn_driver_only", "phases"});
+                        auto call = object(item, {"offset", "expected_instruction", "note"}, {"frame_rate", "nvn_driver_only", "phases", "frame_ratio"});
                         CallPatch site{hex(call[@"offset"]), static_cast<std::uint32_t>(hex(call[@"expected_instruction"], 8))};
                         site.note = note_text(call[@"note"]);
                         if (id phases = call[@"phases"]) {
@@ -370,6 +399,10 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                                 hex(fields[@"counter"]), layout_count(fields[@"phase_count"], 65535)};
                             require(site.phases->phase_count != 0 && site.phases->counter % 4 == 0,
                                     "Compatibility phase counter must be aligned and its period positive.");
+                        }
+                        if (id ratio = call[@"frame_ratio"]) {
+                            auto fields = object(ratio, {"divisor_register"});
+                            site.frame_ratio = FrameRatioDivision{layout_count(fields[@"divisor_register"], 31)};
                         }
                         if (id rate = call[@"frame_rate"]) {
                             site.frame_rate = frame_rate_value(rate, true);
@@ -388,9 +421,13 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                     const id layout_record = record[@"layout"];
                     require([layout_record isKindOfClass:[NSDictionary class]], "Compatibility layout must be an object.");
                     const id variant = layout_record[@"variant"];
+                    const bool division = variant && [variant isEqual:@"ratio-division"];
                     const bool countdown = variant && [variant isEqual:@"fractional-countdown-30"];
                     const bool repeating = variant && [variant isEqual:@"fractional-repeat-30"];
-                    if (repeating || countdown || (variant && [variant isEqual:@"fractional-counter-30"])) {
+                    if (division) {
+                        object(layout_record, {"variant"});
+                        patch.layout.variant = titles::FrameRateVariant::RatioDivision;
+                    } else if (repeating || countdown || (variant && [variant isEqual:@"fractional-counter-30"])) {
                         auto layout = object(layout_record, {"variant", "framework_pointer", "framework_period",
                             "object_register", "state", "active_state", "counter"}, {"repeat_flag", "repeat_frames"});
                         patch.layout.variant = repeating ? titles::FrameRateVariant::FractionalRepeat30
@@ -430,6 +467,14 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                         }
                     }
                 }
+                // A ratio-division layout has only frame-ratio hooks and no
+                // original callee; every other layout has calls to its callee.
+                const bool ratio_division = patch.layout.variant == titles::FrameRateVariant::RatioDivision;
+                require(!has_patch || ratio_division == !record[@"original_callee"],
+                        "Only a ratio-division layout omits the original callee.");
+                for (const auto& call : patch.calls)
+                    require(call.frame_ratio.has_value() == ratio_division && !(call.frame_ratio && call.phases),
+                            "Frame-ratio hooks belong to a ratio-division layout, which has no other calls.");
                 for (const auto& call : patch.calls) if (call.phases)
                     require(patch.layout.variant == titles::FrameRateVariant::IntervalRatio60 &&
                             patch.layout.frame_step != 0,
@@ -499,8 +544,24 @@ std::variant<std::vector<CallPatch>, std::string> select_patch_calls(
 }
 struct GpuBudgetContext {
     std::mutex mutex;
-    titles::title_01007ef00011e000::GpuBudgetState state;
+    titles::resolution::GpuBudgetState state;
 };
+
+// The previous division's time and, since the last report, the real time,
+// the frames, and the game time with the measured step and with the title's
+// own divisor (game seconds per frame are 1 / divisor at any base rate).
+struct FrameRatioContext {
+    std::mutex mutex;
+    std::optional<std::chrono::steady_clock::time_point> last;
+    double real = 0, game = 0, own = 0;
+    std::uint64_t frames = 0;
+};
+
+void initialize_frame_ratio(InstalledPatch& patch) {
+    if (std::any_of(patch.description.calls.begin(), patch.description.calls.end(),
+                    [](const auto& call) { return call.frame_ratio.has_value(); }))
+        patch.frame_ratio = std::make_shared<FrameRatioContext>();
+}
 
 void initialize_gpu_budget(InstalledPatch& patch) {
     if (std::any_of(patch.description.calls.begin(), patch.description.calls.end(),
@@ -510,6 +571,8 @@ void initialize_gpu_budget(InstalledPatch& patch) {
 
 execution::CallHookPatchResult make_patch_hook(const CallPatch& site, std::uint32_t actual,
     std::uint64_t address, std::uint64_t trampoline, execution::CallHookCodeRegion gate) {
+    // A frame-ratio division needs an observer stub (make_observe_hook).
+    if (site.frame_ratio) return {.error = execution::CallHookPatchError::unsupported_site};
     if (!site.gpu_budget) return execution::make_call_hook_patch(actual, address, trampoline, gate);
     // Only the declared 32-bit MOVZ, LSL #16 load-scale form is intercepted.
     // A branch (not BL) preserves the instruction site's live link register.
@@ -524,55 +587,127 @@ execution::CallHookPatchResult make_patch_hook(const CallPatch& site, std::uint3
         patch.trampoline, {patch.dispatch_site.return_address, address + 4, address + 4}}};
 }
 
+namespace {
+
+// Instruction hooks a title module adds are dispatched by their kind, not by
+// the call module that carries them.
+execution::GateStatus handle_frame_ratio(const InstalledPatch& patch, const CallPatch& site,
+                                         execution::GateCall& call) noexcept {
+    if (!patch.frame_ratio) {
+        call.set_failure_message("Compatibility frame ratio has no initialized state.");
+        return execution::GateStatus::failed;
+    }
+    auto& context = *patch.frame_ratio;
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(context.mutex);
+    const auto previous = context.last;
+    context.last = now;
+    if (!previous) return execution::GateStatus::resume;  // The title's own division runs.
+    const auto period = std::chrono::duration<double>(now - *previous).count();
+    const auto reg = site.frame_ratio->divisor_register;
+    const auto own = std::bit_cast<float>(static_cast<std::uint32_t>(call.v(reg).lane[0]));
+    const auto divisor = titles::ratio_division_divisor(period);
+    if (!call.set_v(reg, {{std::bit_cast<std::uint32_t>(divisor), 0}})) {
+        call.set_failure_message("Compatibility frame ratio cannot write its divisor.");
+        return execution::GateStatus::failed;
+    }
+    context.real += period;
+    context.game += 1.0 / divisor;
+    if (own > 0) context.own += 1.0 / own;
+    ++context.frames;
+    if (context.real >= 10.0) {
+        armigo::diag::write(armigo::diag::Level::info,
+            "Armigo compat: frame ratio over %.1f s real: game time %.2f s with the measured step, "
+            "%.2f s at the title's own rate, %llu frames\n",
+            context.real, context.game, context.own, static_cast<unsigned long long>(context.frames));
+        context.real = context.game = context.own = 0;
+        context.frames = 0;
+    }
+    return execution::GateStatus::resume;
+}
+
+execution::GateStatus handle_gpu_budget(const InstalledPatch& patch, const CallPatch& site,
+                                        execution::GateCall& call, PatchFeedback feedback) noexcept {
+    if (!patch.gpu_budget) {
+        call.set_failure_message("Compatibility GPU budget has no initialized state.");
+        return execution::GateStatus::failed;
+    }
+    const auto gpu_ns = feedback.gpu_work_ns ? feedback.gpu_work_ns(feedback.context) : 0;
+    std::lock_guard lock(patch.gpu_budget->mutex);
+    const auto scale = titles::resolution::gpu_budget_scale(
+        patch.gpu_budget->state, gpu_ns, static_cast<std::int64_t>(call.x(0)),
+        site.gpu_budget->target_rate);
+    if (scale && call.set_x(site.expected_instruction & 31, std::bit_cast<std::uint32_t>(*scale)))
+        return execution::GateStatus::resume;
+    call.set_failure_message("Compatibility GPU budget state is invalid.");
+    return execution::GateStatus::failed;
+}
+
+execution::GateStatus handle_frame_rate_call(const InstalledPatch& patch, const CallPatch& site,
+                                             execution::GateCall& call, const horizon::GuestBuffers& memory,
+                                             std::uint64_t counter_frequency) noexcept {
+    if (site.phases) {
+        const auto& phases = *site.phases;
+        titles::FramePhaseDispatch due;
+        if (titles::advance_frame_phases({patch.description.layout.frame_step,
+                phases.counter, phases.phase_count}, patch.module_base, call.x(0), memory, due) &&
+            call.set_x(1, due.first) && call.set_x(2, due.count))
+            return execution::GateStatus::resume;
+        call.set_failure_message("Compatibility phase handler could not access valid scheduler state.");
+        return execution::GateStatus::failed;
+    }
+    if (counter_frequency == 0) {
+        call.set_failure_message("Compatibility frame timing has no guest counter.");
+        return execution::GateStatus::failed;
+    }
+    std::uint32_t maximum_rate = 0;
+    const bool updated = titles::update_frame_rate(
+        patch.description.layout, patch.module_base,
+        call.x(patch.description.layout.variant != titles::FrameRateVariant::IntervalRatio60
+            ? patch.description.layout.object_register : 0),
+        static_cast<std::uint32_t>(call.x(1)), memory, &maximum_rate, counter_frequency);
+    graphics::set_maximum_presentation_rate(maximum_rate);
+    if (updated) return execution::GateStatus::resume;
+    call.set_failure_message("Compatibility call handler could not access valid frame-rate state.");
+    return execution::GateStatus::failed;
+}
+
+constexpr CallModule call_modules[] = {
+    {"frame-rate", &handle_frame_rate_call},
+};
+
+} // namespace
+
+const CallModule* find_call_module(std::string_view name) noexcept {
+    for (const auto& module : call_modules)
+        if (module.name == name) return &module;
+    return nullptr;
+}
+
 execution::GateStatus handle_patch(const InstalledPatch& patch, execution::GateCall& call,
                                     const horizon::GuestBuffers& memory,
-                                    std::uint64_t call_return_address, PatchFeedback feedback) noexcept {
-    if (patch.description.module == "frame-rate") {
-        {
-            const CallPatch* site = nullptr;
-            for (const auto& candidate : patch.description.calls)
-                if (call_return_address >= patch.module_base &&
-                    call_return_address - patch.module_base >= 4 &&
-                    call_return_address - patch.module_base - 4 == candidate.offset)
-                    site = &candidate;
-            if (!site) {
-                call.set_failure_message("Compatibility call site has no retained description.");
-                return execution::GateStatus::failed;
+                                    std::uint64_t call_return_address, PatchFeedback feedback,
+                                    std::uint64_t counter_frequency) noexcept {
+    if (call_return_address >= patch.module_base + 4)
+        for (const auto& point : patch.observers)
+            if (call_return_address - patch.module_base - 4 == point.offset) {
+                observe_hit(point, call, memory);
+                return execution::GateStatus::resume;
             }
-            if (site->gpu_budget) {
-                if (!patch.gpu_budget) {
-                    call.set_failure_message("Compatibility GPU budget has no initialized state.");
-                    return execution::GateStatus::failed;
-                }
-                const auto gpu_ns = feedback.gpu_work_ns ? feedback.gpu_work_ns(feedback.context) : 0;
-                std::lock_guard lock(patch.gpu_budget->mutex);
-                const auto scale = titles::title_01007ef00011e000::gpu_budget_scale(
-                    patch.gpu_budget->state, gpu_ns, static_cast<std::int64_t>(call.x(0)),
-                    site->gpu_budget->target_rate);
-                if (scale && call.set_x(site->expected_instruction & 31, std::bit_cast<std::uint32_t>(*scale)))
-                    return execution::GateStatus::resume;
-                call.set_failure_message("Compatibility GPU budget state is invalid.");
-                return execution::GateStatus::failed;
-            }
-            if (site->phases) {
-                const auto& phases = *site->phases;
-                titles::FramePhaseDispatch due;
-                if (titles::advance_frame_phases({patch.description.layout.frame_step,
-                        phases.counter, phases.phase_count}, patch.module_base, call.x(0), memory, due) &&
-                    call.set_x(1, due.first) && call.set_x(2, due.count))
-                    return execution::GateStatus::resume;
-                call.set_failure_message("Compatibility phase handler could not access valid scheduler state.");
-                return execution::GateStatus::failed;
-            }
+    if (const auto* module = find_call_module(patch.description.module)) {
+        const CallPatch* site = nullptr;
+        for (const auto& candidate : patch.description.calls)
+            if (call_return_address >= patch.module_base &&
+                call_return_address - patch.module_base >= 4 &&
+                call_return_address - patch.module_base - 4 == candidate.offset)
+                site = &candidate;
+        if (!site) {
+            call.set_failure_message("Compatibility call site has no retained description.");
+            return execution::GateStatus::failed;
         }
-        std::uint32_t maximum_rate = 0;
-        const bool updated = titles::update_frame_rate(
-            patch.description.layout, patch.module_base,
-            call.x(patch.description.layout.variant != titles::FrameRateVariant::IntervalRatio60
-                ? patch.description.layout.object_register : 0),
-            static_cast<std::uint32_t>(call.x(1)), memory, &maximum_rate);
-        graphics::set_maximum_presentation_rate(maximum_rate);
-        if (updated) return execution::GateStatus::resume;
+        if (site->frame_ratio) return handle_frame_ratio(patch, *site, call);
+        if (site->gpu_budget) return handle_gpu_budget(patch, *site, call, feedback);
+        return module->handle(patch, *site, call, memory, counter_frequency);
     }
     call.set_failure_message("Compatibility call handler could not access valid frame-rate state.");
     return execution::GateStatus::failed;
@@ -616,7 +751,7 @@ std::string validate_patch(const PatchDescription& patch, const loader::NsoModul
             if (call.offset == word.offset) return "Compatibility instruction word overlaps a call hook.";
     }
     if (patch.module.empty() && patch.calls.empty()) return {};
-    if (patch.module != "frame-rate") return "Unknown compatibility module.";
+    if (!find_call_module(patch.module)) return "Unknown compatibility module.";
     if (patch.layout.variant == titles::FrameRateVariant::FractionalCounter30 ||
         patch.layout.variant == titles::FrameRateVariant::FractionalCountdown30 ||
         patch.layout.variant == titles::FrameRateVariant::FractionalRepeat30) {
@@ -628,10 +763,32 @@ std::string validate_patch(const PatchDescription& patch, const loader::NsoModul
              (patch.layout.repeat_flag >= patch.layout.state && patch.layout.repeat_flag - patch.layout.state < 4) ||
              (patch.layout.repeat_flag >= patch.layout.counter && patch.layout.repeat_flag - patch.layout.counter < 4)))
             return "Compatibility fractional repeat layout is invalid.";
-    } else if (patch.layout.variant != titles::FrameRateVariant::IntervalRatio60) {
+    } else if (patch.layout.variant != titles::FrameRateVariant::IntervalRatio60 &&
+               patch.layout.variant != titles::FrameRateVariant::RatioDivision) {
         return "Unknown compatibility layout variant.";
     }
     if (patch.calls.empty() || patch.calls.size() > 64) return "Compatibility call count is invalid.";
+    const bool ratio_division = patch.layout.variant == titles::FrameRateVariant::RatioDivision;
+    if (ratio_division) {
+        std::set<std::uint64_t> seen;
+        for (const auto& call : patch.calls) {
+            if (!call.frame_ratio || call.phases || call.gpu_budget)
+                return "A ratio-division layout has only frame-ratio hooks.";
+            if (call.frame_rate != 0 && (!patch.frame_rate ||
+                std::find(patch.frame_rate->supported_rates.begin(), patch.frame_rate->supported_rates.end(),
+                          call.frame_rate) == patch.frame_rate->supported_rates.end()))
+                return "Compatibility call has an invalid frame-rate condition.";
+            if (!executable(call.offset) || !executable(call.offset + 4) || !seen.insert(call.offset).second)
+                return "Compatibility call site is invalid or duplicated.";
+            std::uint32_t word = 0;
+            std::memcpy(&word, image.bytes.data() + call.offset, 4);
+            if (word != call.expected_instruction) return "Compatibility call instruction preimage mismatch.";
+            // FDIV Sd, Sn, Sm whose Sm is the declared divisor.
+            if ((word & 0xffe0fc00u) != 0x1e201800u || ((word >> 16) & 31) != call.frame_ratio->divisor_register)
+                return "A frame-ratio hook is not a single-precision division by its declared divisor.";
+        }
+        return {};
+    }
     if (!executable(patch.original_callee)) return "Compatibility original callee is outside executable text.";
     const auto& data = image.segment(loader::NsoSegmentKind::data);
     if (patch.layout.framework_pointer < data.image_offset ||

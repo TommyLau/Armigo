@@ -46,6 +46,17 @@ private:
     const MetalProfile& profile;
     std::vector<std::optional<OperationId>> definitions;
     std::vector<const Phi*> phis;
+    // shared_address_aligned through this program's definition index: one
+    // step a lookup instead of a scan of every operation.
+    bool aligned(const Operand& value, unsigned alignment, AlignmentMemo* memo = nullptr) {
+        return shared_address_aligned_by(p, value, alignment, steps, [&](ValueId id, std::uint64_t& work) {
+            ValueDefinitions found;
+            ++work;
+            if (id.value < definitions.size() && definitions[id.value]) found.operations.push_back(&p.operations[definitions[id.value]->value]);
+            if (id.value < phis.size() && phis[id.value]) found.phis.push_back(phis[id.value]);
+            return found;
+        }, memo);
+    }
     std::array<std::optional<ResourceId>, constant_buffer_slot_count> buffers;
     std::optional<Diagnostic> error;
     std::uint64_t steps{};
@@ -101,7 +112,13 @@ private:
         return id;
     }
     std::optional<ResourceId> buffer(std::uint8_t, std::uint64_t);
+    std::optional<ResourceId> guest_windows;
     bool texture(Operation&);
+    bool pool_texture(Operation&, const std::optional<Handle>&, bool, InputIndex);
+    // Every pooled sampler of the stage shares this one binding. Comparison
+    // lives on the sampler state an ID names, not on a second pool.
+    bool bind_stage_sampler_pool(TextureInfo&);
+    void compact_texture_inputs(Operation&);
     bool memory(Operation&);
     std::vector<TextureKey> address_sources(const Operand&, unsigned = 0);
     std::vector<TextureKey> address_union(const Operand&, std::set<std::uint32_t>&, unsigned = 0);
@@ -286,6 +303,147 @@ std::optional<Handle> Resolver::handle(const Operand& operand, unsigned depth) {
     return {};
 }
 
+// Erases former handle inputs and any level role resolution dropped. Inputs
+// shared with coordinate/data roles survive; every surviving role, the pool
+// handle words among them, is remapped through the compacted input list.
+void Resolver::compact_texture_inputs(Operation& op) {
+    auto& t = std::get<TextureInfo>(op.info);
+    std::vector<bool> live(op.inputs.size());
+    auto mark = [&](InputIndex i) { live[i.value] = true; };
+    for (const auto* list : {&t.coordinates, &t.gradients_x, &t.gradients_y, &t.offsets, &t.data})
+        for (auto i : *list) mark(i);
+    for (const auto i : {t.array_layer, t.array_index, t.level_or_bias, t.compare, t.sample_index, t.lod_clamp,
+                         t.pool_texture, t.pool_sampler}) if (i) mark(*i);
+    std::vector<std::uint16_t> remap(op.inputs.size());
+    std::vector<Operand> inputs;
+    for (std::size_t i = 0; i < live.size(); ++i) if (live[i]) {
+        remap[i] = static_cast<std::uint16_t>(inputs.size()); inputs.push_back(op.inputs[i]);
+    }
+    for (auto* list : {&t.coordinates, &t.gradients_x, &t.gradients_y, &t.offsets, &t.data})
+        for (auto& i : *list) i.value = remap[i.value];
+    for (auto* i : {&t.array_layer, &t.array_index, &t.level_or_bias, &t.compare, &t.sample_index, &t.lod_clamp,
+                    &t.pool_texture, &t.pool_sampler})
+        if (*i) (*i)->value = remap[(*i)->value];
+    op.inputs = std::move(inputs);
+}
+
+// A read-only texture handle no constant-buffer word or handle program
+// resolves is read from the texture pool of its descriptor's element type,
+// indexed by the handle word's texture ID. The sampler is the stage's one
+// sampler pool when it is that same word, or a separate dynamic handle that
+// does not resolve. A separate sampler that resolves to a constant-buffer
+// key or a handle program, and is not itself a combined handle, stays an
+// ordinary sampler binding with that key's fact checks
+// (the project documentation). The descriptor is the one the frontend
+// derived from the stage's own instructions.
+bool Resolver::pool_texture(Operation& op, const std::optional<Handle>& sampler_resolved,
+                            bool sampler_dynamic, InputIndex sampler_input) {
+    auto& t = std::get<TextureInfo>(op.info);
+    if (is_image(op) || t.atomic || t.array_index)
+        return fail("Bindless texture handle has no proven constant-buffer provenance");
+    if (!t.descriptor || !valid_descriptor(*t.descriptor) || t.descriptor->shape.dimension == TextureDimension::buffer)
+        return fail("Pool texture has no admitted descriptor from its instructions", DiagnosticCode::missing_fact);
+    const auto descriptor = *t.descriptor;
+    const auto texture_input = std::get<DynamicHandle>(t.texture).input;
+    enum class SamplerBinding { none, keyed, pool };
+    auto binding = SamplerBinding::none;
+    TextureKey keyed{};
+    InputIndex pool_input{};
+    if (needs_sampler(op)) {
+        if (!t.sampler) {
+            binding = SamplerBinding::pool;
+            pool_input = texture_input;
+        } else if (sampler_resolved && sampler_resolved->sampler) {
+            return fail("Separate sampler handle has no unambiguous provenance");
+        } else if (sampler_resolved) {
+            binding = SamplerBinding::keyed;
+            keyed = sampler_resolved->texture;
+        } else if (sampler_dynamic) {
+            binding = SamplerBinding::pool;
+            pool_input = sampler_input;
+        } else return fail("Separate sampler handle has no unambiguous provenance");
+    } else if (t.sampler) return fail("Sampler handle is not used by this texture mode");
+    // As for a dynamic handle resolved to a key: results take the
+    // descriptor's interpretation, size-query components and the level role
+    // follow its shape.
+    if (t.mode < TextureMode::query_lod) {
+        const auto scalar = descriptor.scalar;
+        op.numeric = NumericMode{scalar_domain(scalar), scalar,
+            scalar == ScalarType::f32 ? Rounding::nearest_even : Rounding::not_applicable};
+    }
+    if (op.opcode == Opcode::texture_query && t.mode == TextureMode::query_size) {
+        const auto dimension = descriptor.shape.dimension;
+        const unsigned spatial_axes = dimension == TextureDimension::d1 ? 1 : dimension == TextureDimension::d3 ? 3 : 2;
+        if (t.query_component >= spatial_axes + unsigned(descriptor.shape.array))
+            return fail("Texture size-query component is absent from the descriptor shape", DiagnosticCode::conflicting_fact);
+    }
+    const bool level_required = t.mode == TextureMode::sample_level || t.mode == TextureMode::sample_bias ||
+        ((t.mode == TextureMode::fetch || t.mode == TextureMode::query_size) && !descriptor.shape.multisample);
+    if (t.level_or_bias && !level_required) t.level_or_bias.reset();
+    t.texture = TextureKey{texture_pool_slot, 0};
+    t.pool_texture = texture_input;
+    if (binding == SamplerBinding::keyed) t.sampler = keyed;
+    else if (binding == SamplerBinding::pool) {
+        t.sampler = TextureKey{texture_pool_slot, 0};
+        t.pool_sampler = pool_input;
+    } else t.sampler.reset();
+    compact_texture_inputs(op);
+    auto checked = check_texture(op, descriptor, profile, p.stage, Phase::legalize);
+    if (auto* e = std::get_if<Diagnostic>(&checked)) { error = *e; return false; }
+    // One texture pool per element type. Pooled samplers share one pool.
+    for (std::uint32_t i = 0; i < r.uses.size() && !t.resource; ++i) {
+        if (!step()) return false;
+        auto* use = std::get_if<TextureUse>(&r.uses[i]);
+        if (!use || !use->pool || use->descriptor != descriptor) continue;
+        auto position = std::lower_bound(use->modes.begin(), use->modes.end(), t.mode);
+        if (position == use->modes.end() || *position != t.mode) use->modes.insert(position, t.mode);
+        t.resource = ResourceId{i};
+    }
+    if (!t.resource) {
+        TextureUse use{ResourceTextureKind::sampled, false, false, TextureKey{texture_pool_slot, 0}, descriptor, Access::read, 1, false, {t.mode}};
+        use.pool = true;
+        t.resource = append(std::move(use));
+        if (!t.resource) return false;
+    }
+    if (binding == SamplerBinding::keyed) {
+        // The same fact checks a resolved separate sampler takes: the key's
+        // descriptor must agree with the texture on comparison and normalized
+        // coordinates, and the binding records that state.
+        auto sampler_descriptor = require(fact_query::texture(keyed));
+        if (!sampler_descriptor) return false;
+        if (!valid_descriptor(*sampler_descriptor) || sampler_descriptor->comparison != descriptor.comparison ||
+            sampler_descriptor->normalized_coordinates != descriptor.normalized_coordinates)
+            return fail("Separate sampler state is incompatible with the texture descriptor", DiagnosticCode::invalid_fact);
+        for (std::uint32_t i = 0; i < r.uses.size() && !t.sampler_resource; ++i) {
+            if (!step()) return false;
+            const auto* use = std::get_if<SamplerUse>(&r.uses[i]);
+            if (use && !use->pool && use->key == keyed && use->array_length == 1 &&
+                use->comparison == descriptor.comparison && use->normalized_coordinates == descriptor.normalized_coordinates)
+                t.sampler_resource = ResourceId{i};
+        }
+        if (!t.sampler_resource) {
+            t.sampler_resource = append(SamplerUse{keyed, descriptor.comparison, descriptor.normalized_coordinates, 1});
+            if (!t.sampler_resource) return false;
+        }
+    } else if (binding == SamplerBinding::pool && !bind_stage_sampler_pool(t)) return false;
+    return true;
+}
+
+bool Resolver::bind_stage_sampler_pool(TextureInfo& t) {
+    for (std::uint32_t i = 0; i < r.uses.size() && !t.sampler_resource; ++i) {
+        if (!step()) return false;
+        const auto* use = std::get_if<SamplerUse>(&r.uses[i]);
+        if (use && use->pool) t.sampler_resource = ResourceId{i};
+    }
+    if (!t.sampler_resource) {
+        SamplerUse use{TextureKey{texture_pool_slot, 0}, false, true, 1};
+        use.pool = true;
+        t.sampler_resource = append(std::move(use));
+        if (!t.sampler_resource) return false;
+    }
+    return true;
+}
+
 std::optional<ResourceId> Resolver::buffer(std::uint8_t slot, std::uint64_t extent) {
     if (slot >= constant_buffer_slot_count) {
         fail("Invalid constant-buffer slot", DiagnosticCode::invalid_ir);
@@ -323,16 +481,53 @@ bool Resolver::texture(Operation& op) {
         return handle(op.inputs[std::get<DynamicHandle>(input).input.value]);
     };
     auto resolved = resolve(t.texture);
-    if (!resolved) return error ? false : fail("Bindless texture handle has no proven constant-buffer provenance");
-    std::optional<Handle> sampler;
-    if (t.sampler) {
-        sampler = resolve(*t.sampler);
-        if (!sampler || sampler->sampler) return error ? false : fail("Separate sampler handle has no unambiguous provenance");
-        if (resolved->sampler && *resolved->sampler != sampler->texture) return fail("Combined and explicit sampler keys disagree");
+    if (error) return false;
+    // A constant-buffer key or a handle program is already resolved and is
+    // never rewritten into a pool access. Only an unresolved dynamic texture
+    // reads the texture pool, and only when pools are enabled.
+    if (!resolved) {
+        if (!dynamic_texture || !profile.texture_pools)
+            return fail("Bindless texture handle has no proven constant-buffer provenance");
+        std::optional<Handle> sampler_resolved;
+        bool sampler_dynamic = false;
+        InputIndex sampler_input{};
+        if (t.sampler) {
+            if (const auto* dynamic = std::get_if<DynamicHandle>(&*t.sampler)) {
+                sampler_dynamic = true;
+                sampler_input = dynamic->input;
+                sampler_resolved = handle(op.inputs[sampler_input.value]);
+                if (error) return false;
+            } else sampler_resolved = Handle{std::get<TextureKey>(*t.sampler), {}};
+        }
+        return pool_texture(op, sampler_resolved, sampler_dynamic, sampler_input);
     }
+    std::optional<Handle> sampler;
+    bool sampler_dynamic = false;
+    InputIndex sampler_input{};
+    if (t.sampler) {
+        if (const auto* dynamic = std::get_if<DynamicHandle>(&*t.sampler)) {
+            sampler_dynamic = true;
+            sampler_input = dynamic->input;
+            sampler = handle(op.inputs[sampler_input.value]);
+            if (error) return false;
+        } else sampler = Handle{std::get<TextureKey>(*t.sampler), {}};
+        // A resolved separate sampler that is itself a combined handle has no
+        // single key. An unresolved dynamic sampler is the stage's sampler
+        // pool when pools are enabled, and the old refusal otherwise.
+        if (sampler && sampler->sampler) return fail("Separate sampler handle has no unambiguous provenance");
+        if (!sampler && !profile.texture_pools) return fail("Separate sampler handle has no unambiguous provenance");
+        if (sampler && resolved->sampler && *resolved->sampler != sampler->texture)
+            return fail("Combined and explicit sampler keys disagree");
+    }
+    const bool pool_sampler = needs_sampler(op) && sampler_dynamic && !sampler;
     if (!needs_sampler(op) && (sampler || resolved->sampler || t.sampler)) return fail("Sampler handle is not used by this texture mode");
     t.texture = resolved->texture;
-    if (needs_sampler(op)) t.sampler = sampler ? sampler->texture : resolved->sampler.value_or(resolved->texture);
+    if (needs_sampler(op)) {
+        if (pool_sampler) {
+            t.sampler = TextureKey{texture_pool_slot, 0};
+            t.pool_sampler = sampler_input;
+        } else t.sampler = sampler ? sampler->texture : resolved->sampler.value_or(resolved->texture);
+    }
     auto descriptor = require(fact_query::texture(resolved->texture));
     if (!descriptor) return false;
     if (t.descriptor && *t.descriptor != *descriptor) return fail("Encoded texture descriptor conflicts with consumed fact", DiagnosticCode::conflicting_fact);
@@ -374,7 +569,7 @@ bool Resolver::texture(Operation& op) {
         if (!maximum || *maximum >= *count) return error ? false : fail("Texture resource-array index has no proven in-range bound");
         length = *count;
     }
-    if (needs_sampler(op)) {
+    if (needs_sampler(op) && !pool_sampler) {
         const auto key = std::get<TextureKey>(*t.sampler);
         auto sampler_descriptor = require(fact_query::texture(key));
         if (!sampler_descriptor) return false;
@@ -387,24 +582,7 @@ bool Resolver::texture(Operation& op) {
             if (*sampler_count != length) return fail("Texture and sampler arrays do not share a proven range");
         }
     }
-    // Erase former handle inputs and any level role resolution dropped. Inputs
-    // shared with coordinate/data roles survive; every surviving role is
-    // remapped through the compacted input list.
-    std::vector<bool> live(op.inputs.size());
-    auto mark = [&](InputIndex i) { live[i.value] = true; };
-    for (const auto* list : {&t.coordinates, &t.gradients_x, &t.gradients_y, &t.offsets, &t.data})
-        for (auto i : *list) mark(i);
-    for (const auto i : {t.array_layer, t.array_index, t.level_or_bias, t.compare, t.sample_index, t.lod_clamp}) if (i) mark(*i);
-    std::vector<std::uint16_t> remap(op.inputs.size());
-    std::vector<Operand> inputs;
-    for (std::size_t i = 0; i < live.size(); ++i) if (live[i]) {
-        remap[i] = static_cast<std::uint16_t>(inputs.size()); inputs.push_back(op.inputs[i]);
-    }
-    for (auto* list : {&t.coordinates, &t.gradients_x, &t.gradients_y, &t.offsets, &t.data})
-        for (auto& i : *list) i.value = remap[i.value];
-    for (auto* i : {&t.array_layer, &t.array_index, &t.level_or_bias, &t.compare, &t.sample_index, &t.lod_clamp})
-        if (*i) (*i)->value = remap[(*i)->value];
-    op.inputs = std::move(inputs);
+    compact_texture_inputs(op);
     auto checked = check_texture(op, *descriptor, profile, p.stage, Phase::legalize);
     if (auto* e = std::get_if<Diagnostic>(&checked)) { error = *e; return false; }
     const auto kind = is_image(op) ? ResourceTextureKind::storage_image : ResourceTextureKind::sampled;
@@ -425,7 +603,9 @@ bool Resolver::texture(Operation& op) {
     if (!t.resource) t.resource = append(TextureUse{kind, t.coherent, t.atomic.has_value(), resolved->texture,
         *descriptor, access, length, t.array_index.has_value(), {t.mode}});
     if (!t.resource) return false;
-    if (needs_sampler(op)) {
+    if (needs_sampler(op) && pool_sampler) {
+        if (!bind_stage_sampler_pool(t)) return false;
+    } else if (needs_sampler(op)) {
         const auto key = std::get<TextureKey>(*t.sampler);
         for (std::uint32_t i = 0; i < r.uses.size(); ++i) {
             if (!step()) return false;
@@ -605,7 +785,7 @@ bool Resolver::storage_word_aligned(const Operand& operand, TextureKey key, unsi
             const auto* entry = memory_base_of(m, *op, operand, depth + 1);
             if (entry && entry->key == key)
                 return entry->const_offset % 4 == 0 && (!entry->offset ||
-                    shared_address_aligned(p, *entry->offset, 4, steps));
+                    aligned(*entry->offset, 4));
         }
         return false;
     }
@@ -711,7 +891,7 @@ bool Resolver::pure_key(const Operand& operand, TextureKey& key, unsigned depth)
 // or when it is a load from a location whose recorded stored values are.
 bool Resolver::displacement_aligned(const Operand& operand, unsigned depth) {
     if (!step(depth)) return false;
-    if (shared_address_aligned(p, operand, 4, steps)) return true;
+    if (aligned(operand, 4)) return true;
     const auto* op = definition(operand);
     if (!op) return false;
     if (op->opcode == Opcode::copy && op->inputs.size() == 1)
@@ -790,6 +970,9 @@ const Resolver::MemoryBase* Resolver::memory_base_of(const MemoryInfo& m, const 
 // One ordered pass records the descriptor origin of every full-word
 // local/shared store.
 void Resolver::record_memory_stores() {
+    // Stored words share most of their arithmetic: each value's alignment is
+    // proven once.
+    AlignmentMemo stored_alignment;
     for (auto& block : p.blocks) {
         for (const auto id : block.operations) {
             if (!step()) return;
@@ -803,8 +986,7 @@ void Resolver::record_memory_stores() {
             const auto key = memory_key(*m, op);
             if (!key || error) continue;
             {
-                const auto value_aligned =
-                    shared_address_aligned(p, op.inputs[m->data[0].value], 4, steps);
+                const auto value_aligned = aligned(op.inputs[m->data[0].value], 4, &stored_alignment);
                 auto [slot, inserted] = memory_alignment.try_emplace(*key, value_aligned);
                 if (!inserted) slot->second = slot->second && value_aligned;
             }
@@ -943,6 +1125,14 @@ bool Resolver::bind_storage(Operation& op, TextureKey key, ResourceId& resource,
 bool Resolver::memory(Operation& op) {
     auto& m = std::get<MemoryInfo>(op.info);
     if (op.opcode == Opcode::barrier || op.opcode == Opcode::memory_barrier) return true;
+    if (m.space == AddressSpace::guest) {
+        // Every guest access of a stage goes through one window table, which
+        // also records the accesses that miss every window.
+        if (!guest_windows) guest_windows = append(BufferUse{SupportBufferSource{std::string(guest_memory_schema),
+            guest_memory_version}, Access::read_write, {SizeKind::accessed_extent, guest_memory_bytes, guest_memory_alignment}});
+        m.resource = guest_windows;
+        return m.resource.has_value();
+    }
     if (m.space == AddressSpace::storage)
         return (m.resource && m.storage_address) || fail("Storage address has no resolved descriptor");
     if (m.array_index) return fail("Memory resource arrays require a source/stride contract");
@@ -995,7 +1185,7 @@ bool Resolver::memory(Operation& op) {
         // only literal or proven offsets keep the natural-alignment proof.
         const bool guarded = m.dynamic_byte_offset && !maximum;
         if (!guarded && (m.byte_offset % m.element_bytes || (m.dynamic_byte_offset &&
-            !shared_address_aligned(p, op.inputs[m.dynamic_byte_offset->value], m.element_bytes, steps))))
+            !aligned(op.inputs[m.dynamic_byte_offset->value], m.element_bytes))))
             return fail("Shared memory address has no natural-alignment proof",
                 steps > p.limits.analysis_steps ? DiagnosticCode::limit_exceeded : DiagnosticCode::unsupported_capability);
         return extent <= r.compute->shared_memory_bytes || fail("Shared memory access exceeds launch allocation");
@@ -1193,6 +1383,9 @@ Result<LegalProgram> legalize(SsaProgram input, FactReader& facts, const MetalPr
     Resolver resolver(output.ir, facts, output.requirements, profile);
     if (auto status = resolver.run(); std::holds_alternative<Diagnostic>(status)) return std::get<Diagnostic>(status);
     if (auto status = validate(output.ir, IrForm::legal, Phase::legalize); std::holds_alternative<Diagnostic>(status)) return std::get<Diagnostic>(status);
+    if (auto status = passes::hoist_guarded_samples(output.ir, profile.hoist_implicit_samples);
+        std::holds_alternative<Diagnostic>(status))
+        return std::get<Diagnostic>(status);
     if (auto status = resources::check_requirements(output.ir, output.requirements, profile, Phase::legalize); std::holds_alternative<Diagnostic>(status))
         return std::get<Diagnostic>(status);
     return output;

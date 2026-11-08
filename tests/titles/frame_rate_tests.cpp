@@ -382,9 +382,58 @@ void test_phase_failures() {
     CHECK(!advance_frame_phases(invalid, module_base, vfr_object, fixture.buffers, due));
 }
 
+void test_counter_frequency() {
+    const auto selected = fractional_layout();
+    Fixture historical_fixture;
+    historical_fixture.memory.store(vfr_object + selected.state, selected.active_state);
+    historical_fixture.memory.store(vfr_object + selected.counter, 0.0f);
+    historical_fixture.memory.store(framework + selected.framework_period, std::int64_t{640000});
+    CHECK(update_frame_rate(selected, module_base, vfr_object, 0, historical_fixture.buffers));
+    const auto historical = historical_fixture.memory.load<float>(vfr_object + selected.counter);
+
+    Fixture explicit_fixture;
+    explicit_fixture.memory.store(vfr_object + selected.state, selected.active_state);
+    explicit_fixture.memory.store(vfr_object + selected.counter, 0.0f);
+    explicit_fixture.memory.store(framework + selected.framework_period, std::int64_t{640000});
+    CHECK(update_frame_rate(selected, module_base, vfr_object, 0, explicit_fixture.buffers,
+                            nullptr, 19'200'000));
+    CHECK(explicit_fixture.memory.load<float>(vfr_object + selected.counter) == historical);
+    const double switch1_seconds = 640000.0 / 19'200'000.0;
+    CHECK(std::fabs(historical - static_cast<float>(switch1_seconds) * 30.0f) < 1e-6f);
+
+    // 31,250,000 is not divisible by 30. The integer period is one tick short of 1/30 s.
+    constexpr std::int64_t switch2_ticks = 31'250'000 / 30;
+    Fixture switch2_fixture;
+    switch2_fixture.memory.store(vfr_object + selected.state, selected.active_state);
+    switch2_fixture.memory.store(vfr_object + selected.counter, 0.0f);
+    switch2_fixture.memory.store(framework + selected.framework_period, switch2_ticks);
+    CHECK(update_frame_rate(selected, module_base, vfr_object, 0, switch2_fixture.buffers,
+                            nullptr, 31'250'000));
+    const double switch2_seconds = static_cast<double>(switch2_ticks) / 31'250'000.0;
+    CHECK(std::abs(switch2_seconds - 1.0 / 30.0) < 1e-7);
+    const auto switch2_step = static_cast<float>(switch2_seconds) * 30.0f;
+    CHECK(std::fabs(switch2_fixture.memory.load<float>(vfr_object + selected.counter) -
+                    switch2_step) < 1e-6f);
+}
+
 } // namespace
 
+// The ratio-division divisor is 60 / the measured step in 60 Hz frames, with
+// the published step's 20-300 Hz bounds.
+void test_ratio_division_divisor() {
+    const auto near = [](float value, float expected) { return std::fabs(value - expected) < 1e-3f; };
+    CHECK(near(armigo::titles::ratio_division_divisor(1.0 / 60.0), 60.0f));
+    CHECK(near(armigo::titles::ratio_division_divisor(1.0 / 30.0), 30.0f));
+    CHECK(near(armigo::titles::ratio_division_divisor(0.025), 40.0f));
+    CHECK(near(armigo::titles::ratio_division_divisor(0.001), 300.0f));
+    CHECK(near(armigo::titles::ratio_division_divisor(1.0), 20.0f));
+    CHECK(near(armigo::titles::ratio_division_divisor(-1.0), 300.0f));
+    CHECK(near(armigo::titles::ratio_division_divisor(std::nan("")), 300.0f));
+}
+
 int main() {
+    test_ratio_division_divisor();
+    test_counter_frequency();
     test_fractional_time();
     test_fractional_countdown_contract();
     test_fractional_repeat_contract();

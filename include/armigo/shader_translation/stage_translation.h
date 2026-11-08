@@ -35,6 +35,9 @@ struct StageOptions {
     // Compute launch specialization: local size and static shared memory.
     std::optional<std::array<std::uint32_t, 3>> compute_local_size;
     std::optional<std::uint32_t> compute_shared_memory_bytes;
+    // Also hoist implicit-LOD and bias samples out of their predicate guards,
+    // as a title opts in to (the project documentation, texture metadata).
+    bool hoist_implicit_samples = false;
 };
 
 // A translated stage: the files a package stage holds besides its Metal library.

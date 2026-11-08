@@ -11,8 +11,22 @@
 #include <armigo/horizon/arbitration.h>
 
 #include <algorithm>
+#include <limits>
 
 namespace armigo::horizon {
+
+std::chrono::nanoseconds kernel_timeout(std::int64_t nanoseconds, CounterRate rate) noexcept {
+    const auto count = static_cast<std::uint64_t>(nanoseconds);
+    const auto whole = count / rate.nanoseconds * rate.ticks;
+    const auto remainder = count % rate.nanoseconds;
+    const auto frac = (remainder * rate.ticks + rate.nanoseconds - 1) / rate.nanoseconds;
+    const auto ticks = whole + frac + 2;
+    const auto groups = ticks / rate.ticks;
+    const auto part = (ticks % rate.ticks) * rate.nanoseconds / rate.ticks;
+    const auto limit = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+    if (groups > (limit - part) / rate.nanoseconds) return std::chrono::nanoseconds::max();
+    return std::chrono::nanoseconds(groups * rate.nanoseconds + part);
+}
 
 ArbitrateOutcome Arbitration::wait_transaction(std::uint64_t address,
                                                 std::int64_t timeout_nanoseconds,
@@ -30,8 +44,9 @@ ArbitrateOutcome Arbitration::wait_transaction(std::uint64_t address,
     const auto now = std::chrono::steady_clock::now();
     const auto available = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::time_point::max() - now).count();
-    const auto deadline = timeout_nanoseconds > 0 && timeout_nanoseconds < available
-        ? now + std::chrono::nanoseconds(timeout_nanoseconds)
+    const auto timeout = timeout_nanoseconds > 0 ? timeout_nanoseconds : 0;
+    const auto deadline = timeout > 0 && timeout < available
+        ? now + std::chrono::nanoseconds(timeout)
         : std::chrono::steady_clock::time_point::max();
     std::unique_lock lock(mutex_);
     if (stop.stop_requested()) return ArbitrateOutcome::cancelled;

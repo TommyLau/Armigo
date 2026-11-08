@@ -145,11 +145,16 @@ struct DisplaySession::QueueState {
     std::uint64_t frame_counter = 0;
     std::weak_ptr<NativeWindowProducerImpl> native_producer;
     bool native_registered = false;
+    // Native windows may present from only their first `active` textures (NVN
+    // active textures); zero means every registered one.
+    std::uint32_t active = 0;
     static constexpr std::uint32_t consumer_usage = 0x800;
+
+    std::uint32_t dequeue_limit() const { return active ? std::min(active, maximum) : maximum; }
 
     void update_free_event() {
         bool ready = false;
-        for (std::size_t index = 0; index < maximum; ++index)
+        for (std::size_t index = 0; index < dequeue_limit(); ++index)
             ready = ready || slots[index].state == Slot::State::Free;
         if (ready) free_event->signal(); else static_cast<void>(free_event->reset());
     }
@@ -197,6 +202,16 @@ public:
         return true;
     }
 
+    bool set_active_textures(std::size_t count) override {
+        const std::lock_guard queue_lock(queue_->mutex);
+        if (!attached_ || !queue_->native_registered ||
+            queue_->native_producer.lock().get() != this || count < 2 || count > queue_->maximum)
+            return false;
+        queue_->active = static_cast<std::uint32_t>(count);
+        queue_->update_free_event();
+        return true;
+    }
+
     bool unregister_textures() override {
         if (!drain_presents(std::chrono::seconds(5)))
             return false;
@@ -227,7 +242,7 @@ public:
             queue_->native_producer.lock().get() != this || source_->failure())
             return {-2, 0};
         std::optional<std::size_t> selected;
-        for (std::size_t index = 0; index < queue_->maximum; ++index) {
+        for (std::size_t index = 0; index < queue_->dequeue_limit(); ++index) {
             const auto& slot = queue_->slots[index];
             if (slot.state != DisplaySession::QueueState::Slot::State::Free ||
                 !slot.native_texture)
@@ -286,6 +301,7 @@ public:
         std::int32_t requested_slot, std::uint64_t fence,
         std::function<bool(std::uint64_t)> wait_fence,
         std::array<std::int32_t, 4> crop, int interval) override {
+        notify_guest_present();
         const std::lock_guard consumer_lock(queue_->consumer_mutex);
         std::unique_lock queue_lock(queue_->mutex);
         if (!attached_ || !queue_->native_registered ||
@@ -365,6 +381,7 @@ public:
                 return;
             }
             const auto target = std::get<runtime::PresentationSchedule>(planned);
+            // The guest clock ends this wait at the slot.
             const auto waited = clock->clock()->wait_until(target.deadline, stop);
             if (const auto* error = std::get_if<runtime::LaunchFailure>(&waited)) {
                 note_failure(error->detail);
@@ -535,6 +552,7 @@ private:
         for (std::size_t index = 0; index < queue_->maximum; ++index)
             queue_->slots[index] = {};
         queue_->maximum = 0;
+        queue_->active = 0;
         queue_->native_registered = false;
         queue_->update_free_event();
     }
@@ -1094,7 +1112,7 @@ IpcReply DisplaySession::request_locked(const IpcMessage& message) {
         if ((type != 4 && type != 6) || raw_words < (cmif + 24 - 8) / 4 ||
             raw_words > (message.size() - 8) / 4)
             return unsupported("GetDisplayResolution request extent is unsupported");
-        // Horizon 20.5.0 returns this compatibility size independently of the
+        // Returns this compatibility size independently of the
         // selected display mode and does not validate the supplied display ID.
         IpcReply reply{IpcDisposition::handled};
         reply.size = cmif + 32;
@@ -1324,6 +1342,32 @@ void unbind_native_window(void* native_window) {
         native_windows.erase(found);
     }
     producer->detach();
+}
+
+namespace {
+// Never destroyed: a guest thread can present during process exit.
+std::mutex& guest_present_mutex() {
+    static auto* mutex = new std::mutex;
+    return *mutex;
+}
+std::function<void()>& guest_present_observer() {
+    static auto* observer = new std::function<void()>;
+    return *observer;
+}
+}  // namespace
+
+void set_guest_present_observer(std::function<void()> observer) {
+    const std::lock_guard lock(guest_present_mutex());
+    guest_present_observer() = std::move(observer);
+}
+
+void notify_guest_present() {
+    std::function<void()> observer;
+    {
+        const std::lock_guard lock(guest_present_mutex());
+        observer = guest_present_observer();
+    }
+    if (observer) observer();
 }
 
 }  // namespace armigo::services::vi

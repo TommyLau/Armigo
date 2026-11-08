@@ -452,6 +452,57 @@ int main() {
         R"({"containers":"gfd-cache","vertex_depth":"zero-to-one","caches":["BASE/ONE.GSC"],"fallbacks":[{"cache":"BASE/MISSING.GSC","alternatives":["BASE/ALT.GSC"]}]})")));
     CHECK(std::holds_alternative<std::string>(shader_of(
         R"({"containers":"gfd-cache","vertex_depth":"zero-to-one","extra":true})")));
+    // A ratio-division layout: frame-ratio hooks on the title's FDIV, no
+    // original callee and no other calls.
+    {
+        const char* division = R"({"version":1,"patches":[{
+"title_id":"0x0000000000000456",
+"main_build_id":"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+"module":"frame-rate",
+"calls":[{"offset":"0x40","expected_instruction":"0x1e201828","note":"Synthetic frame-ratio division.",
+"frame_ratio":{"divisor_register":0}}],
+"layout":{"variant":"ratio-division"}}]})";
+        auto parsed = parse(division);
+        CHECK(std::holds_alternative<compat::PatchDescriptions>(parsed));
+        if (std::holds_alternative<compat::PatchDescriptions>(parsed)) {
+            const auto ratio = std::get<compat::PatchDescriptions>(parsed).front();
+            CHECK(ratio.layout.variant == titles::FrameRateVariant::RatioDivision && ratio.original_callee == 0);
+            CHECK(ratio.calls.size() == 1 && ratio.calls[0].frame_ratio && ratio.calls[0].frame_ratio->divisor_register == 0);
+            CHECK(compat::call_callee(ratio, ratio.calls[0]) == 0x44);
+            CHECK(compat::call_stub_bytes(ratio.calls[0]) == compat::observe_stub_bytes);
+            CHECK(compat::call_stub_bytes(patch.calls[0]) == 16);
+            loader::NsoModuleImage division_image;
+            division_image.bytes.resize(0x400);
+            division_image.segments[0].image_offset = 0;
+            division_image.segments[0].content_size = 0x100;
+            const std::uint32_t fdiv = 0x1e201828;  // fdiv s8, s1, s0
+            std::memcpy(division_image.bytes.data() + 0x40, &fdiv, 4);
+            CHECK(compat::validate_patch(ratio, division_image).empty());
+            auto wrong = ratio;
+            wrong.calls[0].frame_ratio->divisor_register = 1;
+            CHECK(compat::validate_patch(wrong, division_image).find("division") != std::string::npos);
+            const std::uint32_t mov = 0x2a1903ee;
+            std::memcpy(division_image.bytes.data() + 0x40, &mov, 4);
+            wrong = ratio;
+            wrong.calls[0].expected_instruction = mov;
+            CHECK(compat::validate_patch(wrong, division_image).find("division") != std::string::npos);
+            CHECK(compat::make_patch_hook(ratio.calls[0], fdiv, 0x40, 0x1000, {0x2000, 64}).error ==
+                  execution::CallHookPatchError::unsupported_site);
+            CHECK(std::holds_alternative<compat::ObserveHook>(compat::make_observe_hook(fdiv, 0x40, 0x1000, {0x2000, 64})));
+        }
+        std::string with_callee = division;
+        with_callee.replace(with_callee.find("\"calls\""), 0, "\"original_callee\":\"0x80\",");
+        CHECK(std::holds_alternative<std::string>(parse(with_callee)));
+        std::string plain_call = division;
+        plain_call.replace(plain_call.find(",\n\"frame_ratio\":{\"divisor_register\":0}"),
+                           std::string(",\n\"frame_ratio\":{\"divisor_register\":0}").size(), "");
+        CHECK(std::holds_alternative<std::string>(parse(plain_call)));
+        std::string interval = json;
+        interval.replace(interval.find("\"note\":\"Synthetic interval-update hook.\""),
+                         std::string("\"note\":\"Synthetic interval-update hook.\"").size(),
+                         "\"note\":\"Synthetic interval-update hook.\",\"frame_ratio\":{\"divisor_register\":0}");
+        CHECK(std::holds_alternative<std::string>(parse(interval)));
+    }
     std::puts(failures ? "Compatibility patch tests failed." : "Compatibility patch tests passed.");
     return failures ? 1 : 0;
 }

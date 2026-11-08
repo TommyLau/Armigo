@@ -84,10 +84,12 @@ void test_settings() {
     put(control, 24, 3);
     auto reply = session.request(control, 37);
     CHECK(reply.disposition == IpcDisposition::handled && reply.size == 44 && word(reply.bytes, 32) == 0);
+    CHECK(word(reply.bytes, 28) == 0);
 
     reply = session.request(plain(0), 37);
     CHECK(reply.disposition == IpcDisposition::handled && reply.size == 48);
     CHECK(word(reply.bytes, 16) == 0x4f434653 && word(reply.bytes, 24) == 0);
+    CHECK(word(reply.bytes, 28) == 0x7f7baf0a);
     CHECK(word(reply.bytes, 32) == 0x552d6e65 && word(reply.bytes, 36) == 0x53);  // en-US
     reply = session.request(plain(4), 37);
     CHECK(reply.disposition == IpcDisposition::handled && word(reply.bytes, 32) == 1);

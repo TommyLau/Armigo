@@ -12,6 +12,7 @@
 #include "input_log.h"
 #include "runner_shell.h"
 #include <armigo/runtime/host_controller.h>
+#include <armigo/services/vi_producer.h>
 #include <cstdio>
 #include <atomic>
 #include <condition_variable>
@@ -268,7 +269,7 @@ int main() {
              "0 stick left nan 0", "0 stick right 0 1.01", "0 hold a 0", "0 hold a -2",
              "18446744073709551615 hold a 1", "0 down a extra", "0 stick middle 0 0",
              "clock seconds", "clock milliseconds extra", "0 down a\nclock milliseconds",
-             "clock presents\nclock milliseconds", "0 down", "0 jump a", "0 hold a", "0 stick left 0", "0x1 down a"}) {
+             "clock presents\nclock milliseconds", "clock guest-presents extra", "clock guest", "0 down", "0 jump a", "0 hold a", "0 stick left 0", "0x1 down a"}) {
         std::istringstream input(invalid);
         const auto parsed = tools::parse_input_script(input);
         check(std::holds_alternative<std::string>(parsed), invalid);
@@ -313,6 +314,27 @@ int main() {
     inner->fail = false;
     timed_presenter->present({}, {}, {});
     check(state.buttons == 0 && timed_publications == 4, "late successful present publishes all due states in order");
+    std::istringstream guest("clock guest-presents\n0 hold a 2\n3 down b\n");
+    auto guest_script = std::get<tools::InputScript>(tools::parse_input_script(guest));
+    check(guest_script.clock == tools::InputScript::Clock::guest_presents, "guest-present clock parses");
+    unsigned guest_publications = 0;
+    auto guest_presenter = tools::scripted_presenter(inner, guest_script,
+        [&](const platform::HostInputSnapshot& snapshot) {
+            state = runtime::full_key_input(snapshot);
+            ++guest_publications;
+        });
+    check(state.buttons == 1 && guest_publications == 1, "guest-present clock publishes state zero at once");
+    for (unsigned i = 0; i < 5; ++i) guest_presenter->present({}, {}, {});
+    check(guest_publications == 1, "host presents do not advance a guest-present script");
+    services::vi::notify_guest_present();
+    check(state.buttons == 1 && guest_publications == 1, "first guest present keeps the hold");
+    services::vi::notify_guest_present();
+    check(state.buttons == 0 && guest_publications == 2, "hold releases at the second guest present");
+    services::vi::notify_guest_present();
+    check(state.buttons == 2 && guest_publications == 3, "third guest present presses B");
+    guest_presenter.reset();
+    services::vi::notify_guest_present();
+    check(guest_publications == 3, "a released script no longer observes guest presents");
     tools::RunnerArguments arguments;
     arguments.input_script_file = "/nonexistent-armigo-synthetic-input-script";
     const auto report = tools::run_headless_shell(arguments, {});

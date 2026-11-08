@@ -33,4 +33,20 @@ inline std::size_t entry_zero_reads(const Program& program, ValueType type) {
     return count;
 }
 
+// True when `value` is the output of an entry copy of this literal. A
+// synthesized zero reading is such a copy; an earlier initialization of a
+// different value is not.
+inline bool entry_literal_copy(const Program& program, ValueId value, LiteralBits literal) {
+    if (program.functions.size() != 1) return false;
+    for (const auto id : program.blocks[program.functions.front().entry.value].operations) {
+        const auto& operation = program.operations[id.value];
+        if (operation.opcode != Opcode::copy || operation.inputs.size() != 1 ||
+            operation.outputs.size() != 1) continue;
+        const auto* output = std::get_if<ValueId>(&operation.outputs[0]);
+        const auto* bits = std::get_if<LiteralBits>(&operation.inputs[0]);
+        if (output && *output == value && bits && *bits == literal) return true;
+    }
+    return false;
+}
+
 } // namespace armigo::shader::pipeline::test

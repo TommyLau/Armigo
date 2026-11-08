@@ -14,6 +14,8 @@
 #include "../phases.h"
 #include <algorithm>
 #include <bit>
+#include <map>
+#include <vector>
 
 namespace armigo::shader::pipeline::resources {
 [[nodiscard]] Status check_profile(const MetalProfile&, Phase);
@@ -75,61 +77,87 @@ inline bool storage_descriptor_inputs(const Program& p, const Operation& op,
 }
 // Only naturally aligned accesses are admitted until unaligned shared-memory
 // behavior has an established contract. Check every reaching mutable definition.
-inline bool shared_address_aligned(const Program& p, const Operand& value, unsigned alignment,
-                                   std::uint64_t& work, unsigned depth = 0) {
+// The definitions of a value: every operation and phi that outputs it.
+struct ValueDefinitions {
+    std::vector<const Operation*> operations;
+    std::vector<const Phi*> phis;
+};
+// Proven alignments by value and alignment; only proofs that finished inside
+// the analysis budget are recorded.
+using AlignmentMemo = std::map<std::pair<std::uint32_t, unsigned>, bool>;
+// find(id, work) returns the definitions of id, charging its own work.
+template <class Find>
+bool shared_address_aligned_by(const Program& p, const Operand& value, unsigned alignment, std::uint64_t& work,
+                               const Find& find, AlignmentMemo* memo = nullptr, unsigned depth = 0) {
     if (++work > p.limits.analysis_steps || depth > std::min(p.limits.nesting_depth, 256U)) return false;
     if (alignment == 1) return true;
     if (const auto* literal = std::get_if<LiteralBits>(&value))
         return literal->type == ValueType::word32 && literal->bits % alignment == 0;
     const auto* id = std::get_if<ValueId>(&value);
     if (!id || id->value >= p.values.size()) return false;
+    if (memo)
+        if (const auto known = memo->find({id->value, alignment}); known != memo->end()) return known->second;
     auto aligned = [&](const Operand& operand, unsigned required) {
-        return shared_address_aligned(p, operand, required, work, depth + 1);
+        return shared_address_aligned_by(p, operand, required, work, find, memo, depth + 1);
     };
-    bool found = false;
-    for (const auto& op : p.operations) {
-        if (++work > p.limits.analysis_steps) return false;
-        if (std::none_of(op.outputs.begin(), op.outputs.end(), [&](const auto& output) {
-            const auto* result = std::get_if<ValueId>(&output); return result && *result == *id;
-        })) continue;
-        found = true;
-        if (op.numeric.scalar != ScalarType::u32 ||
-            (op.numeric.domain != Domain::bits && op.numeric.domain != Domain::unsigned_integer)) return false;
-        if (op.opcode == Opcode::copy && op.inputs.size() == 1) {
-            if (!aligned(op.inputs[0], alignment)) return false;
-        } else if (op.opcode == Opcode::select && op.inputs.size() == 3) {
-            if (!aligned(op.inputs[1], alignment) || !aligned(op.inputs[2], alignment)) return false;
-        } else if (op.inputs.size() == 2) {
-            if (op.opcode == Opcode::bit_and) {
-                if (!aligned(op.inputs[0], alignment) && !aligned(op.inputs[1], alignment)) return false;
-            } else if (op.opcode == Opcode::shift_left) {
-                const auto* count = std::get_if<LiteralBits>(&op.inputs[1]);
-                if (!count) return false;
-                const auto shift = unsigned(count->bits & 31);
-                const auto factor = shift >= 2 ? 4u : 1u << shift;
-                if (factor < alignment && !aligned(op.inputs[0], alignment / factor)) return false;
-            } else if (op.opcode == Opcode::multiply) {
-                bool product = false;
-                for (unsigned side = 0; side < 2; ++side) {
-                    if (const auto* factor = std::get_if<LiteralBits>(&op.inputs[side])) {
-                        unsigned remaining = alignment;
-                        while (remaining > 1 && factor->bits % (alignment / remaining * 2) == 0) remaining /= 2;
-                        if (aligned(op.inputs[1 - side], remaining)) product = true;
+    const auto proven = [&] {
+        const ValueDefinitions definitions = find(*id, work);
+        if (work > p.limits.analysis_steps) return false;
+        for (const auto* op : definitions.operations) {
+            if (op->numeric.scalar != ScalarType::u32 ||
+                (op->numeric.domain != Domain::bits && op->numeric.domain != Domain::unsigned_integer)) return false;
+            if (op->opcode == Opcode::copy && op->inputs.size() == 1) {
+                if (!aligned(op->inputs[0], alignment)) return false;
+            } else if (op->opcode == Opcode::select && op->inputs.size() == 3) {
+                if (!aligned(op->inputs[1], alignment) || !aligned(op->inputs[2], alignment)) return false;
+            } else if (op->inputs.size() == 2) {
+                if (op->opcode == Opcode::bit_and) {
+                    if (!aligned(op->inputs[0], alignment) && !aligned(op->inputs[1], alignment)) return false;
+                } else if (op->opcode == Opcode::shift_left) {
+                    const auto* count = std::get_if<LiteralBits>(&op->inputs[1]);
+                    if (!count) return false;
+                    const auto shift = unsigned(count->bits & 31);
+                    const auto factor = shift >= 2 ? 4u : 1u << shift;
+                    if (factor < alignment && !aligned(op->inputs[0], alignment / factor)) return false;
+                } else if (op->opcode == Opcode::multiply) {
+                    bool product = false;
+                    for (unsigned side = 0; side < 2; ++side) {
+                        if (const auto* factor = std::get_if<LiteralBits>(&op->inputs[side])) {
+                            unsigned remaining = alignment;
+                            while (remaining > 1 && factor->bits % (alignment / remaining * 2) == 0) remaining /= 2;
+                            if (aligned(op->inputs[1 - side], remaining)) product = true;
+                        }
                     }
-                }
-                if (!product) return false;
-            } else if (op.opcode == Opcode::add || op.opcode == Opcode::subtract ||
-                       op.opcode == Opcode::bit_or || op.opcode == Opcode::bit_xor) {
-                if (!aligned(op.inputs[0], alignment) || !aligned(op.inputs[1], alignment)) return false;
+                    if (!product) return false;
+                } else if (op->opcode == Opcode::add || op->opcode == Opcode::subtract ||
+                           op->opcode == Opcode::bit_or || op->opcode == Opcode::bit_xor) {
+                    if (!aligned(op->inputs[0], alignment) || !aligned(op->inputs[1], alignment)) return false;
+                } else return false;
             } else return false;
-        } else return false;
-    }
-    for (const auto& block : p.blocks) for (const auto& phi : block.phis) {
-        if (++work > p.limits.analysis_steps) return false;
-        if (phi.output != *id) continue;
-        found = true;
-        for (const auto& input : phi.inputs) if (!aligned(input.value, alignment)) return false;
-    }
-    return found;
+        }
+        for (const auto* phi : definitions.phis)
+            for (const auto& input : phi->inputs) if (!aligned(input.value, alignment)) return false;
+        return !definitions.operations.empty() || !definitions.phis.empty();
+    }();
+    if (memo && work <= p.limits.analysis_steps) memo->emplace(std::pair{id->value, alignment}, proven);
+    return proven;
+}
+// The definitions found by scanning the program, one step an operation and
+// phi visited.
+inline bool shared_address_aligned(const Program& p, const Operand& value, unsigned alignment, std::uint64_t& work) {
+    return shared_address_aligned_by(p, value, alignment, work, [&](ValueId id, std::uint64_t& steps) {
+        ValueDefinitions found;
+        for (const auto& op : p.operations) {
+            if (++steps > p.limits.analysis_steps) return found;
+            if (std::any_of(op.outputs.begin(), op.outputs.end(), [&](const auto& output) {
+                const auto* result = std::get_if<ValueId>(&output); return result && *result == id;
+            })) found.operations.push_back(&op);
+        }
+        for (const auto& block : p.blocks) for (const auto& phi : block.phis) {
+            if (++steps > p.limits.analysis_steps) return found;
+            if (phi.output == id) found.phis.push_back(&phi);
+        }
+        return found;
+    });
 }
 } // namespace armigo::shader::pipeline::resources

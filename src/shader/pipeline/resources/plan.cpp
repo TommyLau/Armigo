@@ -58,8 +58,8 @@ Result<ResourcePlan> plan_resources(const StructuredProgram& program, const Meta
     const auto& uses = program.requirements.uses;
     std::uint64_t texture_count = 0, sampler_count = 0;
     for (const auto& use : uses) {
-        if (const auto* texture = std::get_if<TextureUse>(&use)) texture_count += texture->array_length;
-        if (const auto* sampler = std::get_if<SamplerUse>(&use)) sampler_count += sampler->array_length;
+        if (const auto* texture = std::get_if<TextureUse>(&use); texture && !texture->pool) texture_count += texture->array_length;
+        if (const auto* sampler = std::get_if<SamplerUse>(&use); sampler && !sampler->pool) sampler_count += sampler->array_length;
     }
     const bool indirect = texture_count > profile.texture_slots || sampler_count > profile.sampler_slots;
     if (indirect && (texture_count > UINT32_MAX / 8u || sampler_count > UINT32_MAX / 8u - texture_count))
@@ -118,8 +118,12 @@ Result<ResourcePlan> plan_resources(const StructuredProgram& program, const Meta
         if (++steps > program.ir.limits.analysis_steps) return fail("Allocation work exceeds limit", DiagnosticCode::limit_exceeded);
         const auto& use = uses[id];
         MetalRange range;
-        if (const auto* buffer = std::get_if<BufferUse>(&use)) {
-            if (std::holds_alternative<VertexStreamSource>(buffer->source)) continue;
+        const auto* texture_use = std::get_if<TextureUse>(&use);
+        const auto* sampler_use = std::get_if<SamplerUse>(&use);
+        // A pool is a table in the buffer namespace (the project documentation).
+        const bool pool = (texture_use && texture_use->pool) || (sampler_use && sampler_use->pool);
+        if (const auto* buffer = std::get_if<BufferUse>(&use); buffer || pool) {
+            if (buffer && std::holds_alternative<VertexStreamSource>(buffer->source)) continue;
             while (next_buffer < occupied.size() && occupied[next_buffer]) ++next_buffer;
             if (next_buffer >= occupied.size()) return fail("Metal buffer namespace is exhausted", DiagnosticCode::limit_exceeded);
             range = {MetalNamespace::buffer, next_buffer, 1};
@@ -150,9 +154,13 @@ Result<ResourcePlan> plan_resources(const StructuredProgram& program, const Meta
         plan.argument_buffer = StageArgumentBufferLayout{1, next_buffer, member_offset, 8};
         occupied[next_buffer++] = true;
     }
-    if (program.ir.stage == Stage::vertex && std::any_of(plan.io.begin(), plan.io.end(), [](const auto& io) {
-            return io.access == Access::read && io.semantic == IoSemantic::instance_id;
-        })) {
+    const auto reads = [&](IoSemantic semantic) {
+        return std::any_of(plan.io.begin(), plan.io.end(), [&](const auto& io) {
+            return io.access == Access::read && io.semantic == semantic;
+        });
+    };
+    if ((program.ir.stage == Stage::vertex && reads(IoSemantic::instance_id)) ||
+        (program.ir.stage == Stage::fragment && reads(IoSemantic::render_target_height))) {
         while (next_buffer < occupied.size() && occupied[next_buffer]) ++next_buffer;
         if (next_buffer >= occupied.size())
             return fail("Draw support has no free Metal buffer slot", DiagnosticCode::limit_exceeded);

@@ -68,6 +68,15 @@ void test_x18_roles() {
     CHECK(classify_word(0xb4000012u).uses_x18);   // cbz x18, .
     CHECK(no_role(0xf9400020u));                  // ldr x0, [x1]
     CHECK(no_role(0xd63f0100u));                  // blr x8
+    // Atomics and compare-and-swap name x18 like any decoded instruction.
+    CHECK(classify_word(0xb82e0252u).uses_x18);   // ldadd w14, w18, [x18]
+    CHECK(classify_word(0xc8f2fc62u).uses_x18);   // casal x18, x2, [x3]
+    CHECK(classify_word(0x48327c82u).uses_x18);   // casp x18, x19, x2, x3, [x4]
+    CHECK(no_role(0xf8e20062u));                  // ldaddal x2, x2, [x3]
+    // A word the decoder cannot describe is an x18 site when a register
+    // field holds 18, so it is refused rather than run on the hardware x18.
+    CHECK(classify_word(0xf83fd052u).uses_x18);   // ld64b x18, [x2]
+    CHECK(no_role(0xf83fd043u));                  // ld64b x3, [x2]
     CHECK(no_role(0xd65f03c0u));                  // ret
 }
 
@@ -380,23 +389,27 @@ void test_halfword_indexed_x18_switch() {
                                                  armigo::execution::indirect_x18_table_words(256)));
     }
     // B.HS bounds n entries, CMP may compare the 64-bit register, and LDRH may
-    // extend a 32-bit index (UXTW #1).
+    // extend a 32-bit index (UXTW #1). A 4096-byte text holds the words up to
+    // the largest entry; the table follows it.
     {
         auto variant = image;
         std::vector<std::uint32_t> shape = {
             0xf1000e3fu,  // cmp x17, #3
             0x540004e2u,  // b.hs word 40
-            0x90000001u,  // adrp x1, page 0
-            0x91204021u,  // add x1, x1, #0x810
+            0xb0000001u,  // adrp x1, page 1
+            0x91004021u,  // add x1, x1, #0x10
             0x10000192u,  // adr x18, word 16
             0x78715820u,  // ldrh w0, [x1, w17, uxtw #1]
             0x8b000a52u,  // add x18, x18, x0, lsl #2
             0xd61f0240u,  // br x18
         };
         std::memcpy(variant.data(), shape.data(), shape.size() * 4);
+        // The first table's words are text now: NOPs instead.
+        const std::uint32_t nops[] = {0xd503201fu, 0xd503201fu};
+        std::memcpy(variant.data() + 0x800, nops, sizeof nops);
         const std::uint16_t table[] = {0, 2, 600, 1};  // three entries bound: 0, 2, 600 (the fourth is past the bound)
-        std::memcpy(variant.data() + 0x810, table, sizeof table);
-        const auto prepared = prepare_text(variant, true, 1, false, base, text_bytes);
+        std::memcpy(variant.data() + 0x1010, table, sizeof table);
+        const auto prepared = prepare_text(variant, true, 1, false, base, 2 * text_bytes);
         CHECK(prepared.module.stops.size() == 1);  // only the unbounded shape at word 107
         std::uint32_t replaced = 0;
         std::memcpy(&replaced, prepared.image.data() + 7 * 4, 4);
@@ -411,6 +424,149 @@ void test_halfword_indexed_x18_switch() {
             CHECK(bound == 0xd34cfc01u);
         }
     }
+}
+
+// A bounded halfword switch whose table register is set elsewhere reaches every
+// word a halfword entry names from its ADR base: a 65536-entry trampoline. Up
+// to eight words that neither touch x18 nor branch may sit before the BR X18,
+// in the byte form too. Its variants with a gap word that writes or reads x18
+// or branches, nine gap words, or a bound check of another register or none,
+// stop.
+void test_switch_with_distant_table_and_gap() {
+    constexpr std::uint32_t nop = 0xd503201fu, movi_d4 = 0x2f00e404u, movi_d3 = 0x2f00e403u, movi_d2 = 0x2f00e402u;
+    constexpr std::uint32_t cmp_w17 = 0x7100be3fu, cmp_x17 = 0xf100be3fu, cmp_w16 = 0x7100be1fu;
+    constexpr std::uint32_t ldrh = 0x78717940u;  // ldrh w0, [x10, x17, lsl #1]
+    constexpr std::uint32_t ldrb = 0x38716940u;  // ldrb w0, [x10, x17]
+    constexpr std::uint32_t add = 0x8b000a52u;   // add x18, x18, x0, lsl #2
+    constexpr std::uint32_t br = 0xd61f0240u;    // br x18
+    // A text past the 256 KiB a halfword table spans, so no table reaches the appendix.
+    std::vector<std::uint32_t> words(70000, nop);
+    const auto b_cond = [](std::size_t from, std::size_t to, std::uint32_t condition) {
+        return 0x54000000u | ((static_cast<std::uint32_t>(to - from) & 0x7ffffu) << 5) | condition;
+    };
+    const auto adr_x18 = [](std::size_t from, std::size_t to) {
+        return 0x10000012u | ((static_cast<std::uint32_t>(to - from) & 0x7ffffu) << 5);
+    };
+    const auto place = [&](std::size_t at, std::initializer_list<std::uint32_t> code) {
+        std::copy(code.begin(), code.end(), words.begin() + static_cast<std::ptrdiff_t>(at));
+    };
+    // Matched: CMP W17, #0x2f; B.HI; ADR X18; LDRH; ADD; three MOVI; BR X18.
+    place(100, {cmp_w17, b_cond(101, 60000, 8), adr_x18(102, 120), ldrh, add, movi_d4, movi_d3, movi_d2, br});
+    // Matched: a 64-bit compare with B.HS, no gap.
+    place(200, {cmp_x17, b_cond(201, 60000, 2), adr_x18(202, 220), ldrh, add, br});
+    // Matched: a byte table with three gap words.
+    place(300, {adr_x18(300, 320), ldrb, add, movi_d4, movi_d3, movi_d2, br});
+    // Stop: a gap word writes x18 (mov x18, x1).
+    place(400, {cmp_w17, b_cond(401, 60000, 8), adr_x18(402, 420), ldrh, add, movi_d4, 0xaa0103f2u, movi_d2, br});
+    // Stop: a gap word branches (b.ne).
+    place(500, {cmp_w17, b_cond(501, 60000, 8), adr_x18(502, 520), ldrh, add, movi_d4, 0x54000041u, movi_d2, br});
+    // Stop: nine gap words.
+    place(600, {cmp_w17, b_cond(601, 60000, 8), adr_x18(602, 620), ldrh, add, movi_d4, movi_d4, movi_d4, movi_d4,
+                movi_d4, movi_d4, movi_d4, movi_d4, movi_d4, br});
+    // Stop: the bound check compares another register.
+    place(700, {cmp_w16, b_cond(701, 60000, 8), adr_x18(702, 720), ldrh, add, br});
+    // Stop: no bound check.
+    place(800, {nop, nop, adr_x18(802, 820), ldrh, add, br});
+    // Stop: a gap word reads x18 (mov x2, x18).
+    place(900, {cmp_w17, b_cond(901, 60000, 8), adr_x18(902, 920), ldrh, add, movi_d4, 0xaa1203e2u, movi_d2, br});
+    std::vector<std::byte> text(words.size() * 4);
+    std::memcpy(text.data(), words.data(), text.size());
+    constexpr std::uint64_t base = 0x100000000ull;
+    const std::uint64_t refused[] = {408, 508, 614, 705, 805, 908};
+    for (const bool embedded : {false, true}) {
+        const auto prepared = prepare_text(text, true, 1, embedded, base);
+        CHECK(prepared.module.stops.size() == std::size(refused));
+        for (std::size_t i = 0; i != std::min(std::size(refused), prepared.module.stops.size()); ++i)
+            CHECK(prepared.module.stops[i].address == base + 4 * refused[i] &&
+                  std::string_view(prepared.module.stops[i].reason) ==
+                      (embedded ? "Unsupported embedded virtual-x18 instruction."
+                                : "Indirect branch on virtual x18 without a recognised table."));
+        for (const std::size_t site : {108u, 205u, 306u}) {
+            std::uint32_t replaced = 0;
+            std::memcpy(&replaced, prepared.image.data() + site * 4, 4);
+            CHECK(armigo::aarch64::decode(replaced).opcode == armigo::aarch64::Opcode::b);
+        }
+        if (embedded) continue;
+        // Table base, bound shift and last entry of each matched site's trampoline.
+        const struct { std::size_t site, table; std::uint32_t entries, shift; } matched[] = {
+            {108, 120, 65536, 18}, {205, 220, 65536, 18}, {306, 320, 256, 10}};
+        for (const auto& [site, table, entries, shift] : matched) {
+            std::uint32_t replaced = 0;
+            std::memcpy(&replaced, prepared.image.data() + site * 4, 4);
+            const auto branch = armigo::aarch64::decode(replaced);
+            if (branch.opcode != armigo::aarch64::Opcode::b) continue;
+            const auto target = base + site * 4 + static_cast<std::uint64_t>(branch.displacement);
+            const auto at = static_cast<std::size_t>(target - base - text.size());
+            CHECK(at + 4 * armigo::execution::indirect_x18_table_words(entries) <= prepared.appended.size());
+            std::array<std::uint32_t, 10> head{};
+            std::memcpy(head.data(), prepared.appended.data() + at, sizeof head);
+            std::uint64_t table_base = 0;
+            for (unsigned half = 0; half != 4; ++half)
+                table_base |= std::uint64_t{(head[4 + half] >> 5) & 0xffffu} << (16 * half);
+            CHECK(table_base == base + 4 * table);
+            CHECK(head[9] == (0xd340fc01u | (shift << 16)));
+            std::uint32_t entry = 0;
+            const auto entry_at = at + 4 * (16 + 2 * std::size_t{entries - 1} + 1);
+            std::memcpy(&entry, prepared.appended.data() + entry_at, 4);
+            const auto last = armigo::aarch64::decode(entry);
+            CHECK(last.opcode == armigo::aarch64::Opcode::b &&
+                  target + (entry_at - at) + static_cast<std::uint64_t>(last.displacement) ==
+                      base + 4 * table + 4 * std::uint64_t{entries - 1});
+        }
+    }
+}
+
+// Every word a matched table can name lies in the module's text. A halfword
+// range from the text's first word, or one ending at its last, is accepted;
+// one that starts before the text or runs past its end stops, as does a byte
+// table that runs past the end, scanned or not, ordinary or embedded.
+void test_switch_targets_stay_in_text() {
+    constexpr std::uint32_t nop = 0xd503201fu, cmp_w17 = 0x7100be3fu, ldrh = 0x78717940u, ldrb = 0x38716940u,
+                            add = 0x8b000a52u, br = 0xd61f0240u;
+    constexpr std::size_t text_words = 70000, halfword_words = 65536;
+    const auto b_hi = [](std::size_t from, std::size_t to) {
+        return 0x54000008u | ((static_cast<std::uint32_t>(to - from) & 0x7ffffu) << 5);
+    };
+    const auto adr_x18 = [](std::size_t from, std::ptrdiff_t to) {
+        return 0x10000012u | ((static_cast<std::uint32_t>(to - static_cast<std::ptrdiff_t>(from)) & 0x7ffffu) << 5);
+    };
+    struct Case { std::size_t site; std::ptrdiff_t table; bool halfword, accepted; };
+    const Case cases[] = {
+        {100, 0, true, true},                                                       // the text's first word
+        {200, static_cast<std::ptrdiff_t>(text_words - halfword_words), true, true},  // ends at the last word
+        {300, -4, true, false},                                                     // starts before the text
+        {400, static_cast<std::ptrdiff_t>(text_words - halfword_words + 1), true, false},  // one word past the end
+        {69700, static_cast<std::ptrdiff_t>(text_words - 255), false, false},      // a byte table past the end
+        {69800, static_cast<std::ptrdiff_t>(text_words - 256), false, true},       // a byte table ending at the end
+    };
+    std::vector<std::uint32_t> words(text_words, nop);
+    for (const auto& c : cases) {
+        if (c.halfword) {
+            const std::uint32_t code[] = {cmp_w17, b_hi(c.site + 1, 60000), adr_x18(c.site + 2, c.table), ldrh, add, br};
+            std::copy(std::begin(code), std::end(code), words.begin() + static_cast<std::ptrdiff_t>(c.site));
+        } else {
+            const std::uint32_t code[] = {adr_x18(c.site, c.table), ldrb, add, br};
+            std::copy(std::begin(code), std::end(code), words.begin() + static_cast<std::ptrdiff_t>(c.site));
+        }
+    }
+    std::vector<std::byte> text(words.size() * 4);
+    std::memcpy(text.data(), words.data(), text.size());
+    constexpr std::uint64_t base = 0x100000000ull;
+    for (const bool embedded : {false, true})
+        for (const bool scan : {false, true}) {
+            const auto prepared = prepare_text(text, scan, 1, embedded, base);
+            std::vector<std::uint64_t> stopped;
+            for (const auto& stop : prepared.module.stops) stopped.push_back((stop.address - base) / 4);
+            for (const auto& c : cases) {
+                const auto branch_word = c.site + (c.halfword ? 5 : 3);
+                const bool stops = std::find(stopped.begin(), stopped.end(), branch_word) != stopped.end();
+                CHECK(stops != c.accepted);
+                std::uint32_t replaced = 0;
+                std::memcpy(&replaced, prepared.image.data() + branch_word * 4, 4);
+                CHECK((armigo::aarch64::decode(replaced).opcode == armigo::aarch64::Opcode::b) == c.accepted);
+            }
+            CHECK(stopped.size() == 3);
+        }
 }
 
 // The scan's appendix bound covers what preparation emits, and is the same on
@@ -972,6 +1128,8 @@ int main() {
     test_x18_roles();
     test_byte_indexed_x18_switch();
     test_halfword_indexed_x18_switch();
+    test_switch_with_distant_table_and_gap();
+    test_switch_targets_stay_in_text();
     test_exclusive_roles();
     test_unknown_control();
     test_scanned_preparation_matches();

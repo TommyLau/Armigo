@@ -9,7 +9,7 @@
 # ============================================================================
 
 # NVN graphics driver (fast path). Subsystems add their sources here.
-add_library(armigo_nvn STATIC entry_table.cpp null_device.cpp abi.S redirect.cpp guest_wait.cpp
+add_library(armigo_nvn STATIC entry_table.cpp entry_table_231.cpp entries_231.cpp null_device.cpp abi.S redirect.cpp guest_wait.cpp
     device.cpp memory.cpp textures.cpp samplers.cpp programs.cpp state_objects.cpp command_buffers.cpp)
 target_include_directories(armigo_nvn PUBLIC "${PROJECT_SOURCE_DIR}/include")
 target_compile_features(armigo_nvn PUBLIC cxx_std_20)
@@ -56,6 +56,9 @@ if(BUILD_TESTING)
     add_executable(armigo_nvn_flat_map_tests "${PROJECT_SOURCE_DIR}/tests/nvn/flat_map_tests.cpp")
     target_include_directories(armigo_nvn_flat_map_tests PRIVATE "${PROJECT_SOURCE_DIR}/src/nvn")
     add_test(NAME nvn.flat_map COMMAND armigo_nvn_flat_map_tests)
+    add_executable(armigo_nvn_guest_memory_table_tests "${PROJECT_SOURCE_DIR}/tests/nvn/guest_memory_table_tests.cpp")
+    target_include_directories(armigo_nvn_guest_memory_table_tests PRIVATE "${PROJECT_SOURCE_DIR}/src/platform/metal")
+    add_test(NAME nvn.guest_memory_table COMMAND armigo_nvn_guest_memory_table_tests)
     add_executable(armigo_nvn_entry_table_tests "${PROJECT_SOURCE_DIR}/tests/nvn/entry_table_tests.cpp")
     target_include_directories(armigo_nvn_entry_table_tests PRIVATE "${PROJECT_SOURCE_DIR}/src/nvn")
     target_link_libraries(armigo_nvn_entry_table_tests PRIVATE armigo_nvn)
@@ -88,6 +91,11 @@ if(BUILD_TESTING)
         target_link_libraries(armigo_nvn_present_${suite}_tests PRIVATE armigo_nvn)
         add_test(NAME nvn.present_${suite} COMMAND armigo_nvn_present_${suite}_tests)
     endforeach()
+    add_executable(armigo_nvn_api231_tests "${PROJECT_SOURCE_DIR}/tests/nvn/api231_tests.cpp")
+    target_include_directories(armigo_nvn_api231_tests PRIVATE "${PROJECT_SOURCE_DIR}/src/nvn")
+    target_link_libraries(armigo_nvn_api231_tests PRIVATE armigo_nvn)
+    add_test(NAME nvn.api231 COMMAND armigo_nvn_api231_tests)
+    set_tests_properties(nvn.api231 PROPERTIES TIMEOUT 30)
 endif()
 
 if(BUILD_TESTING AND ARMIGO_ENABLE_GPU_TESTS)
@@ -134,11 +142,49 @@ target_sources(armigo_nvn_metal PRIVATE "${PROJECT_SOURCE_DIR}/src/platform/meta
     "${PROJECT_SOURCE_DIR}/src/platform/metal/pso_archive_build.mm")
 target_link_libraries(armigo_nvn_metal PUBLIC armigo_metal_clear_encoder armigo_metal_texture_format armigo_metal_nvn_resources
     armigo_nvn_present_metal armigo_services_vi)
+# The pipeline warm-up reads compute stages from a native package section when
+# the build has the native package reader (it needs zstd).
+if(TARGET armigo_shader_native_package)
+    target_link_libraries(armigo_nvn_metal PRIVATE armigo_shader_native_package)
+    target_compile_definitions(armigo_nvn_metal PRIVATE ARMIGO_HAS_NATIVE_PACKAGE=1)
+endif()
+# API 231 programs carry native Switch 2 stages, translated by the native front
+# end when the build has it.
+if(TARGET armigo_shader_native_frontend)
+    target_sources(armigo_nvn_metal PRIVATE "${PROJECT_SOURCE_DIR}/src/platform/metal/nvn_native_stages.mm")
+    target_include_directories(armigo_nvn_metal PRIVATE "${PROJECT_SOURCE_DIR}/src/loader")
+    target_link_libraries(armigo_nvn_metal PRIVATE armigo_shader_native_frontend armigo_loader)
+    target_compile_definitions(armigo_nvn_metal PRIVATE ARMIGO_HAS_NATIVE_SHADERS=1)
+    if(BUILD_TESTING)
+        add_executable(armigo_nvn_native_stages_tests "${PROJECT_SOURCE_DIR}/tests/metal/nvn_native_stages.mm")
+        target_include_directories(armigo_nvn_native_stages_tests PRIVATE "${PROJECT_SOURCE_DIR}/src/platform/metal"
+            "${PROJECT_SOURCE_DIR}/src/nvn" "${PROJECT_SOURCE_DIR}/tests/shader_native"
+            "${PROJECT_SOURCE_DIR}/tests/shader/translation")
+        target_link_libraries(armigo_nvn_native_stages_tests PRIVATE armigo_nvn_metal armigo_shader_native_frontend
+            armigo_shader_translation)
+        add_test(NAME nvn.native_stages COMMAND armigo_nvn_native_stages_tests)
+        set_tests_properties(nvn.native_stages PROPERTIES LABELS "shader;metal4" TIMEOUT 60)
+        add_executable(armigo_nvn_native_package_tests "${PROJECT_SOURCE_DIR}/tests/metal/native_package_lookup.mm")
+        target_include_directories(armigo_nvn_native_package_tests PRIVATE "${PROJECT_SOURCE_DIR}/src/platform/metal"
+            "${PROJECT_SOURCE_DIR}/src/nvn" "${PROJECT_SOURCE_DIR}/tests/shader_native")
+        target_link_libraries(armigo_nvn_native_package_tests PRIVATE armigo_nvn_metal armigo_shader_native_frontend
+            armigo_shader_native_package)
+        add_test(NAME nvn.native_package COMMAND armigo_nvn_native_package_tests)
+        set_tests_properties(nvn.native_package PROPERTIES LABELS "shader;metal4" TIMEOUT 120)
+    endif()
+endif()
 if(BUILD_TESTING)
     add_executable(armigo_metal_nvn_replay_tests "${PROJECT_SOURCE_DIR}/tests/metal/nvn_replay_tests.mm")
     target_include_directories(armigo_metal_nvn_replay_tests PRIVATE
         "${PROJECT_SOURCE_DIR}/src/nvn" "${PROJECT_SOURCE_DIR}/src/platform/metal")
     target_link_libraries(armigo_metal_nvn_replay_tests PRIVATE armigo_nvn_metal)
+    # Native task and mesh draws record synthetic native stages through the
+    # API 231 resolver.
+    if(TARGET armigo_shader_native_frontend)
+        target_include_directories(armigo_metal_nvn_replay_tests PRIVATE "${PROJECT_SOURCE_DIR}/tests/shader_native")
+        target_link_libraries(armigo_metal_nvn_replay_tests PRIVATE armigo_shader_native_frontend)
+        target_compile_definitions(armigo_metal_nvn_replay_tests PRIVATE ARMIGO_HAS_NATIVE_SHADERS=1)
+    endif()
     # Keep the unbatched path covered alongside default and explicit-on variants.
     add_test(NAME nvn.metal_replay COMMAND armigo_metal_nvn_replay_tests)
     set_tests_properties(nvn.metal_replay PROPERTIES
@@ -150,6 +196,14 @@ if(BUILD_TESTING)
     add_test(NAME nvn.metal_replay_conditional_contract COMMAND armigo_metal_nvn_replay_tests)
     set_tests_properties(nvn.metal_replay_conditional_contract PROPERTIES
         ENVIRONMENT "ARMIGO_NVN_CONDITIONAL_CONTRACT_TESTS=1")
+    # Every dispatch in a command buffer of its own (ARMIGO_NVN_DISPATCH_PROFILE).
+    add_test(NAME nvn.metal_replay_dispatch_profile COMMAND armigo_metal_nvn_replay_tests)
+    set_tests_properties(nvn.metal_replay_dispatch_profile PROPERTIES
+        ENVIRONMENT "ARMIGO_NVN_DISPATCH_PROFILE=1;ARMIGO_NVN_BATCH_FINALIZED_QUERIES=0")
+    # The debug switch that forces full pass barriers over a title's game policy.
+    add_test(NAME nvn.metal_replay_full_barriers COMMAND armigo_metal_nvn_replay_tests)
+    set_tests_properties(nvn.metal_replay_full_barriers PROPERTIES
+        ENVIRONMENT "ARMIGO_NVN_BARRIERS=full;ARMIGO_NVN_BATCH_FINALIZED_QUERIES=0")
     # The same suites under Metal API validation: every encoder barrier must
     # use stages its encoder admits (a render encoder waits only on vertex work).
     add_test(NAME nvn.metal_replay_validation COMMAND armigo_metal_nvn_replay_tests)

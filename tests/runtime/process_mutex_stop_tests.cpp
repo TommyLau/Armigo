@@ -10,6 +10,7 @@
 
 #include "process_runtime_fixture.h"
 #include "../../src/runtime/process_runtime_test_access.h"
+#include "../../src/nvn/entry_table.h"
 
 extern "C" {
 extern const std::byte armigo_process_fixture_mutex_stop[];
@@ -287,7 +288,23 @@ void test_termination_ends_nested_wait(NestedWait kind, const char* name) {
 }
 } // namespace
 
+// A runtime withdraws its unsupported-NVN handler when it shuts down: a later
+// report finds no handler, returns, and never reaches the destroyed runtime.
+void test_nvn_handler_released_at_shutdown() {
+    auto created = create_fixture_runtime(nested_stop_input);
+    const auto fixture = std::move(created.fixture);
+    auto runtime = std::move(created.runtime);
+    CHECK(runtime != nullptr);
+    if (!runtime) return;
+    ProcessRuntimeTestAccess::install_nvn_handler(*runtime);
+    CHECK(ok(runtime->shutdown(std::chrono::steady_clock::now() + 2s)));
+    armigo::nvn::report_unsupported("synthetic unsupported NVN call after shutdown", 0);
+    runtime.reset();
+    armigo::nvn::report_unsupported("synthetic unsupported NVN call after destruction", 0);
+}
+
 int main() {
+    test_nvn_handler_released_at_shutdown();
     test_real_mutex_handoff_stop(true);
     test_real_mutex_handoff_stop(false);
     test_termination_ends_nested_wait(NestedWait::arbitrate_lock, "arbitrate-lock");

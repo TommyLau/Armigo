@@ -230,14 +230,15 @@ Fixture package(const fs::path& root, bool ported = false,
                 const std::string& vertex_extra_dependencies = "",
                 bool v3 = false,
                 const std::string& fragment_argument_buffer = "null",
-                const std::string& vertex_argument_buffer = "null") {
+                const std::string& vertex_argument_buffer = "null",
+                std::string_view sample_hoisting = {}) {
     Fixture result{root, {}, {}, {}, {}, {}};
     result.vertex = program(shader_input::Stage::Vertex, std::byte{0x31});
     result.fragment = program(shader_input::Stage::Fragment, std::byte{0x72});
     result.vertex_variant = hash(ported ? "ported vertex variant" : "vertex variant");
     result.fragment_variant = hash(ported ? "ported fragment variant" : "fragment variant");
     const std::string profile = std::string("{\"platform\":\"macos-metal4\",\"source_version\":\"") +
-                                shader::source_version + "\",\"tool_version\":\"sdk/metal\"}";
+        shader::source_version + "\",\"tool_version\":\"sdk/metal\"}";
     result.chain = hash("armigo-metal-chain-v1\n" + profile);
     fs::create_directories(root / "stages" / result.vertex_variant);
     fs::create_directories(root / "stages" / result.fragment_variant);
@@ -281,8 +282,12 @@ Fixture package(const fs::path& root, bool ported = false,
     NSData* escaped_data = [NSJSONSerialization dataWithJSONObject:@[profile_string] options:0 error:nil];
     std::string escaped(static_cast<const char*>(escaped_data.bytes), escaped_data.length);
     escaped = escaped.substr(1, escaped.size() - 2);
+    std::string hoisting;
+    if (!sample_hoisting.empty())
+        hoisting = ",\"sample_hoisting\":\"" + std::string(sample_hoisting) + "\"";
     write(root / "manifest.json", manifest + escaped +
-        ",\"complete_inventory\":false,\"runnable\":false,\"entries\":[" + entries + "]}\n");
+        ",\"complete_inventory\":false,\"runnable\":false" + hoisting +
+        ",\"entries\":[" + entries + "]}\n");
     return result;
 }
 
@@ -1141,6 +1146,18 @@ void test_v3_draw_support_reflections(const fs::path& base) {
     add_support(fragment, support, false);
     CHECK(std::holds_alternative<platform::MetalShaderPackageError>(
         platform::MetalShaderPackage::open(fragment.root, {fragment.chain, true})));
+    // Version 2 adds the render-target height and serves fragment stages only.
+    const std::string height =
+        "{\"schema\":\"armigo-draw-parameters\",\"version\":2,"
+        "\"byte_extent\":8,\"alignment\":4,\"metal_buffer_index\":2}";
+    auto fragment_height = package(base / "v3-draw-support-fragment-height", true, "[]", "", "[]", "", true);
+    add_support(fragment_height, height, false);
+    CHECK(std::holds_alternative<std::shared_ptr<platform::MetalShaderPackage>>(
+        platform::MetalShaderPackage::open(fragment_height.root, {fragment_height.chain, true})));
+    auto vertex_height = package(base / "v3-draw-support-vertex-height", true, "[]", "", "[]", "", true);
+    add_support(vertex_height, height);
+    CHECK(std::holds_alternative<platform::MetalShaderPackageError>(
+        platform::MetalShaderPackage::open(vertex_height.root, {vertex_height.chain, true})));
 }
 
 void test_v3_storage_buffer_reflections(const fs::path& base) {
@@ -2537,6 +2554,45 @@ void test_lazy_entries(const fs::path& base) {
     }
 }
 
+Fixture package_with_hoisting(const fs::path& root, std::string_view sample_hoisting) {
+    return package(root, false, "[]", "", "[]", "", false, "null", "null", sample_hoisting);
+}
+
+// A manifest without sample_hoisting leaves hoisting off. "implicit" turns it
+// on. Any other value is a compatibility failure. The chain is the plain
+// profile's hash either way.
+void test_sample_hoisting(const fs::path& base) {
+    auto absent = package(base / "hoist-absent");
+    auto absent_opened = platform::MetalShaderPackage::open(absent.root, {absent.chain, true});
+    CHECK(std::holds_alternative<std::shared_ptr<platform::MetalShaderPackage>>(absent_opened));
+    if (const auto* opened = std::get_if<std::shared_ptr<platform::MetalShaderPackage>>(&absent_opened))
+        CHECK(*opened && !(*opened)->hoists_implicit_samples());
+
+    auto implicit = package_with_hoisting(base / "hoist-implicit", "implicit");
+    CHECK(implicit.chain == absent.chain);
+    auto implicit_opened = platform::MetalShaderPackage::open(implicit.root, {implicit.chain, true});
+    if (const auto* error = std::get_if<platform::MetalShaderPackageError>(&implicit_opened))
+        std::fprintf(stderr, "implicit hoisting: %s\n", error->detail.c_str());
+    CHECK(std::holds_alternative<std::shared_ptr<platform::MetalShaderPackage>>(implicit_opened));
+    if (const auto* opened = std::get_if<std::shared_ptr<platform::MetalShaderPackage>>(&implicit_opened))
+        CHECK(*opened && (*opened)->hoists_implicit_samples());
+
+    auto explicit_fixture = package_with_hoisting(base / "hoist-explicit", "explicit");
+    CHECK(explicit_fixture.chain == absent.chain);
+    auto explicit_opened =
+        platform::MetalShaderPackage::open(explicit_fixture.root, {explicit_fixture.chain, true});
+    const auto* error = std::get_if<platform::MetalShaderPackageError>(&explicit_opened);
+    if (!error) {
+        std::fprintf(stderr, "FAIL explicit sample hoisting was accepted\n");
+        ++failures;
+    } else {
+        if (error->detail != "Package sample hoisting is unsupported")
+            std::fprintf(stderr, "explicit hoisting detail: %s\n", error->detail.c_str());
+        CHECK(error->code == platform::MetalShaderPackageError::Code::Compatibility);
+        CHECK(error->detail == "Package sample hoisting is unsupported");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -2563,6 +2619,7 @@ int main() {
         test_adaptive_fragment_outputs(root);
         test_depth_bias_capability(root);
         test_lazy_entries(root);
+        test_sample_hoisting(root);
         fs::remove_all(root, ignored);
         return failures == 0 ? 0 : 1;
     }

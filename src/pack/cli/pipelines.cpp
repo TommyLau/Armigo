@@ -24,20 +24,22 @@ extern char** environ;
 namespace armigo::pack {
 
 std::variant<std::string, armigo::platform::PipelineArchiveResult> build_pack_pipelines(
-    const std::filesystem::path& package, const std::filesystem::path& manifest,
+    const std::filesystem::path& package, const std::vector<std::filesystem::path>& manifests,
     const std::filesystem::path& cache_root, const std::string& expected_chain_id) {
     if (expected_chain_id.empty()) {
         return std::string("This build has no shader chain, so a pipeline archive cannot be built.");
     }
-    if (manifest.empty()) {
+    if (manifests.empty()) {
         return std::string("The matched title settings have no pipeline list.");
     }
     std::error_code error;
     if (!std::filesystem::is_directory(package, error)) {
         return "The shader package is missing: " + package.string() + ".";
     }
-    if (!std::filesystem::is_regular_file(manifest, error)) {
-        return "The pipeline list is missing: " + manifest.string() + ".";
+    for (const std::filesystem::path& manifest : manifests) {
+        if (!std::filesystem::is_regular_file(manifest, error)) {
+            return "The pipeline list is missing: " + manifest.string() + ".";
+        }
     }
     std::filesystem::create_directories(cache_root, error);
     if (error) {
@@ -46,7 +48,7 @@ std::variant<std::string, armigo::platform::PipelineArchiveResult> build_pack_pi
     armigo::platform::PipelineArchiveBuild build;
     build.package = package;
     build.expected_chain_id = expected_chain_id;
-    build.manifests.push_back(manifest);
+    build.manifests = manifests;
     build.cache_root = cache_root;
     auto result = armigo::platform::build_pipeline_archive(build);
     if (!result.ok || result.archive.empty()) {
@@ -59,7 +61,8 @@ std::variant<std::string, armigo::platform::PipelineArchiveResult> build_pack_pi
     return result;
 }
 
-std::string warm_pack_pipelines(const std::filesystem::path& app, const std::filesystem::path& manifest) {
+std::string warm_pack_pipelines(const std::filesystem::path& app,
+                                const std::vector<std::filesystem::path>& manifests) {
     namespace fs = std::filesystem;
     const fs::path player = app / "Contents" / "MacOS" / "Armigo";
     const fs::path resources = app / "Contents" / "Resources" / "Armigo";
@@ -67,10 +70,21 @@ std::string warm_pack_pipelines(const std::filesystem::path& app, const std::fil
     if (!fs::is_regular_file(player, error)) return "The packed player is missing: " + player.string() + ".";
     if (!fs::is_directory(resources / "shaders", error)) return "The packed shader package is missing.";
     if (!fs::is_directory(resources / "pipelines", error)) return "The packed pipeline archive is missing.";
+    if (manifests.empty()) return "The packed player has no pipeline list.";
+    for (const fs::path& manifest : manifests) {
+        if (!fs::is_regular_file(manifest, error))
+            return "The pipeline list is missing: " + manifest.string() + ".";
+    }
 
     std::vector<std::string> arguments{
-        player.string(), "pso-archive", "--shaders", (resources / "shaders").string(),
-        "--manifest", manifest.string(), "--cache", (resources / "pipelines").string(), "--warm-only"};
+        player.string(), "pso-archive", "--shaders", (resources / "shaders").string()};
+    for (const fs::path& manifest : manifests) {
+        arguments.emplace_back("--manifest");
+        arguments.push_back(manifest.string());
+    }
+    arguments.emplace_back("--cache");
+    arguments.push_back((resources / "pipelines").string());
+    arguments.emplace_back("--warm-only");
     std::vector<char*> argv;
     argv.reserve(arguments.size() + 1);
     for (std::string& argument : arguments) argv.push_back(argument.data());

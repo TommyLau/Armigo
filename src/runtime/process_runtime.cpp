@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/execution/guest_timeline.h>
 #include <armigo/common/diagnostics.h>
 #include <armigo/runtime/process_runtime.h>
 #include <armigo/runtime/kernel_queries.h>
@@ -17,6 +18,7 @@
 #include <armigo/compat/title_settings.h>
 #include <armigo/execution/guest_fault.h>
 #include <armigo/memory/write_tracker.h>
+#include <armigo/nvn/driver.h>
 #include <armigo/services/file_system.h>
 #include "service_registry.h"
 #ifdef ARMIGO_RUNTIME_TESTING
@@ -115,7 +117,7 @@ LaunchStatus validate_synthetic(const LaunchProfile& profile) {
     const auto& permissions = profile.permissions;
     const auto& main = profile.main_thread;
     if (profile.origin != ProfileOrigin::synthetic_test || !profile.is_64_bit ||
-        profile.process.baseline != horizon::Baseline::horizon_20_5_0 ||
+        profile.process.baseline != horizon::Baseline::horizon_23_0_1 ||
         profile.process.address_bits != 39 || !profile.process.allowed_core_mask ||
         (profile.process.allowed_core_mask & ~std::uint64_t{15}) ||
         profile.process.private_system_resource_bytes || profile.process.alias_extra_enabled)
@@ -140,6 +142,24 @@ LaunchStatus validate_synthetic(const LaunchProfile& profile) {
     return std::monostate{};
 }
 
+// Publishes the process clock as the guest timeline subsystems below the
+// runtime (the NVN driver) put their times on. A clock that cannot sample is
+// not published.
+void publish_guest_timeline(GuestClock* clock) noexcept {
+    if (!clock) return;
+    const auto sample = clock->sample();
+    const auto* sampled = std::get_if<ClockSample>(&sample);
+    if (!sampled) return;
+    execution::publish_guest_timeline({
+        .elapsed = [](void* context) noexcept -> std::optional<std::chrono::nanoseconds> {
+            const auto now = static_cast<GuestClock*>(context)->sample();
+            if (const auto* taken = std::get_if<ClockSample>(&now)) return taken->counter_time;
+            return std::nullopt;
+        },
+        .context = clock,
+        .origin = sampled->instant - sampled->counter_time});
+}
+
 class NativeProcessRuntime final : public ProcessRuntime {
 #ifdef ARMIGO_RUNTIME_TESTING
     friend class armigo::runtime::ProcessRuntimeTestAccess;
@@ -155,17 +175,22 @@ public:
           launch_(std::move(launch)), handles_(std::move(handles)), memory_(std::move(memory)),
           arbitration_(std::make_shared<horizon::Arbitration>()),
           keys_(std::make_shared<horizon::ProcessWideKey>(arbitration_)),
-          operation_mode_(operation_mode) {}
+          operation_mode_(operation_mode) {
+        publish_guest_timeline(dependencies_.clock.get());
+    }
     ~NativeProcessRuntime() override {
         // Unbounded destruction is intentional: elapsed time never permits
         // retirement beneath native execution. Shells retain timed-out owners.
         if (std::holds_alternative<LaunchFailure>(shutdown(std::nullopt))) std::terminate();
+        release_nvn_handler();
+        execution::withdraw_guest_timeline(dependencies_.clock.get());
     }
 
     LaunchStatus initialize(std::shared_ptr<romfs::Storage> romfs,
                             std::shared_ptr<const services::AddOnContentCatalog> addon_content,
                             const std::filesystem::path& shader_directory,
-                            std::shared_ptr<PendingShaderPackage> shader_package);
+                            std::shared_ptr<PendingShaderPackage> shader_package,
+                            std::optional<std::string> display_version = {});
     RunResult run(const RunLimits&, const ReportDestination&, std::stop_token) override;
     void request_stop(StopReason reason) noexcept override {
         {
@@ -196,6 +221,29 @@ private:
                 outcome_ = std::move(failure);
         }
         changed_.notify_all();
+    }
+    // An NVN entry point the selected driver cannot serve ends the run with an
+    // unsupported result; its caller never returns to the game.
+    static void unsupported_nvn_call(void* context, const char* detail, std::uint64_t guest_return) noexcept {
+        auto& self = *static_cast<NativeProcessRuntime*>(context);
+        try {
+            auto failure = fail(LaunchStage::graphics, LaunchError::unsupported, "nvn-entry", detail);
+            failure.guest_pc = guest_return;
+            self.record_failure(std::move(failure));
+        } catch (...) {
+        }
+        self.stop_execution();
+    }
+    // The handler names this runtime, so it is installed by it and withdrawn
+    // once its guest threads are gone, before the runtime can be destroyed.
+    void install_nvn_handler() noexcept {
+        nvn::set_unsupported_handler(&unsupported_nvn_call, this);
+        nvn_handler_installed_ = true;
+    }
+    void release_nvn_handler() noexcept {
+        if (!nvn_handler_installed_) return;
+        nvn::set_unsupported_handler(nullptr, nullptr);
+        nvn_handler_installed_ = false;
     }
     void record_teardown_failure(LaunchFailure failure) {
         failure.stage = LaunchStage::shutdown;
@@ -345,6 +393,7 @@ private:
     bool ran_ = false;
     bool stopping_ = false;
     bool quiescent_ = false;
+    bool nvn_handler_installed_ = false;
 };
 
 struct NativeProcessRuntime::ThreadBinding {
@@ -613,9 +662,10 @@ LaunchResult<ThreadServiceBinding> NativeProcessRuntime::bind(
     // Firmware supplies a cleared thread-local region. The SDK owns its TLS
     // allocation and all private pointers it later installs in that region.
     const bool original = launch_.plan.entry_abi == LaunchEntryAbi::original_process;
-    // The Switch 2 kernel publishes the thread's own handle at offset 0x110, where
-    // its SDK reads the current thread's lock owner tag.
-    if (profile_.process.platform == GuestPlatform::switch2) {
+    // The kernel publishes the thread's own handle at offset 0x110, both when it
+    // starts the main thread and when CreateThread creates a worker; the SDK
+    // reads it as the current thread's lock owner tag.
+    {
         const std::uint32_t handle = binding->record->creation_handle();
         std::memcpy(reinterpret_cast<void*>(range.address + 0x110), &handle, sizeof handle);
     }
@@ -730,7 +780,8 @@ LaunchResult<std::shared_ptr<void>> NativeProcessRuntime::acquire_graphics_acces
 LaunchStatus NativeProcessRuntime::initialize(std::shared_ptr<romfs::Storage> romfs,
                                              std::shared_ptr<const services::AddOnContentCatalog> addon_content,
                                              const std::filesystem::path& shader_directory,
-                                             std::shared_ptr<PendingShaderPackage> shader_package) {
+                                             std::shared_ptr<PendingShaderPackage> shader_package,
+                                             std::optional<std::string> display_version) {
     static std::atomic<std::uint64_t> next_process{1};
     process_id_ = next_process.fetch_add(1, std::memory_order_relaxed);
     if (!process_id_ || process_id_ == std::numeric_limits<std::uint64_t>::max())
@@ -747,9 +798,11 @@ LaunchStatus NativeProcessRuntime::initialize(std::shared_ptr<romfs::Storage> ro
     service_dependencies.presenter = dependencies_.presenter;
     service_dependencies.romfs = std::move(romfs);
     service_dependencies.addon_content = std::move(addon_content);
+    service_dependencies.display_version = std::move(display_version);
     service_dependencies.shader_package_directory = shader_directory;
     service_dependencies.pending_shader_package = std::move(shader_package);
     service_dependencies.nvn_driver = launch_.nvn_driver;
+    if (launch_.nvn_driver) install_nvn_handler();
     service_dependencies.nvn_pso_manifest = launch_.nvn_pso_manifest;
     service_dependencies.startup_user = launch_.startup_user;
     service_dependencies.observe_frame = [this](const platform::PresentedFrame& frame) { return observe_frame(frame); };
@@ -1023,6 +1076,7 @@ LaunchStatus NativeProcessRuntime::shutdown(std::optional<ClockInstant> deadline
     host_arguments_.reset();
     memory_.reset();
     handles_.reset();
+    release_nvn_handler();
     launch_ = {};
     keys_.reset(); arbitration_.reset();
     dependencies_.presenter.reset();
@@ -1073,6 +1127,10 @@ std::size_t ProcessRuntimeTestAccess::mutex_waiters(ProcessRuntime& process, std
         keys = runtime.keys_;
     }
     return keys ? keys->mutex_waiters(address) : 0;
+}
+
+void ProcessRuntimeTestAccess::install_nvn_handler(ProcessRuntime& process) {
+    dynamic_cast<NativeProcessRuntime&>(process).install_nvn_handler();
 }
 
 bool ProcessRuntimeTestAccess::run_success_selected(ProcessRuntime& process) {
@@ -1178,12 +1236,13 @@ LaunchResult<std::unique_ptr<ProcessRuntime>> ProcessRuntime::create(
             // A Switch 2 process needs one contiguous host arena (1 GiB mappable,
             // alias, stack and heap) plus its 8 GiB remote window below the
             // 39-bit limit. The host leaves about 40 GiB free there, split by two
-            // large system reservations into at most three gaps, so the largest
-            // gap always holds 13 GiB and the remaining pieces then hold 8 GiB.
-            // A 2 GiB alias window keeps the arena at 13 GiB; the title maps only
-            // a few pages there so far and reserves its large ranges remotely.
+            // large system reservations into at most three gaps. The title's
+            // resource heaps grow by mapping pages into the alias window, so a
+            // 2 GiB window starves them. The window is address space, not
+            // memory: the arena asks for the console's window, independent of
+            // the memory budget, and falls back toward 2 GiB to what fits.
             const auto alias_limit = profile.process.platform == GuestPlatform::switch2
-                ? std::min(extent, std::uint64_t{2} << 30) : extent;
+                ? switch2_alias_window : extent;
             profile.process.base_alias_size = std::min(profile.process.base_alias_size, alias_limit);
             profile.process.stack_size = std::min(profile.process.stack_size, extent);
         }
@@ -1290,10 +1349,19 @@ LaunchResult<std::unique_ptr<ProcessRuntime>> ProcessRuntime::create(
         auto& runtime = owner->runtime;
         LaunchStatus initialized;
         try {
+            // A NUP carries no control data; like the practical reference,
+            // its display version reads the package version as
+            // major.minor.micro from bits 16, 8 and 0.
+            std::optional<std::string> display_version;
+            if (nup_selection) {
+                const auto version = nup_selection->version;
+                display_version = std::to_string(version >> 16) + "." + std::to_string((version >> 8) & 0xff) + "." +
+                                  std::to_string(version & 0xff);
+            }
             initialized = runtime->initialize(
                 std::move(romfs),
                 std::get<std::shared_ptr<const services::AddOnContentCatalog>>(std::move(addon_content)),
-                description.shader_package_directory, std::move(shader_package));
+                description.shader_package_directory, std::move(shader_package), std::move(display_version));
         } catch (const std::bad_alloc&) {
             initialized = fail(LaunchStage::memory, LaunchError::resource_limit, "create-runtime",
                                "Runtime allocation failed before guest execution.");

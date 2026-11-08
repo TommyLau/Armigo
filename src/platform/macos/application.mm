@@ -209,7 +209,8 @@
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender {
     (void)sender;
     NSWindow* window = self.window;
-    if (window && (window.visible || window.miniaturized)) [window performClose:nil];
+    // A hidden application's window is not visible but still closes.
+    if (window && (window.visible || window.miniaturized || NSApp.hidden)) [window performClose:nil];
     return NSTerminateCancel;
 }
 

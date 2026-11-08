@@ -75,8 +75,9 @@ IndirectX18PatchResult make_indirect_x18_patch(
     std::span<const IndirectX18Target> targets, ScalarX18Policy policy = {});
 
 // Prepares an in-place BR X18 whose target is a word inside a table that
-// starts at `table_base` and holds `entries` instructions (a power of two),
-// the shape of a switch that adds a scaled byte index to an ADR base. The
+// starts at `table_base` and holds `entries` instructions (a power of two of
+// at most 65536), the shape of a switch that adds a scaled byte or halfword
+// index to an ADR base. The
 // trampoline reads virtual x18, checks that the target lies inside the table
 // and is word-aligned without changing NZCV, then restores x0/x1 and SP and
 // branches directly to the matching table word; every integer register and

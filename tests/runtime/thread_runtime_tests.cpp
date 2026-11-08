@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/event.h>
 #include <armigo/execution/gate_code.h>
 #include <armigo/execution/gate_patch.h>
 #include <armigo/execution/guest_fault.h>
@@ -543,6 +544,7 @@ struct BindingState {
     bool use_exit_current = false;
     bool join_in_binder = false;
     bool join_from_stop_callback = false;
+    bool stop_join_ran = false;
     bool use_startup_sleep = false;
     bool use_scheduling_boundary = false;
     bool defer_cancelled_scheduling_once = false;
@@ -557,7 +559,13 @@ struct StopJoinCallback {
         if (state && state->runtime && invalid(state->runtime->join(std::nullopt))) {
             state->stop_join_rejections.fetch_add(1, std::memory_order_relaxed);
         }
-        if (state) state->changed.notify_all();
+        if (state) {
+            {
+                std::lock_guard lock(state->mutex);
+                state->stop_join_ran = true;
+            }
+            state->changed.notify_all();
+        }
     }
 };
 
@@ -669,7 +677,13 @@ GateStatus supervise(std::uint16_t immediate, GateCall& call,
                 state.changed.notify_all();
             });
             std::unique_lock lock(state.mutex);
-            state.changed.wait(lock, [&] { return state.release || stop.stop_requested(); });
+            // A stop callback that joins must run before this thread exits:
+            // the exit releases the binding owner, which would deregister it
+            // unrun if the stop request had not reached it yet.
+            state.changed.wait(lock, [&] {
+                return state.release || (stop.stop_requested() &&
+                                         (!state.join_from_stop_callback || state.stop_join_ran));
+            });
         }
         if (state.use_exit_current) {
             if (state.runtime && ok(state.runtime->exit_current())) {
@@ -1103,6 +1117,16 @@ void test_create_validation(const LoadedCode& code) {
     invalid = launch;
     invalid.entry.stack_pointer = pin->range().address - 16;
     CHECK(failed(runtime->create(invalid), LaunchError::invalid_input));
+    // A full handle table is the guest's 0xd201, with nothing published.
+    {
+        std::vector<horizon::Handle> fillers;
+        while (const auto filler = environment.handles->insert(std::make_shared<horizon::Event>()))
+            fillers.push_back(*filler);
+        const auto full = runtime->create(launch);
+        const auto* full_error = std::get_if<LaunchFailure>(&full);
+        CHECK(full_error && full_error->code == LaunchError::resource_limit && full_error->guest_result == 0xd201);
+        for (const auto filler : fillers) CHECK(environment.handles->close(filler));
+    }
 
     auto created = REQUIRE_CREATED(runtime->create(launch));
     CHECK(environment.handles->lookup_as<horizon::ThreadRecord>(created.handle) == created.record);
@@ -1642,6 +1666,12 @@ void test_join_reentry_from_worker_and_stop(const LoadedCode& code) {
         CHECK(ok(runtime->start(created.handle)));
         REQUIRE_WITHIN(environment.binding.first_calls.load() == 1);
         runtime->request_stop();
+        // The join from the stop callback is rejected exactly once, once that
+        // callback has completed (bounded wait, never a fixed sleep).
+        REQUIRE_WITHIN([&] {
+            std::lock_guard lock(environment.binding.mutex);
+            return environment.binding.stop_join_ran;
+        }());
         CHECK(environment.binding.stop_join_rejections.load() == 1);
         CHECK(ok(runtime->join(std::nullopt)) && created.record->exited());
         CHECK(environment.binding.owner_destroyed.load() == 1);

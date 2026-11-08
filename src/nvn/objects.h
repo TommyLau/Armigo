@@ -313,16 +313,21 @@ struct CommandBufferState {
     NVNdevice* device;
     std::uint8_t* segment_base;
     // Game-donated segment and the position a native driver would have
-    // written to, while records live in host blocks.
-    std::uint8_t* donated_base;
-    std::uint8_t* donated_end;
-    std::uint8_t* donated_cursor;
+    // written to, while records live in host blocks. Integer addresses: a
+    // segment may run past the end of its pool, and nothing is read or
+    // written through them.
+    std::uintptr_t donated_base;
+    std::uintptr_t donated_end;
+    std::uintptr_t donated_cursor;
     CommandList* list;
     // The out-of-memory callback ran for this segment without adding memory.
     std::uint32_t callback_exhausted;
     // The control-memory callback could not provide more memory; a record of
     // the current recording could not be made.
     std::uint8_t control_exhausted, recording_failed;
+    // API 231 can stop the memory callback for either kind of memory; API 55
+    // never sets these.
+    std::uint8_t command_callback_disabled, control_callback_disabled;
     // Game-donated control memory and the position a native driver would have
     // used, and the strides SetCopyRowStride/SetCopyImageStride last set.
     std::uint8_t* control_base;

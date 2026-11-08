@@ -402,8 +402,9 @@ void test_compatible_memory_spans() {
     transfer[2] = 2 * page;
     transfer[3] = 0;
     CHECK(kernel.dispatch(0x15, transfer) == QueryDisposition::handled);
-    CHECK(transfer[0] == 0 && transfer[1] != 0);
-    CHECK(handles.size() == 1);
+    // The range carries IPC and device references, so the kernel cannot lock it.
+    CHECK(transfer[0] == 0xd401);
+    CHECK(handles.size() == 0);
 
     const auto rejected = [&](std::array<MemoryBlock, 2> map) {
         const auto made = ProcessRecord::create(configuration(), accounting(), map);
@@ -462,6 +463,7 @@ void test_get_info() {
         check_reply(get_info(kernel, type, process_handle), 0, value);
         check_reply(get_info(kernel, upper | type, 0, 1), 0xe801, upper | type);
         check_reply(get_info(kernel, upper | type, 0), 0xe401, upper | type);
+        check_reply(get_info(kernel, type, 0), 0xe401, type);
         check_reply(get_info(kernel, type, thread_handle), 0xe401, type);
         check_reply(get_info(kernel, type, current_thread_handle), 0xe401, type);
     }
@@ -502,6 +504,30 @@ void test_get_info() {
     CHECK(input == before);
     CHECK(kernel.dispatch(0x99, input) == QueryDisposition::unsupported_operation);
     CHECK(input == before);
+
+    // Switch 1 on Horizon 23.0.1. Type 17 reports used private system resources.
+    check_reply(get_info(kernel, 17), 0, 0);
+    check_reply(get_info(kernel, 17, process_handle), 0, 0);
+    // Types 29-33 are invalid information on Switch 1, whatever the baseline.
+    for (auto type : {29u, 30u, 31u, 32u, 33u}) {
+        check_reply(get_info(kernel, type), 0xf001, type);
+    }
+    // Types 36-38 are recognized and unimplemented: unsupported, not invalid info.
+    for (auto type : {36u, 37u, 38u}) {
+        input = registers();
+        input[1] = type;
+        input[2] = current_process_handle;
+        const auto unchanged = input;
+        CHECK(kernel.dispatch(0x29, input) == QueryDisposition::unsupported_operation);
+        CHECK(input == unchanged);
+    }
+    // A zero handle is not a current-process alias. Type 8 checks the handle
+    // before the sub-id.
+    check_reply(get_info(kernel, 20, 0), 0xe401, 20);
+    check_reply(get_info(kernel, 17, 0), 0xe401, 17);
+    check_reply(get_info(kernel, 8, 0, 0), 0, 0);
+    check_reply(get_info(kernel, 8, process_handle, 1), 0xe401, 8);
+    check_reply(get_info(kernel, 8, 0, 1), 0xe801, 8);
 
     auto config = configuration();
     config.alias_extra_enabled = true;
@@ -1016,21 +1042,34 @@ void test_memory_queries() {
         CHECK(kernel.dispatch(0x15, input) == QueryDisposition::handled);
         return input;
     };
-    CHECK(transfer(stack_address, 0x4000, 3)[0] == 0);
-    const auto created = transfer(stack_address, 0x4000, 0);
+    // Argument checks in kernel order: address, size, overflow, then permission
+    // (none, read or read-write).
+    CHECK(transfer(output_address + 8, 0, 2)[0] == 0xcc01);
+    CHECK(transfer(output_address, 0, 2)[0] == 0xca01);
+    CHECK(transfer(output_address, 0x1000 + 8, 0)[0] == 0xca01);
+    CHECK(transfer(0xfffffffffffff000ull, 0x2000, 2)[0] == 0xd401);
+    CHECK(transfer(output_address, 0x1000, 2)[0] == 0xd801);
+    CHECK(transfer(output_address, 0x1000, 4)[0] == 0xd801);
+    // Only a read-write data mapping without attributes may be transferred.
+    CHECK(transfer(stack_address, 0x4000, 0)[0] == 0xd401);
+    CHECK(transfer(code_address, 0x1000, 0)[0] == 0xd401);
+    CHECK(transfer(0x7f0000000000, 0x1000, 0)[0] == 0xd401);
+    CHECK(transfer(output_address + 0x1000, 0x2000, 0)[0] == 0xd401);
+    // The owner's range stays locked while the object lives, so it cannot be
+    // transferred again; the last reference unlocks it.
+    const auto created = transfer(output_address + 0x1000, 0x1000, 0);
     CHECK(created[0] == 0 && created[1] != 0);
     CHECK(handles.lookup_as<TransferMemoryRecord>(created[1]) != nullptr);
-    CHECK(handles.lookup_as<TransferMemoryRecord>(created[1])->range().address == stack_address);
-    CHECK(handles.lookup_as<TransferMemoryRecord>(created[1])->range().size == 0x4000);
-    // A misaligned size, an unmapped address and a permission above three are
-    // refused instead of reporting a handle.
-    CHECK(transfer(stack_address, 0x1000 + 8, 0)[0] != 0);
-    // A range that starts inside a larger mapped block is accepted; the stack block
-    // spans four pages, so its second page is a valid sub-range.
-    CHECK(transfer(stack_address + 0x1000, 0x1000, 0)[0] == 0);
-    CHECK(transfer(stack_address + 0x3000, 0x2000, 0)[0] != 0);
-    CHECK(transfer(0x7f0000000000, 0x1000, 0)[0] != 0);
-    CHECK(transfer(stack_address, 0x1000, 4)[0] != 0);
+    CHECK(handles.lookup_as<TransferMemoryRecord>(created[1])->range().address == output_address + 0x1000);
+    CHECK(handles.lookup_as<TransferMemoryRecord>(created[1])->range().size == 0x1000);
+    CHECK(current->query_memory(output_address + 0x1000).attributes == 1);
+    CHECK(current->query_memory(output_address).attributes == 0);
+    CHECK(transfer(output_address, 0x2000, 3)[0] == 0xd401);
+    CHECK(handles.close(static_cast<Handle>(created[1])));
+    CHECK(current->query_memory(output_address + 0x1000).attributes == 0);
+    const auto whole = transfer(output_address, 0x2000, 3);
+    CHECK(whole[0] == 0 && handles.close(static_cast<Handle>(whole[1])));
+    CHECK(current->query_memory(output_address).attributes == 0);
 
     output.reset();
     check_reply(query(output_address + 1, stack_address + 23), 0, upper);
@@ -1056,12 +1095,18 @@ void test_memory_queries() {
         CHECK(output.word(24, 4) == 0);
         CHECK(output.word(36, 4) == 0);
     }
-    for (auto destination : {std::uint64_t{0}, code_address, ProcessRecord::query_end,
+    // An output outside the process address space fails before the query and keeps
+    // x1 whole; an unmapped output inside it fails the copy after the query.
+    for (auto destination : {std::uint64_t{0}, ProcessRecord::aslr_start - 8,
+                              ProcessRecord::query_end - 32, ProcessRecord::query_end,
                               std::uint64_t{UINT64_MAX - 1}}) {
         output.reset();
-        check_reply(query(destination, stack_address), 0xe601, upper);
+        check_reply(query(destination, stack_address), 0xe601, upper | 0x12345678);
         CHECK(output.completed == 0);
     }
+    output.reset();
+    check_reply(query(code_address, stack_address), 0xe601, upper);
+    CHECK(output.completed == 0);
 
     // Only the first aligned word is writable. A later fault keeps that prefix.
     auto map = blocks();
@@ -1081,6 +1126,67 @@ void test_memory_queries() {
     CHECK(output.word(8, 4) == 0x4000);
     CHECK(output.word(12, 4) == 0xcdcdcdcd);
 }
+
+// The SVC wait timeout is the guest timeout converted once with the process's
+// counter rate; a second conversion would be a different duration. The 1 ns
+// waits below check the SVC wiring on each platform; the waits have no injected
+// clock, so the duration they pass down is checked through svc_wait_timeout.
+void test_svc_timeout_rounded_once() {
+    CHECK(kernel_timeout(1) == std::chrono::nanoseconds(156));
+    CHECK(kernel_timeout(kernel_timeout(1).count()) == std::chrono::nanoseconds(260));
+    CHECK(kernel_timeout(1, switch2_counter) == std::chrono::nanoseconds(96));
+    CHECK(kernel_timeout(kernel_timeout(1, switch2_counter).count(), switch2_counter) ==
+          std::chrono::nanoseconds(160));
+
+    CHECK(svc_wait_timeout(nullptr, 1) == 156);
+
+    const auto run = [](armigo::GuestPlatform platform) {
+        auto config = configuration();
+        config.platform = platform;
+        const auto built = ProcessRecord::create(config, accounting(), blocks());
+        CHECK(built.ok());
+        if (!built.ok()) return;
+        const auto once = platform == armigo::GuestPlatform::switch2 ? 96 : 156;
+        CHECK(svc_wait_timeout(built.process.get(), 1) == once);
+        CHECK(svc_wait_timeout(built.process.get(), 0) == 0);
+        CHECK(svc_wait_timeout(built.process.get(), -1) == -1);
+        CHECK(svc_wait_timeout(built.process.get(), 1'000'000) ==
+              (platform == armigo::GuestPlatform::switch2 ? 1'000'064 : 1'000'104));
+        HandleTable handles(4);
+        auto thread = std::make_shared<ThreadRecord>(built.process, 1, 1);
+        Output output;
+        output.reset();
+        const auto address = output_address + 8;
+        constexpr std::uint32_t word = 5;
+        for (unsigned index = 0; index != 4; ++index)
+            output.bytes[address - output_address + index] =
+                static_cast<std::byte>((word >> (8 * index)) & 255);
+        StartupQueries kernel(built.process, handles, thread,
+                              {Output::write, Output::read, &output, Output::compare_exchange,
+                               Output::read_double_word});
+        auto wait = registers();
+        wait[0] = address;
+        wait[1] = 2;
+        wait[2] = word;
+        wait[3] = 1;
+        CHECK(kernel.dispatch(0x34, wait) == QueryDisposition::handled);
+        CHECK(wait[0] == 0xea01);
+
+        auto sync = registers();
+        sync[2] = 0;
+        sync[3] = 1;
+        CHECK(kernel.dispatch(0x18, sync) == QueryDisposition::handled);
+        CHECK(sync[0] == 0xea01);
+
+        sync = registers();
+        sync[2] = 0;
+        sync[3] = 0;
+        CHECK(kernel.dispatch(0x18, sync) == QueryDisposition::handled);
+        CHECK(sync[0] == 0xea01);
+    };
+    run(armigo::GuestPlatform::switch1);
+    run(armigo::GuestPlatform::switch2);
+}
 } // namespace
 
 int main() {
@@ -1092,6 +1198,7 @@ int main() {
     test_current_processor();
     test_per_processor_allocations();
     test_memory_queries();
+    test_svc_timeout_rounded_once();
     auto compact = configuration();
     compact.allocation_region = {0x100000000, std::uint64_t{5} << 30};
     compact.alias_address = compact.allocation_region.address + (256ull << 20);
@@ -1113,10 +1220,11 @@ int main() {
     }
     compact.heap_size += guest_page_size;
     CHECK(ProcessRecord::create(compact, accounting(), {}).error == ProcessStateError::invalid_layout);
-    // svcClearEvent clears an event whether or not it was signalled; any other
-    // object or no object is an invalid handle.
+    // svcClearEvent clears an event through either end whether or not it was
+    // signalled; any other object or no object is an invalid handle. Only the
+    // writable end accepts svcSignalEvent.
     if (host.ok()) {
-        HandleTable events(4);
+        HandleTable events(6);
         auto thread = std::make_shared<ThreadRecord>(host.process, 1, 44);
         StartupQueries queries(host.process, events, thread);
         auto event = std::make_shared<Event>(true);
@@ -1132,6 +1240,19 @@ int main() {
         CHECK(clear(handle) == 0 && !event->is_signaled());
         CHECK(clear(0x1234) == 0xe401);
         CHECK(clear(other) == 0xe401);
+        unsigned observed = 0;
+        const auto writable = events.insert(std::make_shared<WritableEvent>(event, [&] { ++observed; })).value();
+        const auto signal = [&](Handle target) {
+            QueryRegisters registers{};
+            registers[0] = target;
+            CHECK(queries.dispatch(0x11, registers) == QueryDisposition::handled);
+            return registers[0];
+        };
+        CHECK(signal(handle) == 0xe401 && !event->is_signaled());
+        CHECK(signal(other) == 0xe401);
+        CHECK(signal(writable) == 0 && event->is_signaled() && observed == 1);
+        CHECK(signal(writable) == 0 && event->is_signaled() && observed == 2);
+        CHECK(clear(writable) == 0 && !event->is_signaled());
     }
     std::printf("Horizon startup query failures: %u\n", failures);
         {

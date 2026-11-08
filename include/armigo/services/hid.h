@@ -48,6 +48,11 @@ struct HostFullKeyInput {
     std::array<float, 3> angular_velocity{};
 };
 void set_host_full_key_input(const HostFullKeyInput& input) noexcept;
+// Sets the host input and writes it to every applet resource's shared memory
+// now rather than at its sampler's next 5 ms tick, so a test driver that steps
+// input with the guest's frames makes each state visible before the guest's
+// next read (guest-present input scripts).
+void publish_host_full_key_input_now(const HostFullKeyInput& input) noexcept;
 
 // One vibration value as the guest sends it: amplitudes in [0, 1] and
 // frequencies in Hz for the low and high bands. Neutral is {0, 160, 0, 320}.
@@ -80,8 +85,9 @@ class HidSession final : public horizon::ClientSession {
 public:
     // Initial logical flags can be supplied by the host; construction does not
     // start a sensor. Normal launches begin with both flags clear.
+    // A Switch 2 session also serves the Switch 2 vibration command (214).
     explicit HidSession(std::uint64_t process_id,
-                        SevenSixAxisSamplingState initial_sampling_state = {});
+                        SevenSixAxisSamplingState initial_sampling_state = {}, bool switch2 = false);
     horizon::IpcReply request(const horizon::IpcMessage& message,
                               std::uint64_t sender_pid) override;
     horizon::IpcReply request_with_buffers(const horizon::IpcMessage& message,
@@ -109,6 +115,18 @@ public:
     bool touch_activated() const noexcept {
         const std::lock_guard lock(request_mutex_);
         return touch_activated_;
+    }
+    bool mouse_activated() const noexcept {
+        const std::lock_guard lock(request_mutex_);
+        return mouse_activated_;
+    }
+    bool keyboard_activated() const noexcept {
+        const std::lock_guard lock(request_mutex_);
+        return keyboard_activated_;
+    }
+    std::uint32_t mouse_library_version() const noexcept {
+        const std::lock_guard lock(request_mutex_);
+        return mouse_library_version_;
     }
     SevenSixAxisSamplingState seven_six_axis_sampling_state() const noexcept {
         const std::lock_guard lock(request_mutex_);
@@ -143,6 +161,9 @@ private:
     std::uint32_t revision_ = 0;
     bool activated_ = false;
     bool touch_activated_ = false;
+    bool mouse_activated_ = false;
+    bool keyboard_activated_ = false;
+    std::uint32_t mouse_library_version_ = 0;
     std::uint32_t npad_joy_hold_type_ = 0;
     std::uint32_t npad_handheld_activation_mode_ = 0;
     std::uint32_t npad_single_device_type_ = 0;
@@ -162,6 +183,8 @@ private:
     std::unordered_map<std::uint32_t, SixAxisState> fallback_six_axis_;
     bool full_key_connected_ = false;
     bool vibration_permitted_ = true;
+    bool switch2_ = false;
+    bool switch2_vibration_warned_ = false;
     // The last value sent to each FullKey motor (left, right).
     std::array<VibrationValue, 2> vibration_values_{};
     const char* diagnostic_ = nullptr;

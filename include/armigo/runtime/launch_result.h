@@ -24,7 +24,7 @@ class ProcessRuntime;
 
 // Host orchestration outcomes, never invented Horizon Results. Implementers
 // preserve the first causal failure and its stage, including during teardown.
-// Firmware 20.5.0 is the sole baseline; partial coverage is not success.
+// Horizon 23.0.1 is the sole baseline; partial coverage is not success.
 // An unsupported SVC/IPC,
 // preparation gap or shader miss stops the run; it cannot count as success.
 // Diagnostic addresses/identities are external report data, never fixtures.

@@ -9,6 +9,7 @@
 // ============================================================================
 
 #include <armigo/common/diagnostics.h>
+#include <armigo/nvn/driver.h>
 #include "../../nvn/programs.h"
 #include <armigo/platform/metal_shader_package.h>
 #include <armigo/shader_input/shader_input.h>
@@ -546,6 +547,11 @@ StagePointer prepare_runtime_stage(std::vector<std::byte>&& control, std::vector
     options.texture_handle_cbuf = 2;
     options.texture_descriptors_derived = true;
     std::string text = "ported tc=2 td=derived stage=" + std::to_string(static_cast<unsigned>(stage));
+    // The title's opt-in changes the translation, so it is part of the key.
+    if (nvn::title_policy().hoist_implicit_samples) {
+        options.hoist_implicit_samples = true;
+        text += " hi=1";
+    }
     if (stage == shader_input::Stage::Vertex) {
         options.emission.vertex_depth = depth;
         text += " vd=" + std::to_string(static_cast<unsigned>(depth));
@@ -703,12 +709,16 @@ bool resolve_package(void*, const DeviceState* device, std::span<const NVNshader
         // guest memory at the program's address, as for the command-stream path.
         std::string missing = "The shader package does not hold the stage";
         if (shader_package) {
-            auto found = shader_package->lookup_stage_at(shader.stage, descriptor.data + shader.code_offset, depth);
-            if (const auto* failure = std::get_if<graphics::CommandResult>(&found)) {
-                missing = std::string(failure->detail);
+            if (shader_package->hoists_implicit_samples() != nvn::title_policy().hoist_implicit_samples) {
+                missing = "The shader package was translated with a different sample hoisting than the title selects";
             } else {
-                stages[index] = std::get<std::shared_ptr<const platform::CompiledGraphicsStage>>(std::move(found));
-                continue;
+                auto found = shader_package->lookup_stage_at(shader.stage, descriptor.data + shader.code_offset, depth);
+                if (const auto* failure = std::get_if<graphics::CommandResult>(&found)) {
+                    missing = std::string(failure->detail);
+                } else {
+                    stages[index] = std::get<std::shared_ptr<const platform::CompiledGraphicsStage>>(std::move(found));
+                    continue;
+                }
             }
         }
         if (!runtime_stages().enabled) {

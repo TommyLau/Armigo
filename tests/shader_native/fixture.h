@@ -11,6 +11,7 @@
 #pragma once
 #include <armigo/shader_native/frontend.h>
 #include <armigo/shader_native/instruction.h>
+#include <array>
 #include <stdexcept>
 
 namespace armigo::shader_native::test {
@@ -31,13 +32,32 @@ inline void put(sn::Buffer& b, unsigned at, std::uint32_t value) { for (unsigned
 struct Fixture {
     sn::Buffer control = sn::Buffer(0xe0), code;
     sn::Stage stage;
-    Fixture(std::vector<sn::Instruction> instructions, sn::Stage s = sn::Stage::fragment) : code(128 + instructions.size() * 16), stage(s) {
+    // A compute stage's thread group; launch() rewrites it in the control.
+    std::array<std::uint32_t, 3> local_size{32, 1, 1};
+    // constants follow the image as the program's constant section (bank 1).
+    // Graphics images start with the 128-byte program header; compute code
+    // has none.
+    Fixture(std::vector<sn::Instruction> instructions, sn::Stage s = sn::Stage::fragment, std::vector<std::uint32_t> constants = {})
+        : code((s == sn::Stage::compute ? 0 : 128) + instructions.size() * 16 + constants.size() * 4), stage(s) {
+        const unsigned header = stage == sn::Stage::compute ? 0 : 128;
+        const auto end = static_cast<std::uint32_t>(header + instructions.size() * 16);
         put(control, 0, 0x98761234); put(control, 4, 0xc9); put(control, 8, 20); put(control, 0x30, control.size());
-        put(control, 0x38, code.size()); put(control, 0x40, code.size()); put(control, 0x44, code.size()); control[0x56] = std::byte(unsigned(stage));
-        put(code, 0, (4 << 5) | (stage == sn::Stage::vertex ? 1 | (1 << 10) : 2 | (5 << 10) | (1 << 14)));
-        if (stage == sn::Stage::fragment) put(code, 0x48, 1);
-        else code[0x35] = std::byte{0xf0};
-        for (unsigned n = 0; n < instructions.size(); ++n) for (unsigned w = 0; w < 4; ++w) put(code, 128 + n * 16 + w * 4, instructions[n].words[w]);
+        put(control, 0x38, end); put(control, 0x3c, static_cast<std::uint32_t>(constants.size() * 4)); put(control, 0x40, end);
+        put(control, 0x44, code.size()); control[0x56] = std::byte(unsigned(stage));
+        for (unsigned n = 0; n < constants.size(); ++n) put(code, end + n * 4, constants[n]);
+        if (stage == sn::Stage::compute) launch(local_size, 0);
+        else {
+            // Task and mesh stages take a vertex-kind header.
+            put(code, 0, (4 << 5) | (stage != sn::Stage::fragment ? 1 | (1 << 10) : 2 | (5 << 10) | (1 << 14)));
+            if (stage == sn::Stage::fragment) put(code, 0x48, 1);
+            else code[0x35] = std::byte{0xf0};
+        }
+        for (unsigned n = 0; n < instructions.size(); ++n) for (unsigned w = 0; w < 4; ++w) put(code, header + n * 16 + w * 4, instructions[n].words[w]);
+    }
+    void launch(std::array<std::uint32_t, 3> size, std::uint32_t shared_bytes) {
+        local_size = size;
+        for (unsigned n = 0; n < 3; ++n) put(control, 0x58 + 4 * n, size[n]);
+        put(control, 0x64, shared_bytes);
     }
     sn::Program program() const {
         sn::Record r; r.control = control; r.code = code; r.kind = sn::ContainerKind::bnsh;

@@ -730,6 +730,17 @@ Builder correlated_builder(bool nested, bool loop, bool rewrite = false, bool un
     return b;
 }
 
+bool literal_word_copy(const Program& program, ValueId value, LiteralBits literal) {
+    for (const auto& operation : program.operations) {
+        if (operation.opcode != Opcode::copy || operation.inputs.size() != 1 ||
+            operation.outputs.size() != 1) continue;
+        const auto* output = std::get_if<ValueId>(&operation.outputs[0]);
+        const auto* bits = std::get_if<LiteralBits>(&operation.inputs[0]);
+        if (output && *output == value && bits && *bits == literal) return true;
+    }
+    return false;
+}
+
 void test_nested_correlations_and_phi_chains() {
     for (const bool nested : {false, true}) {
         for (const bool loop : {false, true}) {
@@ -757,19 +768,98 @@ void test_nested_correlations_and_phi_chains() {
                     "A predicate rewrite does not inherit a previous reaching definition's facts");
     expect_zero_reads(correlated_builder(true, false, false, true),
                     "A different guard does not prove the original definition executed");
-    auto bounded = correlated_builder(true, false).take();
-    Limits limits;
-    limits.blocks = bounded.blocks.size();
-    auto result = construct_ssa(RegisterProgram{bounded}, limits);
-    const auto* failure = std::get_if<Diagnostic>(&result);
-    check(failure && failure->code == DiagnosticCode::limit_exceeded,
-          "Legacy correlation cloning respects the inherited block budget");
-    limits = Limits{};
-    limits.operations = bounded.operations.size();
-    result = construct_ssa(RegisterProgram{bounded}, limits);
-    failure = std::get_if<Diagnostic>(&result);
-    check(failure && failure->code == DiagnosticCode::limit_exceeded,
-          "Legacy correlation cloning respects the operation budget");
+    // The nested fixture's register program has 11 blocks and 8 operations.
+    // When a guard proof gives up, dead-code removal drops four operations
+    // (R0's initialization, the latch add, the latch compare, and the unread
+    // R3 copy of 9) and the two undefined inputs of the join phi each gain an
+    // entry zero. The defined path, p and q both true, still stores 7. The
+    // other predicate combinations take an undefined join edge but the same
+    // guards skip the store, so they contribute no output; the value on that
+    // edge is the synthesized zero, not the entry's original R0 copy (that
+    // copy is dead). A completed proof instead clones to 18 blocks and leaves
+    // no entry zero.
+    const auto shape = correlated_builder(true, false).take();
+    const auto check_fallback = [&](const Program& program, std::string_view message) {
+        check(program.functions.size() == 1, message);
+        check(program.blocks.size() == shape.blocks.size(), message);
+        check(shape.operations.size() == 8 && program.operations.size() == 6, message);
+        check(test::entry_zero_reads(program, ValueType::word32) == 2, message);
+        check(test::entry_zero_reads(program, ValueType::predicate) == 0, message);
+        const Phi* join = nullptr;
+        for (const auto& block : program.blocks)
+            if (block.phis.size() == 1 && block.predecessors.size() == 3) join = &block.phis[0];
+        check(join != nullptr, message);
+        if (!join) return;
+        std::vector<ValueId> zeros;
+        int defined_inputs = 0;
+        const LiteralBits zero_word{0, ValueType::word32};
+        const LiteralBits seven{7, ValueType::word32};
+        for (const auto& input : join->inputs) {
+            if (test::entry_literal_copy(program, input.value, zero_word)) zeros.push_back(input.value);
+            else if (literal_word_copy(program, input.value, seven)) ++defined_inputs;
+        }
+        check(zeros.size() == 2 && zeros[0] != zeros[1], message);
+        check(defined_inputs == 1, message);
+        for (const bool p : {false, true}) {
+            for (const bool q : {false, true}) {
+                const bool defined_path = p && q;
+                check(correlated_outputs(program, p, q) ==
+                          (defined_path ? std::vector<std::uint64_t>{7} : std::vector<std::uint64_t>{}),
+                      message);
+            }
+        }
+    };
+    // Correlation cloning that would exceed the block budget proves nothing.
+    {
+        Limits limits;
+        limits.blocks = static_cast<std::uint32_t>(shape.blocks.size());
+        const auto unproven = expect_ok(correlated_builder(true, false),
+            "A correlation proof over the block budget is skipped", limits);
+        check_fallback(unproven, "A skipped block-budget proof zeros only the undefined join inputs");
+    }
+    // Specialization copies an operation for every predicate state. The
+    // register program's 8 operations are enough to reject that clone (9 lets
+    // it finish) and still hold the fallback's 6 operations, including both
+    // entry zeros, so the case is the proof fallback rather than a zero that
+    // itself exceeds the operation budget.
+    {
+        Limits limits;
+        limits.operations = static_cast<std::uint32_t>(shape.operations.size());
+        const auto unproven = expect_ok(correlated_builder(true, false),
+            "A correlation proof over the operation budget is skipped", limits);
+        check_fallback(unproven, "A skipped operation-budget proof clones nothing and zeros the undefined inputs");
+    }
+    // Analysis-step refund, measured by binary search on this fixture in a
+    // Release build. Construction spends 160 steps before either proof.
+    // Zeroing then needs 195 steps and fails at 194. The fixed-CFG repair
+    // reaches step 686 before returning no program, so budgets 195..685
+    // exceed inside that repair and succeed only because those steps are
+    // returned. Specialization then runs from 686 and finishes at 818, so
+    // budgets 686..817 exceed inside specialization and likewise succeed only
+    // after the refund. A finished specialization does not fit until 1015,
+    // where it clones blocks instead of zeroing. 400 and 750 sit inside the
+    // two windows. 176 is above the 160 already spent and below 195, so the
+    // zeroing that follows a refund still exhausts the budget.
+    {
+        Limits limits;
+        limits.analysis_steps = 400;
+        const auto unproven = expect_ok(correlated_builder(true, false),
+            "A fixed-CFG proof over the analysis budget is refunded", limits);
+        check_fallback(unproven, "Refunding a fixed-CFG proof leaves the original CFG and the undefined-input zeros");
+    }
+    {
+        Limits limits;
+        limits.analysis_steps = 750;
+        const auto unproven = expect_ok(correlated_builder(true, false),
+            "A specialization proof over the analysis budget is refunded", limits);
+        check_fallback(unproven, "Refunding a specialization proof leaves the original CFG and the undefined-input zeros");
+    }
+    {
+        Limits limits;
+        limits.analysis_steps = 176;
+        expect_rejected(correlated_builder(true, false), DiagnosticCode::limit_exceeded,
+                        "Zeroing after a refunded proof still obeys the analysis budget", limits);
+    }
 }
 
 void test_loop_predicate_redefinition() {
@@ -1303,8 +1393,9 @@ void test_feasible_undefined_collective_inputs() {
         builder.terminate(join, Return{});
         Limits limits;
         limits.token_states = state_budget;
-        expect_rejected(std::move(builder), DiagnosticCode::limit_exceeded,
-                        "Fixed-CFG proof respects the predicate-state budget", limits);
+        // A proof over the predicate-state budget proves nothing: the read
+        // takes the zero reading.
+        expect_zero_reads(std::move(builder), "A fixed-CFG proof over the predicate-state budget leaves the zero reading", limits);
         (void)replacement;
     }
 
@@ -1625,6 +1716,167 @@ void test_unreachable_and_inputs() {
     }
 }
 
+// How the guarded program ends: a return, or a reachable region that never
+// returns, optionally reading the first guarded register there.
+enum class GuardTail { exit, spin, spin_reads_guarded };
+
+void test_independent_guards_keep_separate_predicate_states(GuardTail tail) {
+    // Twenty guards, each repeated, are simultaneously live. One shared
+    // predicate-assignment key would admit 2^20 states at the joins, past
+    // the predicate-state budget. Each guard's own predicate is enough, also
+    // when a non-returning region leaves postdominance undefined for a block.
+    constexpr int guards = 20;
+    check(std::uint32_t{1} << guards > Limits{}.token_states,
+          "The joint predicate product exceeds the predicate-state budget");
+    Builder builder;
+    std::vector<ValueId> predicates;
+    predicates.reserve(guards);
+    for (int i = 0; i < guards; ++i) predicates.push_back(builder.parameter(ValueType::predicate));
+    const auto replacement = builder.parameter(ValueType::word32);
+    ValueId halt;
+    if (tail != GuardTail::exit) halt = builder.parameter(ValueType::predicate);
+    const auto entry = builder.entry();
+    std::vector<BlockId> heads, assigns, joins, tests, stores;
+    auto previous = entry;
+    std::vector<OperationId> definitions;
+    for (int i = 0; i < guards; ++i) {
+        const auto head = builder.make_block();
+        const auto assign = builder.make_block();
+        const auto join = builder.make_block();
+        builder.terminate(previous, Jump{head});
+        builder.copy(head, pred(0), predicates[static_cast<std::size_t>(i)]);
+        builder.terminate(head, Branch{pred(0), assign, join});
+        definitions.push_back(builder.copy(assign, gpr(static_cast<std::uint16_t>(i)),
+                                            word(static_cast<std::uint32_t>(100 + i))));
+        builder.terminate(assign, Jump{join});
+        heads.push_back(head);
+        assigns.push_back(assign);
+        joins.push_back(join);
+        previous = join;
+    }
+    for (int i = 0; i < guards; ++i) {
+        const auto test = builder.make_block();
+        const auto store = builder.make_block();
+        builder.terminate(previous, Jump{test});
+        builder.copy(test, pred(0), predicates[static_cast<std::size_t>(i)]);
+        builder.terminate(test, Branch{pred(0), store, i + 1 == guards ? test : test});
+        // The false target is patched once the following block exists.
+        (void)store;
+        tests.push_back(test);
+        stores.push_back(store);
+        previous = test;
+    }
+    const auto done = builder.make_block();
+    for (int i = 0; i < guards; ++i) {
+        const auto next = i + 1 == guards ? done : tests[static_cast<std::size_t>(i + 1)];
+        builder.terminate(tests[static_cast<std::size_t>(i)],
+                          Branch{pred(0), stores[static_cast<std::size_t>(i)], next});
+        builder.store_word(stores[static_cast<std::size_t>(i)], gpr(static_cast<std::uint16_t>(i)));
+        builder.terminate(stores[static_cast<std::size_t>(i)], Jump{next});
+    }
+    auto last = done;
+    if (tail == GuardTail::exit) {
+        builder.terminate(done, Return{});
+    } else {
+        // The end either returns or spins forever; the spin never reaches a
+        // return.
+        const auto finish = builder.make_block();
+        const auto spin = builder.make_block();
+        builder.copy(done, pred(0), halt);
+        builder.terminate(done, Branch{pred(0), finish, spin});
+        builder.terminate(finish, Return{});
+        if (tail == GuardTail::spin_reads_guarded) builder.store_word(spin, gpr(0));
+        builder.terminate(spin, Jump{spin});
+        last = spin;
+    }
+    const auto expected_blocks = last.value + 1;
+    if (tail == GuardTail::spin_reads_guarded) {
+        // The spin reads the first guarded register on a feasible path where
+        // its guard was false, so the fixed-CFG repair is refused; path
+        // specialization of twenty guards would exceed the block budget, so
+        // it is skipped and the read takes the zero reading.
+        expect_zero_reads(std::move(builder), "A feasible undefined read in a non-returning region reads zero");
+        return;
+    }
+
+    const auto program = expect_ok(std::move(builder),
+        "Independent repeated guards stay inside the predicate-state budget");
+    if (program.functions.empty()) return;
+    check(program.blocks.size() == expected_blocks,
+          "Each guard is repaired in the original CFG");
+    check(test::entry_zero_reads(program, ValueType::word32) == 0,
+          "Unobservable skip edges are repaired rather than read as zero");
+    for (int i = 0; i < guards; ++i) {
+        const auto& phis = program.blocks[joins[static_cast<std::size_t>(i)].value].phis;
+        check(phis.size() == 1, "Each guarded register has one phi");
+        if (phis.size() != 1) continue;
+        const auto* defined = phi_input(phis[0], assigns[static_cast<std::size_t>(i)]);
+        const auto* skipped = phi_input(phis[0], heads[static_cast<std::size_t>(i)]);
+        check(defined && defined->value == def_of(program, definitions[static_cast<std::size_t>(i)]),
+              "The taken arm keeps the guarded definition");
+        check(skipped && skipped->value == replacement,
+              "The untaken arm reuses the dominating word parameter");
+    }
+
+    const auto run = [&](std::uint32_t mask) -> std::vector<std::uint64_t> {
+        std::vector<std::optional<std::uint64_t>> values(program.values.size());
+        const auto& function = program.functions[0];
+        for (int i = 0; i < guards; ++i)
+            values[function.parameters[static_cast<std::size_t>(i)].value] = (mask >> i) & 1u;
+        values[replacement.value] = 0x11111111u;
+        if (halt.valid()) values[halt.value] = 1;
+        const auto read = [&](const Operand& operand) -> std::optional<std::uint64_t> {
+            if (const auto* literal = std::get_if<LiteralBits>(&operand)) return literal->bits;
+            const auto* id = std::get_if<ValueId>(&operand);
+            if (!id || id->value >= values.size() || !values[id->value]) return std::nullopt;
+            return *values[id->value];
+        };
+        std::vector<std::uint64_t> outputs;
+        BlockId previous;
+        auto current = function.entry;
+        for (unsigned step = 0; step < 400; ++step) {
+            const auto& block = program.blocks[current.value];
+            for (const auto& phi : block.phis) {
+                const auto* edge = phi_input(phi, previous);
+                if (!edge) return std::vector<std::uint64_t>{};
+                const auto bits = read(Operand{edge->value});
+                if (!bits) return {};
+                values[phi.output.value] = *bits;
+            }
+            for (const auto id : block.operations) {
+                const auto& op = program.operations[id.value];
+                if (op.opcode == Opcode::store_io) {
+                    const auto bits = read(op.inputs[0]);
+                    if (!bits) return {};
+                    outputs.push_back(*bits);
+                    continue;
+                }
+                if (op.opcode != Opcode::copy || op.outputs.empty()) return {};
+                const auto bits = read(op.inputs[0]);
+                if (!bits) return {};
+                values[std::get<ValueId>(op.outputs[0]).value] = *bits;
+            }
+            previous = current;
+            if (const auto* branch = std::get_if<Branch>(&block.terminator)) {
+                const auto condition = read(branch->condition);
+                if (!condition) return {};
+                current = *condition ? branch->when_true : branch->when_false;
+            } else if (const auto* jump = std::get_if<Jump>(&block.terminator)) current = jump->target;
+            else if (std::holds_alternative<Return>(block.terminator)) return outputs;
+            else return {};
+        }
+        return std::vector<std::uint64_t>{};
+    };
+    check(run(0) == std::vector<std::uint64_t>{}, "No false guard stores");
+    std::vector<std::uint64_t> all, mixed;
+    for (int i = 0; i < guards; ++i) {
+        all.push_back(static_cast<std::uint64_t>(100 + i));
+        if ((i % 2) == 0) mixed.push_back(static_cast<std::uint64_t>(100 + i));
+    }
+    check(run(0xffffffffu) == all, "Every taken guard stores its own definition");
+    check(run(0x55555u) == mixed, "Alternating guards store only their taken definitions");
+}
+
 void test_dependencies_preserved() {
     Builder b;
     const auto entry = b.entry();
@@ -1660,6 +1912,9 @@ int main() {
     test_loop_phi_undefined_transfer();
     test_integer_mask_guard_correlations();
     test_collective_correlation_fixed_cfg();
+    test_independent_guards_keep_separate_predicate_states(GuardTail::exit);
+    test_independent_guards_keep_separate_predicate_states(GuardTail::spin);
+    test_independent_guards_keep_separate_predicate_states(GuardTail::spin_reads_guarded);
     test_feasible_undefined_collective_inputs();
     test_missing_phi_replacement_rejected();
     test_tainted_real_operation_rejected();

@@ -138,9 +138,14 @@ public:
     [[nodiscard]] MetalShaderPackagePrefetch finish_prefetch() noexcept;
     // The package's compiler-chain ID.
     [[nodiscard]] const std::string& chain_id() const noexcept;
+    // True when the manifest records "sample_hoisting":"implicit".
+    [[nodiscard]] bool hoists_implicit_samples() const noexcept;
     // The SHA-256 of the package manifest (hexadecimal): which stages, with
     // which libraries, the package holds. Two packages from one chain differ here.
     [[nodiscard]] const std::string& content_id() const noexcept;
+    // The package directory that was opened. Native shader sections live beside
+    // the Metal manifest and are not part of Maxwell lookup.
+    [[nodiscard]] const std::filesystem::path& directory() const noexcept;
     // The package and callback context outlive every channel that registers it.
     // Returned diagnostic views remain valid for the package lifetime.
 

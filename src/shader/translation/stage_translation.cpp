@@ -656,6 +656,8 @@ std::string ported_reflection(const pl::MslArtifact& artifact, const gm::EmitOpt
              }))
         out << ",\"point_size\":\"program-v1\"";
     if (plan.reads_point_coord) out << ",\"point_coord\":\"attribute-v1\"";
+    // A vertex stage without outputs draws only with rasterizer discard.
+    if (plan.requires_rasterizer_discard) out << ",\"rasterizer_discard\":\"required-v1\"";
     if (plan.emulate_depth_bias) out << ",\"depth_bias_mode\":\"shader-v1\"";
     if (plan.custom_border) {
         out << ",\"custom_border\":{\"abi\":\"coverage-v1\",\"buffer_index\":"
@@ -670,9 +672,11 @@ std::string ported_reflection(const pl::MslArtifact& artifact, const gm::EmitOpt
         out << "]}";
     }
     if (plan.draw_support_buffer_index) {
+        // A fragment reading the render-target height takes version 2.
+        const bool height = plan.reads_render_target_height;
         out << ",\"draw_support\":{\"schema\":" << quote(pl::draw_support_schema)
-            << ",\"version\":" << pl::draw_support_version
-            << ",\"byte_extent\":" << pl::draw_support_bytes
+            << ",\"version\":" << (height ? pl::draw_support_height_version : pl::draw_support_version)
+            << ",\"byte_extent\":" << (height ? pl::draw_support_height_bytes : pl::draw_support_bytes)
             << ",\"alignment\":4,\"metal_buffer_index\":"
             << *plan.draw_support_buffer_index << '}';
     }
@@ -682,6 +686,22 @@ std::string ported_reflection(const pl::MslArtifact& artifact, const gm::EmitOpt
             << ",\"byte_extent\":" << vertex_fetch_bytes
             << ",\"alignment\":8,\"metal_buffer_index\":"
             << *plan.vertex_fetch_buffer_index << '}';
+    }
+    for (const auto& planned : plan.resources) {
+        // The guest-memory pool table travels as its own record.
+        const auto* buffer = std::get_if<pl::BufferUse>(&planned.use);
+        const auto* support = buffer ? std::get_if<pl::SupportBufferSource>(&buffer->source) : nullptr;
+        if (!support || support->schema != pl::guest_memory_schema) continue;
+        if (support->version != pl::guest_memory_version || buffer->size.bytes != pl::guest_memory_bytes ||
+            buffer->access != pl::Access::read_write)
+            throw std::runtime_error("Ported reflection has an unsupported guest-memory table");
+        out << ",\"guest_memory\":{\"schema\":" << quote(support->schema)
+            << ",\"version\":" << support->version
+            << ",\"byte_extent\":" << buffer->size.bytes
+            << ",\"alignment\":" << buffer->size.alignment
+            << ",\"metal_buffer_index\":" << std::get<pl::MetalRange>(planned.location).first
+            << ",\"tag\":" << plan.guest_memory_tag
+            << ",\"writes\":" << (plan.guest_memory_writes ? "true" : "false") << '}';
     }
     out << ",\"profile\":{\"identity\":" << quote(plan.profile.identity)
         << ",\"version\":" << plan.profile.version << '}';
@@ -722,7 +742,7 @@ std::string ported_reflection(const pl::MslArtifact& artifact, const gm::EmitOpt
         const auto* buffer = std::get_if<pl::BufferUse>(&planned.use);
         if (!buffer) continue;
         const auto* support = std::get_if<pl::SupportBufferSource>(&buffer->source);
-        if (!support) continue;
+        if (!support || support->schema == pl::guest_memory_schema) continue;
         if (support->schema != pl::constant_buffer_support_schema ||
             support->version != pl::constant_buffer_support_version)
             throw std::runtime_error("Ported reflection has an unsupported support-buffer schema");
@@ -959,7 +979,8 @@ pl::MslArtifact run_ported(const si::ParsedShader& shader, Bytes code,
                            std::optional<std::uint8_t> texture_handle_cbuf,
                            bool derived_descriptors,
                            std::optional<pl::ComputeLocalSize> compute_local_size,
-                           std::optional<std::uint32_t> compute_shared_memory_bytes) {
+                           std::optional<std::uint32_t> compute_shared_memory_bytes,
+                           bool hoist_implicit_samples) {
     pl::StageImage image;
     image.stage = shader.stage == si::Stage::Vertex ? pl::Stage::vertex :
         shader.stage == si::Stage::Compute ? pl::Stage::compute : pl::Stage::fragment;
@@ -969,7 +990,8 @@ pl::MslArtifact run_ported(const si::ParsedShader& shader, Bytes code,
     image.bytes.assign(program.begin(), program.end());
     image.entry_pc = 8;
     pl::Limits limits{};
-    const auto profile = ported_profile();
+    auto profile = ported_profile();
+    profile.hoist_implicit_samples = hoist_implicit_samples;
     DerivedTextureFacts derived;
     if (derived_descriptors)
         derived = scan_derived_texture_facts(image, texture_handle_cbuf);
@@ -1055,7 +1077,7 @@ TranslatedStage translate_stage(std::span<const std::byte> control, std::span<co
     const Bytes bytes{code};
     const auto artifact = run_ported(shader, bytes, options.emission, options.texture_handle_cbuf,
                                      options.texture_descriptors_derived, local_size,
-                                     options.compute_shared_memory_bytes);
+                                     options.compute_shared_memory_bytes, options.hoist_implicit_samples);
     const Bytes identity = bytes.subspan(shader.code_offset, shader.c1_offset - shader.code_offset);
     const auto stage = shader.stage == si::Stage::Vertex ? pl::Stage::vertex :
         shader.stage == si::Stage::Compute ? pl::Stage::compute : pl::Stage::fragment;

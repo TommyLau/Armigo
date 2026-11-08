@@ -36,6 +36,8 @@ else()
     add_library(armigo_execution gate_frame_layout_check.cpp)
 endif()
 add_library(armigo::execution ALIAS armigo_execution)
+# Platform-independent: the published guest clock timeline.
+target_sources(armigo_execution PRIVATE guest_timeline.cpp)
 
 add_library(armigo_execution_reachable_code reachable_code.cpp)
 add_library(armigo::execution_reachable_code ALIAS armigo_execution_reachable_code)

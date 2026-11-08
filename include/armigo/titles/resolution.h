@@ -1,5 +1,5 @@
 // ============================================================================
-// Armigo Titles - 01007EF00011E000 Internal Resolution
+// Armigo Titles - Internal Resolution Module
 // Copyright (c) 2026 Tommy Lau.
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Armigo-Proprietary
 //
@@ -15,8 +15,9 @@
 // target pool that hold them, and the dynamic-resolution floor and load scale
 // follow that size. Every site is one MOVZ or MOVK whose 16-bit immediate is
 // replaced; the original values are decoded from the instructions themselves.
-// The private compatibility description supplies the sites. Without a maximum
-// width nothing is changed.
+// A title profile's "resolution" object supplies the sites, so any title with
+// these sites selects the module by data. Without a maximum width nothing is
+// changed.
 
 #pragma once
 
@@ -31,7 +32,7 @@
 
 namespace armigo::loader { struct NsoModuleImage; }
 
-namespace armigo::titles::title_01007ef00011e000 {
+namespace armigo::titles::resolution {
 
 struct ResolutionSettings {
     std::uint32_t maximum_width = 0;   // 0: the game's own sizes
@@ -76,4 +77,4 @@ std::variant<ResolutionPlan, std::string>
 resolution_words(const compat::ResolutionSites& sites, const ResolutionSettings& settings,
                  const loader::NsoModuleImage& image);
 
-} // namespace armigo::titles::title_01007ef00011e000
+} // namespace armigo::titles::resolution

@@ -73,12 +73,15 @@ std::atomic<std::uint64_t> selected_language{code("en-US")};
 std::atomic<std::uint32_t> selected_region{1};  // USA
 std::atomic<std::uint32_t> supported_languages{0xffff};
 
-// A non-domain reply with `output_words` of output after the CMIF header.
-IpcReply reply_with(unsigned output_words) {
+// A non-domain reply with `output_words` of output after the CMIF header. Both
+// 23.0.1 settings programs write the interface word 0x7f7baf0a after a
+// method's result; control replies leave it zero.
+IpcReply reply_with(unsigned output_words, bool method = true) {
     IpcReply reply{IpcDisposition::handled};
     reply.size = 8 + 4 * (8 + output_words);
     write(reply.bytes, 4, 8 + output_words);
     write(reply.bytes, 16, 0x4f434653);
+    if (method) write(reply.bytes, 28, 0x7f7baf0a);
     return reply;
 }
 } // namespace
@@ -232,7 +235,7 @@ horizon::IpcReply SettingsSession::method(const horizon::IpcMessage& message, co
     if (type == 5 || type == 7) {
         if (read(message, 16) != 0x49434653 || read(message, 24) != 3) return {};
         // QueryPointerBufferSize: this endpoint has no pointer buffer.
-        auto reply = reply_with(1);
+        auto reply = reply_with(1, false);
         write(reply.bytes, 32, 0);
         diagnostic_ = nullptr;
         return reply;

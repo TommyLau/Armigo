@@ -10,6 +10,9 @@
 
 #include "stage_internal.h"
 #include "../dispatch.h"
+#include "../resources/detail.h"
+
+#include <bit>
 
 namespace armigo::shader::pipeline {
 using namespace msl;
@@ -62,8 +65,9 @@ Status generate_stage_io(MslContext& c, OperationId id) {
                 io.semantic == IoSemantic::thread_id || io.semantic == IoSemantic::workgroup_id || io.semantic == IoSemantic::subgroup_lane_id ||
                 io.semantic == IoSemantic::quad_lane_id ||
                 // The y-direction word names the stage-level function-constant
-                // selection, like the entry-parameter builtins above.
-                io.semantic == IoSemantic::y_direction);
+                // selection and the render-target height an entry local read
+                // from the draw-parameter record, like the builtins above.
+                io.semantic == IoSemantic::y_direction || io.semantic == IoSemantic::render_target_height);
             const bool adaptive_color = output_storage && io.semantic == IoSemantic::color &&
                 c.fragment_output_types_from_render_targets();
             std::string expression = adaptive_color
@@ -124,6 +128,11 @@ void generate_shared_memory(MslContext& c, OperationId id, const Operation& op, 
     }
     require(!guarded || !atomic, "Guarded shared atomics require a proven offset bound",
         DiagnosticCode::unsupported_capability);
+    // A guarded access whose address is proven naturally aligned keeps whole
+    // element accesses inside its guard; only an unproven one goes byte-wise.
+    std::uint64_t work = 0;
+    const bool byte_wise = guarded && (m.byte_offset % m.element_bytes != 0 ||
+        !resources::shared_address_aligned(c.program().ir, op.inputs[m.dynamic_byte_offset->value], m.element_bytes, work));
     if (!guarded)
         require(std::uint64_t(m.byte_offset) + maximum + std::uint64_t(m.element_bytes) * m.elements <= extent,
                 "Shared access exceeds launch allocation");
@@ -179,7 +188,8 @@ void generate_shared_memory(MslContext& c, OperationId id, const Operation& op, 
             take(c.assign(output(op, 0), function + "(" + ptr + ", " + input(c, op, m.data[0], type) + ", memory_order_relaxed)", type));
         } else if (store) {
             auto data = input(c, op, m.data[i], ScalarType::u32);
-            if (guarded) {
+            if (guarded && !byte_wise) take(c.statement("if (" + inside + ") {"));
+            if (byte_wise) {
                 if (m.element_bytes == 4) {
                     take(c.statement("if (" + inside + ") {"));
                     for (unsigned byte = 0; byte < 4; ++byte)
@@ -207,9 +217,10 @@ void generate_shared_memory(MslContext& c, OperationId id, const Operation& op, 
                 take(c.statement("if (atomic_compare_exchange_weak_explicit(" + pointer + ", &" + old + ", " + next + ", memory_order_relaxed, memory_order_relaxed)) break;"));
                 take(c.statement("} while (true);"));
             }
+            if (guarded && !byte_wise) take(c.statement("}"));
         } else {
             auto expression = "atomic_load_explicit(" + pointer + ", memory_order_relaxed)";
-            if (guarded) {
+            if (byte_wise) {
                 std::string assembled;
                 for (unsigned byte = 0; byte < m.element_bytes; ++byte) {
                     const auto byte_address = "(" + offset + " + " + number(byte) + "ul)";
@@ -359,9 +370,14 @@ Status generate_compute_barrier(MslContext& c, OperationId id) {
                 !m->dynamic_byte_offset_upper_bound && m->data.empty() && !m->atomic && !m->is_volatile &&
                 m->byte_offset == 0 && m->element_bytes == 4 && m->elements == 1 && m->alignment == 1 &&
                 m->order == MemoryOrder::acquire_release &&
-                (m->scope == MemoryScope::workgroup || m->scope == MemoryScope::device),
+                (m->scope == MemoryScope::workgroup || m->scope == MemoryScope::device ||
+                 (op.opcode == Opcode::barrier && m->scope == MemoryScope::subgroup)),
                 "Unsupported compute barrier metadata", DiagnosticCode::unsupported_modifier);
-        if (op.opcode == Opcode::barrier) {
+        if (op.opcode == Opcode::barrier && m->scope == MemoryScope::subgroup) {
+            // A SIMD-group execution barrier orders the group's threadgroup
+            // memory accesses, as a warp's are in order on the guest.
+            take(c.statement("simdgroup_barrier(mem_flags::mem_threadgroup);"));
+        } else if (op.opcode == Opcode::barrier) {
             require(m->scope == MemoryScope::workgroup, "Execution barrier must have workgroup scope");
             take(c.statement("threadgroup_barrier(mem_flags::mem_threadgroup);"));
         } else {
@@ -532,6 +548,110 @@ void generate_multi_target_storage(MslContext& c, OperationId id, const Operatio
     }
 }
 
+// Guest memory: the 64-bit guest address plus its signed displacement is
+// translated through the window table to a device address once per access,
+// for all of its bytes. An access outside every window or off its natural
+// alignment is counted in the table, reads zero and drops its stores or
+// atomic, so every typed device pointer below is naturally aligned: words
+// load through word pointers and narrower elements through their own widths.
+void generate_guest_memory(MslContext& c, OperationId id, const Operation& op, const MemoryInfo& m) {
+    require(m.resource && m.dynamic_byte_offset && m.global_address_high && !m.array_index && !m.is_volatile,
+            "Guest memory access has no window table or full address");
+    const auto tag = number(c.guest_memory_tag()) + "u";
+    require(m.order == MemoryOrder::relaxed, "Guest memory ordering requires explicit lowering", DiagnosticCode::unsupported_modifier);
+    require(m.element_bytes == 1 || m.element_bytes == 2 || m.element_bytes == 4,
+            "Guest memory element width is unsupported", DiagnosticCode::unsupported_capability);
+    require(std::has_single_bit(unsigned(m.elements)) && m.alignment == m.element_bytes * m.elements,
+            "Guest memory accesses are naturally aligned whole accesses", DiagnosticCode::unsupported_capability);
+    const bool store = op.opcode == Opcode::store, atomic = op.opcode == Opcode::atomic;
+    require(op.opcode == Opcode::load || store || atomic, "Invalid guest memory operation");
+    require(!atomic || (m.atomic && m.element_bytes == 4 && m.elements == 1 && m.access == Access::read_write &&
+                        (op.numeric.scalar == ScalarType::u32 || op.numeric.scalar == ScalarType::s32)),
+            "Guest atomics are single 32-bit integer words", DiagnosticCode::unsupported_capability);
+    // A load or store strong at workgroup or device scope reads and writes
+    // each word as a relaxed device atomic: coherent with every other
+    // invocation's accesses and never torn. Metal has no narrower atomics: a
+    // strong byte or half-word load reads its aligned containing word, which
+    // lies in the same pool as pools start on word boundaries, and a strong
+    // narrow store has no Metal form.
+    const bool strong = !atomic && m.scope != MemoryScope::invocation;
+    require(!strong || !store || m.element_bytes == 4, "Strong guest stores narrower than a word have no Metal atomic form",
+            DiagnosticCode::unsupported_capability);
+    take(c.require_helper("armigo_guest_address"));
+    const auto windows = take(c.resource(*m.resource));
+    const auto word = [&](InputIndex index) { return input(c, op, index, ScalarType::u32); };
+    const auto suffix = number(id.value);
+    const auto address = "guest_address" + suffix;
+    take(c.statement("const ulong " + address + " = (ulong(" + word(*m.dynamic_byte_offset) + ") | (ulong(" +
+        word(*m.global_address_high) + ") << 32u)) + ulong(" + std::to_string(static_cast<std::int32_t>(m.byte_offset)) + "l);"));
+    const std::string type = m.element_bytes == 4 ? "uint" : m.element_bytes == 2 ? "ushort" : "uchar";
+    const auto base = "guest_device" + suffix;
+    take(c.statement("const ulong " + base + " = armigo_guest_address(" + windows + ", " + address + ", " +
+        number(m.elements * m.element_bytes) + "u, " + tag + ", " + (store || atomic ? "true" : "false") + ");"));
+    for (unsigned i = 0; i < m.elements; ++i) {
+        const auto device = base + "_" + number(i);
+        take(c.statement("const ulong " + device + " = " + base + " != 0ul ? " + base + " + " +
+            number(i * m.element_bytes) + "ul : 0ul;"));
+        if (atomic) {
+            const bool signed_compare = op.numeric.scalar == ScalarType::s32 &&
+                (*m.atomic == AtomicKind::minimum || *m.atomic == AtomicKind::maximum);
+            const auto scalar_type = signed_compare ? ScalarType::s32 : ScalarType::u32;
+            const auto pointer = std::string("reinterpret_cast<device ") + (signed_compare ? "atomic_int" : "atomic_uint") + "*>(" + device + ")";
+            const auto old = "guest_old" + suffix;
+            take(c.statement(std::string(signed_compare ? "int " : "uint ") + old + " = 0;"));
+            take(c.statement("if (" + device + " != 0ul) {"));
+            if (*m.atomic == AtomicKind::compare_exchange) {
+                require(m.data.size() == 2, "Guest compare-exchange takes expected and replacement words");
+                const auto expected = word(m.data[0]), replacement = word(m.data[1]);
+                // A strong exchange: retry spurious failures while the word still matches.
+                take(c.statement(old + " = " + expected + ";"));
+                take(c.statement("while (!atomic_compare_exchange_weak_explicit(" + pointer + ", &" + old + ", " +
+                    replacement + ", memory_order_relaxed, memory_order_relaxed) && " + old + " == " + expected + ") {}"));
+            } else {
+                require(m.data.size() == 1, "Guest atomic takes one data word");
+                std::string function;
+                switch (*m.atomic) {
+                case AtomicKind::add: function = "atomic_fetch_add_explicit"; break;
+                case AtomicKind::minimum: function = "atomic_fetch_min_explicit"; break;
+                case AtomicKind::maximum: function = "atomic_fetch_max_explicit"; break;
+                case AtomicKind::bit_and: function = "atomic_fetch_and_explicit"; break;
+                case AtomicKind::bit_or: function = "atomic_fetch_or_explicit"; break;
+                case AtomicKind::bit_xor: function = "atomic_fetch_xor_explicit"; break;
+                case AtomicKind::exchange: function = "atomic_exchange_explicit"; break;
+                default: fail("Guest atomic operation is unsupported", DiagnosticCode::unsupported_capability);
+                }
+                take(c.statement(old + " = " + function + "(" + pointer + ", " + input(c, op, m.data[0], scalar_type) +
+                    ", memory_order_relaxed);"));
+            }
+            take(c.statement("}"));
+            take(c.assign(output(op, 0), old, scalar_type));
+        } else if (store && strong) {
+            take(c.statement("if (" + device + " != 0ul) atomic_store_explicit(reinterpret_cast<device atomic_uint*>(" + device +
+                "), " + word(m.data[i]) + ", memory_order_relaxed);"));
+        } else if (store) {
+            take(c.statement("if (" + device + " != 0ul) *reinterpret_cast<device " + type + "*>(" + device + ") = " +
+                type + "(" + word(m.data[i]) + ");"));
+        } else if (strong) {
+            std::string loaded = "atomic_load_explicit(reinterpret_cast<device atomic_uint*>(" + device +
+                (m.element_bytes < 4 ? " & ~3ul" : "") + "), memory_order_relaxed)";
+            if (m.element_bytes < 4) {
+                const auto shifted = "(" + loaded + " >> (uint(" + device + " & 3ul) * 8u))";
+                const std::string narrow = m.element_bytes == 1 ? "uchar" : "ushort";
+                loaded = op.numeric.domain == Domain::signed_integer
+                    ? "as_type<uint>(int(as_type<" + std::string(m.element_bytes == 1 ? "char" : "short") + ">(" + narrow + "(" + shifted + "))))"
+                    : "uint(" + narrow + "(" + shifted + "))";
+            }
+            take(c.assign(output(op, i), "(" + device + " != 0ul ? " + loaded + " : 0u)", ScalarType::u32));
+        } else {
+            std::string loaded = "uint(*reinterpret_cast<device const " + type + "*>(" + device + "))";
+            if (m.element_bytes < 4 && op.numeric.domain == Domain::signed_integer)
+                loaded = "as_type<uint>(int(as_type<" + std::string(m.element_bytes == 1 ? "char" : "short") + ">(*reinterpret_cast<device const " +
+                    type + "*>(" + device + "))))";
+            take(c.assign(output(op, i), "(" + device + " != 0ul ? " + loaded + " : 0u)", ScalarType::u32));
+        }
+    }
+}
+
 Status generate_stage_memory(MslContext& c, OperationId id) {
     return callback(c, id, [&] {
         const auto& op = c.operation(id); const auto* info = std::get_if<MemoryInfo>(&op.info);
@@ -539,6 +659,7 @@ Status generate_stage_memory(MslContext& c, OperationId id) {
         plain_numeric(op);
         if (m.space == AddressSpace::shared) { generate_shared_memory(c, id, op, m); return; }
         if (m.space == AddressSpace::local) { generate_local_memory(c, id, op, m); return; }
+        if (m.space == AddressSpace::guest) { generate_guest_memory(c, id, op, m); return; }
         require(op.opcode == Opcode::load || op.opcode == Opcode::store,
                 "Buffer atomics require a proven Metal address adapter", DiagnosticCode::unsupported_capability);
         require(m.space == AddressSpace::constant_buffer || m.space == AddressSpace::storage,

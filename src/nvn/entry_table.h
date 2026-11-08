@@ -135,6 +135,12 @@ void install_entry(Entry entry, GenericFunction function) noexcept;
 // The implementation currently installed for an entry point (its reporting
 // stub when none is), never a counting thunk: wrappers call through it.
 [[nodiscard]] GenericFunction installed_entry(Entry entry) noexcept;
+// The installed implementation, or null while the entry point has none.
+[[nodiscard]] GenericFunction implemented_entry(Entry entry) noexcept;
+
+// Writes detail as an error and hands it to the runtime's unsupported handler.
+// Returns only when no handler is installed.
+void report_unsupported(const char* detail, std::uint64_t guest_return) noexcept;
 
 template <Entry E>
 void install(typename EntrySignature<E>::type function) noexcept {

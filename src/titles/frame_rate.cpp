@@ -24,15 +24,15 @@
 namespace armigo::titles {
 namespace {
 
-constexpr double ticks_per_second = 19'200'000.0;
 constexpr std::uint32_t maximum_measured_rate = 300;
 constexpr float minimum_ratio = 30.0f / maximum_measured_rate;
 constexpr float maximum_ratio = 30.0f / 20.0f;
 constexpr float minimum_step = 60.0f / maximum_measured_rate;
 constexpr float maximum_step = 60.0f / 20.0f;
 
-double measured_seconds(std::int64_t period_ticks) noexcept {
-    return static_cast<double>(period_ticks) / ticks_per_second;
+double measured_seconds(std::int64_t period_ticks, std::uint64_t counter_frequency) noexcept {
+    if (counter_frequency == 0) return 0;
+    return static_cast<double>(period_ticks) / static_cast<double>(counter_frequency);
 }
 
 bool checked_address(std::uint64_t base, std::uint64_t offset, std::uint64_t& address) noexcept {
@@ -83,7 +83,9 @@ bool read_period(const FrameRateLayout& layout, std::uint64_t module_base,
 }
 
 bool update_fractional_counter(const FrameRateLayout& layout, std::uint64_t module_base,
-                               std::uint64_t object, const horizon::GuestBuffers& buffers) noexcept {
+                               std::uint64_t object, const horizon::GuestBuffers& buffers,
+                               std::uint64_t counter_frequency) noexcept {
+    if (counter_frequency == 0) return false;
     std::uint32_t state = 0;
     if (!read_value(buffers, object, layout.state, state)) return false;
     if (state != layout.active_state) return true;
@@ -92,7 +94,7 @@ bool update_fractional_counter(const FrameRateLayout& layout, std::uint64_t modu
     if (ticks <= 0) return true;
     // Match a native float-seconds getter followed by multiplication. The
     // interval-ratio variant keeps its distinct double-before-float order.
-    const float seconds = static_cast<float>(measured_seconds(ticks));
+    const float seconds = static_cast<float>(measured_seconds(ticks, counter_frequency));
     const float step = std::min(seconds, 0.05f) * 30.0f;
     float counter = 0;
     if (!read_value(buffers, object, layout.counter, counter) ||
@@ -141,15 +143,25 @@ bool advance_frame_phases(const FramePhaseLayout& layout, std::uint64_t module_b
     return true;
 }
 
+float ratio_division_divisor(double period_seconds) noexcept {
+    auto step = static_cast<float>(period_seconds * 60.0);
+    if (!(step >= minimum_step)) step = minimum_step;
+    if (step > maximum_step) step = maximum_step;
+    return 60.0f / step;
+}
+
 bool update_frame_rate(const FrameRateLayout& layout, std::uint64_t module_base,
                             std::uint64_t vfr_object, std::uint32_t interval,
                             const horizon::GuestBuffers& buffers,
-                            std::uint32_t* maximum_rate) noexcept {
+                            std::uint32_t* maximum_rate,
+                            std::uint64_t counter_frequency) noexcept {
     if (maximum_rate) *maximum_rate = 0;
+    if (counter_frequency == 0) return false;
     if (layout.variant == FrameRateVariant::FractionalCounter30 ||
         layout.variant == FrameRateVariant::FractionalCountdown30 ||
         layout.variant == FrameRateVariant::FractionalRepeat30)
-        return update_fractional_counter(layout, module_base, vfr_object, buffers);
+        return update_fractional_counter(layout, module_base, vfr_object, buffers,
+                                         counter_frequency);
     if (layout.variant != FrameRateVariant::IntervalRatio60) return false;
     // The frame step follows the measured period whatever the frame-rate
     // object's state, so counters keep time while the override is set too.
@@ -159,7 +171,7 @@ bool update_frame_rate(const FrameRateLayout& layout, std::uint64_t module_base,
         if (!read_period(layout, module_base, buffers, period_ticks))
             return false;
         if (period_ticks > 0) {
-            float step = static_cast<float>(measured_seconds(period_ticks) * 60.0);
+            float step = static_cast<float>(measured_seconds(period_ticks, counter_frequency) * 60.0);
             if (step < minimum_step)
                 step = minimum_step;
             if (step > maximum_step)
@@ -186,7 +198,7 @@ bool update_frame_rate(const FrameRateLayout& layout, std::uint64_t module_base,
     if (period_ticks <= 0)
         return true;
 
-    float ratio = static_cast<float>(measured_seconds(period_ticks) * 60.0 /
+    float ratio = static_cast<float>(measured_seconds(period_ticks, counter_frequency) * 60.0 /
                                      static_cast<double>(base_interval));
     if (ratio < minimum_ratio)
         ratio = minimum_ratio;

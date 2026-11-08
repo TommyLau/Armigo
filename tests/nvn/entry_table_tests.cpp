@@ -65,6 +65,7 @@ int main() {
     CHECK(package && *package == "20_5_22");
     CHECK(known_api_version("20_5_22") == (ApiVersion{55, 15}));
     CHECK(known_api_version("13_3_2") == (ApiVersion{55, 12}));
+    CHECK(known_api_version("16_2_4") == (ApiVersion{55, 15}));
     select_api_version({55, 12});
     CHECK(selected_api_version() == (ApiVersion{55, 12}));
     CHECK(armigo_nvn_bootstrap_loader("nvnDeviceGetInteger") != nullptr);

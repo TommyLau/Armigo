@@ -23,9 +23,12 @@ CommandFailure usage(std::string detail) {
 } // namespace
 
 std::string command_usage() {
-    return "Usage: armigo <game.xci|nsp or folder> [--update FILE]... [--dlc FILE]...\n"
+    return "Usage: armigo [pack] <game.xci|nsp|nup or folder> [--update FILE]... [--dlc FILE]...\n"
            "             --keys FILE --firmware PATH [--title-keys FILE] [--output DIR]\n"
-           "             [--platform macos|ios] [--reuse APP] [--ios-build DIR] [--keep-app] [--no-ipa]\n";
+           "             [--platform macos|ios] [--reuse APP] [--ios-build DIR] [--keep-app] [--no-ipa]\n"
+           "       armigo [pack] <game> [--update FILE]... [--dlc FILE]... --keys FILE [--title-keys FILE]\n"
+           "             --shaders-only --output DIR\n"
+           "       armigo [pack] --compare OLD_PACKAGE NEW_PACKAGE\n";
 }
 
 std::variant<CommandFailure, Command> parse_command(int argc, char** argv) {
@@ -38,7 +41,9 @@ std::variant<CommandFailure, Command> parse_command(int argc, char** argv) {
     bool saw_reuse = false;
     bool saw_ios_build = false;
     bool saw_firmware = false;
-    for (int index = 1; index < argc; ++index) {
+    // "pack" is the default verb and may be spelled out.
+    const int first = argc > 1 && std::string_view(argv[1]) == "pack" ? 2 : 1;
+    for (int index = first; index < argc; ++index) {
         const std::string_view argument = argv[index];
         const auto take_value = [&](std::string_view flag) -> std::variant<CommandFailure, std::string_view> {
             const auto equals = argument.find('=');
@@ -149,6 +154,25 @@ std::variant<CommandFailure, Command> parse_command(int argc, char** argv) {
             command.no_ipa = true;
             continue;
         }
+        if (argument == "--compare") {
+            if (!command.compare.empty()) {
+                return usage("--compare was given more than once.");
+            }
+            if (index + 2 >= argc || std::string_view(argv[index + 1]).empty() ||
+                std::string_view(argv[index + 2]).empty()) {
+                return usage("--compare requires two shader packages.");
+            }
+            command.compare = {argv[index + 1], argv[index + 2]};
+            index += 2;
+            continue;
+        }
+        if (argument == "--shaders-only") {
+            if (command.shaders_only) {
+                return usage("--shaders-only was given more than once.");
+            }
+            command.shaders_only = true;
+            continue;
+        }
         if (argument == "--keep-app") {
             if (command.keep_app) {
                 return usage("--keep-app was given more than once.");
@@ -180,13 +204,26 @@ std::variant<CommandFailure, Command> parse_command(int argc, char** argv) {
         command.game = argument;
         saw_game = true;
     }
+    if (!command.compare.empty()) {
+        if (saw_game || saw_keys || saw_firmware || command.shaders_only || saw_output) {
+            return usage("--compare takes only the two shader packages.");
+        }
+        return command;
+    }
     if (!saw_game) {
         return usage("A game file or folder is required.");
     }
     if (!saw_keys) {
         return usage("--keys is required.");
     }
-    if (!saw_firmware) {
+    if (command.shaders_only) {
+        if (!saw_output) {
+            return usage("--shaders-only requires --output.");
+        }
+        if (saw_platform && command.platform != "macos") {
+            return usage("--shaders-only builds the macOS shader package.");
+        }
+    } else if (!saw_firmware) {
         return usage("--firmware is required.");
     }
     if (command.platform != "ios" && (saw_reuse || saw_ios_build || command.keep_app || command.no_ipa)) {

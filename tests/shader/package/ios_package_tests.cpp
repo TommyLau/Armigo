@@ -251,6 +251,53 @@ void test_identity_and_cache(Fixture& fixture) {
     CHECK(!fs::exists(options.output));
 }
 
+std::size_t count_occurrences(std::string_view text, std::string_view needle) {
+    std::size_t count = 0;
+    for (std::size_t at = 0; (at = text.find(needle, at)) != std::string_view::npos; at += needle.size()) ++count;
+    return count;
+}
+
+// A macOS manifest that records sample hoisting converts, and the iOS manifest
+// carries the same field. A manifest without it stays without it. The field is
+// outside the profile, so the two iOS chain ids match.
+void test_sample_hoisting_carries(Fixture& fixture) {
+    package::BuildOptions build;
+    build.stages = {fixture.stage, fixture.root / "graphics-stage"};
+    build.translate_tool = fixture.bin / "translate";
+    build.output = fixture.root / "macos-hoisted";
+    build.jobs = 2;
+    build.hoist_implicit_samples = true;
+    const auto macos_built = package::build(build);
+    if (const auto* error = std::get_if<std::string>(&macos_built))
+        std::printf("hoisted macOS build: %s\n", error->c_str());
+    CHECK(std::holds_alternative<package::BuildReport>(macos_built));
+    const std::string hoisted_macos = read(build.output / "manifest.json");
+    const std::string plain_macos = read(fixture.macos / "manifest.json");
+    CHECK(count_occurrences(plain_macos, "sample_hoisting") == 0);
+    CHECK(hoisted_macos.find("\"sample_hoisting\":\"implicit\"") != std::string::npos);
+    CHECK(count_occurrences(hoisted_macos, "sample_hoisting") == 1);
+    CHECK(manifest_value(hoisted_macos, "chain_id") == manifest_value(plain_macos, "chain_id"));
+
+    auto hoisted = fixture.options("ios-hoisted");
+    hoisted.macos_package = build.output;
+    const auto hoisted_built = package::build_ios_package(hoisted);
+    if (const auto* error = std::get_if<std::string>(&hoisted_built))
+        std::printf("hoisted iOS build: %s\n", error->c_str());
+    CHECK(std::holds_alternative<package::IosBuildReport>(hoisted_built));
+    const std::string hoisted_ios = read(hoisted.output / "manifest.json");
+    CHECK(hoisted_ios.find("\"sample_hoisting\":\"implicit\"") != std::string::npos);
+    CHECK(count_occurrences(hoisted_ios, "sample_hoisting") == 1);
+
+    auto plain = fixture.options("ios-plain");
+    const auto plain_built = package::build_ios_package(plain);
+    if (const auto* error = std::get_if<std::string>(&plain_built))
+        std::printf("plain iOS build: %s\n", error->c_str());
+    CHECK(std::holds_alternative<package::IosBuildReport>(plain_built));
+    const std::string plain_ios = read(plain.output / "manifest.json");
+    CHECK(count_occurrences(plain_ios, "sample_hoisting") == 0);
+    CHECK(manifest_value(hoisted_ios, "chain_id") == manifest_value(plain_ios, "chain_id"));
+}
+
 void test_compile_failure(Fixture& fixture) {
     auto options = fixture.options("failed-output");
     fs::create_directory(options.output);
@@ -275,6 +322,10 @@ int main() {
     {
         Fixture fixture;
         test_identity_and_cache(fixture);
+    }
+    {
+        Fixture fixture;
+        test_sample_hoisting_carries(fixture);
     }
     {
         Fixture fixture;

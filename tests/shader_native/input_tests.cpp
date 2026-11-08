@@ -70,10 +70,77 @@ int main() {
         auto b = bnsh(); std::vector<sn::Record> records;
         sn::Enumerator e([&](const auto& r) { records.push_back(r); });
         e.scan(b, "root"); check(records.size() == 4); check(records[2].variation == 1); check(records[1].slot == 4);
+        // Task and mesh stages at +0x40 and +0x48 of a program block count
+        // only when they lead to a control section of that stage.
+        {
+            auto m = bnsh();
+            word(m, 0x180 + 0x40, 0x300, 8); word(m, 0x180 + 0x48, 0x340, 8);
+            word(m, 0x308, 0x380, 8); word(m, 0x310, 0x400, 8); word(m, 0x318, 0x100); word(m, 0x31c, 0xe0);
+            word(m, 0x348, 0x500, 8); word(m, 0x350, 0x400, 8); word(m, 0x358, 0x100); word(m, 0x35c, 0xe0);
+            control(m, 0x380); m[0x380 + 0x56] = std::byte{6};
+            control(m, 0x500); m[0x500 + 0x56] = std::byte{7};
+            records.clear(); e.scan(m, "mesh");
+            check(records.size() == 8 && records[2].slot == 7 && records[3].slot == 8 && records[2].control_offset == 0x380 &&
+                  records[3].control_offset == 0x500);
+            m[0x500 + 0x56] = std::byte{6}; records.clear(); e.scan(m, "mesh");
+            check(records.size() == 6);  // a task control in the mesh slot is not a mesh stage
+            word(m, 0x180 + 0x48, 0x5000, 8); records.clear(); e.scan(m, "mesh");
+            check(records.size() == 6);  // a pointer outside the container is not followed
+        }
         auto nested = sarc(sarc(b)); records.clear(); e.scan(nested, "root");
         check(records.size() == 4 && records[0].ancestry.size() == 3 && records[0].ancestry[1].offset == 0x60);
         auto embedded = b; embedded.insert(embedded.begin(), 43, std::byte{0x55}); records.clear(); e.scan(embedded, "effect");
         check(records.size() == 4 && records[0].container_offset == 43 && records[0].control_offset == 0x280);
+        // Directory program occupies file 0x48..0x228. The inline header starts at that end.
+        sn::Buffer video(0x420);
+        text(video, 0, "NDVE", 4); word(video, 0x0c, 0); word(video, 0x10, 0x3f8); word(video, 0x14, 2);
+        word(video, 0x28, 1); word(video, 0x2c, 1); word(video, 0x30, 0x20);
+        word(video, 0x38, 0x20); word(video, 0x3c, 0xe0); word(video, 0x40, 0x100);
+        control(video, 0x48);
+        word(video, 0x228, 1); word(video, 0x230, 0x18); word(video, 0x234, 0xe0); word(video, 0x238, 0x100);
+        control(video, 0x240);
+        records.clear();
+        const auto unrecognized = e.inventory().unrecognized_spans;
+        e.scan(video, "sequence");
+        check(records.size() == 2 && records[0].control.size() == 0xe0 && records[0].code.size() == 0x100);
+        check(records[1].code.size() == 0x100 && e.inventory().unrecognized_spans == unrecognized);
+        // An NDSR pack: an 8-byte data entry, then one version-17 compute record.
+        sn::Buffer pack(0x208);
+        text(pack, 0, "NDSR", 4);
+        word(pack, 0x10, 0); word(pack, 0x14, 1); word(pack, 0x18, 0x28);
+        word(pack, 0x1c, 0xe0u << 4); word(pack, 0x20, 0x108); word(pack, 0x24, 0);
+        control(pack, 0x28); word(pack, 0x28 + 8, 17); pack[0x28 + 0x56] = std::byte{5};
+        word(pack, 0x28 + 0x30, 0); word(pack, 0x28 + 0xd4, 0);
+        records.clear(); e.scan(pack, "pack");
+        check(records.size() == 1 && records[0].kind == sn::ContainerKind::runtime &&
+              records[0].control.size() == 0xe0 && records[0].code.size() == 0x100 &&
+              records[0].control[0x56] == std::byte{5} && records[0].control_offset == 0x28);
+        // The same pack in an NDVE prefix, ahead of one network program.
+        constexpr std::size_t pack_size = 0x208, section_size = 0x1f8;
+        sn::Buffer wrapped(0x28 + pack_size + section_size);
+        text(wrapped, 0, "NDVE", 4); word(wrapped, 0x0c, pack_size); word(wrapped, 0x10, section_size);
+        word(wrapped, 0x14, 2);
+        std::copy(pack.begin(), pack.end(), wrapped.begin() + 0x28);
+        const auto section = 0x28 + pack_size;
+        word(wrapped, section, 1); word(wrapped, section + 8, 0x18);
+        word(wrapped, section + 0x0c, 0xe0); word(wrapped, section + 0x10, 0x100);
+        control(wrapped, section + 0x18);
+        records.clear(); e.scan(wrapped, "sequence-pack");
+        check(records.size() == 2 && records[0].kind == sn::ContainerKind::runtime &&
+              records[0].control[0x56] == std::byte{5} && records[1].control_offset == section + 0x18);
+        // One model record puts the pack at +0x20.
+        sn::Buffer single(0x20 + pack_size + section_size);
+        text(single, 0, "NDVE", 4); word(single, 0x0c, pack_size); word(single, 0x10, section_size);
+        word(single, 0x14, 1);
+        std::copy(pack.begin(), pack.end(), single.begin() + 0x20);
+        const auto single_section = 0x20 + pack_size;
+        word(single, single_section, 1); word(single, single_section + 8, 0x18);
+        word(single, single_section + 0x0c, 0xe0); word(single, single_section + 0x10, 0x100);
+        control(single, single_section + 0x18);
+        records.clear(); e.scan(single, "sequence-single");
+        check(records.size() == 2 && records[0].kind == sn::ContainerKind::runtime &&
+              records[0].control_offset == 0x20 + 0x28 && records[1].control_offset == single_section + 0x18);
+        auto broken = video; word(broken, 0x40, 0x10); rejects([&]{ e.scan(broken, "bad"); });
         auto a = bahs(); records.clear(); e.scan(a, "archive"); check(records.size() == 1 && e.inventory().duplicate_candidates == 2);
         check(!records[0].variation && !records[0].slot);
         auto bad = b; word(bad, 0x80, ~std::uint64_t{}, 8); rejects([&]{ e.scan(bad, "bad"); });

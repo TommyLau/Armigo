@@ -186,6 +186,27 @@ std::optional<std::size_t> locate_cmif(const IpcMessage& message) noexcept {
     if (read_word(message, 16) == sfci) return 16;
     if (read_word(message, 32) == sfci) return 32;
     if (read_word(message, 48) == sfci) return 48;
+    // More descriptors move the raw data further: it follows the header, the
+    // special header and every pointer and map-alias descriptor, aligned to 16
+    // bytes, with a domain header first when the session is a domain.
+    const auto first = read_word(message, 0);
+    const auto second = read_word(message, 4);
+    std::size_t raw = hipc_header_words * 4;
+    if (second >> 31) {
+        const auto special = read_word(message, raw);
+        raw += 4 + ((special & hipc_special_pid) ? 8 : 0) +
+               4 * (((special >> hipc_special_copy_shift) & hipc_count_mask) +
+                    ((special >> hipc_special_move_shift) & hipc_count_mask));
+    }
+    raw += 4 * hipc_pointer_words * ((first >> hipc_pointer_shift) & hipc_count_mask) +
+           4 * hipc_map_alias_words *
+               (((first >> hipc_send_shift) & hipc_count_mask) + ((first >> hipc_receive_shift) & hipc_count_mask) +
+                ((first >> hipc_exchange_shift) & hipc_count_mask));
+    raw = (raw + 15) & ~std::size_t{15};
+    if (raw + 4 > message.size()) return std::nullopt;
+    if (domain_header(message, raw) && raw + 20 <= message.size() && read_word(message, raw + 16) == sfci)
+        return raw + 16;
+    if (read_word(message, raw) == sfci) return raw;
     return std::nullopt;
 }
 
@@ -250,18 +271,22 @@ IpcDisposition IpcDispatcher::connect(QueryRegisters& registers,
         finish(registers, name_too_long, address);
         return IpcDisposition::handled;
     }
-    auto connection = connector_(connector_context_, {name.data(), length});
-    if (connection.disposition != IpcDisposition::handled) return connection.disposition;
-    if (connection.result) {
-        finish(registers, connection.result, address);
-        return IpcDisposition::handled;
-    }
-    if (!connection.session) return IpcDisposition::invalid_backend;
-    const auto handle = handles_->insert(std::move(connection.session));
+    // The kernel reserves the handle before it connects, so a full table fails
+    // first and without the connection's side effects.
+    const auto handle = handles_->reserve();
     if (!handle) {
         finish(registers, out_of_handles, address);
         return IpcDisposition::handled;
     }
+    auto connection = connector_(connector_context_, {name.data(), length});
+    if (connection.disposition != IpcDisposition::handled || connection.result || !connection.session) {
+        handles_->cancel(*handle);
+        if (connection.disposition != IpcDisposition::handled) return connection.disposition;
+        if (!connection.result) return IpcDisposition::invalid_backend;
+        finish(registers, connection.result, address);
+        return IpcDisposition::handled;
+    }
+    (void)handles_->commit(*handle, std::move(connection.session));
     finish(registers, 0, *handle);
     return IpcDisposition::handled;
 }
@@ -276,22 +301,35 @@ IpcDisposition IpcDispatcher::send(QueryRegisters& registers,
     // the entry here: a second close would then fail with an invalid-handle result the guest
     // never asked for. Validate the handle first, then invoke the endpoint's
     // close hook without sending the payload through its request dispatcher.
-    constexpr std::uint16_t close_request = 2;
-    if ((read_word(request, 0) & 0xffffu) == close_request) {
+    // A TIPC session closes the same way with method 15 (CloseSession); TIPC
+    // requests start at 16 and CMIF uses no type above 7. For either form the
+    // server closes the session without a reply, so the request completes as
+    // session-closed (the Switch 2 SDK's TIPC close aborts on any other
+    // result), and so does every later request on the session.
+    constexpr std::uint16_t close_request = 2, tipc_close_request = 15;
+    if (const auto type = read_word(request, 0) & 0xffffu; type == close_request || type == tipc_close_request) {
         const auto session = handles_->lookup_as<ClientSession>(static_cast<Handle>(registers[0]));
         if (!session) {
             finish(registers, invalid_handle);
             return IpcDisposition::handled;
         }
-        const auto reply = session->close_server();
-        if (reply.disposition != IpcDisposition::handled) return reply.disposition;
-        if (reply.size || reply.transferred_count) return IpcDisposition::invalid_backend;
-        finish(registers, reply.transport_result);
+        // Only the first close runs the server hook; requests that arrive while
+        // it runs already complete as session-closed.
+        if (session->claim_server_close()) {
+            const auto reply = session->close_server();
+            if (reply.disposition != IpcDisposition::handled) return reply.disposition;
+            if (reply.size || reply.transferred_count) return IpcDisposition::invalid_backend;
+        }
+        finish(registers, session_closed_result);
         return IpcDisposition::handled;
     }
     const auto session = handles_->lookup_as<ClientSession>(static_cast<Handle>(registers[0]));
     if (!session) {
         finish(registers, invalid_handle);
+        return IpcDisposition::handled;
+    }
+    if (session->server_closed()) {
+        finish(registers, session_closed_result);
         return IpcDisposition::handled;
     }
     session->set_memory_mapper(caller.memory_mapper);

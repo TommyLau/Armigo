@@ -78,12 +78,18 @@ public:
         // Changing reconvergence can change collective/derivative behavior.
         // Such functions remain ineligible for specialization. Fixed-CFG
         // proof does not change reconvergence and can analyze them normally.
+        // Functions with gathers stay ineligible as well: a gather needs no
+        // derivatives, but specializing them grows their code by about a
+        // third, which is its own change to measure.
         std::vector<bool> eligible(ssa_.functions.size(), true);
         constexpr auto collective = Effects::subgroup | Effects::derivative | Effects::barrier;
         for (const auto& block : ssa_.blocks) {
             for (const auto id : block.operations) {
                 if (!charge()) return *error_;
-                if (!preserve_cfg && (ssa_.operations[id.value].effects & collective) != Effects::none)
+                const auto& op = ssa_.operations[id.value];
+                const auto* texture = std::get_if<TextureInfo>(&op.info);
+                if (!preserve_cfg && ((op.effects & collective) != Effects::none ||
+                                      (texture && texture->mode == TextureMode::gather)))
                     eligible[block.function.value] = false;
             }
         }
@@ -460,6 +466,252 @@ private:
         return id;
     }
 
+    // Immediate postdominators, with BlockId{block count} standing for the
+    // synthetic exit every return reaches. A block that cannot reach a return
+    // (a region that never returns) gets an edge to the synthetic exit too, so
+    // only the branches into and inside that region lose precision. Nullopt
+    // means an edge leaves the function or the budget ran out; the caller then
+    // keeps every predicate fact.
+    std::optional<std::vector<BlockId>> immediate_postdominators(const Function& function) {
+        const auto count = ssa_.blocks.size();
+        const BlockId exit{static_cast<std::uint32_t>(count)};
+        std::vector<char> included(count, 0);
+        for (const auto block : function.blocks) included[block.value] = 1;
+        std::vector<std::vector<BlockId>> forward(count + 1);
+        std::vector<std::vector<BlockId>> reverse(count + 1);
+        for (const auto block : function.blocks) {
+            if (!charge()) return std::nullopt;
+            const auto targets = successors(ssa_.blocks[block.value].terminator);
+            if (targets.empty()) {
+                forward[block.value].push_back(exit);
+                reverse[exit.value].push_back(block);
+                continue;
+            }
+            for (const auto target : targets) {
+                if (target.value >= count || !included[target.value]) return std::nullopt;
+                // A forward edge into `target` is a reverse-graph predecessor
+                // of its source, which is what postdominance iterates.
+                forward[block.value].push_back(target);
+                reverse[target.value].push_back(block);
+            }
+        }
+        std::vector<char> reaches(count + 1, 0);
+        std::vector<BlockId> backward{exit};
+        reaches[exit.value] = 1;
+        while (!backward.empty()) {
+            if (!charge()) return std::nullopt;
+            const auto block = backward.back();
+            backward.pop_back();
+            for (const auto source : reverse[block.value]) {
+                if (reaches[source.value]) continue;
+                reaches[source.value] = 1;
+                backward.push_back(source);
+            }
+        }
+        for (const auto block : function.blocks) {
+            if (reaches[block.value]) continue;
+            forward[block.value].push_back(exit);
+            reverse[exit.value].push_back(block);
+        }
+
+        std::vector<BlockId> postorder;
+        std::vector<std::uint32_t> number(count + 1, invalid_index);
+        std::vector<char> visited(count + 1, 0);
+        std::vector<std::pair<BlockId, std::size_t>> stack;
+        visited[exit.value] = 1;
+        stack.emplace_back(exit, 0);
+        while (!stack.empty()) {
+            if (!charge()) return std::nullopt;
+            auto& [block, next] = stack.back();
+            const auto& edges = reverse[block.value];
+            if (next < edges.size()) {
+                const auto target = edges[next++];
+                if (!visited[target.value]) {
+                    visited[target.value] = 1;
+                    stack.emplace_back(target, 0);
+                }
+            } else {
+                number[block.value] = static_cast<std::uint32_t>(postorder.size());
+                postorder.push_back(block);
+                stack.pop_back();
+            }
+        }
+        if (postorder.size() != function.blocks.size() + 1) return std::nullopt;
+
+        std::vector<BlockId> idom(count + 1);
+        idom[exit.value] = exit;
+        bool exhausted = false;
+        auto intersect = [&](BlockId first, BlockId second) {
+            while (first != second && !exhausted) {
+                while (number[first.value] < number[second.value]) {
+                    if (!charge()) { exhausted = true; break; }
+                    first = idom[first.value];
+                }
+                while (!exhausted && number[second.value] < number[first.value]) {
+                    if (!charge()) { exhausted = true; break; }
+                    second = idom[second.value];
+                }
+            }
+            return first;
+        };
+        bool modified = true;
+        while (modified && !exhausted) {
+            modified = false;
+            for (std::size_t index = postorder.size() - 1; index-- > 0;) {
+                if (!charge()) return std::nullopt;
+                const auto block = postorder[index];
+                BlockId chosen;
+                for (const auto predecessor : forward[block.value]) {
+                    if (!idom[predecessor.value].valid()) continue;
+                    if (!chosen.valid()) { chosen = predecessor; continue; }
+                    chosen = intersect(predecessor, chosen);
+                }
+                if (exhausted) return std::nullopt;
+                if (chosen.valid() && chosen != idom[block.value]) {
+                    idom[block.value] = chosen;
+                    modified = true;
+                }
+            }
+        }
+        if (exhausted) return std::nullopt;
+        idom.pop_back();
+        return idom;
+    }
+
+    // Blocks on the immediate-postdominator chain of one successor, up to but
+    // not including the branch's own postdominator, are controlled by that edge.
+    std::vector<std::vector<BlockId>> control_dependencies(
+        const Function& function, const std::vector<BlockId>& ipdom) {
+        const auto count = ssa_.blocks.size();
+        const BlockId exit{static_cast<std::uint32_t>(count)};
+        std::vector<std::vector<BlockId>> controlled(count);
+        for (const auto branch : function.blocks) {
+            if (!charge()) return {};
+            const auto targets = successors(ssa_.blocks[branch.value].terminator);
+            if (targets.size() < 2 || !ipdom[branch.value].valid()) continue;
+            for (const auto successor : targets) {
+                auto runner = successor;
+                for (std::uint32_t guard = 0; guard < count && runner.valid() && runner != exit &&
+                     runner != ipdom[branch.value]; ++guard) {
+                    if (!charge()) return {};
+                    controlled[runner.value].push_back(branch);
+                    const auto next = ipdom[runner.value];
+                    if (!next.valid() || next == runner) break;
+                    runner = next;
+                }
+            }
+        }
+        for (auto& branches : controlled) {
+            std::sort(branches.begin(), branches.end());
+            branches.erase(std::unique(branches.begin(), branches.end()), branches.end());
+        }
+        return controlled;
+    }
+
+    // Proves `root` never reaches an executed operation or terminator. Facts
+    // outside `relevant` are erased after each transfer, so they cannot
+    // multiply states; keeping every fact is the fallback when control
+    // dependence is unavailable. False means a feasible use rejected the repair.
+    std::optional<bool> prove_root(ValueId root, const std::vector<char>& derived,
+                                   const std::vector<char>& relevant, bool keep_all,
+                                   const std::vector<std::set<std::uint32_t>>& taint_live) {
+        struct ProofState {
+            BlockId block;
+            Facts facts;
+            std::set<std::uint32_t> tainted;
+            auto operator<=>(const ProofState&) const = default;
+        };
+        std::set<ProofState> seen;
+        std::vector<ProofState> pending;
+        auto enqueue = [&](ProofState state) {
+            if (!charge()) return;
+            if (!keep_all) {
+                for (auto it = state.facts.begin(); it != state.facts.end();) {
+                    if (!charge()) return;
+                    if (it->first >= relevant.size() || !relevant[it->first]) it = state.facts.erase(it);
+                    else ++it;
+                }
+            }
+            for (auto it = state.tainted.begin(); it != state.tainted.end();) {
+                if (!charge()) return;
+                if (!taint_live[state.block.value].contains(*it)) it = state.tainted.erase(it);
+                else ++it;
+            }
+            if (seen.contains(state)) return;
+            if (seen.size() >= ssa_.limits.token_states) {
+                error_ = exceeded("predicate state");
+                return;
+            }
+            seen.insert(state);
+            pending.push_back(std::move(state));
+        };
+        for (const auto& function : ssa_.functions) enqueue({function.entry, {}, {}});
+        if (error_) return std::nullopt;
+        while (!pending.empty()) {
+            if (!charge()) return std::nullopt;
+            auto state = std::move(pending.back());
+            pending.pop_back();
+            const auto& block = ssa_.blocks[state.block.value];
+            const auto tainted = [&](ValueId value) {
+                return value == root || (derived[value.value] && state.tainted.contains(value.value));
+            };
+            const auto safe = [&](const Operand& operand) {
+                const auto* value = std::get_if<ValueId>(&operand);
+                return !value || !tainted(*value);
+            };
+            for (const auto id : block.operations) {
+                if (!charge()) return std::nullopt;
+                for (const auto& input : ssa_.operations[id.value].inputs) {
+                    if (!charge()) return std::nullopt;
+                    if (!safe(input)) return false;
+                }
+            }
+            const auto follow = [&](BlockId target, Facts facts) {
+                ProofState next{target, transfer_facts(target, std::move(facts), state.block), state.tainted};
+                // All sources are read from the old state, even on self edges
+                // and mutually dependent loop-carried phi transfers.
+                for (const auto& phi : ssa_.blocks[target.value].phis) {
+                    if (!derived[phi.output.value]) continue;
+                    for (const auto& input : phi.inputs) {
+                        if (!charge()) return;
+                        if (input.predecessor != state.block) continue;
+                        if (tainted(input.value)) next.tainted.insert(phi.output.value);
+                        else next.tainted.erase(phi.output.value);
+                    }
+                }
+                if (!error_) enqueue(std::move(next));
+            };
+            if (const auto* branch = std::get_if<Branch>(&block.terminator)) {
+                if (!safe(branch->condition)) return false;
+                const auto condition = atoms_[state.block.value];
+                if (const auto known = evaluate(condition, state.facts)) {
+                    follow(*known ? branch->when_true : branch->when_false, state.facts);
+                } else {
+                    auto yes = state.facts;
+                    auto no = state.facts;
+                    if (condition.value.valid()) {
+                        yes[condition.value.value] = !condition.inverted;
+                        no[condition.value.value] = condition.inverted;
+                    }
+                    follow(branch->when_true, std::move(yes));
+                    follow(branch->when_false, std::move(no));
+                }
+            } else if (const auto* select = std::get_if<Switch>(&block.terminator)) {
+                if (!safe(select->selector)) return false;
+                for (const auto target : successors(block.terminator)) follow(target, state.facts);
+            } else if (const auto* jump = std::get_if<Jump>(&block.terminator)) {
+                follow(jump->target, state.facts);
+            } else if (const auto* result = std::get_if<Return>(&block.terminator)) {
+                for (const auto& value : result->values) {
+                    if (!charge()) return std::nullopt;
+                    if (!safe(value)) return false;
+                }
+            }
+            if (error_) return std::nullopt;
+        }
+        return true;
+    }
+
     // Fixed-CFG invariant: undefinedness may travel through phi copies, but
     // never reaches an executed operation or terminator on any feasible path.
     // Only after proving this for every missing definition do we replace its
@@ -520,93 +772,123 @@ private:
                 uses.emplace_back(predecessor, value);
         }
 
-        struct ProofState {
-            BlockId block;
-            Facts facts;
-            std::set<std::uint32_t> tainted;
-            auto operator<=>(const ProofState&) const = default;
+        // One missing value's taint does not depend on any other missing
+        // value. A predicate is part of that value's state only when a block
+        // that defines it, skips it, or uses it is control-dependent on the
+        // predicate's branch (or the predicate feeds such a branch through a
+        // phi). Independent guards therefore stay additive instead of forming
+        // one product key. Facts outside that set are dropped after each
+        // transfer, which only adds paths, so a successful proof is exact.
+        std::vector<std::vector<ValueId>> flows(ssa_.values.size());
+        std::set<std::uint32_t> roots;
+        const auto note_missing = [&](const Operand& operand) {
+            if (const auto* value = std::get_if<ValueId>(&operand); value && missing[value->value])
+                roots.insert(value->value);
         };
-        std::set<ProofState> seen;
-        std::vector<ProofState> pending;
-        auto enqueue = [&](ProofState state) {
-            if (!charge()) return;
-            for (auto it = state.tainted.begin(); it != state.tainted.end();) {
-                if (!charge()) return;
-                if (!taint_live[state.block.value].contains(*it)) it = state.tainted.erase(it);
-                else ++it;
-            }
-            if (seen.contains(state)) return;
-            if (seen.size() >= ssa_.limits.token_states) {
-                error_ = exceeded("predicate state");
-                return;
-            }
-            seen.insert(state);
-            pending.push_back(std::move(state));
-        };
-        for (const auto& function : ssa_.functions)
-            enqueue({function.entry, {}, {}});
-        if (error_) return *error_;
-        while (!pending.empty()) {
+        for (std::uint32_t block = 0; block < ssa_.blocks.size(); ++block) {
             if (!charge()) return *error_;
-            auto state = std::move(pending.back());
-            pending.pop_back();
-            const auto& block = ssa_.blocks[state.block.value];
-            const auto tainted = [&](ValueId value) {
-                return missing[value.value] || state.tainted.contains(value.value);
-            };
-            const auto safe = [&](const Operand& operand) {
-                const auto* value = std::get_if<ValueId>(&operand);
-                return !value || !tainted(*value);
-            };
-            for (const auto id : block.operations) {
-                if (!charge()) return *error_;
-                for (const auto& input : ssa_.operations[id.value].inputs) {
+            const auto& body = ssa_.blocks[block];
+            for (const auto& phi : body.phis) {
+                for (const auto& input : phi.inputs) {
                     if (!charge()) return *error_;
-                    if (!safe(input)) return std::optional<Program>{};
+                    flows[input.value.value].push_back(phi.output);
+                    note_missing(Operand{input.value});
                 }
             }
-            const auto follow = [&](BlockId target, Facts facts) {
-                ProofState next{target, transfer_facts(target, std::move(facts), state.block),
-                                state.tainted};
-                // All sources are read from the old state, even on self edges
-                // and mutually dependent loop-carried phi transfers.
-                for (const auto& phi : ssa_.blocks[target.value].phis) {
-                    for (const auto& input : phi.inputs) {
-                        if (!charge()) return;
-                        if (input.predecessor != state.block) continue;
-                        if (tainted(input.value)) next.tainted.insert(phi.output.value);
-                        else next.tainted.erase(phi.output.value);
-                    }
-                }
-                if (!error_) enqueue(std::move(next));
-            };
-            if (const auto* branch = std::get_if<Branch>(&block.terminator)) {
-                if (!safe(branch->condition)) return std::optional<Program>{};
-                const auto condition = atoms_[state.block.value];
-                if (const auto known = evaluate(condition, state.facts)) {
-                    follow(*known ? branch->when_true : branch->when_false, state.facts);
-                } else {
-                    auto yes = state.facts;
-                    auto no = state.facts;
-                    if (condition.value.valid()) {
-                        yes[condition.value.value] = !condition.inverted;
-                        no[condition.value.value] = condition.inverted;
-                    }
-                    follow(branch->when_true, std::move(yes));
-                    follow(branch->when_false, std::move(no));
-                }
-            } else if (const auto* select = std::get_if<Switch>(&block.terminator)) {
-                if (!safe(select->selector)) return std::optional<Program>{};
-                for (const auto target : successors(block.terminator)) follow(target, state.facts);
-            } else if (const auto* jump = std::get_if<Jump>(&block.terminator)) {
-                follow(jump->target, state.facts);
-            } else if (const auto* result = std::get_if<Return>(&block.terminator)) {
-                for (const auto& value : result->values) {
-                    if (!charge()) return *error_;
-                    if (!safe(value)) return std::optional<Program>{};
-                }
-            }
+            for (const auto id : body.operations)
+                for (const auto& input : ssa_.operations[id.value].inputs) note_missing(input);
+            if (const auto* branch = std::get_if<Branch>(&body.terminator)) note_missing(branch->condition);
+            else if (const auto* select = std::get_if<Switch>(&body.terminator)) note_missing(select->selector);
+            else if (const auto* result = std::get_if<Return>(&body.terminator))
+                for (const auto& input : result->values) note_missing(input);
+        }
+        std::vector<std::vector<BlockId>> controlled(ssa_.blocks.size());
+        bool keep_all = false;
+        for (const auto& function : ssa_.functions) {
+            auto post = immediate_postdominators(function);
             if (error_) return *error_;
+            if (!post) { keep_all = true; break; }
+            auto local = control_dependencies(function, *post);
+            if (error_) return *error_;
+            for (std::uint32_t block = 0; block < controlled.size(); ++block) {
+                if (!charge()) return *error_;
+                controlled[block].insert(controlled[block].end(), local[block].begin(), local[block].end());
+            }
+        }
+        for (const auto root_index : roots) {
+            if (!charge()) return *error_;
+            const ValueId root{root_index};
+            std::vector<char> derived(ssa_.values.size(), 0);
+            derived[root.value] = 1;
+            std::vector<ValueId> grow{root};
+            while (!grow.empty()) {
+                if (!charge()) return *error_;
+                const auto value = grow.back();
+                grow.pop_back();
+                for (const auto output : flows[value.value]) {
+                    if (derived[output.value]) continue;
+                    derived[output.value] = 1;
+                    grow.push_back(output);
+                }
+            }
+            std::vector<char> relevant(keep_all ? 0 : ssa_.values.size(), 0);
+            if (!keep_all) {
+                std::vector<char> seed(ssa_.blocks.size(), 0);
+                // Seeds are the definition arms and the real uses. Blocks that
+                // merely carry the value stay out, so a later independent
+                // guard is not control-dependent for this root.
+                const auto mark = [&](BlockId block, const Operand& operand) {
+                    if (const auto* value = std::get_if<ValueId>(&operand);
+                        value && (*value == root || derived[value->value]))
+                        seed[block.value] = 1;
+                };
+                for (std::uint32_t block = 0; block < ssa_.blocks.size(); ++block) {
+                    if (!charge()) return *error_;
+                    const auto& body = ssa_.blocks[block];
+                    for (const auto& phi : body.phis) {
+                        if (!derived[phi.output.value]) continue;
+                        seed[block] = 1;
+                        for (const auto& input : phi.inputs) seed[input.predecessor.value] = 1;
+                    }
+                    for (const auto id : body.operations)
+                        for (const auto& input : ssa_.operations[id.value].inputs) mark(BlockId{block}, input);
+                    if (const auto* branch = std::get_if<Branch>(&body.terminator)) mark(BlockId{block}, branch->condition);
+                    else if (const auto* select = std::get_if<Switch>(&body.terminator)) mark(BlockId{block}, select->selector);
+                    else if (const auto* result = std::get_if<Return>(&body.terminator))
+                        for (const auto& input : result->values) mark(BlockId{block}, input);
+                }
+                std::vector<std::uint32_t> fact_grow;
+                for (std::uint32_t block = 0; block < seed.size(); ++block) {
+                    if (!seed[block]) continue;
+                    for (const auto branch : controlled[block]) {
+                        if (!charge()) return *error_;
+                        const auto fact = atoms_[branch.value].value;
+                        if (!fact.valid() || relevant[fact.value]) continue;
+                        relevant[fact.value] = 1;
+                        fact_grow.push_back(fact.value);
+                    }
+                }
+                while (!fact_grow.empty()) {
+                    if (!charge()) return *error_;
+                    const auto value = fact_grow.back();
+                    fact_grow.pop_back();
+                    const auto* phi = phi_definitions_[value];
+                    if (!phi) continue;
+                    for (const auto& input : phi->inputs) {
+                        const auto incoming = atom(Operand{input.value});
+                        if (error_) return *error_;
+                        if (!incoming.value.valid() || relevant[incoming.value.value]) continue;
+                        relevant[incoming.value.value] = 1;
+                        fact_grow.push_back(incoming.value.value);
+                    }
+                }
+            }
+            const auto proved = prove_root(root, derived, relevant, keep_all, taint_live);
+            if (!proved) {
+                if (error_) return *error_;
+                return std::optional<Program>{};
+            }
+            if (!*proved) return std::optional<Program>{};
         }
 
         // Proof used the original missing roots exclusively. A replacement is

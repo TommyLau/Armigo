@@ -61,4 +61,16 @@ struct BundleSpec {
 [[nodiscard]] std::variant<std::string, std::filesystem::path> assemble_application(
     const BundleSpec& spec);
 
+// The folder an app is assembled in, beside its final path: hidden and without
+// a bundle extension, so LaunchServices and the Finder never record a partial
+// app. `unique` keeps concurrent packs apart.
+[[nodiscard]] std::filesystem::path assembly_path(const std::filesystem::path& app_path, std::uint64_t unique);
+// Moves a complete assembly to its final path in one rename on the same volume.
+// It fails, leaving both paths unchanged, when the final path already exists.
+[[nodiscard]] std::string publish_application(const std::filesystem::path& assembled,
+                                              const std::filesystem::path& app_path);
+// Registers a published macOS app with LaunchServices, so the Finder shows the
+// complete app instead of any state it recorded before.
+[[nodiscard]] std::string register_application(const std::filesystem::path& app_path);
+
 } // namespace armigo::pack

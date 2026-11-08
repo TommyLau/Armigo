@@ -10,8 +10,8 @@
 
 add_library(armigo_compat STATIC
     "${PROJECT_SOURCE_DIR}/src/titles/frame_rate.cpp"
-    "${PROJECT_SOURCE_DIR}/src/titles/01007EF00011E000/resolution.cpp"
-    patches.mm title_settings.mm)
+    "${PROJECT_SOURCE_DIR}/src/titles/resolution.cpp"
+    observer.cpp patches.mm title_plan.cpp title_settings.mm)
 target_include_directories(armigo_compat PUBLIC "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(armigo_compat PUBLIC armigo_horizon armigo_loader armigo_aarch64
     armigo_execution armigo_execution_call_hook armigo_execution_gate_patch "${ARMIGO_FOUNDATION_FRAMEWORK}")
@@ -21,6 +21,9 @@ if(BUILD_TESTING)
     add_executable(armigo_compat_patches_tests "${PROJECT_SOURCE_DIR}/tests/compat/patches_tests.cpp")
     target_link_libraries(armigo_compat_patches_tests PRIVATE armigo_compat)
     add_test(NAME compat.patches COMMAND armigo_compat_patches_tests)
+    add_executable(armigo_compat_observer_tests "${PROJECT_SOURCE_DIR}/tests/compat/observer_tests.cpp")
+    target_link_libraries(armigo_compat_observer_tests PRIVATE armigo_compat)
+    add_test(NAME compat.observer COMMAND armigo_compat_observer_tests)
     # Checks every title folder in the repository, and the lookup on synthetic folders.
     add_executable(armigo_title_settings_tests "${PROJECT_SOURCE_DIR}/tests/compat/title_settings_tests.cpp"
         "${PROJECT_SOURCE_DIR}/src/platform/metal/pso_manifest.cpp")
@@ -30,12 +33,16 @@ if(BUILD_TESTING)
     add_executable(armigo_title_frame_rate_tests "${PROJECT_SOURCE_DIR}/tests/titles/frame_rate_tests.cpp")
     target_link_libraries(armigo_title_frame_rate_tests PRIVATE armigo_compat)
     add_test(NAME title.frame_rate COMMAND armigo_title_frame_rate_tests)
+    # Pins every title's selected words, calls, hooks and resolution words by digest.
+    add_executable(armigo_title_plan_golden_tests "${PROJECT_SOURCE_DIR}/tests/titles/plan_golden_tests.cpp")
+    target_link_libraries(armigo_title_plan_golden_tests PRIVATE armigo_compat)
+    add_test(NAME title.plan_golden COMMAND armigo_title_plan_golden_tests "${PROJECT_SOURCE_DIR}/titles"
+        "${PROJECT_SOURCE_DIR}/tests/titles/plan_golden.txt")
     add_executable(armigo_01007EF00011E000_frame_rate_tests
         "${PROJECT_SOURCE_DIR}/tests/titles/01007EF00011E000/frame_rate_tests.cpp")
     target_link_libraries(armigo_01007EF00011E000_frame_rate_tests PRIVATE armigo_compat)
     add_test(NAME title.01007EF00011E000.frame_rate COMMAND armigo_01007EF00011E000_frame_rate_tests)
-    add_executable(armigo_01007EF00011E000_resolution_tests
-        "${PROJECT_SOURCE_DIR}/tests/titles/01007EF00011E000/resolution_tests.cpp")
-    target_link_libraries(armigo_01007EF00011E000_resolution_tests PRIVATE armigo_compat)
-    add_test(NAME title.01007EF00011E000.resolution COMMAND armigo_01007EF00011E000_resolution_tests)
+    add_executable(armigo_title_resolution_tests "${PROJECT_SOURCE_DIR}/tests/titles/resolution_tests.cpp")
+    target_link_libraries(armigo_title_resolution_tests PRIVATE armigo_compat)
+    add_test(NAME title.resolution COMMAND armigo_title_resolution_tests)
 endif()

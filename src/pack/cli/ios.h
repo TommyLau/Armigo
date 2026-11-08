@@ -64,6 +64,9 @@ struct ShaderStagePaths {
 // the packer's inherited launch-mode override. The parent environment is unchanged.
 [[nodiscard]] std::string run_pack_tool(const std::vector<std::string>& arguments,
                                       bool default_title_rate = false);
-[[nodiscard]] std::string create_ios_ipa(const std::filesystem::path& app_path);
+// Writes <app_path stem>.ipa beside app_path from the app assembled at
+// `assembled`, which the IPA's Payload names by app_path's file name.
+[[nodiscard]] std::string create_ios_ipa(const std::filesystem::path& assembled,
+                                         const std::filesystem::path& app_path);
 
 } // namespace armigo::pack

@@ -17,4 +17,8 @@ namespace armigo::shader::pipeline::passes {
 // Cleanup preserves all effects and never evaluates floating arithmetic on the host.
 [[nodiscard]] Status cleanup(Program&);
 [[nodiscard]] Status legalize_nontexture(Program&, FactReader&, const MetalProfile&);
+// Moves filtered texture samples out of the blocks their instruction
+// predicate guards when their inputs are available before the guard;
+// implicit-LOD and bias samples only when `implicit` is set.
+[[nodiscard]] Status hoist_guarded_samples(Program&, bool implicit = false);
 } // namespace armigo::shader::pipeline::passes

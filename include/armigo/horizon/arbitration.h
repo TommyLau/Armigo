@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include <armigo/common/guest_platform.h>
+
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -19,6 +21,29 @@
 #include <stop_token>
 
 namespace armigo::horizon {
+
+// Guest counter scale. Switch 1 is 19.2 MHz (625 ns per 12 ticks). Switch 2 is
+// 31.25 MHz (exactly 32 ns per tick). The SVC layer rounds a positive timeout
+// once with the process rate; waits below that layer do not convert again.
+struct CounterRate {
+    std::uint64_t frequency = 0;
+    std::uint64_t nanoseconds = 0;
+    std::uint64_t ticks = 0;
+};
+
+inline constexpr CounterRate switch1_counter{19'200'000, 625, 12};
+inline constexpr CounterRate switch2_counter{31'250'000, 32, 1};
+
+constexpr CounterRate counter_rate(GuestPlatform platform) noexcept {
+    return platform == GuestPlatform::switch2 ? switch2_counter : switch1_counter;
+}
+
+// A positive guest timeout as the kernel waits it: the nanoseconds rounded up
+// to whole ticks of `rate`, plus two ticks, converted back exactly. The result
+// saturates when the host duration cannot represent it. The default rate is
+// the Switch 1 counter.
+std::chrono::nanoseconds kernel_timeout(std::int64_t nanoseconds,
+                                        CounterRate rate = switch1_counter) noexcept;
 
 // The arbitration types the guest passes to svcArbitrateAddress. Only the wait and signal
 // forms are implemented; anything else is refused instead of reported as success.
@@ -55,6 +80,8 @@ public:
     // the queue lock alone cannot serialize against instructions outside the kernel.
     using WaitCheck = ArbitrateOutcome (*)(void* context) noexcept;
     using SignalCheck = ArbitrateOutcome (*)(void* context, std::size_t waiting) noexcept;
+    // The timeout arrives already converted by the SVC layer. A host caller passes
+    // raw nanoseconds; this wait does not convert again.
     ArbitrateOutcome wait_transaction(std::uint64_t address, std::int64_t timeout_nanoseconds,
                                       WaitCheck check, void* context,
                                       std::uint32_t priority = 32);

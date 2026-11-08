@@ -59,6 +59,9 @@ struct Arguments {
     // instructions and answer the texture_descriptor facts their encodings
     // prove, for draw-time verification of everything the code cannot know.
     bool texture_descriptors_derived{};
+    // --hoist-samples implicit: also move implicit-LOD and bias samples out
+    // of their predicate guards, as a title's opt-in does at run time.
+    bool hoist_implicit_samples{};
     bool vertex_input_seen{};
     std::optional<pl::ComputeLocalSize> compute_local_size;
     std::optional<std::uint32_t> compute_shared_memory_bytes;
@@ -72,7 +75,7 @@ constexpr std::string_view usage =
     "  [--vertex-input descriptor|fetch]\n"
     "  [--fragment-position reciprocal-clip-w]\n"
     "  [--texture-handle-cbuf SLOT]\n"
-    "  [--texture-descriptors derived]\n"
+    "  [--texture-descriptors derived] [--hoist-samples implicit]\n"
     "  [--compute-local-size X,Y,Z --compute-shared-memory BYTES]\n"
     "  armigo-shader-translate --version\n";
 
@@ -170,6 +173,10 @@ Arguments arguments(int argc, char** argv) {
             if (value != "derived")
                 throw std::runtime_error("Unsupported texture descriptor source");
             result.texture_descriptors_derived = true;
+        } else if (option == "--hoist-samples") {
+            if (result.hoist_implicit_samples) throw std::runtime_error("Duplicate --hoist-samples");
+            if (value != "implicit") throw std::runtime_error("Unsupported sample hoisting mode");
+            result.hoist_implicit_samples = true;
         } else {
             throw std::runtime_error("Unknown option: " + std::string(option));
         }
@@ -381,6 +388,7 @@ void translate_ported(const Arguments& args) {
     options.texture_descriptors_derived = args.texture_descriptors_derived;
     if (args.compute_local_size) options.compute_local_size = args.compute_local_size->dimensions;
     options.compute_shared_memory_bytes = args.compute_shared_memory_bytes;
+    options.hoist_implicit_samples = args.hoist_implicit_samples;
     const auto stage = armigo::shader::translation::translate_stage(control, code, options);
     publish(args, output, text_bytes(stage.source), stage.reflection, stage.program);
 }
@@ -410,6 +418,8 @@ void translate(const Arguments& args) {
         throw std::runtime_error("--texture-handle-cbuf requires --translator ported");
     if (args.translator != "ported" && args.texture_descriptors_derived)
         throw std::runtime_error("--texture-descriptors requires --translator ported");
+    if (args.translator != "ported" && args.hoist_implicit_samples)
+        throw std::runtime_error("--hoist-samples requires --translator ported");
     if (args.translator == "ported") return translate_ported(args);
     const auto output = validate_output(args);
     const auto control = read_file(args.control, 64u * 1024u, "control");

@@ -15,6 +15,9 @@
 
 #include <chrono>
 #include <cstdio>
+#include <span>
+
+#include "flat_av1.h"
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -285,6 +288,34 @@ void test_platform_decoder() {
     CHECK(!decoder->decode(garbage, 0, 64, shown, failure));
 }
 
+// The AV1 configuration record repeats the sequence header's profile and
+// colour format and carries the header; the hardware decoder shows every frame
+// with the source's luma.
+void test_av1_decoder() {
+    const auto units = armigo::test::flat_av1_temporal_units();
+    CHECK(units.size() == 3);
+    const auto record = av1_configuration_record(units[0]);
+    CHECK(record && record->size() == 4 + 13 && (*record)[0] == 0x81 && ((*record)[1] >> 5) == 0 &&
+          ((*record)[2] & 0x4c) == 0x0c && (*record)[4] == 0x0a);
+    CHECK(!av1_configuration_record(units[1]));
+    std::string failure;
+    auto decoder = make_av1_decoder(failure);
+    if (!decoder) {
+        CHECK(!failure.empty());
+        std::puts("No hardware AV1 decoder: decoding is not checked");
+        return;
+    }
+    std::vector<std::shared_ptr<const DecodedFrame>> shown;
+    CHECK(!decoder->decode(units[1], shown, failure) && shown.empty());
+    for (const auto& unit : units) CHECK(decoder->decode(unit, shown, failure));
+    CHECK(shown.size() == 3);
+    for (const auto& frame : shown) {
+        CHECK(frame->width == 64 && frame->height == 64);
+        const int luma = frame->luma.empty() ? 0 : frame->luma[32 * frame->luma_stride + 32];
+        CHECK(luma > 118 && luma < 132);
+    }
+}
+
 // Compositor setup shared by the tests below: an 8x4 picture with luma 40
 // and chroma U 50, V 60 queued by decoder channel 9 for luma surface
 // 0x500000, and a configuration whose slot 0 converts it through
@@ -479,6 +510,7 @@ int main() {
     test_range_writer();
     test_composer();
     test_platform_decoder();
+    test_av1_decoder();
     test_compositor_pitch();
     test_compositor_block_linear();
     test_compositor_n420();

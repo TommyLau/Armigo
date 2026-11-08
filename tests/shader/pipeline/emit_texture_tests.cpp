@@ -295,7 +295,7 @@ void test_gather_and_gradients() {
         const unsigned count = dimension / 2 == 0 ? 1 : dimension / 2 == 1 ? 2 : 3;
         check(t.gradients_x.size() == count && t.gradients_y.size() == count && t.offsets.size() == count, "TXD operand role counts");
         for (unsigned n = 0; n < count; ++n) {
-            check(reads(e.program, op, t.gradients_x[n], 40+n) && reads(e.program, op, t.gradients_y[n], 40+count+n), "TXD gradient vector ordering");
+            check(reads(e.program, op, t.gradients_x[n], 40+2*n) && reads(e.program, op, t.gradients_y[n], 40+2*n+1), "TXD gradient pairs per coordinate");
             const auto* extract = definition(e.program, std::get<ValueId>(op.inputs[t.offsets[n].value]));
             check(extract && reads(e.program, *extract, InputIndex{0}, 20+count) && literal(e.program, *extract, InputIndex{1}, 16+n*4), "TXD offsets in packed A parameter");
         }

@@ -782,9 +782,17 @@ void WriteTracker::note_store(const void* addr, std::size_t len) noexcept {
     const std::uintptr_t first = a & ~(page - 1);
     const std::uintptr_t last = (a + len - 1) & ~(page - 1);
     const unsigned bank = read_enter();
+    // Every owner of a host page resolves to its canonical record, so a range
+    // found for one page serves the pages after it that it also covers: a
+    // store over a large pool scans the registrations once, not per page.
+    Range* owner = nullptr;
+    const auto owner_of = [&](std::uintptr_t at) {
+        if (!owner || at < owner->base || at >= owner->end) owner = find_range(at, true);
+        return owner;
+    };
     bool intersects = false;
     for (std::uintptr_t at = first;; at += page) {
-        if (find_range(at, true)) {
+        if (owner_of(at)) {
             intersects = true;
             break;
         }
@@ -795,7 +803,7 @@ void WriteTracker::note_store(const void* addr, std::size_t len) noexcept {
         advance_unnoted_unless_notified();
         const std::uint64_t generation = g_now.fetch_add(1) + 1;
         for (std::uintptr_t at = first;; at += page) {
-            if (Range* r = find_range(at, true))
+            if (Range* r = owner_of(at))
                 publish_page_store(r->page[page_index(r, at)], at,
                                    generation);
             if (at == last) break;

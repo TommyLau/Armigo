@@ -14,6 +14,8 @@
 
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -26,8 +28,9 @@ struct EventResult;
 class ThreadRecord;
 
 // A readable manual-reset event object. The owning host service retains this
-// object and signals it; guest handles name the readable endpoint. This does
-// not implement writable event handles or CreateEvent/SignalEvent SVCs.
+// object and signals it; guest handles to it name the readable end. A service
+// that hands the guest the writable end inserts a WritableEvent instead.
+// CreateEvent is not implemented.
 // A wait on several objects at once. Each object lists the waiters registered
 // with it and wakes them, under its own lock, when it signals or exits.
 struct MultiWaiter {
@@ -77,6 +80,25 @@ private:
     std::vector<MultiWaiterEntry> waiters_;
 };
 
+// The writable end of an Event. SignalEvent and ClearEvent accept its handle;
+// WaitSynchronization and ResetSignal take only the readable end and reject it
+// as an invalid handle, as the kernel does.
+class WritableEvent final : public KernelObject {
+public:
+    // `observer` runs after each guest signal, outside the event's lock, where
+    // the owning service answers the signal as its server would.
+    explicit WritableEvent(std::shared_ptr<Event> event, std::function<void()> observer = {});
+    // svcSignalEvent.
+    void signal();
+    // svcClearEvent.
+    void clear() noexcept;
+    const std::shared_ptr<Event>& readable() const noexcept { return event_; }
+
+private:
+    std::shared_ptr<Event> event_;
+    std::function<void()> observer_;
+};
+
 enum class EventDisposition { handled, unsupported, cancelled };
 
 struct EventResult {
@@ -90,7 +112,8 @@ struct EventResult {
 };
 
 // Supports exactly one readable Event or ThreadRecord without consuming an event signal.
-// Zero polls; negative waits indefinitely; positive waits use a monotonic timeout. The
+// Positive timeouts arrive already converted by the SVC layer; a host caller passes raw
+// nanoseconds and this wait does not convert again. Zero polls; negative waits indefinitely. The
 // stop-token overload reports host cancellation separately from every guest result.
 // Other object types are unsupported.
 // Lookup pins the object through completion, independently of concurrent close.
@@ -112,6 +135,8 @@ EventResult wait_event(HandleTable& table, std::span<const Handle> handles,
 EventResult cancel_synchronization(HandleTable& table, Handle handle,
                                    ThreadRecord& caller);
 // Clears a signaled readable event; an already-clear event returns 0xfa01.
+// A writable end or any other non-process object is an invalid handle; a
+// process reset is not implemented.
 // Missing handles return 0xe401. No wait index is written.
 EventResult reset_event(HandleTable& table, Handle handle);
 

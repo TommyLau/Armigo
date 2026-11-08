@@ -61,6 +61,13 @@ Status generate_stage_texture(MslContext& c, OperationId id) {
         require(t.array_index.has_value() == (use->array_length > 1), "Texture array index disagrees with resource count");
         require(t.array_index || !t.array_index_upper_bound, "Array bound without an array index");
         std::string tex = take(c.resource(*t.resource));
+        require(use->pool == t.pool_texture.has_value(), "Texture pool role disagrees with its resource");
+        if (use->pool) {
+            // The pool table's entry at the handle's texture ID, marked read
+            // (the project documentation).
+            const auto id = "((" + input(c, op, *t.pool_texture, ScalarType::u32) + ") & 0xfffffu)";
+            tex = "(&" + tex + ".e[0])[armigo_pool_read(" + tex + ".seen, " + id + ", " + tex + ".n)]";
+        }
         if (t.array_index) {
             require(t.array_index->value < op.inputs.size(), "Resource-array index role is out of range");
             if (const auto* literal = std::get_if<LiteralBits>(&op.inputs[t.array_index->value])) {
@@ -77,11 +84,18 @@ Status generate_stage_texture(MslContext& c, OperationId id) {
         if (needs_sampler) {
             const auto& sampler_binding = planned(c.resources(), *t.sampler_resource);
             const auto* sampler = std::get_if<SamplerUse>(&sampler_binding.use);
-            require(sampler && sampler->comparison == d.comparison && sampler->normalized_coordinates == d.normalized_coordinates,
+            // The stage's one sampler pool is not typed by the texture's
+            // comparison. Pooled sampling still requires normalized
+            // coordinates, which check_texture enforces on the descriptor.
+            require(sampler && (sampler->pool || (sampler->comparison == d.comparison &&
+                                                  sampler->normalized_coordinates == d.normalized_coordinates)),
                     "Sampler/texture descriptor mismatch");
             require(!t.sampler || (std::holds_alternative<TextureKey>(*t.sampler) && std::get<TextureKey>(*t.sampler) == sampler->key), "Unresolved or mismatched sampler handle");
             require(sampler->array_length == 1 || sampler->array_length == use->array_length, "Sampler array index cannot be resolved");
             samp = take(c.resource(*t.sampler_resource));
+            require(sampler->pool == t.pool_sampler.has_value(), "Sampler pool role disagrees with its resource");
+            if (sampler->pool)
+                samp = "(&" + samp + ".e[0])[min((" + input(c, op, *t.pool_sampler, ScalarType::u32) + ") >> 20u, " + samp + ".n)]";
             if (sampler->array_length > 1) samp += "[" + input(c, op, *t.array_index, ScalarType::u32) + "]";
         } else require(!t.sampler, "Unused sampler handle on texture read/query");
         const auto count = dimensions(shape.dimension);
@@ -143,50 +157,51 @@ Status generate_stage_texture(MslContext& c, OperationId id) {
         }
         const auto coords = vector(c, op, t.coordinates, fetch ? ScalarType::s32 : ScalarType::f32, count);
         if (atomic) {
-            // Metal 3.1 texture atomics:
-            // the encoded operation maps one-to-one, increment and decrement
-            // become add of one, and CAS
-            // keeps the expected value in a temporary that carries the old
-            // result back to the guest destination.
-            require(op.outputs.size() == 1 && t.component_mask == 1 && t.data.size() == 1,
+            // A read-write 2D texture provides the atomic methods. Each call
+            // takes and returns four components, and an R32 image uses the
+            // first. Increment and decrement have no wrapping method, so they
+            // add one. Compare-and-swap writes the observed vector back
+            // through its expected argument.
+            require(op.outputs.size() == 1 && t.component_mask == 1 &&
+                    t.data.size() == (*t.atomic == AtomicKind::compare_exchange ? 2U : 1U),
                     "Invalid image atomic result shape");
             require(d.scalar == ScalarType::u32 || d.scalar == ScalarType::s32,
                     "Image atomics require integer components");
-            const auto location = "uint" + (count == 1 ? std::string{} : number(count)) + "(" + coords + ")";
-            const auto layer = t.array_layer ? ", " + input(c, op, *t.array_layer, ScalarType::u32) : std::string();
+            require(count == 2 && !shape.array, "Image atomics require a non-array 2D image");
+            const auto location = "uint2(" + coords + ")";
+            const auto vector4 = [&](const std::string& component) {
+                return scalar(d.scalar) + "4(" + component + ", 0, 0, 0)";
+            };
             if (*t.atomic == AtomicKind::compare_exchange) {
-                require(t.data.size() == 1, "Image CAS carries its expected value in one data input");
-                const auto old = "atomic_old" + number(id.value);
-                take(c.statement("const " + scalar(d.scalar) + " " + old + " = " +
-                    input(c, op, t.data[0], d.scalar) + ";"));
-                const auto replacement = input(c, op, t.data.back(), d.scalar);
-                take(c.statement("(void)" + tex + ".atomic_compare_exchange_weak_explicit(" + location +
-                    layer + ", &" + old + ", " + replacement +
-                    ", memory_order_relaxed, memory_order_relaxed);"));
-                take(c.assign(output(op, 0), old, d.scalar));
+                const auto observed = "atomic_observed" + number(id.value);
+                take(c.statement(scalar(d.scalar) + "4 " + observed + " = " +
+                    vector4(input(c, op, t.data[0], d.scalar)) + ";"));
+                take(c.statement("(void)" + tex + ".atomic_compare_exchange_weak(" + location +
+                    ", &" + observed + ", " + vector4(input(c, op, t.data[1], d.scalar)) + ");"));
+                take(c.assign(output(op, 0), observed + ".x", d.scalar));
             } else {
                 std::string call;
                 std::string value = input(c, op, t.data.back(), d.scalar);
                 switch (*t.atomic) {
-                case AtomicKind::add: call = "atomic_fetch_add_explicit"; break;
-                case AtomicKind::minimum: call = "atomic_fetch_min_explicit"; break;
-                case AtomicKind::maximum: call = "atomic_fetch_max_explicit"; break;
+                case AtomicKind::add: call = "atomic_fetch_add"; break;
+                case AtomicKind::minimum: call = "atomic_fetch_min"; break;
+                case AtomicKind::maximum: call = "atomic_fetch_max"; break;
                 case AtomicKind::increment:
-                    call = "atomic_fetch_add_explicit";
+                    call = "atomic_fetch_add";
                     value = scalar(d.scalar) + "(1)";
                     break;
                 case AtomicKind::decrement:
-                    call = "atomic_fetch_add_explicit";
+                    call = "atomic_fetch_add";
                     value = scalar(d.scalar) + "(-1)";
                     break;
-                case AtomicKind::bit_and: call = "atomic_fetch_and_explicit"; break;
-                case AtomicKind::bit_or: call = "atomic_fetch_or_explicit"; break;
-                case AtomicKind::bit_xor: call = "atomic_fetch_xor_explicit"; break;
-                case AtomicKind::exchange: call = "atomic_exchange_explicit"; break;
+                case AtomicKind::bit_and: call = "atomic_fetch_and"; break;
+                case AtomicKind::bit_or: call = "atomic_fetch_or"; break;
+                case AtomicKind::bit_xor: call = "atomic_fetch_xor"; break;
+                case AtomicKind::exchange: call = "atomic_exchange"; break;
                 default: fail("Image atomic operation is unsupported", DiagnosticCode::unsupported_capability);
                 }
-                take(c.assign(output(op, 0), tex + "." + call + "(" + location + layer + ", " + value +
-                    ", memory_order_relaxed)", d.scalar));
+                take(c.assign(output(op, 0), tex + "." + call + "(" + location + ", " +
+                    vector4(value) + ").x", d.scalar));
             }
             return;
         }
@@ -233,28 +248,47 @@ Status generate_stage_texture(MslContext& c, OperationId id) {
                 expression += ", " + std::string(gradient) + "(" + vector(c, op, t.gradients_x, ScalarType::f32, count) + ", " + vector(c, op, t.gradients_y, ScalarType::f32, count) + ")";
             }
             if (gather && !t.compare && !t.offsets.empty() && t.offsets.size() == 4 * count) {
-                // A per-texel offset set uses textureGatherOffsets: texel k is
-                // the (i0, j0) texel of the
-                // footprint at offsets[k]. Metal gathers one offset per call
-                // and returns that texel as its w component.
+                // A per-texel offset set is four gathers. Texel k is the
+                // (i0, j0) texel of the footprint at offsets[k], which one
+                // gather returns as its w component. Literal offsets stay
+                // integer literals. A non-literal set passes each texel's
+                // axis pair as a run-time int2.
                 require(shape.dimension != TextureDimension::cube && count == 2,
                         "Per-texel gather offsets require a 2D texture", DiagnosticCode::unsupported_capability);
-                for (auto index : t.offsets) {
-                    require(index.value < op.inputs.size() && std::holds_alternative<LiteralBits>(op.inputs[index.value]), "Sample offset must be a constant", DiagnosticCode::unsupported_modifier);
-                    auto value = static_cast<std::int32_t>(std::get<LiteralBits>(op.inputs[index.value]).bits);
-                    require(value >= -8 && value <= 7, "Sample offset exceeds Metal range", DiagnosticCode::unsupported_modifier);
-                }
-                const auto offset_word = [&](InputIndex index) {
-                    return std::to_string(static_cast<std::int32_t>(std::get<LiteralBits>(op.inputs[index.value]).bits));
-                };
+                bool literal_offsets = true;
+                for (auto index : t.offsets)
+                    literal_offsets = literal_offsets && index.value < op.inputs.size() &&
+                        std::holds_alternative<LiteralBits>(op.inputs[index.value]);
                 std::string call = tex + ".gather(" + samp + ", " + coords;
                 if (t.array_layer) call += ", " + input(c, op, *t.array_layer, ScalarType::u32);
                 const auto component = ", component::" + std::string(1, "xyzw"[t.gather_component]);
                 std::string combined;
-                for (unsigned texel = 0; texel < 4; ++texel) {
-                    if (!combined.empty()) combined += ", ";
-                    combined += call + ", int2(" + offset_word(t.offsets[2 * texel]) + ", " +
-                        offset_word(t.offsets[2 * texel + 1]) + ")" + component + ").w";
+                if (literal_offsets) {
+                    for (auto index : t.offsets) {
+                        require(index.value < op.inputs.size() && std::holds_alternative<LiteralBits>(op.inputs[index.value]), "Sample offset must be a constant", DiagnosticCode::unsupported_modifier);
+                        auto value = static_cast<std::int32_t>(std::get<LiteralBits>(op.inputs[index.value]).bits);
+                        require(value >= -8 && value <= 7, "Sample offset exceeds Metal range", DiagnosticCode::unsupported_modifier);
+                    }
+                    const auto offset_word = [&](InputIndex index) {
+                        return std::to_string(static_cast<std::int32_t>(std::get<LiteralBits>(op.inputs[index.value]).bits));
+                    };
+                    for (unsigned texel = 0; texel < 4; ++texel) {
+                        if (!combined.empty()) combined += ", ";
+                        combined += call + ", int2(" + offset_word(t.offsets[2 * texel]) + ", " +
+                            offset_word(t.offsets[2 * texel + 1]) + ")" + component + ").w";
+                    }
+                } else {
+                    for (auto index : t.offsets) {
+                        if (index.value < op.inputs.size() && std::holds_alternative<LiteralBits>(op.inputs[index.value])) {
+                            auto value = static_cast<std::int32_t>(std::get<LiteralBits>(op.inputs[index.value]).bits);
+                            require(value >= -8 && value <= 7, "Sample offset exceeds Metal range", DiagnosticCode::unsupported_modifier);
+                        }
+                    }
+                    for (unsigned texel = 0; texel < 4; ++texel) {
+                        if (!combined.empty()) combined += ", ";
+                        combined += call + ", int2(" + input(c, op, t.offsets[2 * texel], ScalarType::s32) + ", " +
+                            input(c, op, t.offsets[2 * texel + 1], ScalarType::s32) + ")" + component + ").w";
+                    }
                 }
                 expression = scalar(d.scalar) + "4(" + combined + ")";
             } else if (!t.offsets.empty()) {
@@ -328,7 +362,7 @@ ResourcePlan plan_custom_border(const StructuredProgram& program, ResourcePlan p
         const bool sample = t->mode == TextureMode::sample_implicit ||
             t->mode == TextureMode::sample_level || t->mode == TextureMode::sample_bias ||
             t->mode == TextureMode::sample_gradients;
-        const bool eligible = use && use->kind == ResourceTextureKind::sampled &&
+        const bool eligible = use && !use->pool && use->kind == ResourceTextureKind::sampled &&
             use->array_length == 1 && use->descriptor.shape.dimension == TextureDimension::d2 &&
             !use->descriptor.shape.array && !use->descriptor.shape.multisample &&
             use->descriptor.scalar == ScalarType::f32 &&
@@ -338,7 +372,7 @@ ResourcePlan plan_custom_border(const StructuredProgram& program, ResourcePlan p
         if (!t->sampler_resource) continue;
         texture_samplers[t->resource->value].insert(t->sampler_resource->value);
         const auto* sampler = std::get_if<SamplerUse>(&planned(plan, *t->sampler_resource).use);
-        if (!eligible || !sampler || sampler->array_length != 1 || sampler->key != use->key)
+        if (!eligible || !sampler || sampler->pool || sampler->array_length != 1 || sampler->key != use->key)
             unsupported_samplers.insert(t->sampler_resource->value);
     }
     CustomBorderSupport support;

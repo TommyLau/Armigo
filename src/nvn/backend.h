@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 
 namespace armigo::nvn {
@@ -44,6 +45,9 @@ public:
     virtual void release_pool(const MemoryPoolState& pool) = 0;
     // The CPU wrote [offset, offset + size) of the pool.
     virtual void flush_pool(const MemoryPoolState& pool, std::uint64_t offset, std::uint64_t size) = 0;
+    // The driver is about to store into [offset, offset + size) of the pool:
+    // backend GPU work that still reads pool bytes finishes first.
+    virtual void prepare_pool_write(const MemoryPoolState&, std::uint64_t, std::uint64_t) {}
     // The CPU is about to read [offset, offset + size): GPU results written
     // there must reach guest memory first.
     virtual void invalidate_pool(const MemoryPoolState& pool, std::uint64_t offset, std::uint64_t size) = 0;
@@ -98,12 +102,36 @@ public:
     // Replays the recorded commands of the given command handles, in order,
     // and returns the fence value the GPU reaches once they complete.
     virtual std::uint64_t submit(std::span<const NVNcommandHandle> handles) = 0;
+    // The same, naming the NVN queue that submits them; a backend that orders
+    // queues independently overrides it (see "Queues and event waits" in
+    // the project documentation).
+    virtual std::uint64_t submit_from(std::uintptr_t queue, std::span<const NVNcommandHandle> handles) {
+        static_cast<void>(queue);
+        return submit(handles);
+    }
+    // The queue `queue` names waits for `fence` to complete before its later
+    // work runs (nvnQueueWaitSync). Returns the fence that completes once the
+    // wait passed, which becomes the queue's latest fence (0 when nothing is
+    // left to wait for), or nothing if `fence` was never submitted. A backend
+    // that orders queues independently does not block the caller.
+    virtual std::optional<std::uint64_t> queue_wait_fence(std::uintptr_t queue, std::uint64_t fence) {
+        static_cast<void>(queue);
+        if (!wait_fence(fence, UINT64_MAX)) return std::nullopt;
+        return 0;
+    }
+    // The queue `queue` named is finalized (nvnQueueFinalize): its submitted
+    // work still runs in order, and nothing is submitted under it again.
+    virtual void forget_queue(std::uintptr_t queue) { static_cast<void>(queue); }
     // Starts submitted work without waiting (nvnQueueFlush).
     virtual void flush() = 0;
-    // Highest fence value the GPU completed.
+    // Highest fence value the GPU completed, with every fence before it.
     [[nodiscard]] virtual std::uint64_t completed_fence() const = 0;
-    // Blocks the calling thread until the fence completes or the timeout
-    // (nanoseconds, UINT64_MAX for none) passes; false on timeout.
+    // Whether the work of `fence` completed: a backend that holds a queue's
+    // work while others run completes a later fence before the held one.
+    [[nodiscard]] virtual bool fence_completed(std::uint64_t fence) const { return completed_fence() >= fence; }
+    // Blocks the calling thread until the fence completes (fence_completed)
+    // or the timeout (nanoseconds, UINT64_MAX for none) passes; false on
+    // timeout.
     virtual bool wait_fence(std::uint64_t fence, std::uint64_t timeout_ns) = 0;
 };
 
@@ -114,5 +142,17 @@ struct Backends {
 };
 void set_backends(Backends backends) noexcept;
 [[nodiscard]] const Backends& backends() noexcept;
+
+// Called right after each CPU nvnEventSignal store, on the signalling thread,
+// with the event and the value that store left, so replay can evaluate the
+// event waits it holds against that value even if a later store already
+// replaced it. One observer at a time; clearing passes the context that
+// registered it.
+using EventSignalObserver = void (*)(void* context, const volatile std::uint32_t* event,
+                                     std::uint32_t value) noexcept;
+void set_event_signal_observer(EventSignalObserver observer, void* context) noexcept;
+void clear_event_signal_observer(void* context) noexcept;
+// Delivers one CPU signal to the observer; nvnEventSignal calls it.
+void notify_event_signal_observer(const volatile std::uint32_t* event, std::uint32_t value) noexcept;
 
 } // namespace armigo::nvn

@@ -21,8 +21,10 @@ inline constexpr std::uint32_t invalid_memory = 0xd401;
 inline constexpr std::uint32_t invalid_permission = 0xd801;
 inline constexpr std::uint32_t invalid_region = 0xdc01;
 inline constexpr std::uint32_t invalid_handle = 0xe401;
-inline constexpr std::uint32_t invalid_combination = 0xf001;
+inline constexpr std::uint32_t invalid_combination = 0xe801;
 inline constexpr std::uint32_t limit_reached = 0x10801;
+inline constexpr std::uint32_t out_of_handles = 0xd201;
+inline constexpr std::uint8_t locked_attribute = 1;
 inline constexpr std::uint8_t merge_disable_left_mask = 0x0f;
 inline constexpr std::uint8_t merge_disable_right_mask = 0x20;
 inline constexpr std::uint8_t merge_disable_mapping = 1;
@@ -42,6 +44,13 @@ bool overlaps(AddressRange left, AddressRange right) noexcept;
 // Firmware argument checks only; placement, state and native feasibility follow.
 std::uint32_t validate_range(AddressRange range) noexcept;
 std::uint32_t validate_heap_size(std::uint64_t size) noexcept;
+// CreateTransferMemory's argument checks in kernel order: address, size and
+// overflow (validate_range), then the owner permission (none, read or
+// read-write). Process placement and the owner's state follow.
+std::uint32_t validate_transfer(AddressRange range, std::uint64_t permission) noexcept;
+// Whether a uniform range may be locked for transfer: a data state (Normal or
+// CodeData) mapped user read-write, with no attributes, IPC or device references.
+bool transferable(const MemoryBlock& block) noexcept;
 
 // A sparse canonical map. Replacement removes just the selected interval;
 // nullopt leaves that interval free. Callers validate coverage/state first.

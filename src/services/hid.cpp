@@ -14,6 +14,8 @@
 #include "hid_shared_memory.h"
 
 #include <algorithm>
+#include <vector>
+#include <cstdio>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -135,10 +137,10 @@ bool matches_shape(const IpcMessage& message, std::size_t cmif,
 
 std::optional<RequestShape> startup_shape(std::uint32_t command) {
     switch (command) {
-    case 0: case 11: case 101: case 103: case 104: case 121: case 129:
+    case 0: case 11: case 21: case 31: case 101: case 103: case 104: case 121: case 129:
     case 303: case 304: case 307: case 310:
         return RequestShape{8, true, 0, 0};
-    case 100: case 109: case 122: case 124: case 66: case 67: case 79: case 202:
+    case 100: case 107: case 109: case 122: case 124: case 66: case 67: case 79: case 202: case 3150:
         return RequestShape{16, true, 0, 8};
     case 120: case 128: return RequestShape{16, true, 0, 0};
     case 123: case 106: return RequestShape{24, true, 0, 8};
@@ -148,6 +150,8 @@ std::optional<RequestShape> startup_shape(std::uint32_t command) {
     case 203: case 205: return RequestShape{0, false, 0, std::nullopt};
     case 204: return RequestShape{1, false, 0, std::nullopt};
     case 206: return RequestShape{8, false, 2, std::nullopt};
+    case 211: return RequestShape{16, true, 0, 8};
+    case 214: return RequestShape{16, false, 2, std::nullopt};
     case 306: return RequestShape{24, true, 0, 0, 2};
     default: return std::nullopt;
     }
@@ -229,8 +233,8 @@ private:
 };
 }  // namespace
 
-HidSession::HidSession(std::uint64_t process_id, SevenSixAxisSamplingState initial_sampling_state)
-    : process_id_(process_id), seven_six_axis_sampling_state_(initial_sampling_state) {}
+HidSession::HidSession(std::uint64_t process_id, SevenSixAxisSamplingState initial_sampling_state, bool switch2)
+    : process_id_(process_id), seven_six_axis_sampling_state_(initial_sampling_state), switch2_(switch2) {}
 
 IpcReply HidSession::unsupported(const char* detail) {
     diagnostic_ = detail;
@@ -518,6 +522,14 @@ IpcReply HidSession::handle(const IpcMessage& message, std::uint64_t sender_pid,
         touch_activated_ = true;
         return success_reply();
     }
+    case 21: {
+        // ActivateMouse(aruid): the host reports no mouse, so the mouse section
+        // stays without samples; the activation is kept.
+        if (!accepts_aruid(read64(message, cmif + 16)))
+            return unsupported("HID command names another applet resource");
+        mouse_activated_ = true;
+        return success_reply();
+    }
     case 109: {
         // ActivateNpadWithRevision(revision, aruid): the same activation with the npad
         // revision used by the firmware's supported-style policy.
@@ -527,6 +539,23 @@ IpcReply HidSession::handle(const IpcMessage& message, std::uint64_t sender_pid,
         revision_ = revision;
         activated_ = true;
         publish_input();
+        return success_reply();
+    }
+    case 31: {
+        // ActivateKeyboard(aruid): the keyboard section stays without samples;
+        // the activation is kept.
+        if (!accepts_aruid(read64(message, cmif + 16)))
+            return unsupported("HID command names another applet resource");
+        keyboard_activated_ = true;
+        return success_reply();
+    }
+    case 3150: {
+        // SetMouseLibraryVersion(version, aruid): the mouse library the application
+        // links; the mouse section does not depend on it here.
+        const auto version = read(message, cmif + 16);
+        if (!accepts_aruid(read64(message, cmif + 24)))
+            return unsupported("HID command names another applet resource");
+        mouse_library_version_ = version;
         return success_reply();
     }
     case 120: {
@@ -646,6 +675,56 @@ IpcReply HidSession::handle(const IpcMessage& message, std::uint64_t sender_pid,
         return success_reply();
     case 205:
         return value_reply(vibration_permitted_, 1);
+    case 107: {
+        // DisconnectNpad(npad id, aruid; PID). Only player one's FullKey
+        // controller (npad 0) is presented, so other controllers are already
+        // disconnected. The presented controller has no reconnection here.
+        const auto npad = read(message, cmif + 16);
+        if (!valid_npad_id(npad)) return unsupported("HID DisconnectNpad names an invalid npad id");
+        if (npad == 0) return unsupported("HID DisconnectNpad of the presented controller is not implemented");
+        return success_reply();
+    }
+    case 211: {
+        // IsVibrationDeviceMounted(handle, aruid; PID) -> bool: only player
+        // one's FullKey controller is presented, with its two motors.
+        const auto handle = read(message, cmif + 16);
+        if (const auto error = vibration_handle_result(handle)) return success_reply(error);
+        const bool mounted = full_key_connected_ && (handle & 0xffffu) == 3 && ((handle >> 16) & 255) <= 1;
+        return value_reply(mounted ? 1 : 0, 1);
+    }
+    case 214: {
+        // Switch 2 vibration (u16, aruid; device handles, 16-byte values): the
+        // 23.0.1 hid program takes these two input pointer arrays. What the
+        // value words mean on Switch 2 is not established; like the practical
+        // reference they are sent as vibration values, and the command never
+        // fails.
+        if (!switch2_) return unsupported("HID command 214 exists only on Switch 2");
+        if (!switch2_vibration_warned_) {
+            switch2_vibration_warned_ = true;
+            std::fprintf(stderr,
+                         "Armigo hid: provisional Switch 2 handler vibration 214 sends values as Switch 1 vibration\n");
+        }
+        if (!buffers || buffers->size() < 2) return success_reply();
+        const auto handle_size = (*buffers)[0].size;
+        const auto value_size = (*buffers)[1].size;
+        if (handle_size % 4 || value_size % 16 || handle_size > session_pointer_capacity ||
+            value_size > session_pointer_capacity)
+            return unsupported("HID Switch 2 vibration arrays exceed the supported transfer shape");
+        std::array<std::byte, session_pointer_capacity> handles{}, values{};
+        if (!buffers->read(0, std::span{handles}.first(handle_size)) ||
+            !buffers->read(1, std::span{values}.first(value_size)))
+            return unsupported("HID Switch 2 vibration arrays are not readable");
+        for (std::size_t pair = 0; pair < std::min(handle_size / 4, value_size / 16); ++pair) {
+            std::uint32_t handle = 0;
+            std::array<std::uint32_t, 4> words{};
+            std::memcpy(&handle, handles.data() + pair * 4, 4);
+            std::memcpy(words.data(), values.data() + pair * 16, 16);
+            if (vibration_handle_result(handle)) continue;
+            send_vibration(handle, VibrationValue{std::bit_cast<float>(words[0]), std::bit_cast<float>(words[1]),
+                                                  std::bit_cast<float>(words[2]), std::bit_cast<float>(words[3])});
+        }
+        return success_reply();
+    }
     case 206: {
         if (!buffers || buffers->empty()) return success_reply();
         const auto handle_size = (*buffers)[0].size;
@@ -706,9 +785,38 @@ void set_host_full_key_input(const HostFullKeyInput& input) noexcept {
     host_input_set.store(true, std::memory_order_release);
 }
 
+namespace {
+// Live applet resources, for writing host input to their shared memory at once.
+// Never destroyed, like the host input lock.
+std::mutex& sessions_mutex() {
+    static auto* mutex = new std::mutex;
+    return *mutex;
+}
+std::vector<AppletResourceSession*>& live_sessions() {
+    static auto* sessions = new std::vector<AppletResourceSession*>;
+    return *sessions;
+}
+}  // namespace
+
+void publish_host_full_key_input_now(const HostFullKeyInput& input) noexcept {
+    set_host_full_key_input(input);
+    const std::lock_guard lock(sessions_mutex());
+    for (auto* session : live_sessions()) {
+        const std::lock_guard write(session->write_mutex());
+        session->shared_memory()->update([&](std::span<std::byte> bytes) {
+            detail::publish_full_key_input(bytes,
+                {input.buttons, input.left_x, input.left_y, input.right_x, input.right_y});
+        });
+    }
+}
+
 AppletResourceSession::AppletResourceSession(std::uint64_t process_id)
     : process_id_(process_id), shared_memory_(std::make_shared<horizon::SharedMemory>(0x40000)) {
     detail::initialize_shared_memory(shared_memory_->bytes());
+    {
+        const std::lock_guard lock(sessions_mutex());
+        live_sessions().push_back(this);
+    }
     sampler_ = std::jthread([this](std::stop_token stop) {
         detail::MotionFusion motion;
         auto next = std::chrono::steady_clock::now();
@@ -722,12 +830,14 @@ AppletResourceSession::AppletResourceSession(std::uint64_t process_id)
             const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - previous).count();
             previous = now;
             if (!input_set && !six_axis) continue;
+            // Read the host input under the write lock, so an immediate publication
+            // between the read and the write cannot be overwritten by an older state.
+            const std::lock_guard write(write_mutex_);
             HostFullKeyInput input;
             if (input_set) {
                 const std::lock_guard lock(host_input_mutex());
                 input = host_input;
             }
-            const std::lock_guard write(write_mutex_);
             if (input_set)
                 shared_memory_->update([&](std::span<std::byte> bytes) {
                     detail::publish_full_key_input(bytes,
@@ -755,7 +865,10 @@ AppletResourceSession::AppletResourceSession(std::uint64_t process_id)
     });
 }
 
-AppletResourceSession::~AppletResourceSession() = default;
+AppletResourceSession::~AppletResourceSession() {
+    const std::lock_guard lock(sessions_mutex());
+    std::erase(live_sessions(), this);
+}
 
 void AppletResourceSession::set_six_axis(bool running, std::uint32_t zero_drift_mode) noexcept {
     six_axis_drift_mode_.store(zero_drift_mode, std::memory_order_relaxed);

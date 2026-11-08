@@ -34,6 +34,8 @@ public:
     static void set_ipc_admission_boundary(ProcessRuntime& runtime, std::function<void(std::stop_token)> boundary);
     static bool run_success_selected(ProcessRuntime& runtime);
     static std::size_t mutex_waiters(ProcessRuntime& runtime, std::uint64_t address);
+    // Installs the runtime's unsupported-NVN handler as an NVN launch does.
+    static void install_nvn_handler(ProcessRuntime& runtime);
 };
 
 } // namespace armigo::runtime

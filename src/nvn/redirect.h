@@ -35,11 +35,14 @@ struct RedirectResult {
 // running guests. No borrowed data is retained and no game file is changed.
 // An embedded stub offset selects a 12-byte appendix stub that loads the host
 // target from appended_data's NVN key word instead of embedding its address.
+// The host target is `loader` (bootstrap_loader_for the selected version), the
+// API 55 loader when null.
 [[nodiscard]] RedirectResult redirect_bootstrap_loader(
     const runtime::ModulePreparationView& view,
     const execution::PreparedImage& prepared,
     std::uint64_t text_offset, std::uint64_t text_size,
-    std::optional<std::size_t> embedded_stub_offset = {}) noexcept;
+    std::optional<std::size_t> embedded_stub_offset = {},
+    BootstrapLoader loader = nullptr) noexcept;
 
 void register_null_entries() noexcept;
 

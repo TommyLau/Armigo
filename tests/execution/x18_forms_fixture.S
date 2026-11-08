@@ -10,7 +10,8 @@
 
 // This wrapper executes only prepared instructions or assembler-authored X28
 // reference instructions. It captures the complete GPR/vector state and owns
-// a frame separate from the trampoline's sixteen scratch bytes.
+// a frame separate from the trampoline's scratch bytes (16, or 32 for a CASP
+// pair).
     .text
     .p2align 2
     .globl _armigo_test_x18_forms_run
@@ -128,6 +129,18 @@ _armigo_test_x18_forms_run:
     ldp x27, x28, [sp, #80]
     ldp x29, x30, [sp]
     add sp, sp, #256
+    ret
+
+// The same runner on a caller-provided stack whose 16-byte aligned top is x2,
+// so a test can guard the storage below the trampoline's scratch.
+    .globl _armigo_test_x18_forms_run_on
+_armigo_test_x18_forms_run_on:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    mov sp, x2
+    bl _armigo_test_x18_forms_run
+    mov sp, x29
+    ldp x29, x30, [sp], #16
     ret
 
 // Each table record has an input kind and two independently assembled words:
@@ -938,6 +951,88 @@ _armigo_test_x18_forms:
     ccmp x18, #7, #9, ne
     ccmp x28, #7, #9, ne
 
+// Atomic memory operations, LDAPR, CAS, and CASP through an x18 base: x18 as
+// source, destination, base and several at once, every operation, size and
+// ordering form.
+    .long 0
+    ldadd x18, x4, [x3]
+    ldadd x28, x4, [x3]
+    .long 0
+    ldadd x2, x18, [x3]
+    ldadd x2, x28, [x3]
+    .long 1
+    ldadd x2, x4, [x18]
+    ldadd x2, x4, [x28]
+    .long 1
+    ldadd w14, w18, [x18]
+    ldadd w14, w28, [x28]
+    .long 0
+    ldaddalb w18, w18, [x3]
+    ldaddalb w28, w28, [x3]
+    .long 0
+    ldclrah w18, w4, [x3]
+    ldclrah w28, w4, [x3]
+    .long 0
+    ldeorl w2, w18, [x3]
+    ldeorl w2, w28, [x3]
+    .long 0
+    ldsetal x18, x18, [x3]
+    ldsetal x28, x28, [x3]
+    .long 0
+    ldsmaxb w18, w4, [x3]
+    ldsmaxb w28, w4, [x3]
+    .long 0
+    ldsminh w2, w18, [x3]
+    ldsminh w2, w28, [x3]
+    .long 0
+    ldumax w18, w4, [x3]
+    ldumax w28, w4, [x3]
+    .long 0
+    ldumin x2, x18, [x3]
+    ldumin x2, x28, [x3]
+    .long 0
+    swp x18, x4, [x3]
+    swp x28, x4, [x3]
+    .long 0
+    swpal w2, w18, [x3]
+    swpal w2, w28, [x3]
+    .long 0
+    swpb w18, w18, [x3]
+    swpb w28, w28, [x3]
+    .long 1
+    swpa x2, x4, [x18]
+    swpa x2, x4, [x28]
+    .long 0
+    stadd x18, [x3]
+    stadd x28, [x3]
+    .long 0
+    stsetlh w18, [x3]
+    stsetlh w28, [x3]
+    .long 0
+    ldapr x18, [x3]
+    ldapr x28, [x3]
+    .long 0
+    ldaprb w18, [x3]
+    ldaprb w28, [x3]
+    .long 1
+    ldapr w2, [x18]
+    ldapr w2, [x28]
+    .long 0
+    cas x18, x2, [x3]
+    cas x28, x2, [x3]
+    .long 0
+    casal w2, w18, [x3]
+    casal w2, w28, [x3]
+    .long 0
+    casb w18, w18, [x3]
+    casb w28, w28, [x3]
+    .long 1
+    casl x2, x4, [x18]
+    casl x2, x4, [x28]
+    .long 1
+    casp x2, x3, x4, x5, [x18]
+    casp x2, x3, x4, x5, [x28]
+
     .globl _armigo_test_x18_forms_end
 _armigo_test_x18_forms_end:
 
@@ -968,5 +1063,46 @@ _armigo_test_x18_refusals:
     stxp w4, x5, x6, [x18]
     .long 1
     stlxp w18, x5, x6, [x3]
+    .long 0
+    ldadd x18, x2, [sp]
+    .long 0
+    cas x18, x2, [sp]
+    .long 0
+    casp x18, x19, x2, x3, [sp]
     .globl _armigo_test_x18_refusals_end
 _armigo_test_x18_refusals_end:
+
+// Compare-and-swap forms, run once with a matching and once with a differing
+// compare value. Pair records (1) rename the x18:x19 pair to x28:x29 in the
+// reference; the others rename x18 alone. The base is x4.
+    .globl _armigo_test_x18_swap_forms
+_armigo_test_x18_swap_forms:
+    .long 0
+    cas x18, x2, [x4]
+    cas x28, x2, [x4]
+    .long 0
+    casal w18, w18, [x4]
+    casal w28, w28, [x4]
+    .long 0
+    casb w18, w2, [x4]
+    casb w28, w2, [x4]
+    .long 0
+    cash w2, w18, [x4]
+    cash w2, w28, [x4]
+    .long 1
+    casp x18, x19, x2, x3, [x4]
+    casp x28, x29, x2, x3, [x4]
+    .long 1
+    caspal w18, w19, w2, w3, [x4]
+    caspal w28, w29, w2, w3, [x4]
+    .long 1
+    casp x2, x3, x18, x19, [x4]
+    casp x2, x3, x28, x29, [x4]
+    .long 1
+    caspa x18, x19, x18, x19, [x4]
+    caspa x28, x29, x28, x29, [x4]
+    .long 1
+    caspl w2, w3, w18, w19, [x4]
+    caspl w2, w3, w28, w29, [x4]
+    .globl _armigo_test_x18_swap_forms_end
+_armigo_test_x18_swap_forms_end:

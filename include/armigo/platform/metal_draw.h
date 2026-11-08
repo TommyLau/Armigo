@@ -143,6 +143,26 @@ struct CompiledCustomBorderSupport {
     std::vector<CompiledCustomBorderPair> pairs;
 };
 
+struct CompiledGuestMemory {
+    std::uint8_t buffer_index{};
+    std::uint32_t tag{};
+    // The stage stores to guest memory or applies an atomic or reduction to
+    // it; a stage that only loads reads its pools.
+    bool writes{true};
+    bool operator==(const CompiledGuestMemory&) const = default;
+};
+
+// An NVN2 task (Metal object) or mesh stage's launch: its threadgroup size
+// and the payload bytes each task threadgroup passes to the mesh threadgroups
+// it launches (a task stage's) or a mesh threadgroup reads (a mesh stage's).
+// launched_by_task: a mesh stage translated to run under a task stage.
+struct CompiledMeshLaunch {
+    std::array<std::uint32_t, 3> local_size{1, 1, 1};
+    std::uint32_t payload_bytes = 0;
+    bool launched_by_task = false;
+    bool operator==(const CompiledMeshLaunch&) const = default;
+};
+
 struct CompiledGraphicsStage {
     std::vector<std::byte> metallib;
     // A stage translated at run time carries its Metal source instead of a
@@ -174,6 +194,11 @@ struct CompiledGraphicsStage {
     // The legacy paired list above is synthesized only for exactly
     // representable direct scalar resources.
     std::vector<CompiledShaderResource> resources;
+    // Host-evaluated handle programs (shader/pipeline/handle_program.h). A
+    // texture or sampler whose cbuf_slot is 31 takes program
+    // handle_byte_offset / 4 from this list. Replay runs it when encoding the
+    // draw or dispatch, not when the command is recorded.
+    std::vector<std::vector<std::uint32_t>> handle_programs;
     std::optional<CompiledArgumentBufferLayout> argument_buffer;
     std::optional<CompiledCustomBorderSupport> custom_border;
     bool legacy_texture_bindings_compatible = true;
@@ -206,6 +231,9 @@ struct CompiledGraphicsStage {
     // The fragment stage reads the guest point coordinate (attribute 0x2e0,
     // Metal [[point_coord]]); function constant 11 selects a lower-left origin.
     bool reads_point_coord = false;
+    // A vertex stage with no outputs, whose entry returns void: it draws only
+    // with rasterizer discard.
+    bool requires_rasterizer_discard = false;
     // The texture_handle_cbuf fact this stage consumed offline: the constant
     // buffer its bound handles were proven to come from. Draw time must stop
     // unless the 3D texture buffer selector register (0x982) still selects it;
@@ -220,9 +248,19 @@ struct CompiledGraphicsStage {
     // armigo-cb-sizes v1: 18 little-endian uint32 programmed byte sizes, zero
     // for disabled slots. Present exactly when runtime windows are present.
     std::optional<std::uint8_t> constant_buffer_support_index;
-    // armigo-draw-parameters v1: original guest first instance as one uint32.
-    // Native baseInstance still includes the split continuation index.
+    // armigo-draw-parameters: original guest first instance as one uint32
+    // (v1, vertex stages); a fragment stage takes v2, which adds the
+    // render-target height as a second word. Native baseInstance still
+    // includes the split continuation index.
     std::optional<std::uint8_t> draw_support_buffer_index;
+    // armigo-guest-memory v2: the writable guest-memory pool table and the
+    // tag the stage records on its first miss.
+    std::optional<CompiledGuestMemory> guest_memory;
+    // Task and mesh stages only: the launch a mesh draw dispatches with. A
+    // task stage reads the draw's first task workgroup, and a mesh stage
+    // without a task stage its first mesh workgroup, as word 0 of the
+    // draw-parameter record at draw_support_buffer_index.
+    std::optional<CompiledMeshLaunch> task, mesh;
     // armigo-vertex-fetch v1: a vertex stage that reads its generic inputs
     // through a per-draw fetch table (armigo/shader/vertex_fetch.h) at this
     // buffer index instead of a vertex descriptor.

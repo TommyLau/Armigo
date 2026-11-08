@@ -161,6 +161,17 @@ std::uint32_t key_index_for_generation(std::uint32_t generation) noexcept {
     return generation == 0 ? 0 : generation - 1;
 }
 
+// A generation-indexed key the keys file lacks: its keys predate the
+// firmware or game that encrypted this content.
+std::string newer_keys_needed(std::uint32_t key_generation) {
+    char text[160];
+    std::snprintf(text, sizeof(text),
+                  " The keys file is older than this content (keys older than firmware): it needs key "
+                  "generation %02x (master_key_%02x); supply keys dumped from firmware at least that new.",
+                  key_generation, key_generation);
+    return text;
+}
+
 // Encodes 16 bytes as 32 lowercase hex characters (used to name rights ids
 // in diagnostics; never key values).
 std::string hex_name(std::span<const std::byte> value) {
@@ -713,7 +724,8 @@ enum class TableOutcome {
             if (!titlekek || titlekek->size() != 16) {
                 failure = {ContainerError::key_missing,
                            std::string("The keys do not provide '") + key_name +
-                               "' (16 bytes), required to decrypt the ticket title key."};
+                               "' (16 bytes), required to decrypt the ticket title key." +
+                               newer_keys_needed(generation)};
                 return false;
             }
             const std::span<const std::byte> encrypted =
@@ -1072,7 +1084,8 @@ CandidateOutcome open_nca_candidate(std::FILE* file, std::uint64_t base,
         if (!area_key || area_key->size() != 16) {
             failure = {ContainerError::key_missing,
                        std::string("The keys do not provide '") + key_name +
-                           "' (16 bytes), required for NCA key-area decryption."};
+                           "' (16 bytes), required for NCA key-area decryption." +
+                           newer_keys_needed(key_generation)};
             return CandidateOutcome::failure;
         }
         program.required_key_names.push_back(key_name);

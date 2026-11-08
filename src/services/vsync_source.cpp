@@ -166,6 +166,8 @@ void VsyncSource::latch_failure(runtime::LaunchFailure failure) {
 }
 
 void VsyncSource::run(std::stop_token stop) {
+    // The guest clock ends each refresh wait at its deadline, so the refresh
+    // is signalled then rather than at a coalesced moment after it.
     try {
         // Each refresh index is signalled once: when the grid's phase follows
         // the display, a refresh may move a little later after it was

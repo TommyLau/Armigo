@@ -1,0 +1,95 @@
+01004B10157F2000 d0 description = 14c9f52d80f2d093
+01004B10157F2000 d0 mode=0 nvn=0 = 84b90d1e35a5b8d1
+01004B10157F2000 d0 mode=0 nvn=1 = 84b90d1e35a5b8d1
+01004B10157F2000 d0 mode=120 nvn=0 = c68128ec0b7fc074
+01004B10157F2000 d0 mode=120 nvn=1 = c68128ec0b7fc074
+01004B10157F2000 d0 mode=30 nvn=0 = 84b90d1e35a5b8d1
+01004B10157F2000 d0 mode=30 nvn=1 = 84b90d1e35a5b8d1
+01004B10157F2000 d0 mode=45 nvn=0 = d0171b4f84949ccd
+01004B10157F2000 d0 mode=45 nvn=1 = d0171b4f84949ccd
+01004B10157F2000 d0 mode=60 nvn=0 = e2206e4fc53d66cb
+01004B10157F2000 d0 mode=60 nvn=1 = e2206e4fc53d66cb
+01004B10157F2000 d0 mode=default nvn=0 = 84b90d1e35a5b8d1
+01004B10157F2000 d0 mode=default nvn=1 = 84b90d1e35a5b8d1
+01004B10157F2000 d0 mode=variable nvn=0 = 8b5f473f9a3562d2
+01004B10157F2000 d0 mode=variable nvn=1 = 8b5f473f9a3562d2
+010054B01AD92000 d0 description = e4d6324cdf62c25d
+010054B01AD92000 d0 mode=0 nvn=0 = 8410e1c477840e74
+010054B01AD92000 d0 mode=0 nvn=1 = 8410e1c477840e74
+010054B01AD92000 d0 mode=120 nvn=0 = 8410e1c477840e74
+010054B01AD92000 d0 mode=120 nvn=1 = 8410e1c477840e74
+010054B01AD92000 d0 mode=30 nvn=0 = 8410e1c477840e74
+010054B01AD92000 d0 mode=30 nvn=1 = 8410e1c477840e74
+010054B01AD92000 d0 mode=45 nvn=0 = 8410e1c477840e74
+010054B01AD92000 d0 mode=45 nvn=1 = 8410e1c477840e74
+010054B01AD92000 d0 mode=60 nvn=0 = 8410e1c477840e74
+010054B01AD92000 d0 mode=60 nvn=1 = 8410e1c477840e74
+010054B01AD92000 d0 mode=default nvn=0 = 8410e1c477840e74
+010054B01AD92000 d0 mode=default nvn=1 = 8410e1c477840e74
+010054B01AD92000 d0 mode=variable nvn=0 = 8410e1c477840e74
+010054B01AD92000 d0 mode=variable nvn=1 = 8410e1c477840e74
+01007EF00011E000 d0 description = 936bace66495b33b
+01007EF00011E000 d0 mode=0 nvn=0 = 843b0cc920cd8048
+01007EF00011E000 d0 mode=0 nvn=1 = f41fa71f4dd94cba
+01007EF00011E000 d0 mode=120 nvn=0 = 4dbf1f30c6b7e679
+01007EF00011E000 d0 mode=120 nvn=1 = 10b5fc39f9fd38f5
+01007EF00011E000 d0 mode=30 nvn=0 = 756bb4ffa4380f2f
+01007EF00011E000 d0 mode=30 nvn=1 = 216cde7b7ad51d9b
+01007EF00011E000 d0 mode=45 nvn=0 = d0171b4f84949ccd
+01007EF00011E000 d0 mode=45 nvn=1 = d0171b4f84949ccd
+01007EF00011E000 d0 mode=60 nvn=0 = 843b0cc920cd8048
+01007EF00011E000 d0 mode=60 nvn=1 = f41fa71f4dd94cba
+01007EF00011E000 d0 mode=default nvn=0 = 843b0cc920cd8048
+01007EF00011E000 d0 mode=default nvn=1 = f41fa71f4dd94cba
+01007EF00011E000 d0 mode=variable nvn=0 = 25f853e709de7613
+01007EF00011E000 d0 mode=variable nvn=1 = 25f853e709de7613
+01007EF00011E000 d0 resolution width=1280 rate=120 gpu_busy=0 = 526e4bd8fcc7fdd2
+01007EF00011E000 d0 resolution width=1280 rate=120 gpu_busy=default = 1f7e113003338bf7
+01007EF00011E000 d0 resolution width=1280 rate=60 gpu_busy=1 = e2963f0dd673b231
+01007EF00011E000 d0 resolution width=1280 rate=60 gpu_busy=default = bf0cdd4b26828a2e
+01007EF00011E000 d0 resolution width=1280 rate=default gpu_busy=default = bf0cdd4b26828a2e
+01007EF00011E000 d0 resolution width=1600 rate=120 gpu_busy=0 = 85ad462b38ee4615
+01007EF00011E000 d0 resolution width=1600 rate=120 gpu_busy=default = 9682664929ac87ce
+01007EF00011E000 d0 resolution width=1600 rate=60 gpu_busy=1 = e2963f0dd673b231
+01007EF00011E000 d0 resolution width=1600 rate=60 gpu_busy=default = 8808cba25493692d
+01007EF00011E000 d0 resolution width=1600 rate=default gpu_busy=default = 8808cba25493692d
+01007EF00011E000 d0 resolution width=1920 rate=120 gpu_busy=0 = 4b9e6a626fd2b0e1
+01007EF00011E000 d0 resolution width=1920 rate=120 gpu_busy=default = ab3d8c9c122631fc
+01007EF00011E000 d0 resolution width=1920 rate=60 gpu_busy=1 = e2963f0dd673b231
+01007EF00011E000 d0 resolution width=1920 rate=60 gpu_busy=default = a2f7060b5e227681
+01007EF00011E000 d0 resolution width=1920 rate=default gpu_busy=default = a2f7060b5e227681
+01007EF00011E000 d0 resolution width=2560 rate=120 gpu_busy=0 = f1abf4d8c8fe0e5e
+01007EF00011E000 d0 resolution width=2560 rate=120 gpu_busy=default = 6ee285f65fb12dd9
+01007EF00011E000 d0 resolution width=2560 rate=60 gpu_busy=1 = e2963f0dd673b231
+01007EF00011E000 d0 resolution width=2560 rate=60 gpu_busy=default = 05f73ed22771082c
+01007EF00011E000 d0 resolution width=2560 rate=default gpu_busy=default = 05f73ed22771082c
+01007EF00011E000 d0 resolution width=3840 rate=120 gpu_busy=0 = f74f06f04633e76d
+01007EF00011E000 d0 resolution width=3840 rate=120 gpu_busy=default = 89ba9292e75490ac
+01007EF00011E000 d0 resolution width=3840 rate=60 gpu_busy=1 = e2963f0dd673b231
+01007EF00011E000 d0 resolution width=3840 rate=60 gpu_busy=default = f7cc4b4eb8164d8f
+01007EF00011E000 d0 resolution width=3840 rate=default gpu_busy=default = f7cc4b4eb8164d8f
+01007EF00011E000 d0 resolution width=640 rate=120 gpu_busy=0 = e0f10852cc94d71a
+01007EF00011E000 d0 resolution width=640 rate=120 gpu_busy=default = e0f10852cc94d71a
+01007EF00011E000 d0 resolution width=640 rate=60 gpu_busy=1 = e0f10852cc94d71a
+01007EF00011E000 d0 resolution width=640 rate=60 gpu_busy=default = e0f10852cc94d71a
+01007EF00011E000 d0 resolution width=640 rate=default gpu_busy=default = e0f10852cc94d71a
+01007EF00011E000 d0 resolution width=default rate=120 gpu_busy=0 = 8882d6c439aaf7f1
+01007EF00011E000 d0 resolution width=default rate=120 gpu_busy=default = 8882d6c439aaf7f1
+01007EF00011E000 d0 resolution width=default rate=60 gpu_busy=1 = e2963f0dd673b231
+01007EF00011E000 d0 resolution width=default rate=60 gpu_busy=default = 3df447162df30044
+01007EF00011E000 d0 resolution width=default rate=default gpu_busy=default = 3df447162df30044
+0400486024DEC000 d0 description = 1059f6cc59c565cb
+0400486024DEC000 d0 mode=0 nvn=0 = 0894e2d524af3191
+0400486024DEC000 d0 mode=0 nvn=1 = 0894e2d524af3191
+0400486024DEC000 d0 mode=120 nvn=0 = 0894e2d524af3191
+0400486024DEC000 d0 mode=120 nvn=1 = 0894e2d524af3191
+0400486024DEC000 d0 mode=30 nvn=0 = 0894e2d524af3191
+0400486024DEC000 d0 mode=30 nvn=1 = 0894e2d524af3191
+0400486024DEC000 d0 mode=45 nvn=0 = 0894e2d524af3191
+0400486024DEC000 d0 mode=45 nvn=1 = 0894e2d524af3191
+0400486024DEC000 d0 mode=60 nvn=0 = 0894e2d524af3191
+0400486024DEC000 d0 mode=60 nvn=1 = 0894e2d524af3191
+0400486024DEC000 d0 mode=default nvn=0 = 0894e2d524af3191
+0400486024DEC000 d0 mode=default nvn=1 = 0894e2d524af3191
+0400486024DEC000 d0 mode=variable nvn=0 = 0894e2d524af3191
+0400486024DEC000 d0 mode=variable nvn=1 = 0894e2d524af3191

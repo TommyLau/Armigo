@@ -11,10 +11,11 @@
 #include <armigo/common/diagnostics.h>
 #include <armigo/runtime/launch_plan.h>
 #include <armigo/aarch64/instruction.h>
-#include <armigo/titles/01007EF00011E000/resolution.h>
+#include <armigo/compat/title_plan.h>
 #include <armigo/execution/gate_code.h>
 
 #include "prepared_artifact.h"
+#include "../nvn/entry_table_231.h"
 #include "../nvn/redirect.h"
 
 #include <algorithm>
@@ -237,6 +238,10 @@ bool prepare_loaded_module(const ModulePreparationView& view, void* raw) noexcep
                     loading.compatibility_error = "Compatibility instruction changed during preparation.";
                     return false;
                 }
+                if (site.frame_ratio) {
+                    loading.compatibility_error = "Prepared launches do not place frame-ratio hooks; prepare at load time.";
+                    return false;
+                }
                 const auto stub = gate_address + loading.hook_gate.size() + i * 16;
                 auto hook = compat::make_patch_hook(site, actual, view.base_address + site.offset,
                     stub, {gate_address, loading.hook_gate.size()});
@@ -270,7 +275,8 @@ bool prepare_loaded_module(const ModulePreparationView& view, void* raw) noexcep
         if (loading.nvn_module == manifest_index) {
             const auto& payload = loading.payloads[manifest_index];
             const auto redirected = nvn::redirect_bootstrap_loader(view, image,
-                payload.text_offset, payload.text_size);
+                payload.text_offset, payload.text_size, std::nullopt,
+                nvn::bootstrap_loader_for(*loading.nvn_version));
             if (!redirected.ok()) {
                 loading.compatibility_error = redirected.error;
                 return false;
@@ -375,40 +381,18 @@ LaunchResult<PreparedLaunch> load_prepared_launch(
                         rate_patch = patch;
                         requested_title_rate = requested_rate ? requested_rate : "";
                     }
-                    auto selected = compat::select_patch_words(*patch, requested_rate ? requested_rate : "");
-                    if (const auto* failure = std::get_if<std::string>(&selected))
-                        return fail(LaunchError::invalid_input, "compatibility-frame-rate", *failure);
-                    auto words = std::get<std::vector<compat::WordPatch>>(std::move(selected));
-                    if (patch->resolution) {
-                        namespace title = titles::title_01007ef00011e000;
-                        const auto settings = title::resolution_settings(*patch->resolution);
-                        if (const auto* failure = std::get_if<std::string>(&settings))
-                            return fail(LaunchError::invalid_input, "compatibility-resolution", *failure);
-                        const auto planned = title::resolution_words(
-                            *patch->resolution, std::get<title::ResolutionSettings>(settings), source);
-                        if (const auto* failure = std::get_if<std::string>(&planned))
-                            return fail(LaunchError::artifact_mismatch, "compatibility-resolution", *failure);
-                        const auto& resolution = std::get<title::ResolutionPlan>(planned);
-                        loading.gpu_budget_hook = resolution.gpu_budget_hook;
-                        if (loading.gpu_budget_hook && patch->module != "frame-rate")
+                    auto planned = compat::plan_title_words(*patch, source,
+                        {requested_rate ? requested_rate : "", false});
+                    if (const auto* failure = std::get_if<compat::TitlePlanFailure>(&planned))
+                        return fail(failure->kind == compat::TitlePlanFailure::Kind::invalid_input
+                            ? LaunchError::invalid_input : LaunchError::artifact_mismatch, failure->stage, failure->detail);
+                    auto& plan = std::get<compat::TitlePlan>(planned);
+                    auto words = std::move(plan.words);
+                    if (!plan.module_calls.empty()) {
+                        loading.gpu_budget_hook = plan.module_calls.front();
+                        if (patch->module != "frame-rate")
                             return fail(LaunchError::unsupported, "compatibility-resolution",
                                         "GPU-work feedback requires the title frame-rate module.");
-                        if (!resolution.words.empty())
-                            armigo::diag::write(armigo::diag::Level::info,  "compat_resolution width=%u height=%u render_target_pool=%llu "
-                                         "graphics_heap=%llu process_heap=%llu root_heap=%llu floor=%.4f load_scale=%.1f\n",
-                                         resolution.width, resolution.height,
-                                         static_cast<unsigned long long>(resolution.render_target_pool),
-                                         static_cast<unsigned long long>(resolution.graphics_heap),
-                                         static_cast<unsigned long long>(resolution.process_heap),
-                                         static_cast<unsigned long long>(resolution.root_heap),
-                                         resolution.floor, resolution.load_scale);
-                        for (const auto& word : resolution.words) {
-                            if (std::any_of(words.begin(), words.end(),
-                                    [&](const auto& other) { return other.offset == word.offset; }))
-                                return fail(LaunchError::artifact_mismatch, "compatibility-resolution",
-                                            "Compatibility resolution site overlaps an instruction word.");
-                            words.push_back(word);
-                        }
                     }
                     if (!words.empty()) {
                         const auto& prepared = payloads[index].image;
@@ -579,6 +563,7 @@ LaunchResult<PreparedLaunch> load_prepared_launch(
         }
         if (loading.nvn_version) {
             nvn::register_null_entries();
+            if (loading.nvn_version->major == 231) nvn::v231::register_entries();
             nvn::select_api_version(*loading.nvn_version);
             armigo::diag::write(armigo::diag::Level::info,  "Armigo NVN: null device selected for API %d.%d.\n",
                 loading.nvn_version->major, loading.nvn_version->minor);

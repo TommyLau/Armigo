@@ -18,7 +18,8 @@
 // zero (false for a predicate), by owner decision (2026-10-24). Hardware
 // initial register contents are not modelled.
 // If a live undefined edge survives, first prove that its phi-carried value
-// cannot reach an executed instruction under correlated predicates. Only those
+// cannot reach an executed instruction under correlated predicates (a proof
+// over its limits proves nothing and leaves the zero reading). Only those
 // unobservable phi inputs can receive an existing dominating definition, with
 // the entire CFG and every operation preserved. Otherwise, bounded
 // specialization of repeated predicate SSA identities and selected predicate
@@ -112,18 +113,34 @@ public:
         if (error_) return *error_;
         remove_dead_code();
         if (error_ && error_->code == DiagnosticCode::undefined_read && registers) {
+            // The repairs are proofs that an undefined value is unobservable.
+            // One that would exceed its block, edge or work limit proves
+            // nothing: the read then takes the zero reading below, with the
+            // analysis budget it spent returned.
+            const auto spent = steps_;
+            const auto over_limit = [](const auto& result) {
+                const auto* failure = std::get_if<Diagnostic>(&result);
+                return failure && failure->code == DiagnosticCode::limit_exceeded;
+            };
             auto repaired = resolve_guarded_phi_inputs(p_, steps_);
-            if (const auto* failure = std::get_if<Diagnostic>(&repaired)) return *failure;
-            if (auto& fixed_cfg = std::get<std::optional<Program>>(repaired); fixed_cfg) {
+            if (over_limit(repaired)) {
+                steps_ = spent;
+            } else if (const auto* failure = std::get_if<Diagnostic>(&repaired)) {
+                return *failure;
+            } else if (auto& fixed_cfg = std::get<std::optional<Program>>(repaired); fixed_cfg) {
                 p_ = std::move(*fixed_cfg);
                 error_.reset();
             } else {
                 auto specialized = specialize_guard_paths(*registers, p_, steps_);
-                if (const auto* failure = std::get_if<Diagnostic>(&specialized)) return *failure;
-                auto& replacement = std::get<std::optional<Program>>(specialized);
-                if (replacement) {
-                    p_ = std::move(*replacement);
-                    return SsaBuilder(p_, limits_, steps_).run(false);
+                if (over_limit(specialized)) {
+                    steps_ = spent;
+                } else {
+                    if (const auto* failure = std::get_if<Diagnostic>(&specialized)) return *failure;
+                    auto& replacement = std::get<std::optional<Program>>(specialized);
+                    if (replacement) {
+                        p_ = std::move(*replacement);
+                        return SsaBuilder(p_, limits_, steps_).run(false);
+                    }
                 }
             }
         }

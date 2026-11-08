@@ -1314,8 +1314,26 @@ void private_interval_authority() {
 
 } // namespace
 
+// The Switch 2 alias window asks for 64 GiB and steps down to 2 GiB when the
+// host cannot place the arena; Switch 1 keeps its profile's size.
+void test_alias_window_sizes() {
+    constexpr std::uint64_t gib = 1ull << 30;
+    CHECK(switch2_alias_window == 64 * gib && switch2_minimum_alias_window == 2 * gib);
+    const auto switch2 = alias_window_sizes(switch2_alias_window, true);
+    CHECK(switch2.size() == 249 && switch2.front() == 64 * gib && switch2.back() == 2 * gib);
+    CHECK(alias_window_sizes(4 * gib, true).size() == 9);
+    for (std::size_t i = 1; i < switch2.size(); ++i) CHECK(switch2[i - 1] - switch2[i] == alias_window_step);
+    // An unaligned request still ends at the minimum, never below it.
+    const auto odd = alias_window_sizes(2 * gib + 300 * mib, true);
+    CHECK(odd.size() == 3 && odd[0] == 2 * gib + 300 * mib && odd[1] == 2 * gib + 44 * mib && odd[2] == 2 * gib);
+    CHECK(alias_window_sizes(2 * gib, true) == std::vector<std::uint64_t>{2 * gib});
+    CHECK(alias_window_sizes(gib, true) == std::vector<std::uint64_t>{gib});
+    CHECK(alias_window_sizes(64 * gib, false) == std::vector<std::uint64_t>{64 * gib});
+}
+
 int main() {
     private_interval_authority();
+    test_alias_window_sizes();
     for (bool mode : {false, true}) {
         private_mode = mode;
         test_observation_copy_does_not_retain_mappings();

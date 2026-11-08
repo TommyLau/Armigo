@@ -112,6 +112,16 @@ enum class Operation : std::uint8_t {
     ldxp, ldaxp, stxp, stlxp,
     ldarb, ldarh, ldar, stlrb, stlrh, stlr,
 
+    // Atomic memory operations (FEAT_LSE): the loaded value goes to Rt, Rs
+    // is the operand (ST<op> is LD<op> with Rt = XZR). Sizes are in the
+    // memory effect, ordering in its attributes. LDAPR is the RCpc load of
+    // the same class.
+    ldadd, ldclr, ldeor, ldset, ldsmax, ldsmin, ldumax, ldumin, swp, ldapr,
+    // Compare and swap: Rs is compared with memory and receives the old
+    // value; Rt is stored on a match. CASP uses the even/odd pairs starting
+    // at Rs and Rt; the odd registers are implicit operands.
+    cas, casp,
+
     // Data Processing - Scalar Floating-Point and Advanced SIMD (op0 = x111)
     // groups with no general-register operand. Vector operands carry the
     // arrangement or scalar view; nothing here reads or writes NZCV except
@@ -220,7 +230,8 @@ struct RegisterOperand {
 
 inline constexpr std::size_t max_register_operands = 6;
 
-enum class MemoryOperation : std::uint8_t { none, load, store, prefetch };
+// atomic: one indivisible read-modify-write of the addressed memory.
+enum class MemoryOperation : std::uint8_t { none, load, store, prefetch, atomic };
 
 enum class AddressingMode : std::uint8_t {
     none,
@@ -344,7 +355,8 @@ bool proven_free_of(const RegisterEffects& effects, unsigned reg) noexcept;
 // (0..30). Returns nullopt unless the effects are decoded and every use of
 // reg is an explicit field, so the result is exactly the set of fields that
 // would name another register if their values changed. An empty mask means
-// the instruction does not use reg.
+// the instruction does not use reg. A CASP pair field also names its implicit
+// second register, so a register it names has no independent fields either.
 std::optional<std::uint32_t> register_fields(const RegisterEffects& effects,
                                              unsigned reg) noexcept;
 

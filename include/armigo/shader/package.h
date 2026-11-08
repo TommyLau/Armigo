@@ -25,6 +25,10 @@ struct BuildOptions {
     std::filesystem::path output;
     std::optional<std::filesystem::path> compile_cache;
     unsigned jobs = 0;
+    // When true, the manifest records "sample_hoisting":"implicit". False omits
+    // the key, so a manifest without the opt-in stays byte-identical. The field
+    // is outside profile_text and does not change the chain id.
+    bool hoist_implicit_samples = false;
 };
 
 struct BuildReport {

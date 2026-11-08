@@ -419,6 +419,7 @@ struct SaveGuest {
 void test_save_data(bool loaded = false) {
     HandleTable handles{4};
     auto session = std::make_shared<FileSystemServiceSession>(71, 0);
+    session->set_application_program_id(0x0100000000001000);
     IpcDispatcher dispatcher{handles, nullptr};
     const auto handle = handles.insert(session).value();
     IpcMessage message{};
@@ -494,6 +495,31 @@ void test_save_data(bool loaded = false) {
     };
 
     CHECK(convert() == IpcDisposition::handled);
+    // Another program's save, whether or not the process may read it, does
+    // not exist on the host: FS reports target not found.
+    const auto open_other = [&](std::uint64_t program) {
+        message.fill(std::byte{0});
+        put(message, 0, 6);
+        put(message, 4, 30);
+        put(message, 16, 0x00580001);
+        put(message, 20, 1);
+        put(message, 32, 0x49434653);
+        put(message, 36, 1);
+        put(message, 40, 51);
+        put(message, 48, 1);
+        put(message, 56, static_cast<std::uint32_t>(program));
+        put(message, 60, static_cast<std::uint32_t>(program >> 32));
+        return send();
+    };
+    CHECK(open_other(0x0100000000003000) == IpcDisposition::handled);
+    CHECK(get(message, 40) == 0x7d402);
+    CHECK(open_other(0x0100000000004000) == IpcDisposition::handled);
+    CHECK(get(message, 40) == 0x7d402);
+    // The application's own id opens its save, as program zero does below.
+    CHECK(open_other(0x0100000000001000) == IpcDisposition::handled);
+    CHECK(get(message, 16) == 1);
+    const auto own_file_system = static_cast<std::uint32_t>(get(message, 48));
+    CHECK(own_file_system >= 2);
     // OpenSaveDataFileSystem returns a save-data file system object.
     message.fill(std::byte{0});
     put(message, 0, 6);
@@ -522,8 +548,13 @@ void test_save_data(bool loaded = false) {
     put(message, 48, 0);
     put(message, 56, 0, 8);
     CHECK(send() == IpcDisposition::handled);
-    // GetEntryType reports a file.
+    // GetEntryType reports a file, also through the save opened by the
+    // application's own id: both name the same save tree.
     pointer_call(file_system, 7);
+    CHECK(send() == IpcDisposition::handled);
+    CHECK(get(message, 48) == 1);
+    set_path("save00");
+    pointer_call(own_file_system, 7);
     CHECK(send() == IpcDisposition::handled);
     CHECK(get(message, 48) == 1);
     // OpenFile returns a file object.

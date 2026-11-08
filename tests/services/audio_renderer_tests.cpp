@@ -292,6 +292,18 @@ int main() {
     CHECK(reply.disposition == IpcDisposition::handled && reply.transferred_count == 1);
     CHECK(std::dynamic_pointer_cast<AudioDeviceSession>(reply.transferred[0]) != nullptr);
 
+    // Device-set notifications: a copied event that never fires, and a release.
+    for (const std::uint32_t acquire : {15u, 17u}) {
+        auto notification = request(acquire);
+        put64(notification, 32, 0);
+        reply = device->request(notification, 17);
+        CHECK(reply.disposition == IpcDisposition::handled && reply.transferred_count == 1 &&
+              reply.transferred_as_copy);
+        auto event = std::dynamic_pointer_cast<armigo::horizon::Event>(reply.transferred[0]);
+        CHECK(event && !event->is_signaled());
+        CHECK(device->request(request(acquire + 1), 17).disposition == IpcDisposition::handled);
+    }
+
     // The device exposes one built-in output, a stereo channel count and a
     // settable volume.
     auto device_command = request(5);

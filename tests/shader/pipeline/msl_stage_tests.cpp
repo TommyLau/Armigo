@@ -11,6 +11,7 @@
 // These independently authored synthetic programs exercise MSL stage-emitter
 // contracts.
 #include "pipeline/phases.h"
+#include "pipeline/msl/matrix_plan.h"
 #include "vertex_builtins_fixture.h"
 #include <armigo/shader/vertex_fetch.h>
 #include <array>
@@ -132,6 +133,10 @@ void basic_tests() {
     check(source.find("[[point_size]]") != std::string::npos && source.find(" = 1.0f;") != std::string::npos &&
           source.find("function_constant(10)") == std::string::npos,
           "A vertex stage without its own point size writes the fixed 1.0 without a function constant");
+    check(source.find("float4 position [[position]];") != std::string::npos, "A vertex position is not invariant by default");
+    auto invariant = vertex; invariant.options.invariant_position = true;
+    check(accepted(invariant, "vertex_invariant").find("float4 position [[position, invariant]];") != std::string::npos,
+          "The invariant option marks the vertex position");
     auto missing = vertex; missing.p.ir.dependencies.clear(); missing.plan.dependencies.clear(); rejected(missing, "Missing depth fact", DiagnosticCode::missing_fact);
     vertex.p.ir.dependencies[0].value = DepthConvention::zero_to_one; vertex.plan.dependencies = vertex.p.ir.dependencies;
     source = accepted(vertex, "vertex_zero_depth"); check(source.find("armigo_depth_sum") == std::string::npos, "Zero-to-one depth remains unchanged");
@@ -1271,7 +1276,7 @@ void definedness_tests() {
     // widened parity summary may admit it, but that abstract path must not
     // witness a vertex write and enable output initialization.
     Fixture widened_witness(Stage::vertex);
-    std::vector<ValueId> witness_conditions, witness_values;
+    std::vector<ValueId> witness_inputs, witness_conditions, witness_flags;
     for (unsigned i = 0; i < widened_count; ++i) {
         widened_witness.io(IoSemantic::generic, Access::read, 1, {ScalarType::u32, 1}, i);
         const auto input_id = widened_witness.value();
@@ -1284,19 +1289,21 @@ void definedness_tests() {
         widened_witness.operation({{}, Opcode::load_io, {}, {}, {}, {input_id}, input});
         widened_witness.operation({{}, Opcode::compare, {}, {Domain::unsigned_integer, ScalarType::u32},
                                    {input_id, word(0)}, {condition_id}, ComparisonInfo{Compare::not_equal, false}});
+        witness_inputs.push_back(input_id);
         witness_conditions.push_back(condition_id);
     }
+    // Each guarded body defines a predicate that stays live, so the arms
+    // differ in their environments and the partitions cannot coalesce.
     for (unsigned i = 0; i < widened_count; ++i) {
-        const auto value_id = widened_witness.value(ValueType::word32, ValueKind::mutable_local);
-        widened_witness.operation({{}, Opcode::copy, {}, {}, {word(i)}, {value_id}, {}});
-        witness_values.push_back(value_id);
+        const auto flag_id = widened_witness.value(ValueType::predicate);
+        widened_witness.operation({{}, Opcode::compare, {}, {Domain::unsigned_integer, ScalarType::u32},
+                                   {witness_inputs[i], word(1)}, {flag_id}, ComparisonInfo{Compare::not_equal, false}});
+        witness_flags.push_back(flag_id);
     }
     const auto unequal = widened_witness.value(ValueType::predicate);
     widened_witness.operation({{}, Opcode::logical_xor, {}, logical,
                                {witness_conditions[0], witness_conditions[1]}, {unequal}, {}});
     widened_witness.store(IoSemantic::position, {fp(0), fp(0), fp(0), fp(1)});
-    for (auto value_id : witness_values)
-        widened_witness.operation({{}, Opcode::copy, {}, {}, {value_id}, {widened_witness.value()}, {}});
     widened_witness.isolate_operations();
     widened_witness.p.regions = {SequenceRegion{}};
     std::vector<RegionId> witness_children;
@@ -1330,9 +1337,11 @@ void definedness_tests() {
     widened_witness.p.regions.push_back(ReturnRegion{});
     witness_children.push_back(RegionId{static_cast<std::uint32_t>(widened_witness.p.regions.size())});
     widened_witness.p.regions.push_back(IfRegion{predicate(true), returned, {}});
-    for (std::uint32_t i = 0; i < widened_count; ++i) {
+    for (auto flag_id : witness_flags) {
+        const RegionId body{static_cast<std::uint32_t>(widened_witness.p.regions.size())};
+        widened_witness.p.regions.push_back(SequenceRegion{});
         witness_children.push_back(RegionId{static_cast<std::uint32_t>(widened_witness.p.regions.size())});
-        widened_witness.p.regions.push_back(BlockRegion{BlockId{3 * widened_count + 2 + i}});
+        widened_witness.p.regions.push_back(IfRegion{flag_id, body, {}});
     }
     std::get<SequenceRegion>(widened_witness.p.regions[0]).children = std::move(witness_children);
     widened_witness.p.ir.limits.analysis_steps = 600000;
@@ -1507,10 +1516,47 @@ void decoded_definedness_tests() {
     }
 }
 }
+// Matrix planning is charged to the emitter's analysis budget: at least one
+// step for each operation in each of its passes, and a spent budget stops it.
+void matrix_plan_budget_tests() {
+    StructuredProgram p;
+    p.ir.stage = Stage::compute;
+    constexpr unsigned count = 40;
+    BasicBlock block;
+    for (unsigned i = 0; i < count; ++i) {
+        Operation op;
+        op.opcode = Opcode::matrix_multiply_add;
+        op.info = SubgroupInfo{};
+        op.inputs.push_back(LiteralBits{0});
+        for (unsigned word = 0; word < 8; ++word) {
+            op.inputs.push_back(ValueId{static_cast<std::uint32_t>(p.ir.values.size())});
+            p.ir.values.push_back({});
+        }
+        for (unsigned word = 0; word < 2; ++word) {
+            op.outputs.push_back(ValueId{static_cast<std::uint32_t>(p.ir.values.size())});
+            p.ir.values.push_back({});
+        }
+        block.operations.push_back(OperationId{static_cast<std::uint32_t>(p.ir.operations.size())});
+        p.ir.operations.push_back(std::move(op));
+    }
+    p.ir.blocks.push_back(block);
+    std::uint64_t steps = 0;
+    const auto plan = plan_matrices(p, [&] { ++steps; });
+    check(plan.multiplies.size() == count && steps >= 5 * count, "Matrix planning charges each operation of each pass");
+    struct Spent {};
+    std::uint64_t left = 10;
+    bool stopped = false;
+    try {
+        (void)plan_matrices(p, [&] { if (!left--) throw Spent{}; });
+    } catch (const Spent&) { stopped = true; }
+    check(stopped, "A spent analysis budget stops matrix planning");
+}
+
 int main(int argc, char** argv) {
     if (argc > 1) { fixture_directory = argv[1]; std::filesystem::create_directories(fixture_directory); }
     if (argc > 2) compile_metal = std::string(argv[2]) == "--metal";
     basic_tests(); depth_bias_tests(); io_tests(); memory_tests(); texture_tests(); custom_border_vertex_tests(); argument_buffer_tests(); shadow_pipeline_tests(); expanded_tests(); review_regressions(); flow_tests(); definedness_tests(); decoded_definedness_tests();
+    matrix_plan_budget_tests();
     if (failures) std::cerr << failures << " MSL stage tests failed\n";
     else std::cout << "MSL stage tests passed\n";
     return failures ? 1 : 0;

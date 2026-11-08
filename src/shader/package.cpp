@@ -557,6 +557,10 @@ std::variant<std::string, BuildReport> build_impl(const BuildOptions& options) {
     manifest.emplace("profile_text", Json{profile_text});
     manifest.emplace("complete_inventory", Json{false});
     manifest.emplace("runnable", Json{false});
+    // Present only when the title opts in. Omitting it keeps a plain manifest
+    // byte-identical. The key is outside profile_text, so the chain id is unchanged.
+    if (options.hoist_implicit_samples)
+        manifest.emplace("sample_hoisting", Json{std::string("implicit")});
     manifest.emplace("entries", std::move(entries));
     std::string manifest_text = detail::canonical_json(Json{std::move(manifest)}) + "\n";
     detail::require(manifest_text.size() <= detail::maximum_output_bytes - artifact_bytes,

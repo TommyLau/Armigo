@@ -19,6 +19,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <span>
@@ -78,8 +79,8 @@ AppletServiceSession::AppletServiceSession(std::uint64_t process_id,
 
 horizon::IpcReply AppletServiceSession::close_server() {
     const std::lock_guard lock(mutex_);
-    if (contract_ == AppletContract::horizon_20_5_0) return ClientSession::close_server();
-    if (contract_ != AppletContract::switch2_23_0_1) return {};
+    if (contract_ == AppletContract::switch1) return ClientSession::close_server();
+    if (contract_ != AppletContract::switch2) return {};
     if (closed_) return {.disposition = horizon::IpcDisposition::handled,
                          .transport_result = horizon::session_closed_result};
     closed_ = true;
@@ -165,7 +166,7 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
     const std::lock_guard lock(mutex_);
     if (closed_) return {.disposition = horizon::IpcDisposition::handled,
                          .transport_result = horizon::session_closed_result};
-    if (contract_ != AppletContract::horizon_20_5_0 && contract_ != AppletContract::switch2_23_0_1)
+    if (contract_ != AppletContract::switch1 && contract_ != AppletContract::switch2)
         return {};
     diagnostic_ = "Applet service request is not implemented";
     if (sender_pid != process_id_) {
@@ -176,12 +177,10 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
     const auto words = read(message, 4);
     if ((type == 4 || type == 6) && domain_ && source == &request && words >= 6 && words < 12 &&
         (read(message, 16) & 0xff) == 2) {
-        if (contract_ == AppletContract::switch2_23_0_1) {
-            diagnostic_ = "Switch 2 applet domain close requires a verified contract";
-            return {};
-        }
         // A domain close releases one object; its reply has no CMIF payload.
-        // Ids stay assigned, so the slot is only marked closed.
+        // Ids stay assigned, so the slot is only marked closed. The Switch 2
+        // SDK sends the same CMIF framework message (type 2 and the object
+        // id) when it releases a child, such as a launch-parameter storage.
         const auto id = read(message, 20);
         if (id < 2 || id - 2 >= objects_.size() || objects_[id - 2].kind == ObjectKind::closed ||
             objects_[id - 2].kind == ObjectKind::application_proxy)
@@ -222,7 +221,7 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
             {ObjectKind::graphics_scale, 10, 12, 0, "GraphicsScale 10", 10},
         };
         static_assert(std::size(switch2_provisional) <= 64);
-        if (contract_ == AppletContract::switch2_23_0_1) {
+        if (contract_ == AppletContract::switch2) {
             for (std::size_t index = 0; index != std::size(switch2_provisional); ++index) {
                 const auto& entry = switch2_provisional[index];
                 if (entry.kind != objects_[id - 2].kind || entry.command != read(message, 40)) continue;
@@ -244,7 +243,7 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
             }
         }
         // Switch 2 child commands admitted so far; each shares the handler below
-        // with the 20.5.0 contract.
+        // with the Switch 1 platform contract.
         struct Admitted { ObjectKind kind; std::uint32_t command; };
         static constexpr Admitted switch2_admitted[] = {
             {ObjectKind::window_controller, 1}, {ObjectKind::window_controller, 10},
@@ -258,13 +257,14 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
             {ObjectKind::self_controller, 2000}, {ObjectKind::self_controller, 2400},
             {ObjectKind::application_functions, 1}, {ObjectKind::application_functions, 20},
             {ObjectKind::application_functions, 21}, {ObjectKind::application_functions, 22},
+            {ObjectKind::application_functions, 23},
             {ObjectKind::application_functions, 40}, {ObjectKind::application_functions, 67},
             {ObjectKind::application_functions, 130}, {ObjectKind::application_functions, 210},
             {ObjectKind::storage, 0}, {ObjectKind::storage_accessor, 0}, {ObjectKind::storage_accessor, 10},
             {ObjectKind::storage_accessor, 11},
             {ObjectKind::graphics_scale, 1050},
         };
-        if (contract_ == AppletContract::switch2_23_0_1 &&
+        if (contract_ == AppletContract::switch2 &&
             objects_[id - 2].kind != ObjectKind::application_proxy &&
             std::none_of(std::begin(switch2_admitted), std::end(switch2_admitted), [&](const Admitted& entry) {
                 return entry.kind == objects_[id - 2].kind && entry.command == read(message, 40);
@@ -282,7 +282,7 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
             (objects_[id - 2].kind != ObjectKind::storage_accessor ||
              (read(message, 40) != 10 && read(message, 40) != 11)))
             return {};
-        if (contract_ == AppletContract::switch2_23_0_1 &&
+        if (contract_ == AppletContract::switch2 &&
             objects_[id - 2].kind == ObjectKind::self_controller && read(message, 40) == 2000) {
             // GetGraphicsSystemSession: one copied handle to a new graphics
             // system session, which the SDK then speaks TIPC on.
@@ -305,7 +305,7 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
             diagnostic_ = nullptr;
             return reply;
         }
-        if (contract_ == AppletContract::switch2_23_0_1 &&
+        if (contract_ == AppletContract::switch2 &&
             objects_[id - 2].kind == ObjectKind::self_controller && read(message, 40) == 2400) {
             // The Switch 2 AM program takes one boolean byte, keeps it in the
             // controller and the applet's display state, and replies without
@@ -346,15 +346,9 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
             return reply;
         }
         if (objects_[id - 2].kind == ObjectKind::window_controller && read(message, 40) == 10) {
-            if (contract_ == AppletContract::horizon_20_5_0) {
-                if (!focused_) {
-                    diagnostic_ = "Foreground ownership has not been granted by launch policy";
-                    return {};
-                }
-                foreground_rights_acquired_ = true;
-            }
-            // The selected Switch 2 firmware method returns zero without
-            // changing state. Foreground selection remains host launch policy.
+            // AcquireForegroundRights returns success without changing focus
+            // or any other session state. Foreground selection remains host
+            // launch policy on both platforms.
             horizon::IpcReply reply{horizon::IpcDisposition::handled};
             reply.size = 56;
             write(reply.bytes, 4, 12);
@@ -384,15 +378,15 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
             return reply;
         }
         if (objects_[id - 2].kind == ObjectKind::common_state && read(message, 40) == 66) {
-            // Command66 takes one inline enum below two and produces no output.
-            // The Switch 2 AM program reads its low byte, adds the GPU-only mode
-            // 2, and answers a larger mode with 0x3f480 without changing state.
+            // Command66 takes one inline mode and produces no output. Both
+            // 23.0.1 AM programs read its low byte and answer a mode above the
+            // platform's limit with 0x3f480 without changing state; Switch 2
+            // adds the GPU-only mode 2 (S1 0x80360-0x80390, S2 0xccf20-0xccf54).
             if (words < 13 || size < 20) return {};
-            const bool switch2 = contract_ == AppletContract::switch2_23_0_1;
-            const auto value = switch2 ? read(message, 48) & 0xff : read(message, 48);
+            const auto limit = contract_ == AppletContract::switch2 ? 2u : 1u;
+            const auto value = read(message, 48) & 0xff;
             std::uint32_t result = 0;
-            if (value >= (switch2 ? 3u : 2u)) {
-                if (!switch2) return {};
+            if (value > limit) {
                 result = 0x3f480;
             } else {
                 common_state_command66_ = value;
@@ -1014,6 +1008,31 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
             diagnostic_ = nullptr;
             return reply;
         }
+        if (objects_[id - 2].kind == ObjectKind::application_functions && read(message, 40) == 23) {
+            // GetDisplayVersion: no input, the 16-byte NUL-terminated display
+            // version. The launch's package has no control data, so the
+            // version is the one the launch derived from the package version;
+            // it stays provisional and warns once.
+            if (!display_version_) {
+                diagnostic_ = "Display version needs the application's control data";
+                return {};
+            }
+            if (!display_version_warned_) {
+                display_version_warned_ = true;
+                armigo::diag::write(armigo::diag::Level::warning,
+                    "Armigo am: provisional Switch 2 handler ApplicationFunctions 23 reports display version %s "
+                    "derived from the package version; the package has no control data\n",
+                    display_version_->c_str());
+            }
+            horizon::IpcReply reply{horizon::IpcDisposition::handled};
+            reply.size = 64;
+            write(reply.bytes, 4, 14);
+            write(reply.bytes, 32, 0x4f434653);
+            write(reply.bytes, 44, 0x21f9610e);
+            std::memcpy(reply.bytes.data() + 48, display_version_->data(), std::min<std::size_t>(display_version_->size(), 15));
+            diagnostic_ = nullptr;
+            return reply;
+        }
         if (objects_[id - 2].kind == ObjectKind::application_functions && read(message, 40) == 40) {
             // ApplicationFunctions command40 NotifyRunning: the application
             // reports that application startup is complete. The request carries no
@@ -1051,11 +1070,11 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
         case 11: child_kind = ObjectKind::library_creator; break;
         case 20: child_kind = ObjectKind::application_functions; break;
         case 40:
-            if (contract_ != AppletContract::switch2_23_0_1) return {};
+            if (contract_ != AppletContract::switch2) return {};
             child_kind = ObjectKind::application_status;
             break;
         case 60:
-            if (contract_ != AppletContract::switch2_23_0_1) return {};
+            if (contract_ != AppletContract::switch2) return {};
             child_kind = ObjectKind::graphics_scale;
             break;
         case 1000: child_kind = ObjectKind::debug_functions; break;
@@ -1080,7 +1099,7 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
     }
     if (type == 4 || type == 6) {
         const auto command = read(message, 56);
-        const bool extended_proxy = contract_ == AppletContract::switch2_23_0_1 && command == 10;
+        const bool extended_proxy = contract_ == AppletContract::switch2 && command == 10;
         const auto raw_words = words & 0x3ffu;
         if (!domain_ || !process_ || (words & ~0x3ffu) != 0x80000000u ||
             raw_words < (extended_proxy ? 16u : 14u) || raw_words > (message.size() - 24) / 4 || read(message, 8) != 3)
@@ -1227,6 +1246,11 @@ bool AppletServiceSession::common_state_boost_active() const {
 std::uint32_t AppletServiceSession::terminate_result() const {
     const std::lock_guard lock(mutex_);
     return terminate_result_;
+}
+
+void AppletServiceSession::set_display_version(std::string version) {
+    const std::lock_guard lock(mutex_);
+    display_version_ = std::move(version);
 }
 
 void AppletServiceSession::set_graphics_system_dependencies(gsv::GraphicsSystemDependencies dependencies) {

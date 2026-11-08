@@ -96,7 +96,7 @@ struct Fixture {
                      GameplayRecordingPolicy recording_policy = GameplayRecordingPolicy::Unavailable,
                      std::shared_ptr<ApplicationRunningState> running_state = {},
                      armigo::services::OperationMode mode = armigo::services::OperationMode::Console,
-                     armigo::services::am::AppletContract contract = armigo::services::am::AppletContract::horizon_20_5_0)
+                     armigo::services::am::AppletContract contract = armigo::services::am::AppletContract::switch1)
         : session(std::make_shared<AppletServiceSession>(pid, process, handles, recording_policy,
                                                          std::move(running_state), mode, contract)),
           handle(handles.insert(session).value()) { caller.process_id = pid; }
@@ -222,7 +222,7 @@ IpcMessage proxy_getter(std::uint32_t proxy, std::uint32_t command, std::uint32_
 void test_switch2_startup_admission() {
     Fixture f(71, GameplayRecordingPolicy::Unavailable, {},
         armigo::services::OperationMode::Console,
-        armigo::services::am::AppletContract::switch2_23_0_1);
+        armigo::services::am::AppletContract::switch2);
     f.message = control(3);
     CHECK(f.send() == IpcDisposition::handled);
     check_control_reply(f.message, 0, 2);
@@ -300,7 +300,7 @@ void test_switch2_startup_admission() {
     CHECK(f.send() == IpcDisposition::handled && get(f.message, 40) == 0x680);
     f.message = {}; put(f.message, 0, 2);
     const auto close = f.message;
-    CHECK(f.send() == IpcDisposition::handled && f.registers[0] == 0);
+    CHECK(f.send() == IpcDisposition::handled && f.registers[0] == 0xf601);
     CHECK(f.message == close && f.handles.lookup(f.handle) == f.session);
     CHECK(f.session->domain_object_count() == 0);
     f.message = proxy_getter(proxy, 0);
@@ -312,7 +312,7 @@ void test_switch2_startup_admission() {
 
 void test_switch2_provisional_handlers() {
     using armigo::services::am::AppletContract;
-    for (const auto contract : {AppletContract::horizon_20_5_0, AppletContract::switch2_23_0_1}) {
+    for (const auto contract : {AppletContract::switch1, AppletContract::switch2}) {
         Fixture f(71, GameplayRecordingPolicy::Unavailable, {},
             armigo::services::OperationMode::Console, contract);
         const auto root = f.convert();
@@ -326,7 +326,7 @@ void test_switch2_provisional_handlers() {
         // Repeating a command replies the same way after its warning was logged.
         for (const auto command : {320u, 321u, 330u, 320u}) {
             f.message = proxy_getter(functions, command);
-            if (contract == AppletContract::horizon_20_5_0) {
+            if (contract == AppletContract::switch1) {
                 f.expect_unsupported();
                 continue;
             }
@@ -343,7 +343,7 @@ void test_switch2_provisional_handlers() {
         put(f.message, 4, 13);
         put(f.message, 16, 0x00110001);
         put(f.message, 48, 1);
-        if (contract == AppletContract::horizon_20_5_0) {
+        if (contract == AppletContract::switch1) {
             f.expect_unsupported();
             continue;
         }
@@ -512,7 +512,7 @@ void test_managed_display_layer() {
 }
 
 void test_suspended_tick_event(armigo::services::am::AppletContract contract =
-        armigo::services::am::AppletContract::horizon_20_5_0) {
+        armigo::services::am::AppletContract::switch1) {
     Fixture f(71, GameplayRecordingPolicy::Unavailable, {},
         armigo::services::OperationMode::Console, contract);
     const auto root = f.convert();
@@ -1156,13 +1156,20 @@ void test_common_state_command66() {
     put(expected, 44, 0x32f27d77);
     CHECK(std::equal(expected.begin(), expected.begin() + 56, f.message.begin()));
     CHECK(f.session->diagnostic() == nullptr);
-    // The argument must be below two.
+    // Only the low byte is the mode: 0x100 is mode 0.
+    f.message = proxy_getter(common, 66);
+    put(f.message, 16, 0x00140001);
+    put(f.message, 4, 13);
+    put(f.message, 48, 0x100);
+    CHECK(f.send() == IpcDisposition::handled && get(f.message, 40) == 0);
+    CHECK(f.session->common_state_command66() == 0u);
+    // A mode above one is Result 0x3f480 on Switch 1 and changes nothing.
     f.message = proxy_getter(common, 66);
     put(f.message, 16, 0x00140001);
     put(f.message, 4, 13);
     put(f.message, 48, 2);
-    f.expect_unsupported();
-    CHECK(f.session->common_state_command66() == 1u);
+    CHECK(f.send() == IpcDisposition::handled && get(f.message, 40) == 0x3f480);
+    CHECK(f.session->common_state_command66() == 0u);
     CHECK(f.session->common_state_boost_active());
     f.session.reset();
     CHECK(f.handles.close(f.handle));
@@ -1170,7 +1177,7 @@ void test_common_state_command66() {
 
 void test_switch2_common_state_command66() {
     Fixture f(71, GameplayRecordingPolicy::Unavailable, {},
-        armigo::services::OperationMode::Console, armigo::services::am::AppletContract::switch2_23_0_1);
+        armigo::services::OperationMode::Console, armigo::services::am::AppletContract::switch2);
     const auto root = f.convert();
     f.message = open_proxy(root, current_process_handle);
     CHECK(f.send() == IpcDisposition::handled);
@@ -1196,6 +1203,55 @@ void test_switch2_common_state_command66() {
     // Only the low byte is read.
     set_mode(0x100, 0);
     CHECK(f.session->common_state_command66() == 0u && f.session->common_state_boost_active());
+}
+
+// ApplicationFunctions 23 (GetDisplayVersion): 16 bytes, the launch's version
+// NUL-terminated; unsupported when the launch supplies none.
+void test_switch2_display_version() {
+    Fixture f(72, GameplayRecordingPolicy::Unavailable, {},
+        armigo::services::OperationMode::Console, armigo::services::am::AppletContract::switch2);
+    const auto root = f.convert();
+    f.message = open_proxy(root, current_process_handle);
+    CHECK(f.send() == IpcDisposition::handled);
+    const auto proxy = static_cast<std::uint32_t>(get(f.message, 48));
+    f.message = proxy_getter(proxy, 20);
+    CHECK(f.send() == IpcDisposition::handled);
+    const auto functions = static_cast<std::uint32_t>(get(f.message, 48));
+    f.message = proxy_getter(functions, 23);
+    CHECK(f.send() == IpcDisposition::unsupported && f.session->diagnostic());
+    f.session->set_display_version("2.0.0");
+    f.message = proxy_getter(functions, 23);
+    CHECK(f.send() == IpcDisposition::handled && get(f.message, 4) == 14 && get(f.message, 32) == 0x4f434653 &&
+          get(f.message, 40) == 0);
+    CHECK(std::memcmp(f.message.data() + 48, "2.0.0", 6) == 0);
+    CHECK(std::all_of(f.message.begin() + 54, f.message.begin() + 64, [](std::byte b) { return b == std::byte{0}; }));
+}
+
+// The Switch 2 SDK releases a child with the CMIF domain close (type 2 and
+// the object id), as on Switch 1.
+void test_switch2_domain_close() {
+    Fixture f(74, GameplayRecordingPolicy::Unavailable, {},
+        armigo::services::OperationMode::Console, armigo::services::am::AppletContract::switch2);
+    const auto root = f.convert();
+    f.message = open_proxy(root, current_process_handle);
+    CHECK(f.send() == IpcDisposition::handled);
+    const auto proxy = static_cast<std::uint32_t>(get(f.message, 48));
+    f.message = proxy_getter(proxy, 20);
+    CHECK(f.send() == IpcDisposition::handled);
+    const auto functions = static_cast<std::uint32_t>(get(f.message, 48));
+    // Ids stay assigned; the closed object takes no more requests or closes.
+    const auto close = [&] {
+        f.message = {};
+        put(f.message, 0, 6);
+        put(f.message, 4, 8);
+        put(f.message, 16, 2);
+        put(f.message, 20, functions);
+        return f.send();
+    };
+    CHECK(close() == IpcDisposition::handled);
+    f.message = proxy_getter(functions, 23);
+    CHECK(f.send() != IpcDisposition::handled);
+    CHECK(close() != IpcDisposition::handled);
 }
 
 void test_common_state_command67() {
@@ -1636,7 +1692,7 @@ void test_notify_running_observer_failure_is_explicit() {
 }
 
 void test_gpu_error_event(armigo::services::am::AppletContract contract =
-        armigo::services::am::AppletContract::horizon_20_5_0) {
+        armigo::services::am::AppletContract::switch1) {
     Fixture f(71, GameplayRecordingPolicy::Unavailable, {},
         armigo::services::OperationMode::Console, contract);
     const auto root = f.convert();
@@ -1701,7 +1757,7 @@ void test_common_state_end_vr_mode() {
 }
 
 void test_common_state_event(armigo::services::am::AppletContract contract =
-        armigo::services::am::AppletContract::horizon_20_5_0) {
+        armigo::services::am::AppletContract::switch1) {
     Fixture f(71, GameplayRecordingPolicy::Unavailable, {},
         armigo::services::OperationMode::Console, contract);
     const auto root = f.convert();
@@ -1933,27 +1989,38 @@ void test_foreground_launch_notification() {
 }
 
 void test_foreground_rights() {
-    Fixture f;
-    const auto root = f.convert();
-    f.message = open_proxy(root, current_process_handle);
-    CHECK(f.send() == IpcDisposition::handled);
-    const auto proxy = static_cast<std::uint32_t>(get(f.message, 48));
-    f.message = proxy_getter(proxy, 2);
-    CHECK(f.send() == IpcDisposition::handled);
-    const auto window = static_cast<std::uint32_t>(get(f.message, 48));
-    f.message = proxy_getter(window, 10);
-    f.expect_unsupported(); // The guest cannot manufacture the host launch grant.
-    f.session->grant_foreground();
-    for (auto type : {4u, 6u}) {
-        f.message = proxy_getter(window, 10, type);
+    using armigo::services::am::AppletContract;
+    // WindowController 10 succeeds on both platforms and does not change focus.
+    for (const auto contract : {AppletContract::switch1, AppletContract::switch2}) {
+        Fixture f(71, GameplayRecordingPolicy::Unavailable, {},
+                  armigo::services::OperationMode::Console, contract);
+        const auto root = f.convert();
+        f.message = open_proxy(root, current_process_handle);
         CHECK(f.send() == IpcDisposition::handled);
-        IpcMessage expected{};
-        put(expected, 4, 12);
-        put(expected, 32, 0x4f434653);
-        put(expected, 44, 0x0279422d);
-        CHECK(std::equal(expected.begin(), expected.begin() + 56, f.message.begin()));
-        CHECK(std::all_of(f.message.begin() + 56, f.message.end(),
-                          [](std::byte b) { return b == std::byte{0xa5}; }));
+        const auto proxy = static_cast<std::uint32_t>(get(f.message, 48));
+        f.message = proxy_getter(proxy, 0);
+        CHECK(f.send() == IpcDisposition::handled);
+        const auto common = static_cast<std::uint32_t>(get(f.message, 48));
+        f.message = proxy_getter(common, 9);
+        CHECK(f.send() == IpcDisposition::handled);
+        check_common_value_reply(f.message, 2, 1);
+        f.message = proxy_getter(proxy, 2);
+        CHECK(f.send() == IpcDisposition::handled);
+        const auto window = static_cast<std::uint32_t>(get(f.message, 48));
+        for (auto type : {4u, 6u}) {
+            f.message = proxy_getter(window, 10, type);
+            CHECK(f.send() == IpcDisposition::handled);
+            IpcMessage expected{};
+            put(expected, 4, 12);
+            put(expected, 32, 0x4f434653);
+            put(expected, 44, 0x0279422d);
+            CHECK(std::equal(expected.begin(), expected.begin() + 56, f.message.begin()));
+            CHECK(std::all_of(f.message.begin() + 56, f.message.end(),
+                              [](std::byte b) { return b == std::byte{0xa5}; }));
+        }
+        f.message = proxy_getter(common, 9);
+        CHECK(f.send() == IpcDisposition::handled);
+        check_common_value_reply(f.message, 2, 1);
     }
 }
 
@@ -2124,7 +2191,7 @@ void test_idle_time_detection_extension() {
 }
 
 void test_initial_focus_preferences(armigo::services::am::AppletContract contract =
-        armigo::services::am::AppletContract::horizon_20_5_0) {
+        armigo::services::am::AppletContract::switch1) {
     for (auto type : {4u, 6u}) {
         Fixture f(71, GameplayRecordingPolicy::Unavailable, {},
             armigo::services::OperationMode::Console, contract);
@@ -2258,7 +2325,9 @@ int main() {
     test_next_program_exit_preference();
     test_managed_display_layer();
     test_suspended_tick_event();
-    test_suspended_tick_event(armigo::services::am::AppletContract::switch2_23_0_1);
+    test_suspended_tick_event(armigo::services::am::AppletContract::switch2);
+    test_switch2_display_version();
+    test_switch2_domain_close();
     test_ensure_save_data();
     test_preselected_user_launch_parameter();
     test_network_connection_applet();
@@ -2280,9 +2349,9 @@ int main() {
     test_notify_running_observer_failure_is_explicit();
     test_common_state_end_vr_mode();
     test_gpu_error_event();
-    test_gpu_error_event(armigo::services::am::AppletContract::switch2_23_0_1);
+    test_gpu_error_event(armigo::services::am::AppletContract::switch2);
     test_common_state_event();
-    test_common_state_event(armigo::services::am::AppletContract::switch2_23_0_1);
+    test_common_state_event(armigo::services::am::AppletContract::switch2);
     test_common_state_mode_queries(armigo::services::OperationMode::Console);
     test_common_state_mode_queries(armigo::services::OperationMode::Handheld);
     test_foreground_launch_notification();
@@ -2290,7 +2359,7 @@ int main() {
     test_idle_time_detection_extension();
     test_exit_lock();
     test_initial_focus_preferences();
-    test_initial_focus_preferences(armigo::services::am::AppletContract::switch2_23_0_1);
+    test_initial_focus_preferences(armigo::services::am::AppletContract::switch2);
     test_unsupported_preservation();
     std::printf("Applet-service failures: %u\n", failures);
     return failures ? 1 : 0;

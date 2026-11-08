@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -169,7 +170,7 @@ inline Bytes fs_access_block(std::uint32_t version, std::uint64_t permissions,
 
 // The fixed 0x2C-byte ACID file-system access header: a version byte and
 // owner-count fields, permission mask, and owner ranges. This synthetic
-// fixture leaves every owner count and range zero (FS 20.5.0, 0x76F34).
+// fixture leaves every owner count and range zero (the FS module).
 inline Bytes acid_fs_access_block(std::uint32_t version, std::uint64_t permissions) {
     Bytes bytes = raw_bytes(0x2C);
     put_u8(bytes, 0x00, static_cast<std::uint8_t>(version));
@@ -197,6 +198,13 @@ struct Parts {
     std::uint32_t fs_version = 1;
     std::uint64_t aci0_fs_permissions = 1;
     std::uint64_t acid_fs_permissions = 3;
+    // Requested FS owners after the ACI0 header, and the ACID's owner lists
+    // and its content/save-data owner id ranges (min, max, min, max).
+    std::vector<std::uint64_t> aci0_content_owners;
+    std::vector<std::pair<std::uint64_t, std::uint8_t>> aci0_save_owners;
+    std::vector<std::uint64_t> acid_content_owners;
+    std::vector<std::uint64_t> acid_save_owners;
+    std::array<std::uint64_t, 4> acid_owner_ranges{};
     std::vector<ServiceEntry> aci0_services{{"fsp-srv", false}, {"acc:u0", false}};
     std::vector<ServiceEntry> acid_services{{"fsp-srv", false}, {"acc:u0", false}};
     std::vector<std::uint32_t> aci0_capabilities{
@@ -247,6 +255,28 @@ inline NpdmImage build_npdm(const Parts& parts) {
     put_u32(aci0, 0x00, 0x30494341u); // "ACI0"
     put_u64(aci0, 0x10, parts.program_id);
     Bytes aci0_fs = fs_access_block(parts.fs_version, parts.aci0_fs_permissions);
+    if (!parts.aci0_content_owners.empty()) {
+        put_u32(aci0_fs, 0x0C, static_cast<std::uint32_t>(aci0_fs.size()));
+        put_u32(aci0_fs, 0x10, static_cast<std::uint32_t>(4 + 8 * parts.aci0_content_owners.size()));
+        Bytes payload = raw_bytes(4 + 8 * parts.aci0_content_owners.size());
+        put_u32(payload, 0, static_cast<std::uint32_t>(parts.aci0_content_owners.size()));
+        for (std::size_t i = 0; i < parts.aci0_content_owners.size(); ++i)
+            put_u64(payload, 4 + 8 * i, parts.aci0_content_owners[i]);
+        aci0_fs.insert(aci0_fs.end(), payload.begin(), payload.end());
+    }
+    if (!parts.aci0_save_owners.empty()) {
+        const std::size_t count = parts.aci0_save_owners.size();
+        const std::size_t ids = (4 + count + 3) & ~std::size_t{3};
+        put_u32(aci0_fs, 0x14, static_cast<std::uint32_t>(aci0_fs.size()));
+        put_u32(aci0_fs, 0x18, static_cast<std::uint32_t>(ids + 8 * count));
+        Bytes payload = raw_bytes(ids + 8 * count);
+        put_u32(payload, 0, static_cast<std::uint32_t>(count));
+        for (std::size_t i = 0; i < count; ++i) {
+            put_u8(payload, 4 + i, parts.aci0_save_owners[i].second);
+            put_u64(payload, ids + 8 * i, parts.aci0_save_owners[i].first);
+        }
+        aci0_fs.insert(aci0_fs.end(), payload.begin(), payload.end());
+    }
     Bytes aci0_sac = service_access_control({});
     for (const ServiceEntry& entry : parts.aci0_services) {
         Bytes entry_bytes = service_access_control({entry});
@@ -279,6 +309,17 @@ inline NpdmImage build_npdm(const Parts& parts) {
     put_u64(acid, body + 0x10, parts.program_id_min);
     put_u64(acid, body + 0x18, parts.program_id_max);
     Bytes acid_fs = acid_fs_access_block(parts.fs_version, parts.acid_fs_permissions);
+    put_u8(acid_fs, 0x01, static_cast<std::uint8_t>(parts.acid_content_owners.size()));
+    put_u8(acid_fs, 0x02, static_cast<std::uint8_t>(parts.acid_save_owners.size()));
+    for (std::size_t i = 0; i < parts.acid_owner_ranges.size(); ++i)
+        put_u64(acid_fs, 0x0C + 8 * i, parts.acid_owner_ranges[i]);
+    for (const auto* list : {&parts.acid_content_owners, &parts.acid_save_owners}) {
+        for (const std::uint64_t id : *list) {
+            Bytes entry = raw_bytes(8);
+            put_u64(entry, 0, id);
+            acid_fs.insert(acid_fs.end(), entry.begin(), entry.end());
+        }
+    }
     Bytes acid_sac;
     for (const ServiceEntry& entry : parts.acid_services) {
         Bytes entry_bytes = service_access_control({entry});

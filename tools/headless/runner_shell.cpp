@@ -570,23 +570,34 @@ ParsedRunArguments parse_runner_arguments(platform::PresentationMode mode,
 
     // A packed app carries its game under Armigo/ in its resources. Given no
     // input, it runs that game with its add-on content and its shader package.
+    // A packed .nup title stores the archive as game/title.nup and has no RomFS tree.
+    bool packed_title_nup = false;
     if (!options.nup_file && !options.container_file && options.exefs_directory.empty() && options.romfs_directory.empty()) {
         if (const auto packed = compat::packed_resources(); !packed.empty()) {
-            options.exefs_directory = packed / "game" / "exefs";
-            options.romfs_directory = packed / "game" / "romfs";
-            if (options.addon_directories.empty()) {
-                std::error_code error;
-                for (const auto& entry : std::filesystem::directory_iterator(packed / "game" / "addons", error))
-                    if (entry.is_directory(error)) options.addon_directories.push_back(entry.path());
-                std::sort(options.addon_directories.begin(), options.addon_directories.end());
+            const auto title_nup = packed / "game" / "title.nup";
+            std::error_code packed_error;
+            if (!path_is_directory(packed / "game" / "romfs") && std::filesystem::is_regular_file(title_nup, packed_error)) {
+                options.nup_file = title_nup;
+                packed_title_nup = true;
+                if (options.shader_package_directory.empty() && path_is_directory(packed / "shaders"))
+                    options.shader_package_directory = packed / "shaders";
+            } else {
+                options.exefs_directory = packed / "game" / "exefs";
+                options.romfs_directory = packed / "game" / "romfs";
+                if (options.addon_directories.empty()) {
+                    std::error_code error;
+                    for (const auto& entry : std::filesystem::directory_iterator(packed / "game" / "addons", error))
+                        if (entry.is_directory(error)) options.addon_directories.push_back(entry.path());
+                    std::sort(options.addon_directories.begin(), options.addon_directories.end());
+                }
+                if (options.shader_package_directory.empty() && path_is_directory(packed / "shaders"))
+                    options.shader_package_directory = packed / "shaders";
             }
-            if (options.shader_package_directory.empty() && path_is_directory(packed / "shaders"))
-                options.shader_package_directory = packed / "shaders";
         }
     }
 
     if (options.nup_file) {
-        if (options.mode != platform::PresentationMode::headless || options.container_file ||
+        if ((!packed_title_nup && options.mode != platform::PresentationMode::headless) || options.container_file ||
             options.keys_file || options.title_keys_file || options.update_container_file ||
             options.cache_directory || !options.exefs_directory.empty() || !options.romfs_directory.empty()) {
             parsed.error = "--nup requires headless mode and excludes container, key, cache and directory inputs.";

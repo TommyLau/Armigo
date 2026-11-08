@@ -95,7 +95,10 @@ Program bindless(Operand input) {
 StructuredProgram structured(const LegalProgram& legal) {
     return {legal.ir, legal.requirements, legal.profile, {BlockRegion{BlockId{0}}}, {{FunctionId{0}, RegionId{0}}}};
 }
-Result<LegalProgram> run(Program p, Facts& f) { FactReader reader(f); return legalize({std::move(p)}, reader, profile()); }
+Result<LegalProgram> run(Program p, Facts& f, const MetalProfile& metal) {
+    FactReader reader(f); return legalize({std::move(p)}, reader, metal);
+}
+Result<LegalProgram> run(Program p, Facts& f) { return run(std::move(p), f, profile()); }
 const BufferUse* constant_buffer(const ResourceRequirements& requirements, std::uint8_t slot) {
     for (const auto& use : requirements.uses) {
         const auto* buffer = std::get_if<BufferUse>(&use);
@@ -682,9 +685,236 @@ void per_texel_gather_offsets() {
     rejected(run(out_of_range, f), DiagnosticCode::unsupported_modifier, "Offset literals stay inside the Metal range");
 }
 
+// Texture and sampler handles resolve independently. A constant-buffer key
+// or a handle program is never rewritten into a pool access. Pooled samplers
+// of one stage share one sampler pool.
+void independent_pool_resolution() {
+    auto pools = profile();
+    pools.texture_pools = true;
+    auto f = facts();
+    auto handle_descriptor = descriptor();
+    f.set(fact_query::texture({handle_program_slot, 0}), handle_descriptor);
+    const auto says = [](const Diagnostic* error, std::string_view text) {
+        const auto matches = error && error->message.find(text) != std::string::npos;
+        if (error && !matches) std::cerr << "  message: " << error->message << '\n';
+        return matches;
+    };
+    auto sample_at = [](HandleSource texture, std::optional<HandleSource> sampler, std::vector<Operand> inputs,
+                        TextureDescriptor desc) {
+        TextureInfo info;
+        info.texture = texture;
+        info.sampler = std::move(sampler);
+        info.descriptor = desc;
+        const auto coordinates = static_cast<std::uint16_t>(inputs.size() - 2);
+        info.coordinates = {InputIndex{coordinates}, InputIndex{static_cast<std::uint16_t>(coordinates + 1)}};
+        Operation op{{40, InstructionName::tex}, Opcode::texture_sample, Effects::texture | Effects::derivative,
+            {Domain::floating, ScalarType::f32, Rounding::nearest_even}, std::move(inputs), {}, info};
+        return op;
+    };
+    auto one = [&](Operation op, const MetalProfile& metal) {
+        auto p = empty();
+        add(p, std::move(op));
+        return run(std::move(p), f, metal);
+    };
+    const auto sampled = [&](const LegalProgram& legal) -> const TextureInfo* {
+        const TextureInfo* found = nullptr;
+        for (const auto& op : legal.ir.operations) if (op.opcode == Opcode::texture_sample) {
+            check(found == nullptr, "one sample in the stage");
+            found = &std::get<TextureInfo>(op.info);
+        }
+        check(found != nullptr, "the sample survives legalization");
+        return found;
+    };
+    const auto sampler_use = [](const LegalProgram& legal, ResourceId id) -> const SamplerUse* {
+        return id.value < legal.requirements.uses.size() ? std::get_if<SamplerUse>(&legal.requirements.uses[id.value]) : nullptr;
+    };
+    const auto texture_use = [](const LegalProgram& legal, ResourceId id) -> const TextureUse* {
+        return id.value < legal.requirements.uses.size() ? std::get_if<TextureUse>(&legal.requirements.uses[id.value]) : nullptr;
+    };
+    auto plain = descriptor();
+    // Pool texture, constant-buffer sampler key.
+    {
+        auto result = one(sample_at(DynamicHandle{InputIndex{0}}, TextureKey{2, 16}, {word(1), word(0), word(0)}, plain), pools);
+        if (const auto* legal = success(result, "Pool texture with a constant-buffer sampler")) {
+            const auto* t = sampled(*legal);
+            check(t && std::get<TextureKey>(t->texture) == TextureKey{texture_pool_slot, 0} && t->pool_texture &&
+                  t->sampler && std::get<TextureKey>(*t->sampler) == TextureKey{2, 16} && !t->pool_sampler,
+                  "the texture is pooled and the sampler keeps its key");
+            if (t && t->sampler_resource && t->resource) {
+                const auto* sampler = sampler_use(*legal, *t->sampler_resource);
+                const auto* texture = texture_use(*legal, *t->resource);
+                check(sampler && !sampler->pool && sampler->key == TextureKey{2, 16} && sampler->comparison == plain.comparison &&
+                      sampler->normalized_coordinates == plain.normalized_coordinates, "keyed sampler binding");
+                check(texture && texture->pool && texture->descriptor == plain, "texture pool binding");
+            }
+            success(plan_resources(structured(*legal), legal->profile), "Pool texture with a keyed sampler plans");
+        }
+    }
+    // Pool texture, sampler proven by a constant-buffer word.
+    {
+        auto result = one(sample_at(DynamicHandle{InputIndex{0}}, DynamicHandle{InputIndex{1}},
+                                    {word(1), ConstantWord{2, 16}, word(0), word(0)}, plain), pools);
+        if (const auto* legal = success(result, "Pool texture with a constant-buffer sampler word")) {
+            const auto* t = sampled(*legal);
+            check(t && t->pool_texture && !t->pool_sampler && t->sampler &&
+                  std::get<TextureKey>(*t->sampler) == TextureKey{2, 16}, "a constant-buffer sampler word stays keyed");
+        }
+    }
+    // Pool texture, handle-program sampler.
+    {
+        auto result = one(sample_at(DynamicHandle{InputIndex{0}}, TextureKey{handle_program_slot, 0},
+                                    {word(1), word(0), word(0)}, plain), pools);
+        if (const auto* legal = success(result, "Pool texture with a handle-program sampler")) {
+            const auto* t = sampled(*legal);
+            check(t && t->pool_texture && !t->pool_sampler && t->sampler &&
+                  std::get<TextureKey>(*t->sampler) == TextureKey{handle_program_slot, 0},
+                  "a handle-program sampler stays keyed");
+        }
+    }
+    // Constant-buffer texture, unresolved separate sampler: the sampler pools.
+    {
+        auto result = one(sample_at(TextureKey{2, 16}, DynamicHandle{InputIndex{0}},
+                                    {word(0x000abcde), word(0), word(0)}, plain), pools);
+        if (const auto* legal = success(result, "Constant-buffer texture with a pool sampler")) {
+            const auto* t = sampled(*legal);
+            check(t && !t->pool_texture && std::get<TextureKey>(t->texture) == TextureKey{2, 16} && t->pool_sampler &&
+                  t->sampler && std::get<TextureKey>(*t->sampler) == TextureKey{texture_pool_slot, 0},
+                  "the texture stays keyed and the sampler is pooled");
+            if (t && t->sampler_resource) {
+                const auto* sampler = sampler_use(*legal, *t->sampler_resource);
+                check(sampler && sampler->pool && !sampler->comparison && sampler->normalized_coordinates &&
+                      sampler->key == TextureKey{texture_pool_slot, 0}, "the stage sampler pool is untyped by comparison");
+            }
+            success(plan_resources(structured(*legal), legal->profile), "A pool sampler without a pool texture plans");
+        }
+    }
+    // The same split when the texture word is a constant-buffer load, not a key literal.
+    {
+        auto result = one(sample_at(DynamicHandle{InputIndex{0}}, DynamicHandle{InputIndex{1}},
+                                    {ConstantWord{2, 16}, word(0x000abcde), word(0), word(0)}, plain), pools);
+        if (const auto* legal = success(result, "Constant-buffer texture word with a pool sampler")) {
+            const auto* t = sampled(*legal);
+            check(t && !t->pool_texture && std::get<TextureKey>(t->texture) == TextureKey{2, 16} && t->pool_sampler,
+                  "a constant-buffer texture word is never a pool");
+        }
+    }
+    // Handle-program texture, pool sampler.
+    {
+        auto result = one(sample_at(TextureKey{handle_program_slot, 0}, DynamicHandle{InputIndex{0}},
+                                    {word(0x000abcde), word(0), word(0)}, plain), pools);
+        if (const auto* legal = success(result, "Handle-program texture with a pool sampler")) {
+            const auto* t = sampled(*legal);
+            check(t && !t->pool_texture && t->pool_sampler &&
+                  std::get<TextureKey>(t->texture) == TextureKey{handle_program_slot, 0},
+                  "a handle program is never a pool");
+        }
+    }
+    // Both halves already resolved: pools stay unused.
+    {
+        auto result = one(sample_at(TextureKey{2, 16}, TextureKey{3, 32}, {word(0), word(0)}, plain), pools);
+        if (const auto* legal = success(result, "Resolved texture and sampler ignore pools")) {
+            unsigned pooled = 0;
+            for (const auto& use : legal->requirements.uses) {
+                if (const auto* texture = std::get_if<TextureUse>(&use)) pooled += texture->pool;
+                if (const auto* sampler = std::get_if<SamplerUse>(&use)) pooled += sampler->pool;
+            }
+            check(pooled == 0, "a constant-buffer key is never rewritten into a pool");
+        }
+    }
+    // Ordinary and depth-comparison pooled samples share one sampler pool.
+    {
+        auto depth = descriptor();
+        depth.format = ComponentFormat::depth;
+        depth.comparison = true;
+        auto p = empty();
+        add(p, sample_at(DynamicHandle{InputIndex{0}}, std::nullopt, {word(1), word(0), word(0)}, plain));
+        auto compared = sample_at(DynamicHandle{InputIndex{0}}, std::nullopt, {word(2), word(0), word(0), word(0)}, depth);
+        auto& compared_info = std::get<TextureInfo>(compared.info);
+        compared_info.coordinates = {InputIndex{1}, InputIndex{2}};
+        compared_info.compare = InputIndex{3};
+        add(p, std::move(compared));
+        auto result = run(std::move(p), f, pools);
+        if (const auto* legal = success(result, "Ordinary and depth-comparison samples share a sampler pool")) {
+            unsigned texture_pools = 0, sampler_pools = 0;
+            const SamplerUse* sampler = nullptr;
+            for (const auto& use : legal->requirements.uses) {
+                if (const auto* texture = std::get_if<TextureUse>(&use); texture && texture->pool) ++texture_pools;
+                if (const auto* use_sampler = std::get_if<SamplerUse>(&use); use_sampler && use_sampler->pool) {
+                    ++sampler_pools; sampler = use_sampler;
+                }
+            }
+            check(texture_pools == 2 && sampler_pools == 1, "one sampler pool and one texture pool per element type");
+            check(sampler && !sampler->comparison && sampler->normalized_coordinates &&
+                  sampler->key == TextureKey{texture_pool_slot, 0} && sampler->array_length == 1,
+                  "the shared sampler pool is not typed by comparison");
+            std::optional<ResourceId> shared;
+            unsigned samples = 0;
+            for (const auto& op : legal->ir.operations) if (op.opcode == Opcode::texture_sample) {
+                ++samples;
+                const auto& t = std::get<TextureInfo>(op.info);
+                check(t.pool_texture && t.pool_sampler && t.sampler_resource, "both samples read the pools");
+                if (!shared) shared = t.sampler_resource;
+                else check(shared == t.sampler_resource, "both samples bind the same sampler pool");
+            }
+            check(samples == 2, "both samples survive");
+            success(plan_resources(structured(*legal), legal->profile), "One sampler pool plans");
+        }
+    }
+    // Pools off keeps the previous refusals.
+    {
+        auto missing = one(sample_at(DynamicHandle{InputIndex{0}}, std::nullopt, {word(1), word(0), word(0)}, plain), profile());
+        auto* error = rejected(missing, DiagnosticCode::unresolved_resource, "Pools off refuse an unresolved texture");
+        check(says(error, "Bindless texture handle has no proven constant-buffer provenance"), "unresolved texture message");
+        auto sampler = one(sample_at(TextureKey{2, 16}, DynamicHandle{InputIndex{0}}, {word(1), word(0), word(0)}, plain), profile());
+        error = rejected(sampler, DiagnosticCode::unresolved_resource, "Pools off refuse an unresolved separate sampler");
+        check(says(error, "Separate sampler handle has no unambiguous provenance"), "unresolved sampler message");
+    }
+    // A separate sampler that is itself a combined handle stays refused.
+    {
+        auto p = empty();
+        auto tex = binary(p, Opcode::bit_and, ConstantWord{2, 16}, word(0x000fffff));
+        auto sam = binary(p, Opcode::bit_and, word(0xfff00000), ConstantWord{3, 32});
+        auto combined = binary(p, Opcode::bit_or, sam, tex);
+        auto op = sample_at(DynamicHandle{InputIndex{0}}, DynamicHandle{InputIndex{1}},
+                            {word(1), combined, word(0), word(0)}, plain);
+        add(p, std::move(op));
+        auto combined_result = run(std::move(p), f, pools);
+        auto* error = rejected(combined_result, DiagnosticCode::unresolved_resource,
+                               "A combined separate sampler stays refused");
+        check(says(error, "Separate sampler handle has no unambiguous provenance"), "combined sampler message");
+    }
+    // Storage images, image atomics and buffer textures stay outside pool admission.
+    {
+        TextureInfo image;
+        image.texture = DynamicHandle{InputIndex{0}};
+        image.mode = TextureMode::fetch;
+        image.descriptor = plain;
+        image.coordinates = {InputIndex{1}, InputIndex{2}};
+        auto load = one({{40, {}}, Opcode::image_load, Effects::read_memory | Effects::texture,
+                         {Domain::floating, ScalarType::f32, Rounding::nearest_even}, {word(1), word(0), word(0)}, {}, image}, pools);
+        auto* error = rejected(load, DiagnosticCode::unresolved_resource, "A pooled storage image is refused");
+        check(says(error, "Bindless texture handle has no proven constant-buffer provenance"), "storage image message");
+        image.atomic = AtomicKind::add;
+        image.data = {InputIndex{3}};
+        auto atomic = one({{40, {}}, Opcode::image_atomic,
+                           Effects::atomic | Effects::read_memory | Effects::write_memory | Effects::texture,
+                           {Domain::unsigned_integer, ScalarType::u32}, {word(1), word(0), word(0), word(1)}, {}, image}, pools);
+        error = rejected(atomic, DiagnosticCode::unresolved_resource, "A pooled image atomic is refused");
+        check(says(error, "Bindless texture handle has no proven constant-buffer provenance"), "image atomic message");
+        auto buffer_desc = plain;
+        buffer_desc.shape.dimension = TextureDimension::buffer;
+        auto buffer = sample_at(DynamicHandle{InputIndex{0}}, std::nullopt, {word(1), word(0)}, buffer_desc);
+        std::get<TextureInfo>(buffer.info).coordinates = {InputIndex{1}};
+        auto buffer_result = one(std::move(buffer), pools);
+        error = rejected(buffer_result, DiagnosticCode::missing_fact, "A pooled buffer texture is refused");
+        check(says(error, "Pool texture has no admitted descriptor from its instructions"), "buffer texture message");
+    }
+}
+
 int main() {
     for (auto test : {vertex_depth_dependency, basic_resolution, bindless_resolution, phi_and_io_resolution, memory_and_limits,
-            arrays_and_numeric, per_texel_gather_offsets, dependency_and_pass_contracts, planning, argument_buffer_planning}) {
+            arrays_and_numeric, per_texel_gather_offsets, dependency_and_pass_contracts, planning, argument_buffer_planning,
+            independent_pool_resolution}) {
         try { test(); } catch (const std::exception& error) {
             ++failures; std::cerr << "Test threw: " << error.what() << '\n';
         }

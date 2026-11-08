@@ -9,6 +9,7 @@
 // ============================================================================
 
 #include <armigo/shader_native/input.h>
+#include <armigo/shader_native/program.h>
 #include <armigo/shader_input/archive.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <zstd.h>
@@ -34,8 +35,10 @@ void zcheck(std::size_t status) {
     if (ZSTD_isError(status)) throw InputError(std::string("Zstandard: ") + ZSTD_getErrorName(status));
 }
 void control_prefix(Bytes control) {
+    const auto version = control.size() >= 12 ? little_endian(control, 8, 4) : 0;
+    // Version 17 keeps the fields read below at the version-20 offsets.
     if (control.size() < 0xd8 || little_endian(control, 0, 4) != 0x98761234 ||
-        little_endian(control, 4, 4) != 0xc9 || little_endian(control, 8, 4) != 20)
+        little_endian(control, 4, 4) != 0xc9 || (version != 20 && version != 17))
         throw InputError("Unsupported native shader control family or version");
 }
 }
@@ -190,6 +193,22 @@ void Enumerator::bnsh(Bytes b, const std::vector<Location>& ancestry, std::size_
                   slice(b, control, little_endian(b, descriptor + 28, 4)),
                   slice(b, code, little_endian(b, descriptor + 24, 4))});
         }
+        // NVN2's task and mesh stages follow at +0x40 (slot 7) and +0x48
+        // (slot 8). An older program block ends before them, so a pointer
+        // there counts only when it leads, inside the container, to a
+        // control section of that stage (selector 6 or 7).
+        for (unsigned slot = 7; slot < 9; ++slot) {
+            if (!covers(b, program + 8 + slot * 8, 8)) continue;
+            const auto descriptor = little_endian(b, program + 8 + slot * 8, 8);
+            if (!descriptor || !covers(b, descriptor, 0x20)) continue;
+            const auto control = little_endian(b, descriptor + 8, 8), code = little_endian(b, descriptor + 16, 8);
+            const auto control_size = little_endian(b, descriptor + 28, 4), code_size = little_endian(b, descriptor + 24, 4);
+            if (control_size <= 0x56 || !covers(b, control, control_size) || !covers(b, code, code_size) ||
+                little_endian(b, control, 4) != 0x98761234 || little_endian(b, control + 0x56, 1) != slot - 1)
+                continue;
+            emit({ContainerKind::bnsh, ancestry, offset, descriptor, control, code, i, slot,
+                  slice(b, control, control_size), slice(b, code, code_size)});
+        }
     }
 }
 void Enumerator::bahs(Bytes b, const std::vector<Location>& ancestry, std::size_t offset) {
@@ -214,6 +233,129 @@ void Enumerator::bahs(Bytes b, const std::vector<Location>& ancestry, std::size_
               c, slice(b, start + code, code_size)});
     }
 }
+bool Enumerator::ndve(Bytes bytes, std::vector<Location>& ancestry, std::size_t offset) {
+    if (!magic(bytes, 0, "NDVE") || bytes.size() < 0x18) return false;
+    // The NDSR pack follows the 8-byte model records counted at +0x14; the
+    // networks follow the pack, whose length is at +0x0c.
+    const auto models = little_endian(bytes, 0x14, 4);
+    if (models > (bytes.size() - 0x18) / 8) return false;
+    const std::uint64_t base = 0x18 + 8 * models;
+    const auto first = little_endian(bytes, 0x0c, 4);
+    const auto second = little_endian(bytes, 0x10, 4);
+    if (first > bytes.size() - base || second != bytes.size() - base - first) return false;
+    const auto section = slice(bytes, base + first, second);
+    auto emit_program = [&](std::uint64_t control_at, std::uint64_t control_size, std::uint64_t code_size) {
+        if (control_size < 0xe0 || code_size == 0 || control_at > section.size() ||
+            control_size > section.size() - control_at || code_size > section.size() - control_at - control_size)
+            throw InputError("NDVE shader extent is outside its group", offset + control_at);
+        const auto control = slice(section, control_at, control_size);
+        if (little_endian(control, 0, 4) != 0x98761234 || little_endian(control, 0x30, 4) != control_size ||
+            little_endian(control, 0xd4, 4) != control_size || little_endian(control, 0x44, 4) != code_size)
+            throw InputError("NDVE shader control does not match its group entry", offset + control_at);
+        const auto code_at = control_at + control_size;
+        emit({ContainerKind::bahs, ancestry, offset, control_at, offset + base + first + control_at,
+              offset + base + first + code_at, {}, {}, control, slice(section, code_at, code_size)});
+    };
+    std::size_t position = 0;
+    bool grouped = false;
+    bool packed = false;
+    if (first >= 4) packed = ndsr(slice(bytes, base, first), ancestry, offset + base);
+    while (position + 0x18 <= section.size()) {
+        const auto count = little_endian(section, position, 4);
+        const auto flags = little_endian(section, position + 4, 4);
+        const auto header = little_endian(section, position + 8, 4);
+        if (flags == 1 && count >= 1 && count <= 64 && header == 0x10 + count * 16 &&
+            position + header <= section.size()) {
+            std::uint64_t end = 0;
+            for (std::uint64_t index = 0; index < count; ++index) {
+                const auto entry = position + 0x10 + index * 16;
+                const auto relative = little_endian(section, entry, 4);
+                const auto control_size = little_endian(section, entry + 4, 4);
+                const auto code_size = little_endian(section, entry + 8, 4);
+                if (little_endian(section, entry + 12, 4) != 0)
+                    throw InputError("NDVE shader group entry is not terminated", offset + entry);
+                emit_program(position + relative, control_size, code_size);
+                end = position + relative + control_size + code_size;
+            }
+            if (end < position + header) throw InputError("NDVE shader group is unordered", offset + position);
+            position = static_cast<std::size_t>(end);
+            grouped = true;
+            continue;
+        }
+        if (count == 1 && flags == 0 && header == 0x18 && position + 0x18 <= section.size() &&
+            little_endian(section, position + 0x14, 4) == 0) {
+            const auto control_size = little_endian(section, position + 0x0c, 4);
+            const auto code_size = little_endian(section, position + 0x10, 4);
+            emit_program(position + 0x18, control_size, code_size);
+            position = static_cast<std::size_t>(position + 0x18 + control_size + code_size);
+            grouped = true;
+            continue;
+        }
+        break;
+    }
+    return grouped || packed;
+}
+
+bool Enumerator::ndsr(Bytes bytes, const std::vector<Location>& ancestry, std::size_t offset) {
+    if (!magic(bytes, 0, "NDSR") || bytes.size() < 0x20) return false;
+    // Records are 16 bytes. A short header puts the first one at +0x10; one
+    // extra header word puts it at +0x14. The start is the one whose first
+    // records point at control sections.
+    const auto points = [&](std::size_t start) {
+        unsigned hits = 0;
+        const auto count = std::min<std::size_t>(16, (bytes.size() - start) / 16);
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto control_at = little_endian(bytes, start + index * 16, 4);
+            if (control_at + 0x48 <= bytes.size() && little_endian(bytes, control_at, 4) == 0x98761234 &&
+                little_endian(bytes, control_at + 4, 4) == 0xc9)
+                ++hits;
+        }
+        return hits;
+    };
+    const auto from_10 = points(0x10);
+    const auto from_14 = bytes.size() >= 0x24 ? points(0x14) : 0u;
+    // A zero score still walks: a data entry of 8 bytes shifts the next shader
+    // off the 16-byte grid the score uses, and that shader is still a record.
+    std::size_t cursor = from_14 > from_10 ? 0x14 : 0x10;
+    bool emitted = false;
+    while (cursor + 16 <= bytes.size()) {
+        const auto control_at = little_endian(bytes, cursor, 4);
+        const auto control_word = little_endian(bytes, cursor + 4, 4);
+        const auto code_at = little_endian(bytes, cursor + 8, 4);
+        const auto code_word = little_endian(bytes, cursor + 12, 4);
+        if ((control_at | control_word | code_at | code_word) == 0) break;
+        const bool control = control_at + 0x48 <= bytes.size() &&
+                             little_endian(bytes, control_at, 4) == 0x98761234 &&
+                             little_endian(bytes, control_at + 4, 4) == 0xc9;
+        // A data entry is 8 bytes, so the next shader can sit 8 bytes on.
+        if (!control) {
+            cursor += 8;
+            continue;
+        }
+        cursor += 16;
+        const auto declared = little_endian(bytes, control_at + 0x30, 4);
+        const auto record_length = control_word >> 4;
+        const auto control_size = declared ? declared : std::max<std::uint64_t>(record_length, 0xe0);
+        const auto code_size = little_endian(bytes, control_at + 0x44, 4);
+        if (control_size < 0xd8 || control_at > bytes.size() || control_size > bytes.size() - control_at ||
+            code_at > bytes.size() || code_size > bytes.size() - code_at || code_size == 0)
+            continue;
+        const auto version = little_endian(bytes, control_at + 8, 4);
+        if (version != 17 && version != 20) continue;
+        // A pack control carries no container extent: +0x30 and +0xd4 are
+        // clear and the section is the reader span. A BAHS record stores its
+        // extent at +0xd4, so this one is a runtime control.
+        const auto file_extent = control_size > 0xd4 ? little_endian(bytes, control_at + 0xd4, 4) : 0;
+        const auto kind = !declared && file_extent == 0 && control_size == runtime_control_bytes
+                              ? ContainerKind::runtime
+                              : ContainerKind::bahs;
+        emit({kind, ancestry, offset, cursor - 16, offset + control_at, offset + code_at, {}, {},
+              slice(bytes, control_at, control_size), slice(bytes, code_at, code_size)});
+        emitted = true;
+    }
+    return emitted;
+}
+
 void Enumerator::scan_inner(Bytes b, std::vector<Location>& ancestry, unsigned depth) {
     if (depth > limits_.depth || inventory_.spans == limits_.spans || b.size() > limits_.member_bytes ||
         b.size() > limits_.traversal_bytes - inventory_.visited_bytes)
@@ -233,6 +375,8 @@ void Enumerator::scan_inner(Bytes b, std::vector<Location>& ancestry, unsigned d
         ancestry.pop_back();
         return;
     }
+    if (ndve(b, ancestry, ancestry.empty() ? 0 : ancestry.back().offset)) return;
+    if (ndsr(b, ancestry, ancestry.empty() ? 0 : ancestry.back().offset)) return;
     if (magic(b, 0, "SARC")) {
         auto result = shader_input::parse_sarc(b);
         if (auto error = std::get_if<shader_input::ArchiveError>(&result)) throw InputError(error->message(), error->offset);

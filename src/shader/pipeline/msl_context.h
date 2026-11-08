@@ -14,6 +14,7 @@
 #include <string_view>
 
 namespace armigo::shader::pipeline {
+struct MatrixPlan;
 // The stage emitter walks structured control flow. Per-op generators emit all
 // results and effects, returning failure for unsupported numerical/texture modes.
 class MslContext {
@@ -22,6 +23,10 @@ public:
     [[nodiscard]] virtual const StructuredProgram& program() const = 0;
     [[nodiscard]] virtual const ResourcePlan& resources() const = 0;
     [[nodiscard]] virtual bool fragment_output_types_from_render_targets() const { return false; }
+    [[nodiscard]] virtual std::uint32_t guest_memory_tag() const { return 0; }
+    // Where warp matrix operations keep their operands; null outside a
+    // compute stage with matrix multiplies.
+    [[nodiscard]] virtual const MatrixPlan* matrix_plan() const { return nullptr; }
     [[nodiscard]] virtual const Operation& operation(OperationId) const = 0;
     [[nodiscard]] virtual Result<std::string> operand(const Operand&, ScalarType) = 0;
     [[nodiscard]] virtual Result<std::string> resource(ResourceId) = 0;

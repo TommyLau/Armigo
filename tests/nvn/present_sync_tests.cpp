@@ -8,6 +8,8 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/execution/guest_timeline.h>
+
 #include "backend.h"
 #include "entry_table.h"
 #include "present_internal.h"
@@ -18,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <future>
+#include <optional>
 #include <span>
 #include <thread>
 #include <vector>
@@ -292,6 +295,36 @@ void verify_timestamps() {
   CHECK(current <= static_cast<std::uint64_t>(after));
 }
 
+// With a published guest clock the current timestamp runs on it: the guest
+// compares GPU timestamps with its own counter, which starts at that origin.
+void verify_guest_clock_timestamps() {
+  const auto current_timestamp =
+      load_entry<Entry::nvnDeviceGetCurrentTimestampInNanoseconds>();
+  struct Fake {
+    std::chrono::nanoseconds elapsed{5'000'000'000};
+  } fake;
+  const auto read = [](void *context) noexcept
+      -> std::optional<std::chrono::nanoseconds> {
+    return static_cast<Fake *>(context)->elapsed;
+  };
+  armigo::execution::publish_guest_timeline(
+      {read, &fake, std::chrono::steady_clock::now()});
+  CHECK(current_timestamp(nullptr) == 5'000'000'000);
+  fake.elapsed = std::chrono::nanoseconds(7'000'000'625);
+  CHECK(current_timestamp(nullptr) == 7'000'000'625);
+  // A clock that cannot sample keeps the timestamp on the steady clock.
+  const auto broken = [](void *) noexcept
+      -> std::optional<std::chrono::nanoseconds> { return std::nullopt; };
+  armigo::execution::publish_guest_timeline(
+      {broken, &fake, std::chrono::steady_clock::now()});
+  const auto before = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+  CHECK(current_timestamp(nullptr) >= static_cast<std::uint64_t>(before - 625));
+  armigo::execution::withdraw_guest_timeline(&fake);
+  CHECK(!armigo::execution::guest_timeline_now());
+}
+
 } // namespace
 
 int main() {
@@ -304,6 +337,7 @@ int main() {
   verify_queue_and_sync(backend);
   verify_events();
   verify_timestamps();
+  verify_guest_clock_timestamps();
 
   set_blocking_wait_hook(nullptr);
   set_backends({});

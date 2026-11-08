@@ -26,7 +26,9 @@ struct ScriptInputState {
     platform::HostInputSnapshot input;
 };
 struct InputScript {
-    enum class Clock { presents, milliseconds };
+    // presents counts the host's successful presents, milliseconds the time since
+    // the first of them, guest-presents the guest's own presents (replay-stable).
+    enum class Clock { presents, milliseconds, guest_presents };
     Clock clock = Clock::presents;
     std::vector<ScriptInputState> states;
 };
@@ -49,8 +51,13 @@ private:
 };
 // Parse the complete script before launch; errors include the source line.
 std::variant<InputScript, std::string> parse_input_script(std::istream& source);
+// The clock's name in scripts and delivery logs.
+const char* input_clock_name(InputScript::Clock clock) noexcept;
 // Publishes position zero immediately, then advances on successful presents only.
 // Millisecond scripts start their steady clock at the first successful present.
+// Guest-present scripts advance on the guest's thread as each guest present
+// starts and write the state to HID shared memory at once, so a state stepped at
+// a guest frame is seen by the same guest read in every run.
 // Uses the same host-to-HID mapping as keyboard/controller input. The optional
 // publication and clock callbacks are test seams; production leaves them empty.
 // Observations capture each applied state; flushing runs once after the whole

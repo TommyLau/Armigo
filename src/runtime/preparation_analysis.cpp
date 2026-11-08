@@ -41,6 +41,17 @@ bool permission(const loader::NsoSegment& segment, loader::SegmentPermission bit
     return (static_cast<unsigned>(segment.permission) & static_cast<unsigned>(bit)) != 0;
 }
 
+// Whether an atomic read-modify-write stores this register's value, or
+// combines it into memory: Rs of an LSE operation or SWP, and the desired
+// Rt (and Rt+1) of CAS and CASP. Their Rs (and Rs+1) are only compared, then
+// receive the old memory value.
+bool atomic_stores(const a64::RegisterEffects& effects, const a64::RegisterOperand& operand) {
+    if (!operand.is_general() || operand.role == a64::OperandRole::base) return false;
+    if (effects.operation == a64::Operation::cas || effects.operation == a64::Operation::casp)
+        return operand.role == a64::OperandRole::transfer && operand.access == a64::Access::read;
+    return operand.role == a64::OperandRole::source;
+}
+
 std::uint64_t read(std::span<const std::byte> bytes, std::uint64_t offset, unsigned size) {
     std::uint64_t value = 0;
     for (unsigned i = 0; i < size; ++i)
@@ -699,6 +710,27 @@ private:
                         }
                     }
                 }
+                if (memory.operation == a64::MemoryOperation::atomic) {
+                    // An atomic read-modify-write loads and stores its
+                    // address and proves no slot: a frame address clears the
+                    // frame's slots, a stack address among the values it
+                    // stores escapes (a compared one does not), and what it
+                    // returns may alias the frame.
+                    Value base;
+                    for (unsigned i = 0; i < effects.operand_count; ++i)
+                        if (effects.operands[i].role == a64::OperandRole::base)
+                            base = before.registers[effects.operands[i].number];
+                    if (base.is_stack()) after.slots.clear();
+                    for (unsigned i = 0; i < effects.operand_count; ++i) {
+                        const auto& operand = effects.operands[i];
+                        if (!operand.is_general() || operand.names_zero_register() ||
+                            operand.role == a64::OperandRole::base) continue;
+                        if (atomic_stores(effects, operand) && before.registers[operand.number].is_stack())
+                            refuse_return(node, ReturnError::stack_pointer_escape);
+                        if (a64::includes_write(operand.access))
+                            after.registers[operand.number] = base.is_stack() ? Value{Kind::maybe_stack} : Value{};
+                    }
+                }
                 if (after.registers[31].kind != Kind::stack || after.registers[31].offset > 0)
                     refuse_return(node, ReturnError::unproven_stack_pointer);
                 // Deallocated storage cannot later recreate a saved-link proof.
@@ -886,6 +918,10 @@ private:
                         fail("A module address escapes through a stored data reference.");
                     stored_address_register = operand.number;
                 }
+                // No proof covers an atomic storing a module address.
+                if (memory.operation == a64::MemoryOperation::atomic && atomic_stores(effects, operand) &&
+                    (before & bit))
+                    fail("A module address escapes through a stored data reference.");
                 if (operand.role != a64::OperandRole::base) continue;
                 if (memory.addressing == a64::AddressingMode::register_offset) continue;
                 const auto base = modules_[node.location.module_index].guest_relocations
@@ -904,7 +940,8 @@ private:
                 data_address = referenced(node, address);
             if ((before & address_registers) &&
                 (memory.operation == a64::MemoryOperation::load ||
-                 memory.operation == a64::MemoryOperation::store)) {
+                 memory.operation == a64::MemoryOperation::store ||
+                 memory.operation == a64::MemoryOperation::atomic)) {
                 if (!data_address)
                     fail("A module address has an unproven register-addressed data reference.");
                 const auto owner = location(*data_address, false);
@@ -949,6 +986,18 @@ private:
                 if (memory.writeback) after |= before & address_registers;
             } else if (memory.operation == a64::MemoryOperation::store) {
                 if (memory.writeback) after |= before & address_registers;
+            } else if (memory.operation == a64::MemoryOperation::atomic) {
+                // The registers it writes receive the old memory value: an
+                // address only when the access overlaps a relocated pointer,
+                // never one derived from its inputs.
+                const auto size = memory.element_bytes * memory.elements;
+                if (data_address && overlaps_relocated_pointer(*data_address, size)) {
+                    for (unsigned i = 0; i < effects.operand_count; ++i) {
+                        const auto& operand = effects.operands[i];
+                        if (a64::includes_write(operand.access) && operand.is_general() && operand.number < 31)
+                            after |= Mask{1} << operand.number;
+                    }
+                }
             } else if (effects.control_flow == a64::ControlFlow::none && (effects.reads & before)) {
                 if (!effects.writes)
                     fail("A module address escapes through an unsupported data reference use.");

@@ -10,7 +10,7 @@
 
 #include <armigo/common/diagnostics.h>
 #include <armigo/runtime/launch_plan.h>
-#include <armigo/titles/01007EF00011E000/resolution.h>
+#include <armigo/compat/title_plan.h>
 #include <armigo/execution/gate_code.h>
 #include <armigo/execution/embedded_patch.h>
 #include <armigo/platform/host_module.h>
@@ -18,6 +18,7 @@
 #include "native_preparation.h"
 #include "prepared_artifact.h"
 #include "sha256.h"
+#include "../nvn/entry_table_231.h"
 #include "../nvn/redirect.h"
 
 #include <algorithm>
@@ -52,6 +53,8 @@ struct NativeLoading {
     std::vector<compat::WordPatch> launch_words;
     std::optional<std::size_t> launch_module;
     std::optional<std::size_t> nvn_module;
+    // The host bootstrap loader of the selected API version.
+    nvn::BootstrapLoader nvn_loader = nullptr;
     std::optional<compat::CallPatch> gpu_budget_hook;
     EmbeddedNativeArtifacts* capture = nullptr;
     const EmbeddedNativeArtifacts* artifacts = nullptr;
@@ -82,6 +85,10 @@ std::array<std::byte, 32> code_settings_digest(const NativeLoading& loading) {
         if (call.gpu_budget) {
             number(0x6770756275646765); // GPU budget instruction metadata.
             number(call.gpu_budget->target_rate);
+        }
+        if (call.frame_ratio) {
+            number(0x726174696f); // Frame-ratio division metadata.
+            number(call.frame_ratio->divisor_register);
         }
     }
     // Launch-time sites are code; the words they apply are not.
@@ -199,7 +206,8 @@ void restore_native_module(const ModulePreparationView& view, NativeLoading& loa
     std::memcpy(view.appended_data.data(), &slot, 8);
     std::memcpy(view.appended_data.data() + execution::embedded_gate_dispatcher_offset, &dispatcher, 8);
     if (loading.nvn_module == view.module_index) {
-        const auto nvn = reinterpret_cast<std::uintptr_t>(&nvn::armigo_nvn_bootstrap_loader);
+        const auto nvn = reinterpret_cast<std::uintptr_t>(
+            loading.nvn_loader ? loading.nvn_loader : &nvn::armigo_nvn_bootstrap_loader);
         std::memcpy(view.appended_data.data() + execution::embedded_nvn_bootstrap_offset, &nvn, 8);
     }
     module.completed = true;
@@ -320,7 +328,8 @@ bool prepare_native_module(const ModulePreparationView& view, void* raw) noexcep
         if (loading.nvn_module == context.index) {
             const auto stub = (module.code_bytes + 3) & ~std::size_t{3};
             const auto redirected = nvn::redirect_bootstrap_loader(view, entry_words,
-                module.text_begin, module.text_size, module.embedded ? std::optional(stub) : std::nullopt);
+                module.text_begin, module.text_size, module.embedded ? std::optional(stub) : std::nullopt,
+                loading.nvn_loader);
             if (!redirected.ok()) {
                 context.error = redirected.error;
                 return false;
@@ -350,12 +359,16 @@ bool prepare_native_module(const ModulePreparationView& view, void* raw) noexcep
                 return false;
             }
             const auto& hook_gate = module.embedded ? *embedded_gate : loading.hook_gate;
-            const auto need = hook_gate.size() + description.calls.size() * 16;
+            const auto& observers = loading.compatibility_patch->observers;
+            std::size_t call_bytes = 0;
+            for (const auto& call : description.calls) call_bytes += compat::call_stub_bytes(call);
+            const auto need = hook_gate.size() + call_bytes + observers.size() * compat::observe_stub_bytes;
             if (gate_offset > view.appended_code.size() || need > view.appended_code.size() - gate_offset) {
                 context.error = "Compatibility hooks do not fit the preparation appendix.";
                 return false;
             }
             std::memcpy(view.appended_code.data() + gate_offset, hook_gate.data(), hook_gate.size());
+            auto stub_offset = gate_offset + hook_gate.size();
             for (std::size_t i = 0; i < description.calls.size(); ++i) {
                 const auto& site = description.calls[i];
                 std::uint32_t actual = 0;
@@ -364,9 +377,23 @@ bool prepare_native_module(const ModulePreparationView& view, void* raw) noexcep
                     context.error = "Compatibility instruction changed during preparation.";
                     return false;
                 }
-                const auto stub_offset = gate_offset + hook_gate.size() + i * 16;
-                const auto hook = compat::make_patch_hook(site, actual, view.base_address + site.offset,
-                    view.base_address + view.appended_code_offset + stub_offset,
+                const auto stub = view.base_address + view.appended_code_offset + stub_offset;
+                if (site.frame_ratio) {
+                    // The gate runs before the division, which then runs as it is.
+                    auto ratio = compat::make_observe_hook(actual, view.base_address + site.offset, stub,
+                                                           {gate_address, hook_gate.size()});
+                    if (const auto* failure = std::get_if<std::string>(&ratio)) {
+                        context.error = "Compatibility frame-ratio hook: " + *failure;
+                        return false;
+                    }
+                    const auto& made = std::get<compat::ObserveHook>(ratio);
+                    std::memcpy(view.appended_code.data() + stub_offset, made.trampoline.data(), compat::observe_stub_bytes);
+                    std::memcpy(view.image.data() + site.offset, &made.replacement_instruction, 4);
+                    loading.call_hooks.push_back(made.site);
+                    stub_offset += compat::observe_stub_bytes;
+                    continue;
+                }
+                const auto hook = compat::make_patch_hook(site, actual, view.base_address + site.offset, stub,
                     {gate_address, hook_gate.size()});
                 if (!hook.ok()) {
                     context.error = execution::describe(hook.error);
@@ -375,6 +402,29 @@ bool prepare_native_module(const ModulePreparationView& view, void* raw) noexcep
                 std::memcpy(view.appended_code.data() + stub_offset, hook.patch->trampoline.data(), 16);
                 std::memcpy(view.image.data() + site.offset, &hook.patch->replacement_instruction, 4);
                 loading.call_hooks.push_back(hook.patch->site);
+                stub_offset += 16;
+            }
+            for (std::size_t i = 0; i < observers.size(); ++i) {
+                const auto& point = observers[i];
+                std::uint32_t actual = 0;
+                std::memcpy(&actual, view.image.data() + point.offset, 4);
+                if (actual != point.expected_instruction) {
+                    context.error = "Observer '" + point.text + "' is an instruction that preparation rewrote.";
+                    return false;
+                }
+                const auto stub_offset = gate_offset + hook_gate.size() + call_bytes + i * compat::observe_stub_bytes;
+                auto hook = compat::make_observe_hook(actual, view.base_address + point.offset,
+                    view.base_address + view.appended_code_offset + stub_offset, {gate_address, hook_gate.size()});
+                if (const auto* failure = std::get_if<std::string>(&hook)) {
+                    context.error = "Observer '" + point.text + "': " + *failure;
+                    return false;
+                }
+                const auto& made = std::get<compat::ObserveHook>(hook);
+                std::memcpy(view.appended_code.data() + stub_offset, made.trampoline.data(), compat::observe_stub_bytes);
+                std::memcpy(view.image.data() + point.offset, &made.replacement_instruction, 4);
+                loading.call_hooks.push_back(made.site);
+                armigo::diag::write(armigo::diag::Level::info, "Armigo observe: main+%#llx (%#010x) observed\n",
+                                    static_cast<unsigned long long>(point.offset), actual);
             }
             loading.compatibility_patch->module_base = view.base_address;
         }
@@ -541,6 +591,7 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
         bool title_nvn_enabled = false;
         std::string title_pso_manifest;
         bool title_startup_user = false;
+        nvn::TitlePolicy title_nvn_policy;
         bool title_matched = false;
         const compat::PatchDescription* rate_patch = nullptr;
         std::string requested_title_rate;
@@ -551,6 +602,12 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
                 title_nvn_enabled = patch->nvn_driver;
                 title_pso_manifest = patch->pso_manifest;
                 title_startup_user = patch->startup_user;
+                title_nvn_policy.cpu_cached_texture_writes = patch->nvn_policy.cpu_cached_texture_writes;
+                if (patch->nvn_policy.segment_timestamps)
+                    title_nvn_policy.timestamps = nvn::TitlePolicy::Timestamps::segment;
+                if (patch->nvn_policy.game_barriers)
+                    title_nvn_policy.barriers = nvn::TitlePolicy::Barriers::game;
+                title_nvn_policy.hoist_implicit_samples = patch->nvn_policy.hoist_implicit_samples;
                 if (auto error = compat::validate_patch(*patch, source); !error.empty())
                     return fail(LaunchError::artifact_mismatch, "compatibility-preflight", std::move(error));
                 // Embedded capture records the profile's default independently of
@@ -562,78 +619,20 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
                     rate_patch = patch;
                     requested_title_rate = requested_rate ? requested_rate : "";
                 }
-                auto selected = compat::select_patch_words(*patch, requested_rate ? requested_rate : "");
-                if (const auto* failure = std::get_if<std::string>(&selected))
-                    return fail(LaunchError::invalid_input, "compatibility-frame-rate", *failure);
-                auto words = std::get<std::vector<compat::WordPatch>>(std::move(selected));
-                std::vector<compat::WordPatch> launch_words;
-                if (patch->resolution) {
-                    namespace title = titles::title_01007ef00011e000;
-                    const auto settings = title::resolution_settings(*patch->resolution);
-                    if (const auto* failure = std::get_if<std::string>(&settings))
-                        return fail(LaunchError::invalid_input, "compatibility-resolution", *failure);
-                    const auto planned = title::resolution_words(
-                        *patch->resolution, std::get<title::ResolutionSettings>(settings), source);
-                    if (const auto* failure = std::get_if<std::string>(&planned))
-                        return fail(LaunchError::artifact_mismatch, "compatibility-resolution", *failure);
-                    const auto& resolution = std::get<title::ResolutionPlan>(planned);
-                    loading.gpu_budget_hook = resolution.gpu_budget_hook;
-                    if (loading.gpu_budget_hook && (patch->module != "frame-rate" ||
-                        native_options.embedded_preparation || native_options.artifacts))
+                const bool ahead_of_time = native_options.embedded_preparation || native_options.artifacts;
+                auto planned = compat::plan_title_words(*patch, source,
+                    {requested_rate ? requested_rate : "", ahead_of_time});
+                if (const auto* failure = std::get_if<compat::TitlePlanFailure>(&planned))
+                    return fail(failure->kind == compat::TitlePlanFailure::Kind::invalid_input
+                        ? LaunchError::invalid_input : LaunchError::artifact_mismatch, failure->stage, failure->detail);
+                auto& plan = std::get<compat::TitlePlan>(planned);
+                auto words = std::move(plan.words);
+                auto launch_words = std::move(plan.launch_words);
+                if (!plan.module_calls.empty()) {
+                    loading.gpu_budget_hook = plan.module_calls.front();
+                    if (patch->module != "frame-rate" || ahead_of_time)
                         return fail(LaunchError::unsupported, "compatibility-resolution",
                                     "GPU-work feedback requires load-time preparation and the title frame-rate module.");
-                    if (!resolution.words.empty())
-                        armigo::diag::write(armigo::diag::Level::info,  "compat_resolution width=%u height=%u render_target_pool=%llu "
-                                     "graphics_heap=%llu process_heap=%llu root_heap=%llu floor=%.4f load_scale=%.1f\n",
-                                     resolution.width, resolution.height,
-                                     static_cast<unsigned long long>(resolution.render_target_pool),
-                                     static_cast<unsigned long long>(resolution.graphics_heap),
-                                     static_cast<unsigned long long>(resolution.process_heap),
-                                     static_cast<unsigned long long>(resolution.root_heap),
-                                     resolution.floor, resolution.load_scale);
-                    // Code compiled ahead of time keeps every resolution site
-                    // as a gate site, so one pack serves every width: a plan at
-                    // a fixed width names the sites, and this launch's plan (or
-                    // the game's own words) gives what they apply.
-                    std::vector<compat::WordPatch> planned_words = resolution.words;
-                    if (native_options.embedded_preparation || native_options.artifacts) {
-                        auto fixed = std::get<title::ResolutionSettings>(settings);
-                        fixed.maximum_width = 1920;
-                        const auto sites = title::resolution_words(*patch->resolution, fixed, source);
-                        if (const auto* failure = std::get_if<std::string>(&sites))
-                            return fail(LaunchError::artifact_mismatch, "compatibility-resolution", *failure);
-                        for (auto site : std::get<title::ResolutionPlan>(sites).words) {
-                            site.replacement_instruction = site.expected_instruction;
-                            for (const auto& chosen : resolution.words)
-                                if (chosen.offset == site.offset) site.replacement_instruction = chosen.replacement_instruction;
-                            launch_words.push_back(site);
-                        }
-                        // The planned word may change only the immediate the gate applies.
-                        if (std::any_of(launch_words.begin(), launch_words.end(), [](const auto& site) {
-                                return ((site.replacement_instruction ^ site.expected_instruction) & ~(0xffffu << 5)) != 0;
-                            }))
-                            return fail(LaunchError::artifact_mismatch, "compatibility-resolution",
-                                        "A launch-time word changes more than its immediate.");
-                        if (!std::all_of(resolution.words.begin(), resolution.words.end(), [&](const auto& chosen) {
-                                return std::any_of(launch_words.begin(), launch_words.end(),
-                                                   [&](const auto& site) { return site.offset == chosen.offset; });
-                            }))
-                            return fail(LaunchError::artifact_mismatch, "compatibility-resolution",
-                                        "Compatibility resolution sites differ between widths.");
-                        planned_words.clear();
-                    }
-                    for (const auto& word : planned_words) {
-                        if (std::any_of(words.begin(), words.end(),
-                                [&](const auto& other) { return other.offset == word.offset; }))
-                            return fail(LaunchError::artifact_mismatch, "compatibility-resolution",
-                                        "Compatibility resolution site overlaps an instruction word.");
-                        words.push_back(word);
-                    }
-                    for (const auto& word : launch_words)
-                        if (std::any_of(words.begin(), words.end(),
-                                [&](const auto& other) { return other.offset == word.offset; }))
-                            return fail(LaunchError::artifact_mismatch, "compatibility-resolution",
-                                        "Compatibility resolution site overlaps an instruction word.");
                 }
                 if (!launch_words.empty()) {
                     loading.launch_module = *main;
@@ -667,6 +666,7 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
             if (selection.error) return fail(LaunchError::invalid_input, "nvn-selection", selection.error);
             if (selection.version) {
                 loading.nvn_module = *sdk;
+                loading.nvn_loader = nvn::bootstrap_loader_for(*selection.version);
                 nvn_version = selection.version;
             } else if ((title_nvn_enabled || override_value == "driver") && override_value != "stream") {
                 const auto package = nvn::driver_package(images[*sdk].bytes);
@@ -698,7 +698,35 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
             } else {
                 compat::set_present_link(description.present_link);
                 compat::initialize_gpu_budget(*loading.compatibility_patch);
+                compat::initialize_frame_ratio(*loading.compatibility_patch);
             }
+        }
+        // Debugging observers share the compatibility gate of the main module.
+        if (const char* observe = std::getenv("ARMIGO_OBSERVE"); observe && *observe) {
+            const auto main = position_of("main");
+            if (native_options.embedded_preparation || native_options.artifacts || !main)
+                return fail(LaunchError::unsupported, "observe", "Observers need a load-time prepared main module.");
+            auto parsed = compat::parse_observe_points(observe);
+            if (const auto* failure = std::get_if<std::string>(&parsed))
+                return fail(LaunchError::invalid_input, "observe", *failure);
+            auto points = std::get<std::vector<compat::ObservePoint>>(std::move(parsed));
+            const auto& text = images[*main].segment(loader::NsoSegmentKind::text);
+            for (auto& point : points) {
+                if (point.offset < text.image_offset || point.offset - text.image_offset >= text.content_size)
+                    return fail(LaunchError::invalid_input, "observe", "Observer '" + point.text + "' is outside main's text.");
+                std::memcpy(&point.expected_instruction, images[*main].bytes.data() + point.offset, 4);
+                if (loading.compatibility_patch)
+                    for (const auto& call : loading.compatibility_patch->description.calls)
+                        if (call.offset == point.offset)
+                            return fail(LaunchError::invalid_input, "observe", "Observer '" + point.text + "' is a compatibility call.");
+            }
+            if (!loading.compatibility_patch) {
+                loading.compatibility_patch = std::make_shared<compat::InstalledPatch>();
+                loading.compatibility_patch->description.module = "observe";
+            }
+            loading.compatibility_module = *main;
+            loading.hook_gate = gate;
+            loading.compatibility_patch->observers = std::move(points);
         }
         if (!loading.nvn_module)
             std::erase_if(loading.words, [](const compat::WordPatch& word) { return word.nvn_driver_only; });
@@ -735,8 +763,10 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
         for (std::size_t position = 0; position < order->size(); ++position) {
             auto bytes = decoded[position].appendix;
             if (!native_options.artifacts && native_options.embedded_preparation && loading.nvn_module == position) bytes += 16;
-            if (!native_options.artifacts && loading.compatibility_module == position)
-                bytes += 16 + loading.hook_gate.size() + loading.compatibility_patch->description.calls.size() * 16;
+            if (!native_options.artifacts && loading.compatibility_module == position) {
+                bytes += 16 + loading.hook_gate.size() + loading.compatibility_patch->observers.size() * compat::observe_stub_bytes;
+                for (const auto& call : loading.compatibility_patch->description.calls) bytes += compat::call_stub_bytes(call);
+            }
             if (!native_options.artifacts && loading.launch_module == position) bytes += loading.launch_words.size() * 16;
             bytes = (bytes + *page_size - 1) & ~(*page_size - 1);
             contexts[position].loading = &loading;
@@ -753,6 +783,11 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
         ModuleLoadOptions options;
         options.preparation = preparations;
         options.relocation_mode = ModuleRelocationMode::host_link;
+        // The title's rtld binds a default-visibility reference to the first
+        // module in load order that defines it (only other visibilities bind
+        // to the referring module), so main's operator new preempts the SDK
+        // module's weak one, as on the console.
+        options.bindings.preemption = linker::PreemptionModel::load_order;
         options.parallel_preparation = true;
         auto loaded = ModuleSet::load_nso(sources, options);
         if (!loaded.ok()) {
@@ -848,7 +883,9 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
             result.nvn_driver = true;
             result.nvn_pso_manifest = title_pso_manifest;
             nvn::register_null_entries();
+            if (nvn_version->major == 231) nvn::v231::register_entries();
             nvn::select_api_version(*nvn_version);
+            nvn::set_title_policy(title_nvn_policy);
             armigo::diag::write(armigo::diag::Level::info,  "Armigo NVN: driver selected for API %d.%d.\n", nvn_version->major, nvn_version->minor);
         }
         if (native_options.capture) *native_options.capture = std::move(capture);

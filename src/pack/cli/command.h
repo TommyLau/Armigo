@@ -31,6 +31,13 @@ struct Command {
     bool keep_app = false;
     // iOS only: keep the unsigned app and its entitlements and write no IPA.
     bool no_ipa = false;
+    // Writes only the shader package (output/shaders) and the pipeline
+    // archive (output/pipelines) into an explicit output folder, new or
+    // empty; no app, no firmware.
+    bool shaders_only = false;
+    // --compare OLD NEW: report the stage-by-stage difference of two shader
+    // packages; takes no game.
+    std::vector<std::filesystem::path> compare;
     bool help = false;
 };
 

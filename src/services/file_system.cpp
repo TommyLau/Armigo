@@ -64,6 +64,8 @@ constexpr std::uint64_t save_file_limit = 64ull << 20;
 constexpr std::uint64_t save_space_free = 512ull << 20;
 constexpr std::uint64_t save_space_total = 512ull << 20;
 constexpr std::uint32_t path_not_found = 0x202;
+// FS ResultTargetNotFound: the requested save data does not exist.
+constexpr std::uint32_t target_not_found = 0x7d402;
 constexpr std::uint32_t path_already_exists = 0x402;
 constexpr std::size_t directory_entry_size = 0x310;
 
@@ -246,6 +248,11 @@ FileSystemServiceSession::FileSystemServiceSession(std::uint64_t process_id,
                                                    std::shared_ptr<DomainState> state)
     : process_id_(process_id), pointer_capacity_(pointer_buffer_capacity),
       romfs_(std::move(romfs)), addons_(std::move(addons)), state_(std::move(state)) {}
+
+void FileSystemServiceSession::set_application_program_id(std::uint64_t program_id) {
+    const std::lock_guard lock(state_->mutex);
+    state_->application_program_id = program_id;
+}
 
 IpcReply FileSystemServiceSession::unsupported(const char* message) {
     state_->diagnostic = message;
@@ -667,8 +674,15 @@ IpcReply FileSystemServiceSession::request(const IpcMessage& message, std::uint6
         if (state_->directory_objects.find(id) != state_->directory_objects.end())
             return directory_command(id, command, cmif, message, nullptr);
         if (command == 51) {
-            // OpenSaveDataFileSystem: one save-data file system backed by the
-            // session's save tree. The reply carries its domain object id.
+            // OpenSaveDataFileSystem(u8 space id, attribute): attribute +0 is
+            // the owning program, zero or its own id for this application. FS
+            // looks a save up before it checks the caller's access to it, and
+            // the host keeps no other program's saves: such a save is not found.
+            if (const auto program = read64(message, cmif + 24);
+                program != 0 && program != state_->application_program_id)
+                return save_result(cmif, target_not_found);
+            // One save-data file system backed by the session's save tree. The
+            // reply carries its domain object id.
             const auto save_id = ++state_->next_object_id;
             state_->save_objects.push_back(save_id);
             {

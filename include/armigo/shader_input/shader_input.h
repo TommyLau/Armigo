@@ -82,9 +82,11 @@ inline constexpr std::uint32_t compute_min_c1_offset = 8u;
 
 // Version 15 (SDK 13 drivers) keeps version 14's fields: the C1 offset, code
 // size, code offset and stage words and the extended metadata are where 14 has
-// them.
+// them. Version 16 (SDK 16 GLSLC) keeps them too: in every version-16 GLSLC
+// output examined, the control size, code size, code offset, C1 offset and
+// stage words agree with the output's own section headers.
 [[nodiscard]] constexpr bool is_accepted_version(std::uint32_t version) {
-    return version == 9u || version == 14u || version == 15u;
+    return version == 9u || version == 14u || version == 15u || version == 16u;
 }
 
 }  // namespace format

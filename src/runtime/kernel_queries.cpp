@@ -28,20 +28,14 @@
 namespace armigo::runtime {
 namespace {
 
+// A void supervisor call returns with its result registers cleared.
 execution::GateStatus finish_sleep(execution::GateCall& call) {
     for (unsigned index = 0; index < 18; ++index) call.set_x(index, 0);
     return execution::GateStatus::resume;
 }
 
-std::chrono::nanoseconds sleep_duration(std::int64_t nanoseconds) {
-    // The baseline rounds nanoseconds up to 19.2 MHz ticks and adds two ticks.
-    // Saturate when the corresponding host duration cannot be represented.
-    const auto count = static_cast<std::uint64_t>(nanoseconds);
-    const auto ticks = count / 625 * 12 + ((count % 625) * 12 + 624) / 625 + 2;
-    const auto part = (ticks % 12) * 625 / 12;
-    const auto limit = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
-    if (ticks / 12 > (limit - part) / 625) return std::chrono::nanoseconds::max();
-    return std::chrono::nanoseconds(ticks / 12 * 625 + part);
+std::chrono::nanoseconds sleep_duration(std::int64_t nanoseconds, GuestPlatform platform) {
+    return horizon::kernel_timeout(nanoseconds, horizon::counter_rate(platform));
 }
 
 // A host yield that returns sooner than this ran no other thread.
@@ -96,6 +90,13 @@ execution::GateStatus StartupSupervisor::dispatch(std::uint16_t immediate,
     if (immediate == break_immediate) {
         auto length = horizon::describe_break(call.x(0), call.x(1), call.x(2), self.break_message_,
                                               sizeof self.break_message_);
+        // Bit 31 of the reason marks a notification. Without an attached debugger
+        // the kernel returns from it, clearing the return registers, and the
+        // guest continues; only the other reasons end the process.
+        if (horizon::break_is_notification(call.x(0))) {
+            diag::opt_in("%s Notification only; the guest continues.\n", self.break_message_);
+            return finish_sleep(call);
+        }
         // A four-byte payload is the result code the guest aborted on.
         std::array<std::byte, 4> payload{};
         if (call.x(2) == 4 && self.caller_.read_memory &&
@@ -107,9 +108,11 @@ execution::GateStatus StartupSupervisor::dispatch(std::uint16_t immediate,
                           " Result 0x%x (module %u, description %u).", result, result & 0x1ffu,
                           (result >> 9) & 0x1fffu);
         }
-        // ARMIGO_TRACE_SUPERVISOR=1 also prints the guest's return chain: x30 and
-        // the return addresses of up to 16 AAPCS64 frame records from x29.
-        static const bool trace = std::getenv("ARMIGO_TRACE_SUPERVISOR") != nullptr;
+        // ARMIGO_TRACE_SUPERVISOR=1 or ARMIGO_TRACE_BREAK=1 also prints the guest's
+        // return chain: x30 and the return addresses of up to 16 AAPCS64 frame
+        // records from x29.
+        static const bool trace = std::getenv("ARMIGO_TRACE_SUPERVISOR") != nullptr ||
+                                  std::getenv("ARMIGO_TRACE_BREAK") != nullptr;
         if (trace && self.caller_.read_memory) {
             char chain[512];
             auto used = std::snprintf(chain, sizeof chain, "break x30=%llx frames",
@@ -140,6 +143,8 @@ execution::GateStatus StartupSupervisor::dispatch(std::uint16_t immediate,
         const auto nanoseconds = static_cast<std::int64_t>(call.x(0));
         switch (classify_guest_sleep(nanoseconds)) {
         case GuestSleep::duration: {
+            const auto platform =
+                self.queries_->thread()->process()->configuration().platform;
             self.queries_->thread()->process()->note_scheduling();
             if (self.clock_ != nullptr) {
                 const auto sample = self.clock_->sample();
@@ -148,9 +153,11 @@ execution::GateStatus StartupSupervisor::dispatch(std::uint16_t immediate,
                     return execution::GateStatus::failed;
                 }
                 const auto now = std::get<ClockSample>(sample).instant;
-                const auto duration = sleep_duration(nanoseconds);
+                const auto duration = sleep_duration(nanoseconds, platform);
                 const auto deadline = duration > ClockInstant::max() - now
                     ? ClockInstant::max() : now + duration;
+                // The process clock ends the sleep at its deadline, as the
+                // kernel's timer does.
                 const auto waited = self.clock_->wait_until(deadline, self.queries_->cancellation_token());
                 if (std::holds_alternative<LaunchFailure>(waited)) {
                     call.set_failure_message("Process clock wait failed.");
@@ -164,7 +171,10 @@ execution::GateStatus StartupSupervisor::dispatch(std::uint16_t immediate,
                 call.set_failure_message("A cancellable sleep requires the process clock.");
                 return execution::GateStatus::failed;
             }
-            std::this_thread::sleep_for(sleep_duration(nanoseconds));
+            // Without a process clock (an embedder that cannot cancel), the
+            // sleep is an ordinary host sleep and may end a few milliseconds
+            // late; precise sleeps need the process clock.
+            std::this_thread::sleep_for(sleep_duration(nanoseconds, platform));
             return finish_sleep(call);
         }
         case GuestSleep::yield: {
