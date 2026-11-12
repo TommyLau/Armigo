@@ -17,6 +17,7 @@
 
 #include <armigo/graphics/texture_layout.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -35,17 +36,17 @@ struct DeswizzleKernel {
 [[nodiscard]] bool deswizzle_supported(
     const graphics::BlockLinearLevelAddressing &level, std::uint64_t pitch);
 
-// Encodes one dispatch that copies the level, whose storage starts at
-// `source_offset` in `source` (guest_base is relative to it), into
-// `destination` from `destination_offset`: block row y of depth slice z goes
-// to destination_offset + (z * rows + y) * pitch, and the row's bytes past
-// row_bytes are left untouched. One threadgroup of 32 threads covers one GOB;
-// each thread copies one 16-byte GOB segment. The caller checks
-// deswizzle_supported first.
-void encode_deswizzle(id<MTLComputeCommandEncoder> encoder,
-                      id<MTLComputePipelineState> pipeline, id<MTLBuffer> source,
-                      std::uint64_t source_offset, id<MTLBuffer> destination,
-                      std::uint64_t destination_offset, std::uint64_t pitch,
-                      const graphics::BlockLinearLevelAddressing &level);
+inline constexpr std::size_t deswizzle_parameter_bytes = 64;
+
+// Metal 4 keeps dispatch parameters in caller-owned storage through GPU
+// completion. A batch can suballocate this storage with 256-byte alignment.
+bool encode_deswizzle_metal4(id<MTL4ComputeCommandEncoder> encoder,
+                            id<MTLComputePipelineState> pipeline,
+                            id<MTL4ArgumentTable> table,
+                            id<MTLBuffer> parameters, std::uint64_t parameter_offset,
+                            id<MTLBuffer> source, std::uint64_t source_offset,
+                            id<MTLBuffer> destination, std::uint64_t destination_offset,
+                            std::uint64_t pitch,
+                            const graphics::BlockLinearLevelAddressing& level);
 
 } // namespace armigo::platform::metal::nvn_driver

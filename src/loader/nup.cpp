@@ -142,6 +142,9 @@ std::optional<NupFailure> NupArchive::parse() {
                 if (type == 1) {
                     if (!package.npdm.empty()) return bad("metadata", "Duplicate NPDM metadata.");
                     package.npdm.assign(bytes.begin() + at, bytes.begin() + at + count);
+                } else if (type == 4) {
+                    package.display_version.assign(
+                        reinterpret_cast<const char*>(bytes.data() + at), static_cast<std::size_t>(count));
                 }
                 at += count;
             }
@@ -255,6 +258,7 @@ std::variant<NupFailure, NupSelection> NupArchive::select(std::uint64_t title_id
     result.title_id = base->title_id;
     result.version = active.version;
     result.update_applied = update != nullptr;
+    result.display_version = active.display_version;
     result.npdm = active.npdm;
     collect(active.exefs, {}, result.exefs);
     auto apply_tree = [&](std::uint32_t root) {

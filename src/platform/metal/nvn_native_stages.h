@@ -57,6 +57,9 @@ struct NativeMeshLaunch {
 std::string record_refused_stage(const std::filesystem::path& directory, unsigned selector,
                                  std::span<const std::byte> control, std::span<const std::byte> code);
 
+// Enabled unless ARMIGO_NVN_TEXTURE_POOLS is exactly "0".
+[[nodiscard]] bool native_texture_pools_enabled();
+
 } // namespace armigo::platform::metal
 
 namespace armigo::nvn {

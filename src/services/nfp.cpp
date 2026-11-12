@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/nfp.h>
 
 namespace armigo::services::nfp {
@@ -16,22 +17,10 @@ using horizon::IpcDisposition;
 using horizon::IpcMessage;
 using horizon::IpcReply;
 
-constexpr std::uint32_t sfci = 0x49434653;
-constexpr std::uint32_t sfco = 0x4f434653;
+using namespace horizon::cmif;
 constexpr std::uint32_t control_interface = 0xec6be3ff;
 
-std::uint32_t read(const IpcMessage& message, std::size_t offset, unsigned width = 4) {
-    std::uint32_t value = 0;
-    for (unsigned index = 0; index != width; ++index)
-        value |= std::uint32_t{std::to_integer<unsigned char>(message[offset + index])}
-                 << (8 * index);
-    return value;
-}
 
-void write(IpcMessage& message, std::size_t offset, std::uint32_t value, unsigned width = 4) {
-    for (unsigned index = 0; index != width; ++index)
-        message[offset + index] = static_cast<std::byte>((value >> (8 * index)) & 255);
-}
 
 // A domain request's reply carries the domain out header at byte16 and the CMIF
 // header at byte32, like the other domain services; a plain request keeps its

@@ -8,14 +8,25 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
+#import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
 
 #include "commands.h"
 #include "present_internal.h"
 #include "entry_table.h"
+#include "entry_table_231.h"
 #include "nvn_replay.h"
+#include "nvn_present.h"
+#include <armigo/services/video_interface.h>
+#include <armigo/runtime/presentation.h>
+#include "commit_feedback.h"
+#include "nvn_image_formats.h"
 #include "nvn_draw_state.h"
+#include "nvn_pass_dump.h"
+#include "nvn_pool_tables.h"
+#include "pso_manifest.h"
 #include <armigo/common/diagnostics.h>
 #include <armigo/execution/guest_timeline.h>
 #include <armigo/memory/write_tracker.h>
@@ -23,10 +34,17 @@
 #include <armigo/platform/presentation_thread.h>
 #include <armigo/shader/vertex_fetch.h>
 #include "programs.h"
+#include "program_capture.h"
+#include "../../src/shader/pipeline/msl/custom_border.h"
+#include "../../src/platform/metal/texture_fact.h"
 #include "resource_layout.h"
 #if ARMIGO_HAS_NATIVE_SHADERS
 #include "fixture.h"
 #include "nvn_native_stages.h"
+#include <armigo/platform/metal_shader_package.h>
+#include <armigo/shader/source_version.h>
+#include <armigo/shader_native/package.h>
+#import <CommonCrypto/CommonDigest.h>
 #endif
 
 #include <map>
@@ -41,6 +59,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <dlfcn.h>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -56,6 +75,9 @@
 #include <mach/mach_time.h>
 #include <mach/thread_policy.h>
 #include <sys/mman.h>
+#include <unistd.h>
+
+namespace armigo::nvn { void register_resource_entries(); }
 
 // The proxy observes only private upload arenas; every Metal operation still
 // executes on the real device. Production replay needs no inspection hook.
@@ -103,6 +125,26 @@
 }
 @end
 
+// Allocation observation forwards all Metal work to the real device.
+@interface TextureAllocationProbeDevice : NSProxy
+@property(nonatomic, strong) id<MTLDevice> target;
+@property(nonatomic, strong) NSMutableArray<id<MTLTexture>>* textures;
+@end
+
+@implementation TextureAllocationProbeDevice
+- (NSMethodSignature*)methodSignatureForSelector:(SEL)selector {
+    return [(NSObject*)self.target methodSignatureForSelector:selector];
+}
+- (void)forwardInvocation:(NSInvocation*)invocation {
+    [invocation invokeWithTarget:self.target];
+}
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor*)descriptor {
+    id<MTLTexture> texture = [self.target newTextureWithDescriptor:descriptor];
+    if (texture) @synchronized(self) { [self.textures addObject:texture]; }
+    return texture;
+}
+@end
+
 @interface PredicateCanaryQueue : NSProxy
 @property(nonatomic, strong) id<MTL4CommandQueue> target;
 @property(nonatomic, strong) PredicateCanaryDevice* probe;
@@ -121,6 +163,82 @@
 }
 @end
 
+// Observe the real shared residency set without replacing Metal operations.
+@interface ResidencyProbeDevice : NSProxy
+@property(nonatomic, strong) id<MTLDevice> target;
+@property(nonatomic, strong) id<MTLResidencySet> residency;
+@end
+
+@implementation ResidencyProbeDevice
+- (NSMethodSignature*)methodSignatureForSelector:(SEL)selector {
+    return [(NSObject*)self.target methodSignatureForSelector:selector];
+}
+- (void)forwardInvocation:(NSInvocation*)invocation {
+    [invocation invokeWithTarget:self.target];
+}
+- (id<MTLResidencySet>)newResidencySetWithDescriptor:(MTLResidencySetDescriptor*)descriptor
+                                             error:(NSError**)error {
+    self.residency = [self.target newResidencySetWithDescriptor:descriptor error:error];
+    return self.residency;
+}
+@end
+
+// Pause a real timestamp report during CPU publication, after GPU completion.
+@interface RetirementPauseDevice : NSProxy {
+@public
+    std::atomic<bool> armed, entered, released;
+    const volatile std::uint32_t* observedWord;
+    std::uint32_t pausedValue;
+}
+@property(nonatomic, strong) id<MTLDevice> target;
+@end
+
+@implementation RetirementPauseDevice
+- (NSMethodSignature*)methodSignatureForSelector:(SEL)selector {
+    return [(NSObject*)self.target methodSignatureForSelector:selector];
+}
+- (void)forwardInvocation:(NSInvocation*)invocation {
+    [invocation invokeWithTarget:self.target];
+}
+- (void)sampleTimestamps:(MTLTimestamp*)cpu gpuTimestamp:(MTLTimestamp*)gpu {
+    [self.target sampleTimestamps:cpu gpuTimestamp:gpu];
+    if (armed.load(std::memory_order_acquire) &&
+        __atomic_load_n(observedWord, __ATOMIC_SEQ_CST) == pausedValue &&
+        armed.exchange(false, std::memory_order_acq_rel)) {
+        entered.store(true, std::memory_order_release);
+        while (!released.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+@end
+
+@interface SubmissionAllocationFailureDevice : NSProxy {
+@public
+    std::atomic<bool> fail_next;
+}
+@property(nonatomic,strong) id<MTLDevice> target;
+@end
+@implementation SubmissionAllocationFailureDevice
+- (NSMethodSignature*)methodSignatureForSelector:(SEL)selector { return [(NSObject*)self.target methodSignatureForSelector:selector]; }
+- (void)forwardInvocation:(NSInvocation*)invocation { [invocation invokeWithTarget:self.target]; }
+- (id<MTL4CommandAllocator>)newCommandAllocator {
+    if(fail_next.exchange(false))return nil;
+    return [self.target newCommandAllocator];
+}
+@end
+@interface CapturePoolSentinel : NSObject {
+@public
+    std::shared_ptr<std::atomic<unsigned>> destroyed;
+}
+@end
+@implementation CapturePoolSentinel
+- (void)dealloc { if(destroyed) ++*destroyed; }
+@end
+
+namespace armigo::shader::test::cbuf_msl {
+std::string gpu_small_window_source(unsigned words);
+}
+
 namespace {
 
 using namespace armigo;
@@ -137,10 +255,24 @@ unsigned failures = 0;
         }                                                                       \
     } while (false)
 
+bool drain_abandoned(replay::MetalReplayBackend& backend, std::uint64_t fence) {
+    if (!fence) return false;
+    static_cast<void>(backend.wait_fence(fence, 10'000'000'000ull));
+    if (backend.fatal_error_detail().empty()) return false;
+    return backend.stop_submission_workers(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+}
+
 template <Entry E>
 typename EntrySignature<E>::type load() {
-    return reinterpret_cast<typename EntrySignature<E>::type>(
-        armigo_nvn_bootstrap_loader(entry_name(E).data()));
+    const auto loader = bootstrap_loader_for(selected_api_version().value_or(ApiVersion{55,15}));
+    return reinterpret_cast<typename EntrySignature<E>::type>(loader(entry_name(E).data()));
+}
+
+// Synthetic fixtures declare their logical mesh route explicitly.
+void bind_mesh_program(NVNcommandBuffer* commands, const NVNprogram* program, bool task) {
+    load<Entry::nvnCommandBufferBindProgram>()(commands, program,
+        (task ? 0xc0 : 0x80) | NVN_SHADER_STAGE_FRAGMENT_BIT);
+    command_geometry_processing_mode(commands, task ? 1 : 2);
 }
 
 // ARMIGO_NVN_DISPATCH_PROFILE commits every dispatch on its own: no two
@@ -180,6 +312,11 @@ std::vector<std::byte> build_library(std::string_view source) {
 }
 
 struct Stages {
+    std::shared_ptr<const platform::CompiledGraphicsStage> image_read_compute, image_read_fragment;
+    std::shared_ptr<const platform::CompiledGraphicsStage> bad_view_compute, bad_view_fragment;
+    std::shared_ptr<const platform::CompiledGraphicsStage> image_pixels_fragment, separate_fragment, empty_descriptor_reader, empty_descriptor_writer;
+    std::array<std::shared_ptr<const platform::CompiledGraphicsStage>, 7> zero_sample_fragments;
+    std::shared_ptr<const platform::CompiledGraphicsStage> bits_image_compute;
     std::shared_ptr<const platform::CompiledGraphicsStage> vertex;
     std::shared_ptr<const platform::CompiledGraphicsStage> fragment;
     std::shared_ptr<const platform::CompiledGraphicsStage> compute;
@@ -193,17 +330,30 @@ struct Stages {
     std::shared_ptr<const platform::CompiledGraphicsStage> push_fragment;
     std::array<std::shared_ptr<const platform::CompiledGraphicsStage>, 3> mrt_fragments;
     std::shared_ptr<const platform::CompiledGraphicsStage> sampled_fragment;
+    std::shared_ptr<const platform::CompiledGraphicsStage> border_fragment;
+    std::array<std::shared_ptr<const platform::CompiledGraphicsStage>, 6> coverage_border_fragments;
+    std::array<std::shared_ptr<const platform::CompiledGraphicsStage>, 4> attachment_feedback;
+    std::array<std::shared_ptr<const platform::CompiledGraphicsStage>, 4> attachment_feedback_views;
+    std::shared_ptr<const platform::CompiledGraphicsStage> attachment_feedback_image;
+    std::shared_ptr<const platform::CompiledGraphicsStage> attachment_feedback_lod;
     std::shared_ptr<const platform::CompiledGraphicsStage> mrt_feedback;
     std::shared_ptr<const platform::CompiledGraphicsStage> mrt_fourth;
     std::shared_ptr<const platform::CompiledGraphicsStage> green_mapped_fragment;
     std::shared_ptr<const platform::CompiledGraphicsStage> mip_fragment;
     std::array<std::shared_ptr<const platform::CompiledGraphicsStage>, 2> depth_reader_fragments;
+    std::array<std::shared_ptr<const platform::CompiledGraphicsStage>, 2> depth_feedback_fragments;
+    std::array<std::shared_ptr<const platform::CompiledGraphicsStage>, 2> depth_kind_fragments;
+    std::shared_ptr<const platform::CompiledGraphicsStage> stencil_feedback_fragment;
+    std::array<std::shared_ptr<const platform::CompiledGraphicsStage>, 2> mixed_depth_fragments;
     std::shared_ptr<const platform::CompiledGraphicsStage> writer_fragment;
     std::shared_ptr<const platform::CompiledGraphicsStage> reader_fragment;
     std::shared_ptr<const platform::CompiledGraphicsStage> writer_vertex;
+    std::shared_ptr<const platform::CompiledGraphicsStage> attachmentless_vertex;
+    std::array<std::shared_ptr<const platform::CompiledGraphicsStage>, 3> outputless_vertices;
     std::shared_ptr<const platform::CompiledGraphicsStage> descriptor_writer_vertex;
     std::shared_ptr<const platform::CompiledGraphicsStage> handle_fragment;
     std::shared_ptr<const platform::CompiledGraphicsStage> handle_program_fragment;
+    std::shared_ptr<const platform::CompiledGraphicsStage> driver_handle_program_fragment;
     std::shared_ptr<const platform::CompiledGraphicsStage> malformed_handle_fragment;
     std::shared_ptr<const platform::CompiledGraphicsStage> descriptor_fragment;
     std::shared_ptr<const platform::CompiledGraphicsStage> tail_descriptor_fragment;
@@ -212,22 +362,52 @@ struct Stages {
     std::shared_ptr<const platform::CompiledGraphicsStage> height_fragment;
     std::shared_ptr<const platform::CompiledGraphicsStage> guest_fragment;
     std::shared_ptr<const platform::CompiledGraphicsStage> guest_input_vertex;
+    std::shared_ptr<const platform::CompiledGraphicsStage> pool_mesh, pool_task;
     std::shared_ptr<const platform::CompiledGraphicsStage> column_mesh;
     std::shared_ptr<const platform::CompiledGraphicsStage> column_task;
     std::shared_ptr<const platform::CompiledGraphicsStage> table_mesh;
+    std::shared_ptr<const platform::CompiledGraphicsStage> retained_mesh, c1_mesh, c1_task, retained_uniform_mesh, retained_uniform_vertex, publication_writer_mesh;
     std::shared_ptr<const platform::CompiledGraphicsStage> table_task;
     std::shared_ptr<const platform::CompiledGraphicsStage> payload_mesh;
     std::shared_ptr<const platform::CompiledGraphicsStage> layout_compute;
     std::shared_ptr<const platform::CompiledGraphicsStage> edge_compute;
     std::shared_ptr<const platform::CompiledGraphicsStage> image_compute, image_fragment, corner_image_compute;
+    std::shared_ptr<const platform::CompiledGraphicsStage> atomic_or_compute;
+    std::shared_ptr<const platform::CompiledGraphicsStage> atomic_add_compute;
+    std::shared_ptr<const platform::CompiledGraphicsStage> atomic_min_compute;
+    std::shared_ptr<const platform::CompiledGraphicsStage> mixed_image_atomic_compute;
+    std::shared_ptr<const platform::CompiledGraphicsStage> atomic_sample_vertex;
+    std::shared_ptr<const platform::CompiledGraphicsStage> atomic_sample_fragment;
     std::shared_ptr<const platform::CompiledGraphicsStage> guest_store_compute, guest_load_compute;
+    std::shared_ptr<const platform::CompiledGraphicsStage> guest_store_third;
+    std::shared_ptr<const platform::CompiledGraphicsStage> guest_store_raw;
     std::shared_ptr<const platform::CompiledGraphicsStage> guest_green_compute;
     std::shared_ptr<const platform::CompiledGraphicsStage> guest_reader_fragment;
+    std::shared_ptr<const platform::CompiledGraphicsStage> pool_texture_fragment;
+    std::shared_ptr<const platform::CompiledGraphicsStage> pool_array_fragment;
+    std::shared_ptr<const platform::CompiledGraphicsStage> pool_sampler_fragment;
+    std::shared_ptr<const platform::CompiledGraphicsStage> pool_depth_fragment;
+    std::shared_ptr<const platform::CompiledGraphicsStage> prefix_vertex, prefix_fragment, api231_fragment, publication_red_fragment;
+    std::shared_ptr<const platform::CompiledGraphicsStage> pass_dump_vertex;
+    std::shared_ptr<const platform::CompiledGraphicsStage> pass_dump_fragment, pass_dump_large_fragment;
 
     static bool resolve(void* raw, const DeviceState*, std::span<const NVNshaderData> shaders,
                         std::array<std::shared_ptr<const platform::CompiledGraphicsStage>, 6>& out,
                         std::string& error) {
         auto& self = *static_cast<Stages*>(raw);
+        if (!shaders.empty() && shaders[0].control) {
+            const auto* control = static_cast<const std::byte*>(shaders[0].control);
+            std::uint32_t fixture = 0;
+            std::memcpy(&fixture, control + 0x10, 4);
+            if (fixture == 0xc1) {
+                if (shaders.size() == 3) {
+                    out[NVN_SHADER_STAGE_TESS_CONTROL] = self.c1_task;
+                    out[NVN_SHADER_STAGE_TESS_EVALUATION] = self.payload_mesh;
+                } else out[NVN_SHADER_STAGE_TESS_EVALUATION] = self.c1_mesh;
+                out[NVN_SHADER_STAGE_FRAGMENT] = self.api231_fragment;
+                return true;
+            }
+        }
         if (shaders.size() == 2 && (shaders[0].data == 63 || shaders[0].data == 64)) {
             out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
             out[NVN_SHADER_STAGE_FRAGMENT] = shaders[0].data == 63 ? self.height_fragment : self.guest_fragment;
@@ -305,6 +485,63 @@ struct Stages {
             out[NVN_SHADER_STAGE_FRAGMENT] = self.uniform_fragment;
             return true;
         }
+        if (shaders.size() == 2 && (shaders[0].data == 195 || shaders[0].data == 196)) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.mixed_depth_fragments[shaders[0].data - 195];
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data >= 0x7010 && shaders[0].data < 0x7014) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.attachment_feedback_views[shaders[0].data - 0x7010];
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data == 198) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.pool_array_fragment;
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data == 197) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.stencil_feedback_fragment;
+            return true;
+        }
+        if (shaders.size() == 2 && (shaders[0].data == 192 || shaders[0].data == 193)) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.depth_kind_fragments[shaders[0].data - 192];
+            return true;
+        }
+        if (shaders.size() == 2 && (shaders[0].data == 190 || shaders[0].data == 191)) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.depth_feedback_fragments[shaders[0].data - 190];
+            return true;
+        }
+        if (shaders.size() == 2 && (shaders[0].data == 187 || shaders[0].data == 188)) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = shaders[0].data == 187
+                ? self.attachment_feedback[0] : self.attachment_feedback_lod;
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data >= 184 && shaders[0].data <= 186) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = shaders[0].data == 184
+                ? self.attachment_feedback_image : self.attachment_feedback[1];
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data >= 180 && shaders[0].data <= 183) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.attachment_feedback[shaders[0].data - 180];
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data >= 0x7210 && shaders[0].data < 0x7216) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.coverage_border_fragments[shaders[0].data - 0x7210];
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data == 176) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.border_fragment;
+            return true;
+        }
         if (shaders.size() == 2 && shaders[0].data == 4) {
             out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
             out[NVN_SHADER_STAGE_FRAGMENT] = self.sampled_fragment;
@@ -331,6 +568,52 @@ struct Stages {
             out[NVN_SHADER_STAGE_FRAGMENT] = self.fragment;
             return true;
         }
+        if (shaders.size() == 1 && shaders[0].data == 911) {
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.writer_fragment;
+            return true;
+        }
+        if (shaders.size() == 3 && shaders[0].data == 910) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.publication_red_fragment;
+            out[NVN_SHADER_STAGE_COMPUTE] = self.chain_compute;
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data == 908) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.publication_red_fragment;
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data == 909) {
+            out[NVN_SHADER_STAGE_TESS_EVALUATION] = self.publication_writer_mesh;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.api231_fragment;
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data == 903) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.api231_fragment;
+            return true;
+        }
+        if (shaders.size() == 2 && (shaders[0].data == 906 || shaders[0].data == 907)) {
+            if (shaders[0].data == 906) out[NVN_SHADER_STAGE_TESS_EVALUATION] = self.retained_uniform_mesh;
+            else out[NVN_SHADER_STAGE_VERTEX] = self.retained_uniform_vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.api231_fragment;
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data == 904) {
+            out[NVN_SHADER_STAGE_TESS_EVALUATION] = self.retained_mesh;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.api231_fragment;
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data >= 900 && shaders[0].data <= 902) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.outputless_vertices[shaders[0].data - 900];
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.fragment;
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data == 194) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.attachmentless_vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.fragment;
+            return true;
+        }
         if (shaders.size() == 2 && shaders[0].data == 17) {
             out[NVN_SHADER_STAGE_VERTEX] = self.writer_vertex;
             out[NVN_SHADER_STAGE_FRAGMENT] = self.fragment;
@@ -352,10 +635,10 @@ struct Stages {
                 ? self.handle_fragment : self.descriptor_fragment;
             return true;
         }
-        if (shaders.size() == 2 && (shaders[0].data == 96 || shaders[0].data == 97)) {
+        if (shaders.size() == 2 && (shaders[0].data == 96 || shaders[0].data == 97 || shaders[0].data == 98)) {
             out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
-            out[NVN_SHADER_STAGE_FRAGMENT] = shaders[0].data == 96
-                ? self.handle_program_fragment : self.malformed_handle_fragment;
+            out[NVN_SHADER_STAGE_FRAGMENT] = shaders[0].data == 96 ? self.handle_program_fragment
+                : shaders[0].data == 98 ? self.driver_handle_program_fragment : self.malformed_handle_fragment;
             return true;
         }
         if (shaders.size() == 2 && shaders[0].data == 8) {
@@ -376,6 +659,14 @@ struct Stages {
             out[NVN_SHADER_STAGE_COMPUTE] = shaders[0].data == 84 ? self.guest_store_compute : self.guest_load_compute;
             return true;
         }
+        if (shaders.size() == 1 && shaders[0].data == 110) {
+            out[NVN_SHADER_STAGE_COMPUTE] = self.guest_store_third;
+            return true;
+        }
+        if (shaders.size() == 1 && shaders[0].data == 112) {
+            out[NVN_SHADER_STAGE_COMPUTE] = self.guest_store_raw;
+            return true;
+        }
         if (shaders.size() == 2 && shaders[0].data == 80) {
             out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
             out[NVN_SHADER_STAGE_FRAGMENT] = self.push_fragment;
@@ -384,6 +675,39 @@ struct Stages {
         if (shaders.size() == 2 && shaders[0].data == 81) {
             out[NVN_SHADER_STAGE_TESS_EVALUATION] = self.column_mesh;
             out[NVN_SHADER_STAGE_FRAGMENT] = self.fragment;
+            return true;
+        }
+        if (shaders.size() == 1 && (shaders[0].data == 135 || shaders[0].data == 136)) {
+            out[NVN_SHADER_STAGE_COMPUTE] = shaders[0].data == 135 ? self.image_read_compute : self.bad_view_compute;
+            return true;
+        }
+        if (shaders.size() == 2 && (shaders[0].data == 135 || shaders[0].data == 136)) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = shaders[0].data == 135 ? self.image_read_fragment : self.bad_view_fragment;
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data >= 142 && shaders[0].data <= 148) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.zero_sample_fragments[shaders[0].data - 142];
+            return true;
+        }
+        if (shaders.size() == 2 && (shaders[0].data == 140 || shaders[0].data == 141)) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = shaders[0].data == 140 ? self.empty_descriptor_writer : self.empty_descriptor_reader;
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data == 139) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.separate_fragment;
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data == 138) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.image_pixels_fragment;
+            return true;
+        }
+        if (shaders.size() == 1 && shaders[0].data == 134) {
+            out[NVN_SHADER_STAGE_COMPUTE] = self.bits_image_compute;
             return true;
         }
         if (shaders.size() == 1 && shaders[0].data == 90) {
@@ -409,19 +733,72 @@ struct Stages {
         }
         if (shaders.size() == 2 && shaders[0].data == 93) {
             out[NVN_SHADER_STAGE_TESS_EVALUATION] = self.table_mesh;
-            out[NVN_SHADER_STAGE_FRAGMENT] = self.fragment;
+            out[NVN_SHADER_STAGE_FRAGMENT] = selected_api_version() == ApiVersion{231,40} ? self.api231_fragment : self.fragment;
             return true;
         }
         if (shaders.size() == 3 && shaders[0].data == 95) {
             out[NVN_SHADER_STAGE_TESS_CONTROL] = self.table_task;
             out[NVN_SHADER_STAGE_TESS_EVALUATION] = self.payload_mesh;
-            out[NVN_SHADER_STAGE_FRAGMENT] = self.fragment;
+            out[NVN_SHADER_STAGE_FRAGMENT] = selected_api_version() == ApiVersion{231,40} ? self.api231_fragment : self.fragment;
             return true;
         }
         if (shaders.size() == 3 && shaders[0].data == 82) {
             out[NVN_SHADER_STAGE_TESS_CONTROL] = self.column_task;
             out[NVN_SHADER_STAGE_TESS_EVALUATION] = self.payload_mesh;
             out[NVN_SHADER_STAGE_FRAGMENT] = self.fragment;
+            return true;
+        }
+        if (shaders.size() == 1 && shaders[0].data == 98) {
+            out[NVN_SHADER_STAGE_COMPUTE] = self.atomic_or_compute;
+            return true;
+        }
+        if (shaders.size() == 1 && shaders[0].data == 99) {
+            out[NVN_SHADER_STAGE_COMPUTE] = self.atomic_add_compute;
+            return true;
+        }
+        if (shaders.size() == 1 && shaders[0].data == 100) {
+            out[NVN_SHADER_STAGE_COMPUTE] = self.atomic_min_compute;
+            return true;
+        }
+        if (shaders.size() == 1 && shaders[0].data == 102) {
+            out[NVN_SHADER_STAGE_COMPUTE] = self.mixed_image_atomic_compute;
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data == 101) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.atomic_sample_vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.atomic_sample_fragment;
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data >= 120 && shaders[0].data <= 122) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = shaders[0].data == 120 ? self.pool_texture_fragment
+                : shaders[0].data == 121 ? self.pool_sampler_fragment : self.pool_depth_fragment;
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data == 131) {
+            out[NVN_SHADER_STAGE_TESS_EVALUATION] = self.pool_mesh;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.fragment;
+            return true;
+        }
+        if (shaders.size() == 3 && shaders[0].data == 132) {
+            out[NVN_SHADER_STAGE_TESS_CONTROL] = self.pool_task;
+            out[NVN_SHADER_STAGE_TESS_EVALUATION] = self.payload_mesh;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.fragment;
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data == 411) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.prefix_vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.prefix_fragment;
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data == 410) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.pass_dump_vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.pass_dump_large_fragment;
+            return true;
+        }
+        if (shaders.size() == 2 && shaders[0].data == 130) {
+            out[NVN_SHADER_STAGE_VERTEX] = self.pass_dump_vertex;
+            out[NVN_SHADER_STAGE_FRAGMENT] = self.pass_dump_fragment;
             return true;
         }
         error = "synthetic resolver received an unknown program marker";
@@ -437,6 +814,11 @@ public:
         memory = [device newBufferWithLength:0x10000 options:MTLResourceStorageModeShared];
     }
 
+    std::unordered_map<std::int32_t, std::uint32_t> pinned_levels;
+    std::optional<std::uint32_t> sampler_pinned_level(std::int32_t descriptor, std::uint64_t) const override {
+        const auto found = pinned_levels.find(descriptor);
+        return found == pinned_levels.end() ? std::nullopt : std::optional{found->second};
+    }
     bool buffer_addresses_are_cpu() const override { return canonical_buffers; }
     bool texture_is_in_place(const TextureState& texture) override { return in_place_textures && texture.memory; }
     void set_completion_hook(std::function<bool()> callback) override { completion_hook = std::move(callback); }
@@ -485,14 +867,21 @@ public:
     // guest-memory table lists; with empty_guest_pools the provider lists an
     // empty set. Each call is a lease.
     bool list_guest_pools = false, empty_guest_pools = false;
+    // Extra guest-memory pools, used instead of the single memory buffer when
+    // non-empty. Each address is the pool's guest start.
+    std::vector<std::pair<std::uint64_t, id<MTLBuffer>>> guest_pools;
     unsigned guest_claims = 0;
     std::uint64_t claim_guest_memory_pools(std::uint64_t known,
                                            std::vector<replay::Resources::GuestMemoryPool>& pools) override {
-        if (!list_guest_pools && !empty_guest_pools) return 0;
+        if (!list_guest_pools && !empty_guest_pools && guest_pools.empty()) return 0;
         ++guest_claims;
         if (known == 1) return 1;
         pools.clear();
-        if (list_guest_pools) pools.push_back({logical_base, logical_base + memory.length, memory.gpuAddress, memory});
+        if (!guest_pools.empty()) {
+            for (const auto& [begin, buffer] : guest_pools)
+                if (buffer) pools.push_back({begin, begin + buffer.length, buffer.gpuAddress, buffer});
+        } else if (list_guest_pools)
+            pools.push_back({logical_base, logical_base + memory.length, memory.gpuAddress, memory});
         return 1;
     }
 
@@ -506,6 +895,11 @@ public:
         if (alias_memory && size <= alias_max_size && address >= alias_base && address - alias_base <= alias_memory.length) {
             if (size > alias_memory.length - (address - alias_base)) return {};
             return replay::BufferSpan{alias_memory, address - alias_base};
+        }
+        for (const auto& [begin, buffer] : guest_pools) {
+            if (!buffer || address < begin || address - begin > buffer.length ||
+                size > buffer.length - (address - begin)) continue;
+            return replay::BufferSpan{buffer, address - begin};
         }
         if (!memory || address < logical_base || address - logical_base > memory.length ||
             size > memory.length - (address - logical_base)) return {};
@@ -526,13 +920,50 @@ public:
         return {found->second.pixelFormat, found->second.sampleCount};
     }
 
+    id<MTLTexture> null_handle_texture = nil;
+    std::unique_ptr<replay::Resources> typed_zeros;
+    id<MTLTexture> fitted_texture(std::int32_t, id<MTLTexture> texture, MTLTextureType type,
+                                  bool typed_handle, MTLPixelFormat format) override {
+        if (texture || !typed_handle) return nil;
+        if (null_handle_texture && type == MTLTextureType2D && format == MTLPixelFormatRGBA8Unorm)
+            return null_handle_texture;
+        if (!typed_zeros) typed_zeros = std::make_unique<replay::Resources>(memory.device);
+        return typed_zeros->fitted_texture(0, nil, type, true, format);
+    }
+
+    std::unordered_set<std::int32_t> empty_texture_ids;
+    bool texture_id_empty(std::int32_t id) const override { return empty_texture_ids.contains(id); }
+    std::unordered_set<std::int32_t> refused_texture_views;
+    id<MTLTexture> image_base_for_id(std::int32_t texture_id, DescriptorStamp& stamp) override {
+        if (!refused_texture_views.contains(texture_id)) return texture_for_id_stamped(texture_id, stamp);
+        stamp = {};
+        stamp.serial = texture_id_serials[texture_id];
+        const auto found = texture_ids.find(texture_id);
+        return found == texture_ids.end() ? nil : found->second;
+    }
+
+    id<MTLTexture> raw_image_view(std::int32_t, id<MTLTexture> texture) override {
+        return replay::new_raw_image_view(texture);
+    }
+
+    std::int32_t last_texture_lookup = -1;
     id<MTLTexture> texture_for_id(std::int32_t texture_id) override {
+        last_texture_lookup = texture_id;
         ++texture_lookups;
         note_event('t');
+        if (const auto pooled = pool_textures.find(texture_id); pooled != pool_textures.end()) {
+            pooled->second.made = true;
+            if (on_texture_lookup) on_texture_lookup();
+            return pooled->second.texture;
+        }
+        if (pool_fallback && texture_id > 0 && texture_id < pool_texture_count) {
+            if (on_texture_lookup) on_texture_lookup();
+            return pool_fallback;
+        }
         const auto found = texture_ids.find(texture_id);
         id<MTLTexture> texture = found == texture_ids.end() ? nil : found->second;
         if (on_texture_lookup) on_texture_lookup();
-        return texture;
+        return refused_texture_views.contains(texture_id) ? nil : texture;
     }
 
     // With `stamped`, a descriptor lookup carries the ID's own version as its
@@ -576,8 +1007,12 @@ public:
         if (on_texture_write) on_texture_write(state);
     }
     std::uint64_t registration_generation() const override { return registration; }
-    // These fixture textures are separate allocations, not views of memory.
-    bool overlaps_texture_backing(std::uint64_t, std::uint64_t) const override { return false; }
+    // These fixture textures are separate allocations, not views of memory;
+    // a test may name a guest range as texture storage.
+    std::uint64_t backing_begin = 0, backing_end = 0;
+    bool overlaps_texture_backing(std::uint64_t address, std::uint64_t size) const override {
+        return address < backing_end && backing_begin < address + size;
+    }
     void note_gpu_write(std::uint64_t, std::uint64_t) override {
         ++buffer_writes;
         pending_write = true;
@@ -642,6 +1077,132 @@ public:
     std::function<void(const TextureState&)> on_texture_write;
     std::function<void(const TextureState&)> on_texture_resolve;
     std::uint64_t registration = 1;
+
+    // Pool-table queries. Empty unless a pool test fills them, so other tests
+    // keep the base class answers (no registered descriptors, no log notes).
+    struct PoolTexture {
+        id<MTLTexture> texture = nil;
+        bool made = true;
+        bool live = true;
+        bool compressible = false;
+        bool shared = false;
+        bool depth = false;
+        std::uint64_t size = 1;
+        std::uint64_t serial = 0;
+        std::uint64_t descriptor_key = 1;
+        std::uint64_t storage_key = 0;
+    };
+    std::unordered_map<std::int32_t, PoolTexture> pool_textures;
+    id<MTLTexture> pool_fallback = nil;
+    std::int32_t pool_texture_count = 0;
+    std::int32_t pool_sampler_count = 0;
+    std::uint64_t pool_fallback_key = 1;
+    std::uint64_t pool_generation = 1;
+    std::uint64_t pool_empty_generation = 1;
+    std::unordered_map<std::int32_t, std::uint64_t> pool_empty_epochs;
+    std::function<void()> on_texture_serial;
+    std::function<void()> on_texture_identity;
+    struct PoolNote {
+        std::int32_t id = 0;
+        std::uint32_t kind = 0;
+        bool present = false;
+    };
+    std::vector<PoolNote> pool_notes;
+    std::uint64_t pool_reg_gen = 1;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> pool_depth_reads;
+
+    void note_pool_registration(std::int32_t id, std::uint32_t kind) {
+        if (kind == 0 && !texture_registered(id)) pool_empty_epochs[id] = ++pool_empty_generation;
+        const auto generation = ++pool_reg_gen;
+        if (pool_notes.size() <= generation) pool_notes.resize(generation + 1);
+        pool_notes[generation] = {id, kind, true};
+    }
+
+    [[nodiscard]] std::uint64_t registration_log_generation() const override { return pool_reg_gen; }
+    bool read_registration_note(std::uint64_t generation, RegistrationNote& note) const override {
+        if (generation == 0 || generation >= pool_notes.size() || !pool_notes[generation].present)
+            return false;
+        note.id = pool_notes[generation].id;
+        note.kind = pool_notes[generation].kind;
+        return true;
+    }
+    [[nodiscard]] std::int32_t registered_texture_count() const override { return pool_texture_count; }
+    [[nodiscard]] std::int32_t sampler_count() const override { return pool_sampler_count; }
+    [[nodiscard]] bool texture_registered(std::int32_t id) const override {
+        if (id <= 0) return false;
+        if (pool_textures.find(id) != pool_textures.end()) return true;
+        return pool_fallback && id < pool_texture_count;
+    }
+    [[nodiscard]] bool texture_storage_made(std::int32_t id) const override {
+        if (const auto found = pool_textures.find(id); found != pool_textures.end()) return found->second.made;
+        return pool_fallback && id > 0 && id < pool_texture_count;
+    }
+    [[nodiscard]] bool texture_storage_shared(std::int32_t id) const override {
+        const auto found = pool_textures.find(id);
+        return found != pool_textures.end() && found->second.shared;
+    }
+    [[nodiscard]] bool texture_compressible(std::int32_t id) const override {
+        const auto found = pool_textures.find(id);
+        return found != pool_textures.end() && found->second.compressible;
+    }
+    [[nodiscard]] std::uint64_t texture_storage_size(std::int32_t id) const override {
+        const auto found = pool_textures.find(id);
+        if (found == pool_textures.end()) return 1;
+        return found->second.size ? found->second.size : 1;
+    }
+    [[nodiscard]] bool texture_storage_live(std::int32_t id) const override {
+        if (!texture_registered(id)) return false;
+        const auto found = pool_textures.find(id);
+        return found == pool_textures.end() ? true : found->second.live;
+    }
+    [[nodiscard]] std::uint64_t texture_serial(std::int32_t id) const override {
+        const auto found = pool_textures.find(id);
+        const auto serial = found == pool_textures.end() ? 0 : found->second.serial;
+        if (on_texture_serial) on_texture_serial();
+        return serial;
+    }
+    [[nodiscard]] std::uint64_t texture_descriptor_key(std::int32_t id) const override {
+        if (!texture_registered(id)) return 0;
+        const auto found = pool_textures.find(id);
+        return found == pool_textures.end() ? pool_fallback_key : found->second.descriptor_key;
+    }
+    [[nodiscard]] bool texture_is_depth(std::int32_t id) const override {
+        const auto found = pool_textures.find(id);
+        return found != pool_textures.end() && found->second.depth;
+    }
+    [[nodiscard]] std::uint64_t texture_storage_key(std::int32_t id) const override {
+        const auto found = pool_textures.find(id);
+        return found == pool_textures.end() ? 0 : found->second.storage_key;
+    }
+    [[nodiscard]] std::uint64_t texture_pool_generation() const override { return pool_generation; }
+    [[nodiscard]] std::uint64_t texture_empty_generation() const override { return pool_empty_generation; }
+    bool texture_read_identity(std::int32_t id, replay::TextureReadIdentity& identity) const override {
+        identity = {};
+        if (id < 0) return false;
+        const auto epoch = pool_empty_epochs.find(id);
+        if (epoch != pool_empty_epochs.end()) identity.empty_epoch = epoch->second;
+        if (!texture_registered(id)) return true;
+        const auto found = pool_textures.find(id);
+        if (found == pool_textures.end()) {
+            identity.descriptor_key = pool_fallback_key;
+            return true;
+        }
+        const auto& entry = found->second;
+        identity.descriptor_key = entry.descriptor_key;
+        identity.serial = entry.serial;
+        identity.storage_key = entry.storage_key;
+        identity.depth = entry.depth;
+        if (on_texture_identity) on_texture_identity();
+        return true;
+    }
+    void note_pool_depth_read(std::uint64_t serial, std::uint64_t storage_key) override {
+        pool_depth_reads.push_back({serial, storage_key});
+    }
+    [[nodiscard]] bool pool_depth_read(std::uint64_t serial, std::uint64_t storage_key) const override {
+        for (const auto& read : pool_depth_reads)
+            if ((serial && read.first == serial) || (storage_key && read.second == storage_key)) return true;
+        return false;
+    }
 };
 
 // These contracts cover validity and ordering independently of Metal encoding.
@@ -709,6 +1270,18 @@ void test_draw_table_contracts() {
         CHECK(table.find({i % 3 + 4, i}) == nullptr);
     }
     CHECK(table.size() == values.size());
+}
+
+struct ScopedApi231 {
+    ApiVersion previous = selected_api_version().value_or(ApiVersion{55,15});
+    explicit ScopedApi231(bool enabled) { if (enabled) { v231::register_entries(); select_api_version({231, 40}); } }
+    ~ScopedApi231() { select_api_version(previous); }
+};
+
+bool initialize_graphics_program(NVNprogram& program, NVNdevice& device,
+                                  std::span<const NVNshaderData> shaders) {
+    return load<Entry::nvnProgramInitialize>()(&program, &device) &&
+        load<Entry::nvnProgramSetShaders>()(&program, static_cast<int>(shaders.size()), shaders.data());
 }
 
 struct Recorder {
@@ -1020,7 +1593,7 @@ void test_report_texture_alias(id<MTLDevice> device, id<MTL4CommandQueue> queue,
     CHECK(bytes != MAP_FAILED);
     if (bytes == MAP_FAILED) return;
     {
-        replay::Resources resources(device);
+        replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
         MemoryPoolState pool{};
         pool.memory = bytes;
         pool.size = size;
@@ -1139,6 +1712,13 @@ public:
     }
     id<MTLTexture> texture_for_id(std::int32_t id) override { return resources_.texture_for_id(id); }
     id<MTLSamplerState> sampler_for_id(std::int32_t id) override { return resources_.sampler_for_id(id); }
+    std::shared_ptr<replay::Metal4SubmissionOwner> submission_owner() const override { return resources_.submission_owner(); }
+    void set_upload_publication(replay::UploadPublication publication) override { resources_.set_upload_publication(std::move(publication)); }
+    void begin_walk() override { resources_.begin_walk(); }
+    void end_walk() override { resources_.end_walk(); }
+    bool publish_uploads() override { return resources_.publish_uploads(); }
+    void commit_uploads(replay::UploadFence& range) override { resources_.commit_uploads(range); }
+    bool uploads_failed(const replay::UploadFence& range) override { return resources_.uploads_failed(range); }
     void set_completion_hook(std::function<bool()> hook) override { resources_.set_completion_hook(std::move(hook)); }
     void note_gpu_write(const TextureState& state) override { resources_.note_gpu_write(state); }
     void note_gpu_write(std::uint64_t address, std::uint64_t size) override { resources_.note_gpu_write(address, size); }
@@ -1163,7 +1743,7 @@ void test_report_isolation_probe(id<MTLDevice> device, id<MTL4CommandQueue> queu
     CHECK(bytes != MAP_FAILED);
     if (bytes == MAP_FAILED) return;
     {
-        replay::Resources resources(device);
+        replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
         MemoryPoolState pool{};
         pool.memory = bytes; pool.size = size;
         CHECK(resources.register_pool(pool));
@@ -1249,7 +1829,7 @@ void test_report_on_guest_clock(id<MTLDevice> device, id<MTL4CommandQueue> queue
     };
     armigo::execution::publish_guest_timeline({elapsed, &clock, clock.origin});
     {
-        replay::Resources resources(device);
+        replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
         MemoryPoolState pool{};
         pool.memory = bytes; pool.size = size;
         CHECK(resources.register_pool(pool));
@@ -1287,7 +1867,7 @@ void test_report_after_unbound_update(id<MTLDevice> device, id<MTL4CommandQueue>
     CHECK(bytes != MAP_FAILED);
     if (bytes == MAP_FAILED) return;
     {
-        replay::Resources resources(device);
+        replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
         MemoryPoolState pool{};
         pool.memory = bytes; pool.size = size;
         CHECK(resources.register_pool(pool));
@@ -1383,7 +1963,7 @@ void test_report_attachment_alias(id<MTLDevice> device, id<MTL4CommandQueue> que
     CHECK(bytes != MAP_FAILED);
     if (bytes == MAP_FAILED) return;
     {
-        replay::Resources resources(device);
+        replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
         MemoryPoolState pool{};
         pool.memory = bytes; pool.size = size;
         pool.flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
@@ -2084,6 +2664,372 @@ void test_depth_bounds_draw(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
     load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
 }
 
+// One render pass cleared to red, dumped for frame 0. The PNG is written after
+// the submission retires, so the files are polled for.
+bool png_mean(const std::filesystem::path& path, int& red, int& green, int& blue) {
+    NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()]];
+    CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url, nullptr);
+    if (!source) return false;
+    CGImageRef image = CGImageSourceCreateImageAtIndex(source, 0, nullptr);
+    CFRelease(source);
+    if (!image) return false;
+    const std::size_t width = CGImageGetWidth(image);
+    const std::size_t height = CGImageGetHeight(image);
+    if (!width || !height) {
+        CGImageRelease(image);
+        return false;
+    }
+    std::vector<std::uint8_t> pixels(width * height * 4);
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(pixels.data(), width, height, 8, width * 4, space,
+                                                 static_cast<CGBitmapInfo>(kCGImageAlphaPremultipliedLast) |
+                                                     static_cast<CGBitmapInfo>(kCGBitmapByteOrder32Big));
+    CGColorSpaceRelease(space);
+    if (!context) {
+        CGImageRelease(image);
+        return false;
+    }
+    CGContextDrawImage(context, CGRectMake(0, 0, static_cast<CGFloat>(width), static_cast<CGFloat>(height)), image);
+    CGContextRelease(context);
+    CGImageRelease(image);
+    std::uint64_t sum_r = 0, sum_g = 0, sum_b = 0;
+    for (std::size_t pixel = 0; pixel < width * height; ++pixel) {
+        sum_r += pixels[pixel * 4];
+        sum_g += pixels[pixel * 4 + 1];
+        sum_b += pixels[pixel * 4 + 2];
+    }
+    const auto count = width * height;
+    red = static_cast<int>((sum_r + count / 2) / count);
+    green = static_cast<int>((sum_g + count / 2) / count);
+    blue = static_cast<int>((sum_b + count / 2) / count);
+    return true;
+}
+
+void test_pass_dump_numeric(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    replay::PassDumpConfig config;
+    config.enabled = true;
+    config.inputs = true;
+    config.width = 4;
+    replay::PassDump dump(device, config);
+    auto* descriptor = [MTLTextureDescriptor new];
+    descriptor.textureType = MTLTextureType3D;
+    descriptor.pixelFormat = MTLPixelFormatRGBA32Float;
+    descriptor.width = 4; descriptor.height = 4; descriptor.depth = 2;
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> volume = [device newTextureWithDescriptor:descriptor];
+    std::array<float, 128> values{};
+    for (unsigned z = 0; z != 2; ++z)
+        for (unsigned pixel = 0; pixel != 16; ++pixel) {
+            const auto i = (z * 16 + pixel) * 4;
+            values[i] = float(z + 1); values[i + 1] = -float(z + 2);
+            values[i + 2] = 0.5f; values[i + 3] = 1.0f;
+        }
+    values[0] = std::numeric_limits<float>::quiet_NaN();
+    values[5] = std::numeric_limits<float>::infinity();
+    [volume replaceRegion:MTLRegionMake3D(0, 0, 0, 4, 4, 2) mipmapLevel:0 slice:0
+        withBytes:values.data() bytesPerRow:64 bytesPerImage:256];
+    CHECK(volume && dump.first_input(volume) && !dump.first_input(volume));
+    std::array<std::byte, 64> pattern{};
+    for (std::size_t i = 0; i != pattern.size(); ++i) pattern[i] = std::byte(i * 3);
+    id<MTLBuffer> source = [device newBufferWithBytes:pattern.data() length:pattern.size()
+        options:MTLResourceStorageModeShared];
+    auto image = dump.prepare(volume, "input", 1, 0, 0, 0, true);
+    auto buffer = dump.prepare_buffer("uniform", source.gpuAddress + 5, 37);
+    auto* compressed_descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBC4_RUnorm
+        width:4 height:4 mipmapped:NO];
+    compressed_descriptor.storageMode = MTLStorageModeShared;
+    compressed_descriptor.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> compressed = [device newTextureWithDescriptor:compressed_descriptor];
+    const std::array<std::uint8_t, 8> block{255, 0, 0, 0, 0, 0, 0, 0};
+    [compressed replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:block.data() bytesPerRow:8];
+    auto compressed_job = dump.prepare(compressed, "compressed", 2, 0, 0, 0, true);
+    CHECK(compressed && compressed_job.pipeline);
+    auto* copy_descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    copy_descriptor.storageMode = MTLStorageModeShared;
+    copy_descriptor.usage = MTLTextureUsageRenderTarget;
+    id<MTLTexture> copy_source = [device newTextureWithDescriptor:copy_descriptor];
+    std::array<std::uint8_t, 64> red_pixels{};
+    for (unsigned pixel = 0; pixel != 16; ++pixel) red_pixels[pixel * 4] = red_pixels[pixel * 4 + 3] = 255;
+    [copy_source replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:red_pixels.data() bytesPerRow:16];
+    auto copied = dump.prepare(copy_source, "sampled-copy", 3, 0, 0, 0, true);
+    CHECK(copied.pipeline && copied.blit_from == copy_source && copied.sample != copy_source);
+    CHECK(copied.sample.storageMode == MTLStorageModePrivate && !copied.sample.allowGPUOptimizedContents);
+    auto* depth_descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+        width:4 height:4 mipmapped:NO];
+    depth_descriptor.storageMode = MTLStorageModePrivate;
+    depth_descriptor.usage = MTLTextureUsageRenderTarget;
+    id<MTLTexture> depth = [device newTextureWithDescriptor:depth_descriptor];
+    auto depth_copy = dump.prepare(depth, "depth-copy", 4, 0, 0, 0);
+    CHECK(depth_copy.sample && depth_copy.blit_from == depth);
+    CHECK(depth_copy.sample.allowGPUOptimizedContents == depth_descriptor.allowGPUOptimizedContents);
+
+    CHECK(image.pipeline && image.image.raw && image.image.dst_h == 8 && buffer.pipeline);
+    if (!volume || !source || !image.pipeline || !buffer.pipeline || !compressed_job.pipeline || !copied.pipeline) return;
+    auto allocator = [device newCommandAllocator];
+    auto commands = [device newCommandBuffer];
+    NSError* error = nil;
+    auto* residency_descriptor = [MTLResidencySetDescriptor new];
+    id<MTLResidencySet> residency = [device newResidencySetWithDescriptor:residency_descriptor error:&error];
+    NSMutableArray* retained = [NSMutableArray arrayWithObjects:volume, source, allocator, commands, residency, nil];
+    [residency addAllocation:source];
+    [commands beginCommandBufferWithAllocator:allocator];
+    [commands useResidencySet:residency];
+    replay::encode_pass_dump_jobs(commands, residency, retained, {image, buffer, compressed_job, copied});
+    [residency commit];
+    [commands endCommandBuffer];
+    auto completed = dispatch_semaphore_create(0);
+    __block bool failed = false;
+    auto* options = [MTL4CommitOptions new];
+    [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+        static_cast<void>(retained.count);
+        failed = feedback.error != nil;
+        dispatch_semaphore_signal(completed);
+    }];
+    id<MTL4CommandBuffer> submitted[]{commands};
+    [queue commit:submitted count:1 options:options];
+    const bool finished = dispatch_semaphore_wait(completed, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) == 0;
+    CHECK(finished && !failed);
+    if (!finished || failed) return;
+    CHECK(std::memcmp(buffer.image.raw.contents, pattern.data() + 5, 37) == 0);
+    const auto* copied_red = static_cast<const float*>(copied.image.raw.contents);
+    for (unsigned pixel = 0; pixel != 16; ++pixel)
+        CHECK(copied_red[pixel * 3] == 1 && copied_red[pixel * 3 + 1] == 0 && copied_red[pixel * 3 + 2] == 0);
+    const auto* red = static_cast<const float*>(compressed_job.image.raw.contents);
+    for (unsigned pixel = 0; pixel != 16; ++pixel) CHECK(red[pixel * 3] == 1.0f);
+    const auto* sampled = static_cast<const float*>(image.image.raw.contents);
+    for (unsigned pixel = 0; pixel != 32; ++pixel)
+        for (unsigned channel = 0; channel != 3; ++channel) {
+            const auto expected = values[pixel * 4 + channel], actual = sampled[pixel * 3 + channel];
+            CHECK(std::isnan(expected) ? std::isnan(actual) : actual == expected);
+        }
+}
+
+void test_pass_dump_metadata(id<MTLDevice> device) {
+    replay::PassDumpConfig config;
+    config.enabled = true;
+    config.metadata_only = true;
+    config.inputs = true;
+    config.draw_width = config.draw_height = 4;
+    replay::PassDump dump(device, config);
+    CHECK(!dump.inputs() && !dump.splits_draws(4, 4));
+    auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                     width:4 height:4 mipmapped:NO];
+    id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
+    CHECK(texture != nil);
+    for (unsigned index = 0; index != 1000; ++index) {
+        const auto job = dump.prepare(texture, "c0", 120, 0, 0, 0);
+        CHECK(job.image.width == 4 && job.image.height == 4 && job.image.native_id == texture.gpuResourceID._impl &&
+              job.image.native_root_id == texture.gpuResourceID._impl);
+        CHECK(job.image.note == "metadata" && !job.pipeline && !job.table && !job.image.pixels && !job.image.raw);
+    }
+    const auto buffer = dump.prepare_buffer("cb", 0x12340000, 64);
+    CHECK(!buffer.pipeline && !buffer.table && !buffer.image.raw && !buffer.args);
+    CHECK(!dump.stopped());
+}
+
+void test_pass_dump_clear(id<MTLDevice> device, id<MTL4CommandQueue> queue, bool split_draws, bool metadata_only = false, bool large_input = false) {
+    auto pattern = (std::filesystem::temp_directory_path() / "armigo-pass-dump-XXXXXX").string();
+    std::vector<char> path(pattern.begin(), pattern.end());
+    path.push_back('\0');
+    if (!mkdtemp(path.data())) {
+        CHECK(false);
+        return;
+    }
+    const std::filesystem::path directory(path.data());
+    struct RestoreEnv {
+        std::optional<std::string> dump, dir, width, draw_size, metadata, inputs, input_shader;
+        const std::filesystem::path directory;
+        static std::optional<std::string> copy_env(const char* name) {
+            const char* value = std::getenv(name);
+            if (!value) return std::nullopt;
+            return std::string(value);
+        }
+        explicit RestoreEnv(const std::filesystem::path& output, bool split, bool metadata_only, bool large) : directory(output) {
+            inputs = copy_env("ARMIGO_NVN_PASS_DUMP_INPUTS");
+            input_shader = copy_env("ARMIGO_NVN_PASS_DUMP_INPUT_SHADER");
+            if (large) {
+                setenv("ARMIGO_NVN_PASS_DUMP_INPUTS", "1", 1);
+                setenv("ARMIGO_NVN_PASS_DUMP_INPUT_SHADER", "unselected,pass-dump-large", 1);
+            } else {
+                unsetenv("ARMIGO_NVN_PASS_DUMP_INPUTS");
+                unsetenv("ARMIGO_NVN_PASS_DUMP_INPUT_SHADER");
+            }
+            metadata = copy_env("ARMIGO_NVN_PASS_DUMP_METADATA_ONLY");
+            if (metadata_only) setenv("ARMIGO_NVN_PASS_DUMP_METADATA_ONLY", "1", 1);
+            else unsetenv("ARMIGO_NVN_PASS_DUMP_METADATA_ONLY");
+            dump = copy_env("ARMIGO_NVN_PASS_DUMP");
+            dir = copy_env("ARMIGO_NVN_PASS_DUMP_DIR");
+            width = copy_env("ARMIGO_NVN_PASS_DUMP_WIDTH");
+            draw_size = copy_env("ARMIGO_NVN_PASS_DUMP_DRAW_SIZE");
+            if (large) setenv("ARMIGO_NVN_PASS_DUMP_DRAW_SIZE", "8x8", 1);
+            else if (split) setenv("ARMIGO_NVN_PASS_DUMP_DRAW_SIZE", "4x4", 1);
+            else unsetenv("ARMIGO_NVN_PASS_DUMP_DRAW_SIZE");
+            setenv("ARMIGO_NVN_PASS_DUMP", "0", 1);
+            setenv("ARMIGO_NVN_PASS_DUMP_DIR", directory.c_str(), 1);
+            unsetenv("ARMIGO_NVN_PASS_DUMP_WIDTH");
+        }
+        ~RestoreEnv() {
+            if (inputs) setenv("ARMIGO_NVN_PASS_DUMP_INPUTS", inputs->c_str(), 1);
+            else unsetenv("ARMIGO_NVN_PASS_DUMP_INPUTS");
+            if (input_shader) setenv("ARMIGO_NVN_PASS_DUMP_INPUT_SHADER", input_shader->c_str(), 1);
+            else unsetenv("ARMIGO_NVN_PASS_DUMP_INPUT_SHADER");
+            if (metadata) setenv("ARMIGO_NVN_PASS_DUMP_METADATA_ONLY", metadata->c_str(), 1);
+            else unsetenv("ARMIGO_NVN_PASS_DUMP_METADATA_ONLY");
+            if (dump) setenv("ARMIGO_NVN_PASS_DUMP", dump->c_str(), 1);
+            else unsetenv("ARMIGO_NVN_PASS_DUMP");
+            if (dir) setenv("ARMIGO_NVN_PASS_DUMP_DIR", dir->c_str(), 1);
+            else unsetenv("ARMIGO_NVN_PASS_DUMP_DIR");
+            if (width) setenv("ARMIGO_NVN_PASS_DUMP_WIDTH", width->c_str(), 1);
+            else unsetenv("ARMIGO_NVN_PASS_DUMP_WIDTH");
+            if (draw_size) setenv("ARMIGO_NVN_PASS_DUMP_DRAW_SIZE", draw_size->c_str(), 1);
+            else unsetenv("ARMIGO_NVN_PASS_DUMP_DRAW_SIZE");
+            std::error_code ignored;
+            std::filesystem::remove_all(directory, ignored);
+        }
+    } restore(directory, split_draws, metadata_only, large_input);
+
+    TestResources resources(device);
+    id<MTLBuffer> large = nil;
+    constexpr std::uint64_t large_address = TestResources::base + 0x200000;
+    constexpr std::size_t large_bytes = 2 * 1024 * 1024 + 64;
+    if (large_input) {
+        large = [device newBufferWithLength:large_bytes options:MTLResourceStorageModeShared];
+        CHECK(large != nil);
+        if (!large) return;
+        std::memset(large.contents, 0x31, large.length);
+        auto* words = static_cast<std::uint32_t*>(large.contents);
+        words[0] = 0x12345678; words[1024*1024/4] = 0x87654321; words[2*1024*1024/4] = 0x5a5aa5a5;
+        resources.guest_pools.emplace_back(large_address, large);
+    }
+    std::atomic<std::size_t> residency_peak{0};
+    replay::ReplaySchedulingPolicy observation;
+    observation.context = &residency_peak;
+    observation.observe_residency_sets = [](void* context, std::uint64_t, std::uint64_t, std::size_t count) {
+        auto& peak = *static_cast<std::atomic<std::size_t>*>(context);
+        auto old = peak.load();
+        while (old < count && !peak.compare_exchange_weak(old, count)) {}
+    };
+    auto backend = replay::create_replay_backend(device, queue, resources, observation);
+    auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    resources.textures[140] = [device newTextureWithDescriptor:descriptor];
+    auto color_state = texture_state(140, 4, 4);
+    auto color = texture_object(color_state);
+    const NVNtexture* targets[]{&color};
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const std::uint64_t marker = large_input ? 410 : 130;
+    const NVNshaderData shaders[]{{marker, nullptr}, {marker, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+    NVNprogram following{};
+    if (large_input) {
+        CHECK(load<Entry::nvnProgramInitialize>()(&following, &recorder.device));
+        const NVNshaderData next[]{{130, nullptr}, {130, nullptr}};
+        CHECK(load<Entry::nvnProgramSetShaders>()(&following, 2, next));
+    }
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+    const float red[]{1.f, 0.f, 0.f, 1.f};
+    std::memcpy(resources.memory.contents, red, sizeof red);
+    load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, red, 15);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+        TestResources::base, sizeof red);
+    if (large_input)
+        load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+            large_address, large_bytes);
+    NVNchannelMaskState channels{};
+    load<Entry::nvnChannelMaskStateSetDefaults>()(&channels);
+    load<Entry::nvnChannelMaskStateSetChannelMask>()(&channels, 0, 0, 0, 0, 0);
+    load<Entry::nvnCommandBufferBindChannelMaskState>()(&recorder.commands, &channels);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    load<Entry::nvnChannelMaskStateSetDefaults>()(&channels);
+    load<Entry::nvnCommandBufferBindChannelMaskState>()(&recorder.commands, &channels);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    if (large_input)
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &following, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().skipped == 0 && backend->statistics().render_passes == (split_draws ? 3 : 1));
+
+    const auto png_path = directory / "f0-p0000-c0-140.png";
+    const auto text_path = directory / "f0-passes.txt";
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    std::string passes;
+    while (std::chrono::steady_clock::now() < deadline) {
+        passes.clear();
+        if ((metadata_only || std::filesystem::exists(png_path)) && std::filesystem::exists(text_path)) {
+            std::ifstream text(text_path);
+            passes.assign(std::istreambuf_iterator<char>(text), {});
+            if (passes.find("draw p=" + std::string(split_draws ? "0002" : "0000") +
+                    " ordinal=" + std::string(split_draws ? "0" : "3")) != std::string::npos) break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK(std::filesystem::exists(png_path) == !metadata_only);
+    CHECK(std::filesystem::exists(text_path));
+    CHECK(residency_peak.load() == (metadata_only ? 1 : 2));
+    std::size_t pngs = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(directory))
+        if (entry.path().extension() == ".png") ++pngs;
+    CHECK(pngs == (metadata_only ? 0 : split_draws ? 3 : 1));
+    if (!metadata_only) {
+        int mean_r = -1, mean_g = -1, mean_b = -1;
+        CHECK(png_mean(png_path, mean_r, mean_g, mean_b));
+        CHECK(mean_r >= 253 && mean_r <= 255 && mean_g <= 2 && mean_b <= 2);
+    } else {
+        char address[64];
+        std::snprintf(address, sizeof address, "kind=buffer index=0 gpu=%#llx",
+                      static_cast<unsigned long long>(resources.memory.gpuAddress));
+        CHECK(passes.find(address) != std::string::npos);
+        CHECK(passes.find(":native_id:") != std::string::npos);
+        CHECK(passes.find("images=c0:metadata") != std::string::npos);
+    }
+    CHECK(passes.find("p=0000") != std::string::npos);
+    CHECK(passes.find("kind=render") != std::string::npos);
+    CHECK(passes.find("c0:140:") != std::string::npos);
+    CHECK(passes.find("why=finish") != std::string::npos);
+    CHECK(passes.find("draw p=0000 ordinal=0 submission_draw=0 vs=pass-dump-vertex ts=- ms=- fs=pass-dump-" +
+        std::string(large_input ? "large" : "fragment")) != std::string::npos);
+    CHECK((passes.find("why=draw_dump") != std::string::npos) == split_draws);
+    CHECK(passes.find(split_draws ? "p=0002" : "draws=4") != std::string::npos);
+    CHECK(passes.find("vs=pass-dump-vertex") != std::string::npos);
+    CHECK(passes.find(large_input ? "fs=pass-dump-large" : "fs=pass-dump-fragment") != std::string::npos);
+    if (large_input) {
+        std::size_t chunks = 0, captured = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+            const auto name = entry.path().filename().string();
+            const auto chunk = name.find("sb1-1-d2-o");
+            if (chunk == std::string::npos || entry.path().extension() != ".bin") continue;
+            const auto offset = std::stoull(name.substr(chunk + std::strlen("sb1-1-d2-o")));
+            std::ifstream input(entry.path(), std::ios::binary);
+            const std::vector<char> bytes((std::istreambuf_iterator<char>(input)), {});
+            CHECK(offset <= large_bytes && bytes.size() <= large_bytes - offset);
+            if (offset <= large_bytes && bytes.size() <= large_bytes - offset)
+                CHECK(std::memcmp(bytes.data(), static_cast<const std::byte*>(large.contents) + offset, bytes.size()) == 0);
+            ++chunks; captured += bytes.size();
+        }
+        CHECK(chunks == 3 && captured == large_bytes);
+        for (const auto& entry : std::filesystem::directory_iterator(directory))
+            CHECK(entry.path().filename().string().find("sb1-1-d3") == std::string::npos);
+        CHECK(passes.find("requested=" + std::to_string(large_bytes)) != std::string::npos);
+        CHECK(passes.find("captured=" + std::to_string(large_bytes)) != std::string::npos);
+    }
+
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&program);
+    if (large_input) load<Entry::nvnProgramFinalize>()(&following);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
 // A program without a fragment stage still rasterizes: the draw writes depth
 // and leaves the bound color targets unchanged.
 // Pipelines come from a pipeline archive instead of compiling: a session that
@@ -2300,6 +3246,45 @@ void test_clear_pipeline_record(id<MTLDevice> device, id<MTL4CommandQueue> queue
     CHECK(text.find(expected) != std::string::npos);
     if (text.find(expected) == std::string::npos) std::fprintf(stderr, "clear record: %s\n", text.c_str());
     std::filesystem::remove(record);
+}
+
+void test_fragment_y_specialization(id<MTLDevice> device, id<MTL4CommandQueue> queue, Stages& stages) {
+    const auto original = stages.fragment;
+    auto fragment = std::make_shared<platform::CompiledGraphicsStage>(*original);
+    fragment->entry_point = "required_y_direction";
+    fragment->identity = "required-y-direction";
+    fragment->consumes_y_direction = true;
+    stages.fragment = fragment;
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    resources.textures[199] = [device newTextureWithDescriptor:descriptor];
+    auto state = texture_state(199, 4, 4); auto color = texture_object(state);
+    const NVNtexture* targets[]{&color};
+    Recorder recorder; NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const NVNshaderData shaders[]{{1, nullptr}, {1, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    const auto handle = recorder.finish(); const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+    std::array<std::uint8_t, 64> pixels{};
+    [resources.textures[199] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0,0,4,4) mipmapLevel:0];
+    for (unsigned y = 0; y < 4; ++y) for (unsigned x = 0; x < 4; ++x) {
+        CHECK(pixels[(y*4+x)*4] == (y < 2 ? 255 : 0));
+        CHECK(pixels[(y*4+x)*4+1] == (y < 2 ? 0 : 255));
+    }
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+    stages.fragment = original;
 }
 
 void test_vertex_only_depth_draw(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
@@ -2715,6 +3700,65 @@ void test_gpu_conditional_render(id<MTLDevice> device, id<MTL4CommandQueue> queu
     load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
 }
 
+// Replay policy: a timestamp counter is known 0 while encoding, so it compares
+// equal to an untouched neighbour of 0 and the draw is skipped without a GPU
+// wait. The title policy is restored before the function returns.
+void test_replay_conditional_render(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    struct RestorePolicy {
+        ~RestorePolicy() { nvn::set_title_policy({}); }
+    } restore_policy;
+    nvn::TitlePolicy policy;
+    policy.conditional_render = nvn::TitlePolicy::ConditionalRender::replay;
+    nvn::set_title_policy(policy);
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    resources.textures[171] = [device newTextureWithDescriptor:descriptor];
+    auto color_state = texture_state(171, 4, 4);
+    auto color = texture_object(color_state);
+    const NVNtexture* targets[]{&color};
+    const NVNcopyRegion whole{0, 0, 0, 4, 4, 1};
+    auto* bytes = static_cast<std::byte*>(resources.memory.contents);
+    std::memset(bytes, 0, resources.memory.length);
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const NVNshaderData shaders[]{{1, nullptr}, {1, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+    const float black[]{0, 0, 0, 1};
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+    load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, black, 15);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferReportCounter>()(&recorder.commands, NVN_COUNTER_TYPE_TIMESTAMP,
+        TestResources::base + 0x700);
+    load<Entry::nvnCommandBufferSetRenderEnableConditional>()(&recorder.commands,
+        NVN_CONDITIONAL_RENDER_MODE_RENDER_IF_NOT_EQUAL, TestResources::base + 0x700);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    load<Entry::nvnCommandBufferSetRenderEnable>()(&recorder.commands, 1);
+    load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands, &color, nullptr, &whole,
+        TestResources::base + 0x2000, 0);
+    const auto handle = recorder.finish();
+    const auto waits = backend->statistics().synchronize_gpu_waits;
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+    CHECK(backend->statistics().synchronize_gpu_waits == waits);
+    const auto* output = reinterpret_cast<const std::uint8_t*>(bytes + 0x2000);
+    for (unsigned pixel = 0; pixel != 16; ++pixel) {
+        CHECK(output[pixel * 4] == 0);
+        CHECK(output[pixel * 4 + 1] == 0);
+        CHECK(output[pixel * 4 + 2] == 0);
+        CHECK(output[pixel * 4 + 3] == 255);
+    }
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
 // Counter operations inside a pass that counts samples keep the pass: a reset
 // between two draws drops the first draw's samples, and the report counts the
 // second draw only. Further reports cross a timestamp-heap page without ending
@@ -3067,9 +4111,14 @@ void test_conditional_case(id<MTLDevice> device, id<MTL4CommandQueue> queue, Con
         // prefix. The next two effects write disjoint B, where memory still
         // contains a nonzero counter until the event signals are applied.
         // An event wait drains without a subsequent buffer lookup that would
-        // independently notice the temporarily empty effect list.
+        // independently notice the temporarily empty effect list. The wait
+        // drains because this submission first adds to the event, so its value
+        // depends on memory the GPU has not finished with; a written value the
+        // wait accepts would only need a barrier.
         load<Entry::nvnCommandBufferSetRenderEnableConditional>()(&recorder.commands, mode, counter);
         load<Entry::nvnCommandBufferSetRenderEnable>()(&recorder.commands, 1);
+        load<Entry::nvnCommandBufferSignalEvent>()(&recorder.commands, &drain_event,
+            NVN_EVENT_SIGNAL_MODE_ADD, NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, 0);
         load<Entry::nvnCommandBufferWaitEvent>()(&recorder.commands, &drain_event, NVN_EVENT_WAIT_MODE_EQUAL, 0);
         for (const auto& event : disjoint_events)
             load<Entry::nvnCommandBufferSignalEvent>()(&recorder.commands, &event,
@@ -3351,6 +4400,12 @@ void test_segmented_failed_prefix(id<MTLDevice> device, id<MTL4CommandQueue> que
     CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
     const NVNshaderData shaders[]{{1, nullptr}, {1, nullptr}};
     CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+    NVNevent skipped_signal{};
+    auto& signal_state = *reinterpret_cast<EventState*>(&skipped_signal);
+    signal_state.tag = object_tag('E', 'V', 'N', 'T');
+    signal_state.value = reinterpret_cast<volatile std::uint32_t*>(
+        static_cast<std::byte*>(resources.memory.contents) + 0x4000);
+    *signal_state.value = 0;
     id<MTLSharedEvent> gate = [device newSharedEvent];
     [queue waitForEvent:gate value:1];
     load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
@@ -3362,27 +4417,41 @@ void test_segmented_failed_prefix(id<MTLDevice> device, id<MTL4CommandQueue> que
     // An unchanged target with an already closed encoder is a legal cut point.
     load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
     load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 0, 0, -1, 4);
+    load<Entry::nvnCommandBufferSignalEvent>()(&recorder.commands, &skipped_signal,
+        NVN_EVENT_SIGNAL_MODE_WRITE, NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, 77);
     const auto handle = recorder.finish();
     const auto fence = backend->submit({&handle, 1});
     CHECK(fence != 0);
-    CHECK(!backend->wait_fence(fence, 10'000'000));
+    const auto dependent = backend->queue_wait_fence(0x777, fence);
+    CHECK(dependent && *dependent > fence);
+    auto waiting = std::async(std::launch::async, [&] {
+        return backend->wait_fence(dependent.value_or(fence), UINT64_MAX);
+    });
+    // The failure must wake an infinite wait before the committed prefix can
+    // finish. Its GPU allocation remains live until the blocked prefix drains.
+    const bool woke = waiting.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    CHECK(woke);
+    CHECK(!backend->wait_fence(dependent.value_or(fence), 10'000'000'000ull));
+    CHECK(*signal_state.value == 0);
+    CHECK(backend->fatal_error_detail().find("scissor") != std::string::npos);
     CHECK(backend->completed_fence() == 0);
+    CHECK(!backend->fence_completed(fence));
+    CHECK(!dependent || !backend->fence_completed(*dependent));
+    CHECK(backend->submit({&handle, 1}) == 0);
     gate.signaledValue = 1;
-    CHECK(backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(waiting.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    CHECK(!waiting.get());
+    CHECK(backend->stop_submission_workers(std::chrono::steady_clock::now() + std::chrono::seconds(5)));
     CHECK(backend->last_error().code == replay::ReplayErrorCode::invalid_command);
+    CHECK(*signal_state.value == 0);
     std::array<std::uint8_t, 64> pixels{};
     [resources.textures[103] getBytes:pixels.data() bytesPerRow:16
         fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
     for (unsigned i = 0; i < 16; ++i) CHECK(pixels[i * 4 + 1] == 255);
+    // A fatal replay error rejects new work without inventing GPU completion.
+    CHECK(backend->submit({&handle, 1}) == 0);
+    CHECK(backend->fatal_error_detail().find("scissor") != std::string::npos);
     load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
-    // An encoding error after a committed prefix leaves no hole in retirement.
-    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
-    load<Entry::nvnCommandBufferClearBuffer>()(&recorder.commands, TestResources::base, 4, 17);
-    const auto next = recorder.finish();
-    const auto next_fence = backend->submit({&next, 1});
-    CHECK(next_fence == fence + 1 && backend->wait_fence(next_fence, 10'000'000'000ull));
-    CHECK(*static_cast<const std::uint32_t*>(resources.memory.contents) == 17);
-    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, next);
     load<Entry::nvnProgramFinalize>()(&program);
     load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
 }
@@ -3885,6 +4954,131 @@ void test_constant_window_bound(id<MTLDevice> device, id<MTL4CommandQueue> queue
     load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
 }
 
+void test_constant_window_zero_pad(id<MTLDevice> device, id<MTL4CommandQueue> queue, Stages& stages, bool full_binding) {
+    TestResources resources(device);
+    std::memset(resources.memory.contents, 0, resources.memory.length);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget;
+    resources.textures[92] = [device newTextureWithDescriptor:descriptor];
+    auto state = texture_state(92, 4, 4);
+    auto target = texture_object(state);
+    const NVNtexture* targets[]{&target};
+    Recorder recorder;
+    NVNprogram far_program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&far_program, &recorder.device));
+    const NVNshaderData far_shaders[]{{8, nullptr}, {8, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&far_program, 2, far_shaders));
+    constexpr auto uniform = TestResources::base + 0x200;
+    const std::array<float, 4> blue{0, 0, 1, 1};
+    // The window's fifth vector lies past a 64-byte bound and inside a 128-byte one.
+    std::memcpy(static_cast<std::byte*>(resources.memory.contents) + 0x240, blue.data(), sizeof blue);
+    // Resolve two independent programs: equal physical allocations, different
+    // logical extents. Reusing the first upload would expose the blue sentinel
+    // as the second program's mandatory zero pad.
+    const auto original = stages.far_uniform_fragment;
+    auto padded = std::make_shared<platform::CompiledGraphicsStage>(*original);
+    padded->constant_buffer_windows[0].window_bytes = 64;
+    padded->constant_buffer_windows[0].zero_padding_bytes = 16;
+    stages.far_uniform_fragment = padded;
+    NVNprogram padded_program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&padded_program, &recorder.device));
+    CHECK(load<Entry::nvnProgramSetShaders>()(&padded_program, 2, far_shaders));
+    stages.far_uniform_fragment = original;
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &far_program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, uniform, full_binding ? 128 : 76);
+    load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 0, 0, 2, 4);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &padded_program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 2, 0, 2, 4);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error());
+    std::array<std::uint8_t, 64> pixels{};
+    [resources.textures[92] getBytes:pixels.data() bytesPerRow:16
+        fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+    for (unsigned y = 0; y < 4; ++y)
+        for (unsigned x = 0; x < 4; ++x) {
+            const auto offset = (y * 4 + x) * 4;
+            const bool inside = x < 2;
+            CHECK(pixels[offset] == 0 && pixels[offset + 1] == 0 &&
+                  pixels[offset + 2] == (inside ? 255 : 0) && pixels[offset + 3] == (inside && full_binding ? 255 : 0));
+        }
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&far_program);
+    load<Entry::nvnProgramFinalize>()(&padded_program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+// Exercise production-emitted clamps through the complete replay bindings.
+void test_small_padded_window(id<MTLDevice> device, id<MTL4CommandQueue> queue, Stages& stages) {
+    const auto original = stages.far_uniform_fragment;
+    for (const unsigned words : {1u, 2u, 4u}) {
+        auto fragment = std::make_shared<platform::CompiledGraphicsStage>(*original);
+        fragment->metallib = build_library(shader::test::cbuf_msl::gpu_small_window_source(words));
+        CHECK(!fragment->metallib.empty());
+        fragment->entry_point = "armigo_fragment_main";
+        fragment->identity = "small-padded-window-" + std::to_string(words);
+        fragment->constant_buffer_windows = {{3, 64, 3, 16}, {4, 4, 4, 16}};
+        fragment->constant_buffer_support_index = 11;
+        fragment->color_outputs = {{0, 15, platform::ColorOutputScalar::u32}};
+        stages.far_uniform_fragment = fragment;
+        TestResources resources(device);
+        auto* memory = static_cast<std::uint32_t*>(resources.memory.contents);
+        std::fill_n(memory + 0x200 / 4, 24, 0xdecafbadu);
+        std::fill_n(memory + 0x200 / 4, 16, 0u);
+        memory[0x23c / 4] = 0xfaceb00cu;
+        auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Uint
+            width:4 height:4 mipmapped:NO];
+        descriptor.storageMode = MTLStorageModeShared;
+        descriptor.usage = MTLTextureUsageRenderTarget;
+        resources.textures[92] = [device newTextureWithDescriptor:descriptor];
+        auto target_state = texture_state(92, 4, 4); auto target = texture_object(target_state);
+        const NVNtexture* targets[]{&target};
+        auto backend = replay::create_replay_backend(device, queue, resources);
+        for (const auto offset : {63u, 64u, 65u, 80u, UINT32_MAX}) {
+            Recorder recorder; NVNprogram program{};
+            CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+            const NVNshaderData shaders[]{{8, nullptr}, {8, nullptr}};
+            CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+            load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+            load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+            load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+            load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+                TestResources::base + 0x200, 96);
+            load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 1,
+                TestResources::base + 0x300, 4);
+            load<Entry::nvnCommandBufferUpdateUniformBuffer>()(&recorder.commands,
+                TestResources::base + 0x300, 4, 0, 4, &offset);
+            load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+            const auto handle = recorder.finish(); const auto fence = backend->submit({&handle, 1});
+            CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+            CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+            std::array<std::uint32_t, 64> pixels{};
+            [resources.textures[92] getBytes:pixels.data() bytesPerRow:64
+                fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+            std::array<std::uint32_t, 4> expected{};
+            if (offset == 63) {
+                expected[0] = 0xfaceb00cu;
+                if (words == 1) expected.fill(0xfaceb00cu);
+                else if (words == 2) expected[2] = 0xfaceb00cu;
+            }
+            for (unsigned pixel = 0; pixel < 16; ++pixel)
+                CHECK(std::equal(expected.begin(), expected.end(), pixels.begin() + pixel * 4));
+            load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+            load<Entry::nvnProgramFinalize>()(&program);
+            load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+        }
+    }
+    stages.far_uniform_fragment = original;
+}
+
 // Hardware constant buffer 16 is NVN uniform slot 13 until a push names it
 // as the stage's push block; then draws read the block, and a later push
 // changes only the words it writes.
@@ -4170,6 +5364,819 @@ void test_cpu_signal_value_is_latched(id<MTLDevice> device, id<MTL4CommandQueue>
 // the part before the wait. Queue 3 draws column 3 blue, waits for a CPU
 // signal and then draws it green: its fence stays incomplete until the
 // signal. A backend shut down while a queue is parked at such a wait returns.
+// A wait that is not the first command of its submission waits for the GPU
+// only while a writer of the event is pending: an event the CPU already set
+// does not drain, and one an earlier submission signals orders after that
+// submission without draining the current one. A wait the submission's own
+// signals satisfy (an add, then a write) ends the pass with a barrier and
+// does not drain; one they leave unsatisfied drains, reads the event and
+// fails the submission. Both events meet their waits at submission, so the
+// queue does not split the submissions at them.
+void test_event_wait_paths(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    std::memset(resources.memory.contents, 0, resources.memory.length);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget;
+    resources.textures[99] = [device newTextureWithDescriptor:descriptor];
+    auto state = texture_state(99, 4, 4);
+    auto target = texture_object(state);
+    const NVNtexture* targets[]{&target};
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const NVNshaderData shaders[]{{5, nullptr}, {5, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+    auto* memory = static_cast<std::byte*>(resources.memory.contents);
+    constexpr auto green = TestResources::base + 0x200;
+    const std::array<float, 4> color{0, 1, 0, 1};
+    std::memcpy(memory + 0x200, color.data(), 16);
+    NVNevent cpu_event{}, gpu_event{}, own_event{};
+    for (auto [event, offset] : {std::pair{&cpu_event, 0x4000}, std::pair{&gpu_event, 0x4010},
+                                 std::pair{&own_event, 0x4020}}) {
+        auto& event_state = *reinterpret_cast<EventState*>(event);
+        event_state.tag = object_tag('E', 'V', 'N', 'T');
+        event_state.value = reinterpret_cast<volatile std::uint32_t*>(memory + offset);
+    }
+    // Both conditions already hold when the submissions are made, so neither
+    // queue is held: the encoder meets each wait in the middle of a submission.
+    *reinterpret_cast<volatile std::uint32_t*>(memory + 0x4000) = 5;
+    *reinterpret_cast<volatile std::uint32_t*>(memory + 0x4010) = 7;
+    const auto begin = [&] {
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, green, 16);
+    };
+    const auto column = [&](int x) {
+        load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, x, 0, 1, 4);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    };
+    // The CPU set the event: the wait between the two draws does not drain.
+    begin(); column(0);
+    load<Entry::nvnCommandBufferWaitEvent>()(&recorder.commands, &cpu_event, NVN_EVENT_WAIT_MODE_EQUAL, 5);
+    column(1);
+    const auto cpu_ready = recorder.finish();
+    const auto before = backend->statistics().synchronize_gpu_waits;
+    const auto fence_cpu = backend->submit_from(1, {&cpu_ready, 1});
+    CHECK(fence_cpu && backend->wait_fence(fence_cpu, 10'000'000'000ull));
+    CHECK(backend->statistics().synchronize_gpu_waits == before);
+    // An earlier submission signals the event the next one waits on. The
+    // wait orders after that submission; it does not drain its own prefix.
+    begin(); column(2);
+    load<Entry::nvnCommandBufferSignalEvent>()(&recorder.commands, &gpu_event, NVN_EVENT_SIGNAL_MODE_WRITE,
+                                               NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, 7);
+    const auto signalling = recorder.finish();
+    begin(); column(3);
+    load<Entry::nvnCommandBufferWaitEvent>()(&recorder.commands, &gpu_event, NVN_EVENT_WAIT_MODE_EQUAL, 7);
+    column(3);
+    const auto waiting = recorder.finish();
+    const auto between = backend->statistics().synchronize_gpu_waits;
+    const auto fence_signal = backend->submit_from(1, {&signalling, 1});
+    const auto fence_wait = backend->submit_from(1, {&waiting, 1});
+    CHECK(fence_signal && fence_wait && fence_signal < fence_wait);
+    CHECK(backend->wait_fence(fence_wait, 10'000'000'000ull));
+    CHECK(backend->statistics().synchronize_gpu_waits == between);
+    // The submission's own add and write leave 9: the wait takes a barrier.
+    // The event already holds 9 at submission, so the queue does not split
+    // the submission at the wait.
+    *reinterpret_cast<volatile std::uint32_t*>(memory + 0x4020) = 9;
+    begin(); column(0);
+    load<Entry::nvnCommandBufferSignalEvent>()(&recorder.commands, &own_event, NVN_EVENT_SIGNAL_MODE_ADD,
+                                               NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, 1);
+    load<Entry::nvnCommandBufferSignalEvent>()(&recorder.commands, &own_event, NVN_EVENT_SIGNAL_MODE_WRITE,
+                                               NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, 9);
+    load<Entry::nvnCommandBufferWaitEvent>()(&recorder.commands, &own_event, NVN_EVENT_WAIT_MODE_EQUAL, 9);
+    column(1);
+    const auto own_ready = recorder.finish();
+    const auto own_before = backend->statistics().synchronize_gpu_waits;
+    const auto fence_own = backend->submit_from(1, {&own_ready, 1});
+    CHECK(fence_own && backend->wait_fence(fence_own, 10'000'000'000ull));
+    CHECK(backend->statistics().synchronize_gpu_waits == own_before);
+    CHECK(*reinterpret_cast<volatile std::uint32_t*>(memory + 0x4020) == 9);
+    CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+    std::array<std::uint8_t, 64> pixels{};
+    [resources.textures[99] getBytes:pixels.data() bytesPerRow:16
+        fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+    for (unsigned y = 0; y < 4; ++y)
+        for (unsigned x = 0; x < 4; ++x) {
+            const auto* pixel = pixels.data() + (y * 4 + x) * 4;
+            CHECK(pixel[0] == 0 && pixel[1] == 255 && pixel[2] == 0);
+        }
+    // The own write leaves 9 but the wait needs 10, which the event holds at
+    // submission: the wait drains, reads 9 and fails the submission.
+    *reinterpret_cast<volatile std::uint32_t*>(memory + 0x4020) = 10;
+    begin(); column(0);
+    load<Entry::nvnCommandBufferSignalEvent>()(&recorder.commands, &own_event, NVN_EVENT_SIGNAL_MODE_WRITE,
+                                               NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, 9);
+    load<Entry::nvnCommandBufferWaitEvent>()(&recorder.commands, &own_event, NVN_EVENT_WAIT_MODE_GEQUAL_WRAP, 10);
+    column(1);
+    const auto unmet = recorder.finish();
+    const auto unmet_before = backend->statistics().synchronize_gpu_waits;
+    const auto fence_unmet = backend->submit_from(1, {&unmet, 1});
+    CHECK(drain_abandoned(*backend, fence_unmet));
+    CHECK(backend->statistics().synchronize_gpu_waits > unmet_before);
+    CHECK(backend->last_error());
+}
+
+// A pending event writer stays authoritative while its completed GPU report
+// is being published. Reevaluating a held wait during that report must not
+// expose the CPU value that preceded the wait and the pending writer.
+void test_event_retirement_publication(id<MTLDevice> device, id<MTL4CommandQueue> queue,
+                                        bool add, bool replay_reports, bool pulse) {
+    auto* probe = [RetirementPauseDevice alloc];
+    probe.target = device;
+    probe->armed.store(false);
+    probe->entered.store(false);
+    probe->released.store(false);
+    TestResources resources(device);
+    auto* bytes = static_cast<std::byte*>(resources.memory.contents);
+    std::memset(bytes, 0, resources.memory.length);
+    nvn::TitlePolicy policy;
+    if (replay_reports) policy.conditional_render = nvn::TitlePolicy::ConditionalRender::replay;
+    nvn::set_title_policy(policy);
+    auto backend = replay::create_replay_backend((id<MTLDevice>)probe, queue, resources);
+    auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget;
+    resources.textures[99] = [device newTextureWithDescriptor:descriptor];
+    auto state = texture_state(99, 4, 4);
+    auto texture = texture_object(state);
+    const NVNtexture* target[]{&texture};
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const NVNshaderData shaders[]{{1, nullptr}, {1, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+    NVNevent event{};
+    auto& event_state = *reinterpret_cast<EventState*>(&event);
+    event_state.tag = object_tag('E', 'V', 'N', 'T');
+    auto* word = reinterpret_cast<volatile std::uint32_t*>(bytes + 0x4000);
+    event_state.value = word;
+    probe->observedWord = word;
+    probe->pausedValue = 15;
+    const auto draw = [&] {
+        load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, target, nullptr, nullptr, nullptr);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    };
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    draw();
+    load<Entry::nvnCommandBufferReportCounter>()(&recorder.commands, NVN_COUNTER_TYPE_TIMESTAMP,
+        TestResources::base + 0x1000);
+    if (pulse)
+        load<Entry::nvnCommandBufferSignalEvent>()(&recorder.commands, &event,
+            NVN_EVENT_SIGNAL_MODE_WRITE, NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, 14);
+    load<Entry::nvnCommandBufferSignalEvent>()(&recorder.commands, &event,
+        add ? NVN_EVENT_SIGNAL_MODE_ADD : NVN_EVENT_SIGNAL_MODE_WRITE, NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, 16);
+    const auto writer = recorder.finish();
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferWaitEvent>()(&recorder.commands, &event, NVN_EVENT_WAIT_MODE_EQUAL, pulse ? 14 : 15);
+    draw();
+    const auto waiter = recorder.finish();
+    id<MTLSharedEvent> gpu_gate = [device newSharedEvent];
+    [queue waitForEvent:gpu_gate value:1];
+    const auto writing = backend->submit_from(1, {&writer, 1});
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (backend->statistics().submissions < 1 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(backend->statistics().submissions == 1);
+    __atomic_store_n(word, 15u, __ATOMIC_SEQ_CST);
+    notify_event_signal_observer(word, 15);
+    const auto waiting = backend->submit_from(2, {&waiter, 1});
+    CHECK(writing && waiting && !backend->wait_fence(waiting, 20'000'000ull));
+    probe->armed.store(true, std::memory_order_release);
+    gpu_gate.signaledValue = 1;
+    const auto paused_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!probe->entered.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < paused_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(probe->entered.load(std::memory_order_acquire));
+    CHECK(__atomic_load_n(word, __ATOMIC_SEQ_CST) == 15);
+    // A notification for another event reevaluates held queues, without
+    // being a new CPU signal of the word on which this queue is parked.
+    auto* other = reinterpret_cast<volatile std::uint32_t*>(bytes + 0x4004);
+    notify_event_signal_observer(other, 0);
+    probe->released.store(true, std::memory_order_release);
+    CHECK(backend->wait_fence(writing, 10'000'000'000ull));
+    CHECK(__atomic_load_n(word, __ATOMIC_SEQ_CST) == (add ? (pulse ? 30u : 31u) : 16u));
+    if (pulse) {
+        // The GPU really published 14 while this queue was parked. That
+        // release stays latched when the next signal replaces the value.
+        CHECK(backend->wait_fence(waiting, 10'000'000'000ull));
+    } else {
+        CHECK(!backend->wait_fence(waiting, 100'000'000ull));
+    }
+    __atomic_store_n(word, 15u, __ATOMIC_SEQ_CST);
+    notify_event_signal_observer(word, 15);
+    CHECK(backend->wait_fence(waiting, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().draws == 2);
+    std::array<std::uint8_t, 64> pixels{};
+    [resources.textures[99] getBytes:pixels.data() bytesPerRow:16
+        fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+    for (unsigned pixel = 0; pixel != 16; ++pixel)
+        CHECK(pixels[pixel * 4] == 0 && pixels[pixel * 4 + 1] == 255 && pixels[pixel * 4 + 3] == 255);
+    nvn::set_title_policy({});
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, writer);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, waiter);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+// Target-specific observations avoid another queue's wait being mistaken
+// for the event being tested. Publication pauses run on the retiring thread.
+struct EventObservation {
+    const volatile std::uint32_t* event = nullptr;
+    std::uint32_t target = 0, next_target = 0;
+    bool pause_signal = false, evaluated = false;
+    std::atomic<bool> parked{false}, next_reached{false}, paused{false}, released{false};
+    replay::ReplaySchedulingPolicy policy() {
+        replay::ReplaySchedulingPolicy result;
+        result.context = this;
+        result.observe_event_wait = [](void* context, const volatile std::uint32_t* event,
+                                       std::uint32_t target, std::uint64_t) {
+            auto& self = *static_cast<EventObservation*>(context);
+            if (event != self.event) return;
+            if (target == self.target) self.parked.store(true, std::memory_order_release);
+            if (target == self.next_target) self.next_reached.store(true, std::memory_order_release);
+        };
+        if (pause_signal)
+            result.observe_event_signal = [](void* context, const volatile std::uint32_t* event,
+                                             std::uint64_t, bool evaluated) {
+                auto& self = *static_cast<EventObservation*>(context);
+                if (event != self.event || evaluated != self.evaluated) return;
+                self.paused.store(true, std::memory_order_release);
+                while (!self.released.load(std::memory_order_acquire))
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            };
+        return result;
+    }
+};
+
+// A wait can reach an ADD after its value was published but while the
+// writer is still registered. Pause before or after evaluating holds under
+// both report policies; retirement needs no further signal to release it.
+void test_event_wait_after_publication(id<MTLDevice> device, id<MTL4CommandQueue> queue,
+                                       bool split, bool replay_reports, bool evaluated) {
+    EventObservation observer;
+    TestResources resources(device);
+    auto* bytes = static_cast<std::byte*>(resources.memory.contents);
+    std::memset(bytes, 0, resources.memory.length);
+    auto* word = reinterpret_cast<volatile std::uint32_t*>(bytes + 0x4000);
+    __atomic_store_n(word, 15u, __ATOMIC_SEQ_CST);
+    observer.event = word; observer.target = 31;
+    observer.pause_signal = true; observer.evaluated = evaluated;
+    nvn::TitlePolicy policy;
+    if (replay_reports) policy.conditional_render = nvn::TitlePolicy::ConditionalRender::replay;
+    nvn::set_title_policy(policy);
+    auto backend = replay::create_replay_backend(device, queue, resources, observer.policy());
+    auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget;
+    resources.textures[99] = [device newTextureWithDescriptor:descriptor];
+    auto state = texture_state(99, 4, 4); auto target = texture_object(state);
+    const NVNtexture* targets[]{&target};
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const NVNshaderData shaders[]{{1, nullptr}, {1, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+    const auto draw = [&] {
+        load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    };
+    NVNevent event{};
+    auto& event_state = *reinterpret_cast<EventState*>(&event);
+    event_state.tag = object_tag('E', 'V', 'N', 'T'); event_state.value = word;
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    draw();
+    load<Entry::nvnCommandBufferSignalEvent>()(&recorder.commands, &event, NVN_EVENT_SIGNAL_MODE_ADD,
+        NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, 16);
+    load<Entry::nvnCommandBufferReportCounter>()(&recorder.commands, NVN_COUNTER_TYPE_TIMESTAMP,
+        TestResources::base + 0x1000);
+    const auto writer = recorder.finish();
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    if (split) load<Entry::nvnCommandBufferBarrier>()(&recorder.commands, 0);
+    load<Entry::nvnCommandBufferWaitEvent>()(&recorder.commands, &event, NVN_EVENT_WAIT_MODE_EQUAL, 31);
+    draw();
+    const auto waiter = recorder.finish();
+    id<MTLSharedEvent> gate = [device newSharedEvent];
+    [queue waitForEvent:gate value:1];
+    const auto writing = backend->submit_from(1, {&writer, 1});
+    gate.signaledValue = 1;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!observer.paused.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(observer.paused.load(std::memory_order_acquire));
+    CHECK(__atomic_load_n(word, __ATOMIC_SEQ_CST) == 31);
+    const auto waiting = backend->submit_from(2, {&waiter, 1});
+    if (split) {
+        // An unmet wait after work creates a separately held continuation
+        // synchronously, before submit returns its second fence.
+        CHECK(waiting == writing + 2);
+    } else {
+        const auto parked_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!observer.parked.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < parked_deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(observer.parked.load(std::memory_order_acquire));
+    }
+    CHECK(__atomic_load_n(word, __ATOMIC_SEQ_CST) == 31);
+    observer.released.store(true, std::memory_order_release);
+    CHECK(backend->wait_fence(writing, 10'000'000'000ull));
+    const bool completed = backend->wait_fence(waiting, 10'000'000'000ull);
+    CHECK(completed);
+    if (!completed) notify_event_signal_observer(word, 31);
+    CHECK(backend->wait_fence(waiting, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().draws == 2);
+    std::array<std::uint8_t, 64> pixels{};
+    [resources.textures[99] getBytes:pixels.data() bytesPerRow:16
+        fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+    for (unsigned pixel = 0; pixel != 16; ++pixel)
+        CHECK(pixels[pixel * 4] == 0 && pixels[pixel * 4 + 1] == 255 && pixels[pixel * 4 + 3] == 255);
+    for (const auto handle : {writer, waiter}) load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+    nvn::set_title_policy({});
+}
+
+enum class EventWriterOrder { after_wait, before_wait, second_wait, reversed_single, reversed_second };
+
+// A wait already parked behind A observes A's pulse, even when B was
+// encoded later. A subsequent wait instead takes the writer current when
+// it is reached. Guest fence numbers need not follow encoding order.
+void test_event_wait_predecessor(id<MTLDevice> device, id<MTL4CommandQueue> queue,
+                                  bool add, bool replay_reports, EventWriterOrder order) {
+    EventObservation observer;
+    TestResources resources(device);
+    std::atomic<bool> marker_seen{false};
+    resources.on_texture_write = [&](const TextureState& texture) {
+        if (texture.serial == 102) marker_seen.store(true, std::memory_order_release);
+    };
+    auto* bytes = static_cast<std::byte*>(resources.memory.contents);
+    std::memset(bytes, 0, resources.memory.length);
+    observer.event = reinterpret_cast<volatile std::uint32_t*>(bytes + 0x4000);
+    observer.target = 11;
+    observer.next_target = order == EventWriterOrder::second_wait || order == EventWriterOrder::reversed_second ? 12 : 0;
+    const std::array<std::array<float, 4>, 3> colors{{{1, 0, 0, 1}, {0, 0, 1, 1}, {0, 1, 0, 1}}};
+    std::memcpy(bytes + 0x200, colors.data(), sizeof colors);
+    nvn::TitlePolicy policy;
+    if (replay_reports) policy.conditional_render = nvn::TitlePolicy::ConditionalRender::replay;
+    nvn::set_title_policy(policy);
+    auto backend = replay::create_replay_backend(device, queue, resources, observer.policy());
+    std::array<NVNtexture, 2> targets{};
+    std::array<TextureState, 2> states{};
+    for (unsigned index = 0; index != targets.size(); ++index) {
+        auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+            width:4 height:4 mipmapped:NO];
+        descriptor.storageMode = MTLStorageModeShared;
+        descriptor.usage = MTLTextureUsageRenderTarget;
+        resources.textures[index ? 102 : 99] = [device newTextureWithDescriptor:descriptor];
+        states[index] = texture_state(index ? 102 : 99, 4, 4);
+        targets[index] = texture_object(states[index]);
+    }
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const NVNshaderData shaders[]{{5, nullptr}, {5, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+    NVNevent event{}, delay{};
+    auto* word = reinterpret_cast<volatile std::uint32_t*>(bytes + 0x4000);
+    auto* delayed = reinterpret_cast<volatile std::uint32_t*>(bytes + 0x4004);
+    auto& event_state = *reinterpret_cast<EventState*>(&event);
+    event_state.tag = object_tag('E', 'V', 'N', 'T'); event_state.value = word;
+    auto& delay_state = *reinterpret_cast<EventState*>(&delay);
+    delay_state.tag = object_tag('E', 'V', 'N', 'T'); delay_state.value = delayed;
+    const auto setup = [&](unsigned color, unsigned target) {
+        const NVNtexture* into[]{&targets[target]};
+        load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, into, nullptr, nullptr, nullptr);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+            TestResources::base + 0x200 + color * 16, 16);
+    };
+    const auto draw = [&] {
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    };
+    const auto signal = [&](unsigned value, NVNeventSignalMode mode = NVN_EVENT_SIGNAL_MODE_WRITE) {
+        load<Entry::nvnCommandBufferSignalEvent>()(&recorder.commands, &event, mode,
+            NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, value);
+    };
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    setup(0, 0); draw();
+    signal(11);
+    signal(add ? 1 : 12, add ? NVN_EVENT_SIGNAL_MODE_ADD : NVN_EVENT_SIGNAL_MODE_WRITE);
+    const auto a = recorder.finish();
+    const bool reversed = order == EventWriterOrder::reversed_single || order == EventWriterOrder::reversed_second;
+    const bool second = order == EventWriterOrder::second_wait || order == EventWriterOrder::reversed_second;
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    setup(1, 0);
+    if (reversed)
+        load<Entry::nvnCommandBufferWaitEvent>()(&recorder.commands, &delay, NVN_EVENT_WAIT_MODE_EQUAL, 1);
+    draw(); signal(13);
+    const auto b = recorder.finish();
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferWaitEvent>()(&recorder.commands, &event, NVN_EVENT_WAIT_MODE_EQUAL, 11);
+    if (second)
+        load<Entry::nvnCommandBufferWaitEvent>()(&recorder.commands, &event, NVN_EVENT_WAIT_MODE_EQUAL, 12);
+    setup(2, 0); draw();
+    const auto waiter = recorder.finish();
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    setup(1, 1); draw();
+    const auto marker = recorder.finish();
+    const auto await = [&](const std::atomic<bool>& value) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!value.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(value.load(std::memory_order_acquire));
+    };
+    id<MTLSharedEvent> gate = [device newSharedEvent];
+    [queue waitForEvent:gate value:1];
+    const auto fence_b_first = reversed ? backend->submit_from(3, {&b, 1}) : 0;
+    const auto fence_a = backend->submit_from(1, {&a, 1});
+    std::uint64_t fence_b = fence_b_first, fence_marker = 0;
+    if (order == EventWriterOrder::before_wait) {
+        fence_b = backend->submit_from(3, {&b, 1});
+        fence_marker = backend->submit_from(4, {&marker, 1});
+        await(marker_seen);
+    }
+    const auto fence_waiter = backend->submit_from(2, {&waiter, 1});
+    await(observer.parked);
+    if (order != EventWriterOrder::before_wait) {
+        if (reversed) {
+            __atomic_store_n(delayed, 1u, __ATOMIC_SEQ_CST);
+            notify_event_signal_observer(delayed, 1);
+        } else {
+            fence_b = backend->submit_from(3, {&b, 1});
+        }
+        fence_marker = backend->submit_from(4, {&marker, 1});
+        // The worker reached a later submission, so B's writer entry has
+        // been registered before A is allowed to publish its pulse.
+        await(marker_seen);
+    }
+    CHECK(fence_a && fence_b && fence_waiter && fence_marker);
+    if (reversed) CHECK(fence_b < fence_a);
+    gate.signaledValue = 1;
+    CHECK(backend->wait_fence(fence_b, 10'000'000'000ull));
+    CHECK(backend->wait_fence(fence_marker, 10'000'000'000ull));
+    CHECK(__atomic_load_n(word, __ATOMIC_SEQ_CST) == 13);
+    const bool passed = backend->wait_fence(fence_waiter, 100'000'000ull);
+    CHECK(passed == (order == EventWriterOrder::after_wait || order == EventWriterOrder::reversed_single));
+    if (second) CHECK(observer.next_reached.load(std::memory_order_acquire));
+    // Rescue a failing waiter only after recording the regression result,
+    // so every test run can drain its real GPU work and finish.
+    __atomic_store_n(word, 11u, __ATOMIC_SEQ_CST);
+    notify_event_signal_observer(word, 11);
+    if (second) {
+        __atomic_store_n(word, 12u, __ATOMIC_SEQ_CST);
+        notify_event_signal_observer(word, 12);
+    }
+    CHECK(backend->wait_fence(fence_waiter, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().draws == 4);
+    std::array<std::uint8_t, 64> pixels{};
+    [resources.textures[99] getBytes:pixels.data() bytesPerRow:16
+        fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+    for (unsigned pixel = 0; pixel != 16; ++pixel)
+        CHECK(pixels[pixel * 4] == 0 && pixels[pixel * 4 + 1] == 255 && pixels[pixel * 4 + 3] == 255);
+    nvn::set_title_policy({});
+    for (const auto handle : {a, b, waiter, marker})
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+// A queue held at an event wait goes on once a write that meets the wait is
+// encoded, before the writing submission runs: the queue orders the waiter
+// after it. Queue 1's writer is gated on the GPU; queue 2's leading wait is
+// encoded while the writer has not retired, without a GPU drain, and runs
+// after it. An add's result depends on the writes before it landing, so a wait on it stays held
+// until the adding submission retires. A wait after other work in its
+// submission that an encoded write meets does not split the submission. The
+// newest encoded writer decides: a value in memory that meets the wait, or an
+// older writer's value, does not release it while a newer writer that leaves
+// another value has not run. A CPU signal is the exception: a queue parked at
+// the wait, or reaching it before the pending write lands, sees its value.
+void test_event_hold_release_at_encode(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    std::memset(resources.memory.contents, 0, resources.memory.length);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget;
+    resources.textures[99] = [device newTextureWithDescriptor:descriptor];
+    auto state = texture_state(99, 4, 4);
+    auto target = texture_object(state);
+    const NVNtexture* targets[]{&target};
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const NVNshaderData shaders[]{{5, nullptr}, {5, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+    auto* memory = static_cast<std::byte*>(resources.memory.contents);
+    constexpr auto green = TestResources::base + 0x200;
+    constexpr auto red = TestResources::base + 0x210;
+    const std::array<float, 4> color{0, 1, 0, 1}, red_color{1, 0, 0, 1};
+    std::memcpy(memory + 0x200, color.data(), 16);
+    std::memcpy(memory + 0x210, red_color.data(), 16);
+    NVNevent event{};
+    auto& event_state = *reinterpret_cast<EventState*>(&event);
+    event_state.tag = object_tag('E', 'V', 'N', 'T');
+    auto* word = reinterpret_cast<volatile std::uint32_t*>(memory + 0x4020);
+    event_state.value = word;
+    const auto setup = [&] {
+        load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, green, 16);
+    };
+    const auto begin = [&] {
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        setup();
+    };
+    const auto column = [&](int x) {
+        load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, x, 0, 1, 4);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    };
+    // A submission that begins with the wait: its wait is a leading one.
+    const auto waiting = [&](std::uint32_t value, int x) {
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        load<Entry::nvnCommandBufferWaitEvent>()(&recorder.commands, &event, NVN_EVENT_WAIT_MODE_EQUAL, value);
+        setup(); column(x);
+        return recorder.finish();
+    };
+    // A writer draws its column red when `first`: the waiter drawing it green
+    // afterwards shows the GPU ran the writer first.
+    const auto signal = [&](int x, NVNeventSignalMode mode, std::uint32_t value, bool first = false) {
+        begin();
+        if (first)
+            load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, red, 16);
+        column(x);
+        load<Entry::nvnCommandBufferSignalEvent>()(&recorder.commands, &event, mode,
+                                                   NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, value);
+        return recorder.finish();
+    };
+    const auto encoded = [&](std::uint64_t count, int milliseconds) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+        while (backend->statistics().submissions < count && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return backend->statistics().submissions >= count;
+    };
+
+    // A write of 7, gated: the leading wait for 7 is encoded before it runs,
+    // and runs after it (column 1 ends green).
+    {
+        id<MTLSharedEvent> gate = [device newSharedEvent];
+        [queue waitForEvent:gate value:1];
+        const auto writer = signal(1, NVN_EVENT_SIGNAL_MODE_WRITE, 7, true);
+        const auto waiter = waiting(7, 1);
+        const auto before = backend->statistics().submissions;
+        const auto drains = backend->statistics().synchronize_gpu_waits;
+        const auto fence_waiter = backend->submit_from(2, {&waiter, 1});
+        const auto fence_writer = backend->submit_from(1, {&writer, 1});
+        CHECK(fence_waiter && fence_writer && fence_writer == fence_waiter + 1);
+        CHECK(encoded(before + 2, 5000));
+        CHECK(backend->completed_fence() < fence_writer && *word == 0);
+        gate.signaledValue = 1;
+        CHECK(backend->wait_fence(fence_writer, 10'000'000'000ull) && backend->wait_fence(fence_waiter, 10'000'000'000ull));
+        CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+        CHECK(backend->statistics().synchronize_gpu_waits == drains && *word == 7);
+    }
+    // An add of 7 to 7, gated: the wait for 14 stays held until it retires.
+    {
+        id<MTLSharedEvent> gate = [device newSharedEvent];
+        [queue waitForEvent:gate value:1];
+        const auto writer = signal(2, NVN_EVENT_SIGNAL_MODE_ADD, 7);
+        const auto waiter = waiting(14, 3);
+        const auto before = backend->statistics().submissions;
+        const auto fence_writer = backend->submit_from(1, {&writer, 1});
+        const auto fence_waiter = backend->submit_from(2, {&waiter, 1});
+        CHECK(fence_writer && fence_waiter && fence_waiter == fence_writer + 1);
+        CHECK(encoded(before + 1, 5000));
+        CHECK(!encoded(before + 2, 200));
+        CHECK(backend->completed_fence() < fence_writer);
+        gate.signaledValue = 1;
+        CHECK(backend->wait_fence(fence_writer, 10'000'000'000ull) && backend->wait_fence(fence_waiter, 10'000'000'000ull));
+        CHECK(!backend->last_error() && backend->statistics().skipped == 0 && *word == 14);
+    }
+    // A write of 9, gated and encoded first: the wait for 9 after a draw of
+    // the next submission neither splits it nor waits for the writer.
+    {
+        id<MTLSharedEvent> gate = [device newSharedEvent];
+        [queue waitForEvent:gate value:1];
+        const auto writer = signal(0, NVN_EVENT_SIGNAL_MODE_WRITE, 9);
+        const auto before = backend->statistics().submissions;
+        const auto fence_writer = backend->submit_from(1, {&writer, 1});
+        CHECK(fence_writer && encoded(before + 1, 5000));
+        begin(); column(2);
+        load<Entry::nvnCommandBufferWaitEvent>()(&recorder.commands, &event, NVN_EVENT_WAIT_MODE_EQUAL, 9);
+        column(2);
+        const auto waiter = recorder.finish();
+        const auto fence_waiter = backend->submit_from(2, {&waiter, 1});
+        CHECK(fence_waiter && fence_waiter == fence_writer + 1);
+        CHECK(encoded(before + 2, 5000));
+        CHECK(backend->completed_fence() < fence_writer);
+        gate.signaledValue = 1;
+        CHECK(backend->wait_fence(fence_writer, 10'000'000'000ull) && backend->wait_fence(fence_waiter, 10'000'000'000ull));
+        CHECK(!backend->last_error() && backend->statistics().skipped == 0 && *word == 9);
+    }
+    // The event holds 9, which the wait for 9 accepts, but a gated write of
+    // 10 runs before the waiter: the wait stays held, also once the write
+    // landed, until a CPU signal of 9.
+    {
+        id<MTLSharedEvent> gate = [device newSharedEvent];
+        [queue waitForEvent:gate value:1];
+        const auto writer = signal(3, NVN_EVENT_SIGNAL_MODE_WRITE, 10);
+        const auto waiter = waiting(9, 3);
+        const auto before = backend->statistics().submissions;
+        const auto fence_writer = backend->submit_from(1, {&writer, 1});
+        CHECK(fence_writer && encoded(before + 1, 5000));
+        const auto fence_waiter = backend->submit_from(2, {&waiter, 1});
+        CHECK(fence_waiter && fence_waiter == fence_writer + 1);
+        CHECK(!encoded(before + 2, 200));
+        gate.signaledValue = 1;
+        CHECK(backend->wait_fence(fence_writer, 10'000'000'000ull) && *word == 10);
+        CHECK(!encoded(before + 2, 200));
+        *word = 9;
+        armigo::nvn::notify_event_signal_observer(word, 9);
+        CHECK(backend->wait_fence(fence_waiter, 10'000'000'000ull));
+        CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+    }
+    // Writes of 11 and then 12, gated: the wait for 11 stays held when the
+    // write of 11 retires, as the write of 12 runs before the waiter.
+    {
+        id<MTLSharedEvent> gate = [device newSharedEvent];
+        [queue waitForEvent:gate value:1];
+        const auto first = signal(3, NVN_EVENT_SIGNAL_MODE_WRITE, 11);
+        const auto second = signal(3, NVN_EVENT_SIGNAL_MODE_WRITE, 12);
+        const auto waiter = waiting(11, 3);
+        const auto before = backend->statistics().submissions;
+        const auto fence_first = backend->submit_from(1, {&first, 1});
+        const auto fence_second = backend->submit_from(1, {&second, 1});
+        CHECK(fence_first && fence_second && encoded(before + 2, 5000));
+        const auto fence_waiter = backend->submit_from(2, {&waiter, 1});
+        CHECK(fence_waiter && fence_waiter == fence_second + 1);
+        gate.signaledValue = 1;
+        CHECK(backend->wait_fence(fence_second, 10'000'000'000ull) && *word == 12);
+        CHECK(!encoded(before + 3, 200));
+        *word = 11;
+        armigo::nvn::notify_event_signal_observer(word, 11);
+        CHECK(backend->wait_fence(fence_waiter, 10'000'000'000ull));
+        CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+    }
+    // A wait for 13 is held behind a gated write of 14. A CPU signal of 13
+    // while that write is still pending releases it: the parked queue sees
+    // 13 before the write lands, as a queue parked on the hardware would.
+    // Judged by the pending write alone, the wait would stay held after the
+    // write of 14 landed, until something signalled 13 again.
+    {
+        id<MTLSharedEvent> gate = [device newSharedEvent];
+        [queue waitForEvent:gate value:1];
+        const auto writer = signal(3, NVN_EVENT_SIGNAL_MODE_WRITE, 14);
+        const auto waiter = waiting(13, 3);
+        const auto before = backend->statistics().submissions;
+        const auto fence_writer = backend->submit_from(1, {&writer, 1});
+        CHECK(fence_writer && encoded(before + 1, 5000));
+        const auto fence_waiter = backend->submit_from(2, {&waiter, 1});
+        CHECK(fence_waiter && fence_waiter == fence_writer + 1);
+        CHECK(!encoded(before + 2, 200));
+        *word = 13;
+        armigo::nvn::notify_event_signal_observer(word, 13);
+        CHECK(encoded(before + 2, 5000));
+        CHECK(backend->completed_fence() < fence_writer);
+        gate.signaledValue = 1;
+        CHECK(backend->wait_fence(fence_writer, 10'000'000'000ull));
+        CHECK(backend->wait_fence(fence_waiter, 2'000'000'000ull));
+        CHECK(!backend->last_error() && backend->statistics().skipped == 0 && *word == 14);
+    }
+    // A CPU signal preceding a new wait cannot override its pending writer:
+    // host memory may still hold that CPU value after GPU execution but
+    // before retirement publishes the writer's deferred signal. WRITE and
+    // ADD both keep the new wait parked until a fresh CPU signal releases it.
+    for (const auto mode : {NVN_EVENT_SIGNAL_MODE_WRITE, NVN_EVENT_SIGNAL_MODE_ADD}) {
+        id<MTLSharedEvent> gate = [device newSharedEvent];
+        [queue waitForEvent:gate value:1];
+        *word = 0;
+        const auto writer = signal(3, mode, 16);
+        const auto waiter = waiting(15, 3);
+        const auto before = backend->statistics().submissions;
+        const auto fence_writer = backend->submit_from(1, {&writer, 1});
+        CHECK(fence_writer && encoded(before + 1, 5000));
+        *word = 15;
+        armigo::nvn::notify_event_signal_observer(word, 15);
+        const auto fence_waiter = backend->submit_from(2, {&waiter, 1});
+        CHECK(fence_waiter && !encoded(before + 2, 200));
+        CHECK(backend->completed_fence() < fence_writer);
+        gate.signaledValue = 1;
+        CHECK(backend->wait_fence(fence_writer, 10'000'000'000ull));
+        CHECK(*word == (mode == NVN_EVENT_SIGNAL_MODE_WRITE ? 16u : 31u));
+        CHECK(!encoded(before + 2, 200));
+        *word = 15;
+        armigo::nvn::notify_event_signal_observer(word, 15);
+        CHECK(backend->wait_fence(fence_waiter, 10'000'000'000ull));
+        CHECK(!backend->last_error() && backend->statistics().skipped == 0 && *word == 15);
+    }
+    std::array<std::uint8_t, 64> pixels{};
+    [resources.textures[99] getBytes:pixels.data() bytesPerRow:16
+        fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+    for (unsigned y = 0; y < 4; ++y)
+        for (unsigned x = 0; x < 4; ++x) {
+            const auto* pixel = pixels.data() + (y * 4 + x) * 4;
+            CHECK(pixel[0] == 0 && pixel[1] == 255 && pixel[2] == 0);
+        }
+}
+
+// ARMIGO_NVN_GPUPROF=every:1 times every encoder of a profiled frame: a frame
+// with one draw reports a render encoder line and the frame's totals once its
+// fence completed and the next frame boundaries passed.
+void test_gpu_profile(id<MTLDevice> device, id<MTL4CommandQueue> queue, unsigned kind) {
+    struct Lines {
+        mutable std::mutex mutex;
+        std::vector<std::string> written;
+        const diag::Level saved = diag::minimum_level();
+        Lines() {
+            diag::testing_set_level(diag::Level::info);
+            diag::testing_set_sink([](diag::Level, std::string_view line, void* context) {
+                auto& self = *static_cast<Lines*>(context);
+                const std::lock_guard lock(self.mutex);
+                self.written.emplace_back(line);
+            }, this);
+        }
+        ~Lines() {
+            diag::testing_set_sink(nullptr, nullptr);
+            diag::testing_set_level(saved);
+        }
+        std::size_t count(std::string_view needle) const {
+            const std::lock_guard lock(mutex);
+            return static_cast<std::size_t>(std::ranges::count_if(written, [&](const std::string& line) {
+                return line.find(needle) != std::string::npos;
+            }));
+        }
+    } lines;
+    struct RestoreEnv {
+        ~RestoreEnv() { unsetenv("ARMIGO_NVN_GPUPROF"); }
+    } restore_env;
+    setenv("ARMIGO_NVN_GPUPROF", "every:1", 1);
+    TestResources resources(device);
+    std::memset(resources.memory.contents, 0, resources.memory.length);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget;
+    resources.textures[99] = [device newTextureWithDescriptor:descriptor];
+    auto state = texture_state(99, 4, 4);
+    auto target = texture_object(state);
+    const NVNtexture* targets[]{&target};
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const auto marker = kind == 0 ? 5u : kind == 1 ? 81u : 82u;
+    const NVNshaderData shaders[]{{marker, nullptr}, {marker, nullptr}, {marker, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, kind == 2 ? 3 : 2, shaders));
+    const std::array<float, 4> color{0, 1, 0, 1};
+    std::memcpy(static_cast<std::byte*>(resources.memory.contents) + 0x200, color.data(), 16);
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+    if (kind) bind_mesh_program(&recorder.commands, &program, kind == 2);
+    else load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+                                                     TestResources::base + 0x200, 16);
+    // A masked clear requires its own encoded call before the render pass,
+    // covering call and render entries at different counter-heap offsets.
+    const float clear[]{0, 0, 0, 1};
+    load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, clear, 1);
+    if (kind == 0)
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    else
+        command_draw_mesh_tasks(&recorder.commands, 0, 1);
+    const auto draw = recorder.finish();
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    const auto empty = recorder.finish();
+    // Frame 1 is profiled from its boundary on; frame 2's boundary closes it,
+    // and a boundary after its fence completed reports it.
+    backend->finish_frame(0);
+    const auto profiled = backend->submit({&draw, 1});
+    backend->finish_frame(0);
+    CHECK(profiled && backend->wait_fence(profiled, 10'000'000'000ull));
+    backend->finish_frame(0);
+    const auto after = backend->submit({&empty, 1});
+    CHECK(after && backend->wait_fence(after, 10'000'000'000ull));
+    CHECK(!backend->last_error());
+    CHECK(lines.count("nvn_gpuprof frame=") >= 1);
+    CHECK(lines.count("kind=render") >= 1);
+    CHECK(lines.count("kind=call") >= 1);
+    CHECK(lines.count("end_stage=") >= 1);
+    const auto expected_stage = kind == 0 ? "begin_stage=1 " : kind == 1 ? "begin_stage=16 " : "begin_stage=8 ";
+    CHECK(lines.count(expected_stage) >= 1);
+    CHECK(backend->statistics().draws == 1 && backend->statistics().skipped == 0);
+    CHECK(lines.count("nvn_gpuprof_frame frame=") == 1);
+    CHECK(lines.count("call_ms=") == 1);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, draw);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, empty);
+}
+
 void test_event_waits_inside_submissions(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
     TestResources resources(device);
     std::memset(resources.memory.contents, 0, resources.memory.length);
@@ -4403,18 +6410,21 @@ void test_held_parts_beyond_slots(id<MTLDevice> device, id<MTL4CommandQueue> que
     load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
 }
 
-// While queue 1 is held at a wait inside its submission, queue 2's forty
+// While queue 1 is held at a wait inside its submission, queue 2's 320
 // submissions run and retire: each adds 1 to a counter event, queue 2's last
 // fence completes (a guest wait on it returns) while queue 1's does not, and
 // the history later encodes order against stays small because retired
 // submissions leave it although the contiguous fence stays behind the held
 // one. Once a CPU signal releases queue 1, every fence publishes, the counter
-// holds 40 (each effect applied once), and queue 1's rest draws column 1 with
-// its own state.
+// holds 320 (each effect applied once), and queue 1's rest draws column 1 with
+// its own state and residency after the shared set's 256-submission sweep
+// window has passed.
 void test_sustained_hold(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
     TestResources resources(device);
     std::memset(resources.memory.contents, 0, resources.memory.length);
-    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto* probe = [ResidencyProbeDevice alloc];
+    probe.target = device;
+    auto backend = replay::create_replay_backend((id<MTLDevice>)probe, queue, resources);
     auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
         width:4 height:4 mipmapped:NO];
     descriptor.storageMode = MTLStorageModeShared;
@@ -4451,9 +6461,10 @@ void test_sustained_hold(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
     column(1);
     std::vector<NVNcommandHandle> handles{recorder.finish()};
     const auto fence_held = backend->submit_from(1, {&handles.back(), 1});
+    constexpr unsigned intervening_submissions = 320;
     std::uint64_t fence_last = 0;
     const auto arenas_before = backend->statistics().upload_arena_allocations;
-    for (unsigned i = 0; i < 40; ++i) {
+    for (unsigned i = 0; i < intervening_submissions; ++i) {
         load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
         // An inline uniform update takes upload memory every submission.
         const std::array<std::uint32_t, 4> values{i, i + 1, i + 2, i + 3};
@@ -4466,20 +6477,24 @@ void test_sustained_hold(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
     }
     const auto* count = reinterpret_cast<volatile std::uint32_t*>(memory + 0x4010);
     CHECK(backend->wait_fence(fence_last, 10'000'000'000ull) && backend->fence_completed(fence_last));
-    CHECK(*count == 40);
+    CHECK(*count == intervening_submissions);
     CHECK(backend->completed_fence() < fence_held && !backend->fence_completed(fence_held));
     CHECK(backend->statistics().unretired_history <= 8);
     // Upload arenas are reused once their submission retired, not only once
     // the held fence publishes.
     CHECK(backend->statistics().upload_arena_allocations - arenas_before <= 8);
+    // Unrelated submissions must not inherit the held submission's carry:
+    // its retired first part no longer protects this unused allocation.
+    CHECK(probe.residency && ![probe.residency containsAllocation:resources.textures[102]]);
     register_sync_entries();
     load<Entry::nvnEventSignal>()(&release, NVN_EVENT_SIGNAL_MODE_WRITE, 1);
     CHECK(fence_held < fence_last && backend->wait_fence(fence_held, 10'000'000'000ull));
     CHECK(backend->completed_fence() == fence_last);
-    CHECK(!backend->last_error() && backend->statistics().skipped == 0 && *count == 40);
+    CHECK([probe.residency containsAllocation:resources.textures[102]]);
+    CHECK(!backend->last_error() && backend->statistics().skipped == 0 && *count == intervening_submissions);
     // A CPU access with nothing in flight returns at once.
     CHECK(resources.completion_hook && resources.completion_hook());
-    CHECK(reinterpret_cast<const std::uint32_t*>(memory + 0x300)[0] == 39);
+    CHECK(reinterpret_cast<const std::uint32_t*>(memory + 0x300)[0] == intervening_submissions - 1);
     std::array<std::uint8_t, 64> pixels{};
     [resources.textures[102] getBytes:pixels.data() bytesPerRow:16
         fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
@@ -4696,7 +6711,7 @@ void test_invalid_leading_waits_fail(id<MTLDevice> device, id<MTL4CommandQueue> 
             return;
         }
         const auto fence = backend->submit({&handle, 1});
-        CHECK(fence && backend->wait_fence(fence, 2'000'000'000ull));
+        CHECK(drain_abandoned(*backend, fence));
         CHECK(backend->last_error().code == (unknown_mode ? replay::ReplayErrorCode::unsupported
                                                           : replay::ReplayErrorCode::invalid_command));
         load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
@@ -4752,6 +6767,136 @@ void test_frame_work_with_held_queue(id<MTLDevice> device, id<MTL4CommandQueue> 
 // A texture registered as an image without shader-write usage: its first
 // write gives it writable storage, with the old texels copied over first.
 // The dispatch writes the corner green; the rest stays the red it held.
+void test_storage_image_format_view(id<MTLDevice> device, id<MTL4CommandQueue> queue, int mode) {
+    const bool cpu_rewrite = mode == 1, pending_writer = mode >= 2;
+    replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
+    id<MTLBuffer> memory = [device newBufferWithLength:0x10000 options:MTLResourceStorageModeShared];
+    MemoryPoolState pool{};
+    pool.tag = object_tag('P', 'O', 'O', 'L');
+    pool.memory = static_cast<std::uint8_t*>(memory.contents);
+    pool.size = memory.length;
+    pool.flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+    CHECK(resources.register_pool(pool));
+    auto state = texture_state(4300, 4, 4);
+    state.pool = &pool; state.memory = pool.memory; state.offset = 0;
+    state.description.flags = 0;
+    const auto layout = resource_layout(state);
+    CHECK(layout.has_value());
+    if (!layout) return;
+    state.size = layout->total_size; state.layer_size = layout->layer_stride;
+    const auto write_guest = [&](std::uint32_t color) {
+        std::array<std::uint32_t, 16> pixels;
+        pixels.fill(color);
+        TexelTransfer transfer;
+        transfer.region = {0, 0, 0, 4, 4, 1};
+        transfer.row_stride = 16; transfer.image_stride = 64;
+        CHECK(transfer_pool_texels(state, transfer, reinterpret_cast<std::byte*>(pixels.data()), true));
+    };
+    if (cpu_rewrite) write_guest(0xff0000ffu);
+    resources.register_texture(state);
+    id<MTLTexture> original = resources.texture(state, nullptr);
+    CHECK(original && !(original.usage & MTLTextureUsagePixelFormatView));
+    CHECK(resources.flush_uploads());
+    id<MTLCommandQueue> initialization_queue = [device newCommandQueue];
+    auto* clear = [MTLRenderPassDescriptor renderPassDescriptor];
+    clear.colorAttachments[0].texture = original;
+    clear.colorAttachments[0].loadAction = MTLLoadActionClear;
+    clear.colorAttachments[0].storeAction = MTLStoreActionStore;
+    clear.colorAttachments[0].clearColor = MTLClearColorMake(1, 0, 0, 1);
+    if (!cpu_rewrite && !pending_writer) {
+        auto command = [initialization_queue commandBuffer];
+        auto encoder = [command renderCommandEncoderWithDescriptor:clear];
+        [encoder endEncoding]; [command commit]; [command waitUntilCompleted];
+        CHECK(command.status == MTLCommandBufferStatusCompleted);
+    }
+    const auto read_pixels = [&](id<MTLTexture> source) {
+        id<MTLBuffer> bytes = [device newBufferWithLength:1024 options:MTLResourceStorageModeShared];
+        auto copy = [initialization_queue commandBuffer];
+        auto blit = [copy blitCommandEncoder];
+        [blit copyFromTexture:source sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+            sourceSize:MTLSizeMake(4, 4, 1) toBuffer:bytes destinationOffset:0 destinationBytesPerRow:256 destinationBytesPerImage:1024];
+        [blit endEncoding]; [copy commit]; [copy waitUntilCompleted];
+        CHECK(copy.status == MTLCommandBufferStatusCompleted);
+        std::array<std::uint32_t, 16> pixels{};
+        for (unsigned row = 0; row != 4; ++row)
+            std::memcpy(pixels.data() + row * 4, static_cast<const std::byte*>(bytes.contents) + row * 256, 16);
+        return pixels;
+    };
+    if (!pending_writer)
+        for (const auto value : read_pixels(original)) CHECK(value == 0xff0000ffu);
+    if (!cpu_rewrite && !pending_writer) {
+        resources.note_gpu_write(state);
+        resources.complete_gpu_writes(resources.gpu_write_generation());
+    } else if (cpu_rewrite) {
+        // Do not resolve the texture after this tracked CPU rewrite. The image
+        // upgrade must preserve the new backing bytes, not its stale texels.
+        write_guest(0xffff0000u);
+    }
+    TextureViewState view{};
+    view.sets_format = 1; view.format = NVN_FORMAT_R32UI;
+    resources.register_texture_descriptor(43, state, &view);
+    auto output = state;
+    output.serial = 4301; output.offset = 0x4000; output.memory = pool.memory + output.offset;
+    resources.register_texture(output);
+    resources.register_texture_descriptor(44, state, nullptr);
+    const std::array<std::uint32_t, 3> groups{1, 1, 1};
+    std::memcpy(pool.memory + 0x8000, groups.data(), sizeof groups);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    Recorder recorder;
+    std::array<std::byte, 0x100> control{};
+    control[0x56] = std::byte{NVN_SHADER_STAGE_COMPUTE};
+    control[0xb6] = std::byte{1}; control[0xba] = std::byte{0x18};
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const auto set = load<Entry::nvnProgramSetShaders>();
+    select_api_version({231, 40});
+    const NVNshaderData shaders[]{{134, control.data()}};
+    CHECK(set(&program, 1, shaders));
+    select_api_version({55, 15});
+    NVNprogram drawing{};
+    if (pending_writer) {
+        CHECK(load<Entry::nvnProgramInitialize>()(&drawing, &recorder.device));
+        const NVNshaderData graphics[]{{138, nullptr}, {138, nullptr}};
+        CHECK(set(&drawing, 2, graphics));
+    }
+    auto target = texture_object(state), destination = texture_object(output);
+    const NVNtexture* source_targets[]{&target};
+    const NVNtexture* destination_targets[]{&destination};
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    if (pending_writer) {
+        load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, source_targets, nullptr, nullptr, nullptr);
+        const float red[]{1, 0, 0, 1};
+        load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, red, 15);
+    }
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_COMPUTE_BIT);
+    load<Entry::nvnCommandBufferBindImage>()(&recorder.commands, NVN_SHADER_STAGE_COMPUTE, 0, 43);
+    if (mode == 3)
+        load<Entry::nvnCommandBufferDispatchComputeIndirect>()(&recorder.commands,
+            reinterpret_cast<std::uint64_t>(pool.memory + 0x8000));
+    else
+    load<Entry::nvnCommandBufferDispatchCompute>()(&recorder.commands, 1, 1, 1);
+    if (pending_writer) {
+        load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, destination_targets, nullptr, nullptr, nullptr);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &drawing, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, combined_handle(44, 0));
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    }
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().image_sinks == 0);
+    auto sample = resources.texture(pending_writer ? output : state, nullptr);
+    const auto pixels = read_pixels(sample);
+    CHECK(pixels[0] == 0xff00ff00u);
+    for (unsigned pixel = 1; pixel != 16; ++pixel) CHECK(pixels[pixel] == (cpu_rewrite ? 0xffff0000u : 0xff0000ffu));
+    CHECK(state.description.flags == 0);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&program);
+    if (pending_writer) load<Entry::nvnProgramFinalize>()(&drawing);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+    resources.release_pool(pool);
+}
+
 void test_storage_image_upgrade(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
     TestResources resources(device);
     std::memset(resources.memory.contents, 0, resources.memory.length);
@@ -4795,6 +6940,191 @@ void test_storage_image_upgrade(id<MTLDevice> device, id<MTL4CommandQueue> queue
     CHECK(pixels[0] == 0 && pixels[1] == 255);
     for (unsigned pixel = 1; pixel < 16; ++pixel)
         CHECK(pixels[pixel * 4] == 255 && pixels[pixel * 4 + 1] == 0);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+// A supplied handle cannot turn into an unrelated direct binding when its
+// descriptor is missing or its format view is refused.
+void test_image_resolution_errors(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    for (const bool graphics : {false, true}) for (const bool bad_view : {false, true}) {
+        TestResources resources(device);
+        std::memset(resources.memory.contents, 0, resources.memory.length);
+        auto* words = static_cast<std::uint32_t*>(resources.memory.contents);
+        words[0x200 / 4] = bad_view ? 43 : 77;
+        words[0x400 / 4] = 0xdeadbeefu;
+        auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+            (bad_view ? MTLPixelFormatR32Uint : MTLPixelFormatRGBA8Unorm) width:4 height:4 mipmapped:NO];
+        descriptor.storageMode = MTLStorageModeShared;
+        descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        id<MTLTexture> poison = [device newTextureWithDescriptor:descriptor];
+        std::array<std::uint32_t, 16> initial; initial.fill(0xff0000ffu);
+        [poison replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:initial.data() bytesPerRow:16];
+        resources.texture_ids[44] = poison;
+        bool queried_poison = false;
+        resources.on_texture_lookup = [&] { queried_poison |= resources.last_texture_lookup == 44; };
+        if (bad_view) {
+            descriptor.pixelFormat = MTLPixelFormatR16Float;
+            resources.texture_ids[43] = [device newTextureWithDescriptor:descriptor];
+            resources.texture_id_serials[43] = 4343;
+            // The base is known, but a requested R32 view has incompatible texel size.
+            resources.refused_texture_views.insert(43);
+        }
+        descriptor.pixelFormat = MTLPixelFormatRGBA8Unorm;
+        descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        resources.textures[96] = [device newTextureWithDescriptor:descriptor];
+        auto state = texture_state(96, 4, 4); auto target = texture_object(state);
+        const NVNtexture* targets[]{&target};
+        auto backend = replay::create_replay_backend(device, queue, resources);
+        Recorder recorder;
+        NVNprogram program{};
+        CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+        const std::uint64_t marker = bad_view ? 136 : 135;
+        const NVNshaderData shaders[]{{marker, nullptr}, {marker, nullptr}};
+        CHECK(load<Entry::nvnProgramSetShaders>()(&program, graphics ? 2 : 1, shaders));
+        const auto stage = graphics ? NVN_SHADER_STAGE_FRAGMENT : NVN_SHADER_STAGE_COMPUTE;
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        if (graphics)
+            load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program,
+            graphics ? NVN_SHADER_STAGE_ALL_GRAPHICS_BITS : NVN_SHADER_STAGE_COMPUTE_BIT);
+        load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, stage, 0, TestResources::base + 0x200, 4);
+        load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, stage, 0, TestResources::base + 0x400, 4);
+        load<Entry::nvnCommandBufferBindImage>()(&recorder.commands, stage, 3, 44);
+        if (graphics) load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+        else load<Entry::nvnCommandBufferDispatchCompute>()(&recorder.commands, 1, 1, 1);
+        const auto handle = recorder.finish();
+        const auto fence = backend->submit({&handle, 1});
+        CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+        CHECK(!backend->last_error());
+        const auto reasons = backend->skip_reasons();
+        CHECK(std::any_of(reasons.begin(), reasons.end(), [](const auto& reason) {
+            return reason.first == "resolved storage image is unavailable" && reason.second == 1;
+        }));
+        CHECK(!queried_poison && backend->statistics().skipped == 1);
+        CHECK(backend->statistics().draws == 0 && backend->statistics().dispatches == 0 && backend->statistics().image_sinks == 0);
+        CHECK(resources.image_upgrades == 0 && words[0x400 / 4] == 0xdeadbeefu);
+        std::array<std::uint32_t, 16> pixels{};
+        [poison getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+        CHECK(pixels == initial);
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+        load<Entry::nvnProgramFinalize>()(&program);
+        load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+    }
+}
+
+// Missing or truncated descriptors cannot select unrelated storage. A valid
+// zero descriptor reads zeros, and its writes cannot corrupt those defaults.
+void test_storage_descriptor_resolution_errors(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    for (unsigned mode = 0; mode != 4; ++mode) {
+        TestResources resources(device);
+        std::memset(resources.memory.contents, 0, resources.memory.length);
+        auto* words = static_cast<std::uint32_t*>(resources.memory.contents);
+        words[0x400 / 4] = 0xdeadbeefu;
+        auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+            width:4 height:4 mipmapped:NO];
+        descriptor.storageMode = MTLStorageModeShared;
+        descriptor.usage = MTLTextureUsageRenderTarget;
+        resources.textures[96] = [device newTextureWithDescriptor:descriptor];
+        auto state = texture_state(96, 4, 4); auto target = texture_object(state);
+        const NVNtexture* targets[]{&target};
+        auto backend = replay::create_replay_backend(device, queue, resources);
+        Recorder recorder;
+        NVNprogram program{};
+        CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+        const std::uint64_t marker = mode == 2 ? 141 : 16;
+        const NVNshaderData shaders[]{{marker, nullptr}, {marker, nullptr}};
+        CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+        NVNprogram writer{};
+        if (mode == 2) {
+            CHECK(load<Entry::nvnProgramInitialize>()(&writer, &recorder.device));
+            const NVNshaderData writes[]{{140, nullptr}, {140, nullptr}};
+            CHECK(load<Entry::nvnProgramSetShaders>()(&writer, 2, writes));
+        }
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        if (mode != 0)
+            load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+                mode == 3 ? TestResources::base + resources.memory.length + 0x200 : TestResources::base + 0x200,
+                mode == 1 ? 8 : 12);
+        load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+            TestResources::base + 0x400, 4);
+        if (mode == 2) {
+            load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &writer, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+            load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+            load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        }
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+        const auto handle = recorder.finish();
+        const auto fence = backend->submit({&handle, 1});
+        CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+        CHECK(!backend->last_error());
+        const auto reasons = backend->skip_reasons();
+        if (mode == 2) {
+            CHECK(reasons.empty() && backend->statistics().draws == 2 && backend->statistics().skipped == 0);
+            std::array<std::uint8_t, 64> pixels{};
+            [resources.textures[96] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+            for (unsigned pixel = 0; pixel < 16; ++pixel)
+                CHECK(pixels[pixel * 4] == 0 && pixels[pixel * 4 + 1] == 0 && pixels[pixel * 4 + 2] == 0 && pixels[pixel * 4 + 3] == 255);
+        } else {
+            CHECK(std::any_of(reasons.begin(), reasons.end(), [](const auto& reason) {
+                return reason.first == "storage buffer descriptor is unavailable" && reason.second == 1;
+            }));
+            CHECK(backend->statistics().draws == 0 && backend->statistics().skipped == 1);
+        }
+        CHECK(words[0x400 / 4] == 0xdeadbeefu);
+        if (mode == 2) load<Entry::nvnProgramFinalize>()(&writer);
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+        load<Entry::nvnProgramFinalize>()(&program);
+        load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+    }
+}
+
+// An unbound image handle names the reference write sink:
+// the dispatch runs instead of being skipped, and nothing is written anywhere.
+void test_storage_image_without_texture(id<MTLDevice> device, id<MTL4CommandQueue> queue, int mode) {
+    const bool invalid_handle = mode == 1;
+    const std::int32_t id = mode == 1 ? 77 : mode == 2 ? 0xfffff : mode == 3 ? 78 : 0;
+    TestResources resources(device);
+    if (mode >= 2) resources.empty_texture_ids.insert(id);
+    std::memset(resources.memory.contents, 0, resources.memory.length);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    Recorder recorder;
+    std::array<std::byte, 0x100> control{};
+    control[0x56] = std::byte{NVN_SHADER_STAGE_COMPUTE};
+    control[0xb6] = std::byte{1};
+    control[0xba] = std::byte{0x18};
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const auto set_shaders = load<Entry::nvnProgramSetShaders>();
+    select_api_version({231, 40});
+    const NVNshaderData shaders[]{{90, control.data()}};
+    CHECK(set_shaders(&program, 1, shaders));
+    select_api_version({55, 15});
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_COMPUTE_BIT);
+    load<Entry::nvnCommandBufferBindImage>()(&recorder.commands, NVN_SHADER_STAGE_COMPUTE, 0, id);
+    load<Entry::nvnCommandBufferDispatchCompute>()(&recorder.commands, 1, 1, 1);
+    load<Entry::nvnCommandBufferDispatchCompute>()(&recorder.commands, 1, 1, 1);
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    const auto statistics = backend->statistics();
+    if (invalid_handle) {
+        CHECK(!backend->last_error());
+        const auto reasons = backend->skip_reasons();
+        CHECK(std::any_of(reasons.begin(), reasons.end(), [](const auto& reason) {
+            return reason.first == "storage image descriptor backing is unavailable" && reason.second == 2;
+        }));
+        CHECK(statistics.skipped == 2);
+        CHECK(statistics.dispatches == 0 && statistics.image_sinks == 0);
+    } else {
+        CHECK(!backend->last_error() && statistics.dispatches == 2 && statistics.skipped == 0);
+        CHECK(statistics.image_sinks == 2);
+    }
+    CHECK(resources.image_upgrades == 0);
     load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
     load<Entry::nvnProgramFinalize>()(&program);
     load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
@@ -4868,7 +7198,8 @@ void test_storage_image_upgrade_after_sample(id<MTLDevice> device, id<MTL4Comman
     CHECK(backend->statistics().dispatches == 2 && backend->statistics().draws == 1);
     CHECK(backend->statistics().skipped == 0);
     CHECK(resources.image_upgrades == 1);
-    CHECK(resources.texture_lookups == 2);
+    // One sampled lookup, two image preparations and one replacement view.
+    CHECK(resources.texture_lookups == 4);
     id<MTLTexture> stored = resources.texture_ids[43];
     CHECK(stored && stored != view && stored.parentTexture && stored.parentTexture != original);
     CHECK(!(stored.usage & MTLTextureUsageShaderWrite));
@@ -4882,6 +7213,2647 @@ void test_storage_image_upgrade_after_sample(id<MTLDevice> device, id<MTL4Comman
     load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
     load<Entry::nvnProgramFinalize>()(&compute);
     load<Entry::nvnProgramFinalize>()(&drawing);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+// Lines the replay writes while a case runs. The worker thread calls the sink.
+struct DiagCapture {
+    std::mutex mutex;
+    std::vector<std::string> lines;
+    DiagCapture() {
+        diag::testing_set_sink([](diag::Level, std::string_view line, void* context) {
+            auto& self = *static_cast<DiagCapture*>(context);
+            const std::lock_guard lock(self.mutex);
+            self.lines.emplace_back(line);
+        }, this);
+    }
+    ~DiagCapture() { diag::testing_set_sink(nullptr, nullptr); }
+    DiagCapture(const DiagCapture&) = delete;
+    std::size_t count(std::string_view needle) {
+        const std::lock_guard lock(mutex);
+        std::size_t found = 0;
+        for (const auto& line : lines)
+            if (line.find(needle) != std::string::npos) ++found;
+        return found;
+    }
+};
+
+// Diagnostic capture preserves queued program identity and draw admission,
+// while bounding bind history and repeated output.
+void test_missing_mesh_diagnostics(id<MTLDevice> device, id<MTL4CommandQueue> queue, bool enabled) {
+    const char* previous = std::getenv("ARMIGO_NVN_MESH_DIAGNOSTICS");
+    const std::string saved = previous ? previous : "";
+    setenv("ARMIGO_NVN_MESH_DIAGNOSTICS",enabled ? "1" : "0",1);
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device,queue,resources);
+    if (previous) setenv("ARMIGO_NVN_MESH_DIAGNOSTICS",saved.c_str(),1);
+    else unsetenv("ARMIGO_NVN_MESH_DIAGNOSTICS");
+    Recorder recorder; NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program,&recorder.device));
+    const NVNshaderData shaders[]{{1,nullptr},{1,nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program,2,shaders));
+    const auto serial = reinterpret_cast<const ProgramState*>(&program)->serial;
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    for (unsigned bind=0;bind!=10;++bind)
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands,&program,NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    for (int first=1;first<=20;++first) {
+        command_draw_mesh_tasks(&recorder.commands,first,1);
+        if (first==1) {
+            command_draw_mesh_tasks(&recorder.commands,first,1);
+            command_draw_mesh_tasks(&recorder.commands,first,1);
+        }
+    }
+    const auto handle=recorder.finish();
+    load<Entry::nvnProgramFinalize>()(&program);
+    CHECK(load<Entry::nvnProgramInitialize>()(&program,&recorder.device));
+    CHECK(reinterpret_cast<const ProgramState*>(&program)->serial!=serial);
+    DiagCapture capture;
+    const auto fence=backend->submit({&handle,1});
+    CHECK(fence && backend->wait_fence(fence,10'000'000'000ull));
+    CHECK(backend->statistics().draws==0 && backend->statistics().skipped==22);
+    backend.reset();
+    CHECK(capture.count("nvn_mesh_diag command_id=")==(enabled ? 16 : 0));
+    CHECK(capture.count("nvn_mesh_diag records_truncated=1 record_limit=16")==unsigned(enabled));
+    CHECK(capture.count("nvn_mesh_diag_summary seen=22 emitted=16 duplicates=2 records_truncated=4")==unsigned(enabled));
+    CHECK(capture.count("history_scope=current-submission previous_submission=unavailable history_count=8 history_dropped=2")== (enabled ? 16 : 0));
+    CHECK(capture.count("api_return=unavailable api_return_domain=internal-record")== (enabled ? 16 : 0));
+    CHECK(capture.count("mask=31,program="+std::to_string(serial)+",result=vs@"+std::to_string(serial)+":")== (enabled ? 16 : 0));
+    if (!enabled) CHECK(capture.count("nvn_mesh_diag")==0);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device,handle);
+    load<Entry::nvnProgramFinalize>()(&program);
+}
+
+struct GuestImage {
+    TextureState state{};
+};
+
+// Block-linear storage filled with one repeated word, so every texel uploads
+// as that word. The caller points snapshot at the object that outlives recording.
+GuestImage place_image(std::uint8_t* bytes, MemoryPoolState& pool, std::size_t& cursor,
+                       std::uint64_t serial, std::int32_t format, std::uint32_t flags,
+                       std::uint32_t fill, std::uint32_t levels = 1) {
+    GuestImage image;
+    auto& description = image.state.description;
+    description.target = NVN_TEXTURE_TARGET_2D;
+    description.format = format;
+    description.flags = flags;
+    description.width = 4;
+    description.height = 4;
+    description.depth = 1;
+    description.levels = levels;
+    description.samples = 1;
+    const auto layout = resource_layout(description);
+    CHECK(layout.has_value());
+    if (!layout) return image;
+    auto alignment = resource_alignment(description);
+    if (!alignment) alignment = 1;
+    cursor = (cursor + alignment - 1) & ~(alignment - 1);
+    image.state.serial = serial;
+    image.state.size = layout->total_size;
+    image.state.layer_size = layout->layer_stride;
+    image.state.pool = &pool;
+    image.state.offset = cursor;
+    image.state.memory = bytes + cursor;
+    for (std::size_t index = 0; index + 4 <= image.state.size; index += 4)
+        std::memcpy(image.state.memory + index, &fill, 4);
+    cursor += image.state.size;
+    return image;
+}
+
+std::vector<std::uint8_t> read_private_texels(id<MTLDevice> device, replay::Resources& resources,
+                                              id<MTLTexture> texture, std::uint32_t bytes_per_texel) {
+    std::vector<std::uint8_t> result(16 * bytes_per_texel);
+    CHECK(texture != nil);
+    if (!texture) return result;
+    CHECK(resources.flush_uploads());
+    constexpr std::size_t row = 256;
+    id<MTLBuffer> output = [device newBufferWithLength:row * 4 options:MTLResourceStorageModeShared];
+    id<MTLCommandQueue> blit_queue = [device newCommandQueue];
+    id<MTLCommandBuffer> commands = [blit_queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [commands blitCommandEncoder];
+    [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0
+             sourceOrigin:MTLOriginMake(0, 0, 0)
+               sourceSize:MTLSizeMake(4, 4, 1)
+                 toBuffer:output destinationOffset:0
+    destinationBytesPerRow:row destinationBytesPerImage:row * 4];
+    [blit endEncoding];
+    [commands commit];
+    [commands waitUntilCompleted];
+    if (commands.status != MTLCommandBufferStatusCompleted) {
+        const char* detail = commands.error ? commands.error.localizedDescription.UTF8String : "blit failed";
+        std::fprintf(stderr, "image atomic readback: %s\n", detail);
+    }
+    CHECK(commands.status == MTLCommandBufferStatusCompleted);
+    const auto* source = static_cast<const std::uint8_t*>(output.contents);
+    for (std::size_t y = 0; y < 4; ++y)
+        std::memcpy(result.data() + y * 4 * bytes_per_texel, source + y * row, 4 * bytes_per_texel);
+    return result;
+}
+
+void expect_words(id<MTLDevice> device, replay::Resources& resources, id<MTLTexture> texture,
+                  std::uint32_t word, const char* label) {
+    const auto pixels = read_private_texels(device, resources, texture, 4);
+    for (std::size_t texel = 0; texel < 16; ++texel) {
+        std::uint32_t value = 0;
+        std::memcpy(&value, pixels.data() + texel * 4, 4);
+        if (value != word) {
+            std::fprintf(stderr, "image atomic %s texel %zu is 0x%08x, expected 0x%08x\n",
+                         label, texel, value, word);
+            CHECK(value == word);
+            return;
+        }
+    }
+}
+
+void expect_words_at(id<MTLDevice> device, replay::Resources& resources, id<MTLTexture> texture,
+                     const std::uint32_t* words, const char* label) {
+    const auto pixels = read_private_texels(device, resources, texture, 4);
+    for (std::size_t texel = 0; texel < 16; ++texel) {
+        std::uint32_t value = 0;
+        std::memcpy(&value, pixels.data() + texel * 4, 4);
+        if (value != words[texel]) {
+            std::fprintf(stderr, "image atomic %s texel %zu is 0x%08x, expected 0x%08x\n",
+                         label, texel, value, words[texel]);
+            CHECK(value == words[texel]);
+            return;
+        }
+    }
+}
+
+class SamplerPoolProbe final : public replay::ReplayResources {
+public:
+    explicit SamplerPoolProbe(replay::Resources& resources) : resources_(resources) {}
+    replay::BufferSpan buffer_at(std::uint64_t a, std::uint64_t n) override { return resources_.buffer_at(a, n); }
+    id<MTLTexture> texture(const TextureState& t, const TextureViewState* v) override { return resources_.texture(t, v); }
+    id<MTLTexture> texture_for_id(std::int32_t descriptor) override { return resources_.texture_for_id(descriptor); }
+    id<MTLSamplerState> sampler_for_id(std::int32_t descriptor) override { return resources_.sampler_for_id(descriptor); }
+    std::string take_sampler_failure() override { return resources_.take_sampler_failure(); }
+    std::int32_t sampler_count() const override { return resources_.sampler_count(); }
+    std::uint64_t registration_generation() const override { return resources_.registration_generation(); }
+    std::uint64_t registration_log_generation() const override { return resources_.registration_log_generation(); }
+    bool read_registration_note(std::uint64_t generation, RegistrationNote& note) const override {
+        replay::Resources::RegistrationNote source;
+        if (!resources_.read_registration_note(generation, source)) return false;
+        note = {source.id, source.kind};
+        return true;
+    }
+    void note_gpu_write(const TextureState& t) override { resources_.note_gpu_write(t); }
+    void note_gpu_write(std::uint64_t a, std::uint64_t n) override { resources_.note_gpu_write(a, n); }
+private:
+    replay::Resources& resources_;
+};
+
+// Unsupported samplers fail both fresh and patched tables without publishing
+// a default entry that a later lookup could mistake for the registered sampler.
+void test_custom_border_pool_diagnostic(id<MTLDevice> device) {
+    replay::Resources resources(device);
+    SamplerPoolProbe probe(resources);
+    SamplerParameters sampler{};
+    sampler.min_filter = NVN_MIN_FILTER_LINEAR;
+    sampler.mag_filter = NVN_MAG_FILTER_LINEAR;
+    sampler.wrap_s = sampler.wrap_t = sampler.wrap_r = NVN_WRAP_MODE_CLAMP_TO_BORDER;
+    sampler.max_anisotropy = 1;
+    sampler.reduction_filter = NVN_SAMPLER_REDUCTION_AVERAGE;
+    resources.register_sampler_descriptor(27, sampler);
+    replay::PoolTableKey key;
+    key.sampler = true;
+    replay::PoolTableCache cache(device);
+    CHECK(cache.lookup(key, probe, 1, 0, 0).ok);
+    sampler.border[0] = 0.25f;
+    resources.register_sampler_descriptor(27, sampler);
+    for (unsigned repeat = 0; repeat != 2; ++repeat) {
+        const auto result = cache.lookup(key, probe, 2, 1, 0);
+        CHECK(!result.ok && !result.version);
+        CHECK(result.diagnostic.find("unsupported custom sampler border") != std::string::npos);
+    }
+    replay::PoolTableCache fresh(device);
+    const auto rebuilt = fresh.lookup(key, probe, 3, 2, 0);
+    CHECK(!rebuilt.ok && !rebuilt.version && !rebuilt.diagnostic.empty());
+    sampler.border[0] = 0;
+    resources.register_sampler_descriptor(27, sampler);
+    CHECK(cache.lookup(key, probe, 4, 3, 0).ok);
+}
+
+// Rendering a raw block view preserves guest BC4 storage and writes through
+// a private, uncompressed integer alias. Decode the result on the GPU.
+void test_bc4_colour_alias(id<MTLDevice> device, id<MTL4CommandQueue> queue, Stages& stages) {
+    const auto original = stages.fragment;
+    for (const bool snorm : {false, true}) {
+        TestResources resources(device);
+        auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+            snorm ? MTLPixelFormatBC4_RSnorm : MTLPixelFormatBC4_RUnorm width:8 height:8 mipmapped:NO];
+        descriptor.storageMode = MTLStorageModePrivate;
+        descriptor.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> storage = [device newTextureWithDescriptor:descriptor];
+        CHECK(storage != nil);
+        if (!storage) continue;
+        const bool original_optimization = storage.allowGPUOptimizedContents;
+        resources.textures[194] = storage;
+        auto state = texture_state(194, 8, 8);
+        state.description.format = snorm ? NVN_FORMAT_RGTC1_SNORM : NVN_FORMAT_RGTC1_UNORM;
+        auto target = texture_object(state);
+        NVNtextureView view{};
+        TextureViewState view_state{};
+        view_state.sets_format = 1;
+        view_state.format = NVN_FORMAT_RGBA16UI;
+        std::memcpy(&view, &view_state, sizeof view_state);
+        const NVNtexture* targets[]{&target};
+        const NVNtextureView* views[]{&view};
+        auto initializer = [device newCommandQueue];
+        auto initial = [initializer commandBuffer];
+        auto zero = [device newBufferWithLength:512 options:MTLResourceStorageModeShared];
+        std::memset(zero.contents, 0, zero.length);
+        auto blit = [initial blitCommandEncoder];
+        [blit copyFromBuffer:zero sourceOffset:0 sourceBytesPerRow:256 sourceBytesPerImage:512
+            sourceSize:MTLSizeMake(8, 8, 1) toTexture:storage destinationSlice:0 destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding]; [initial commit]; [initial waitUntilCompleted];
+        CHECK(initial.status == MTLCommandBufferStatusCompleted && !initial.error);
+        auto probe = [TextureAllocationProbeDevice alloc];
+        probe.target = device; probe.textures = [NSMutableArray array];
+        auto backend = replay::create_replay_backend((id<MTLDevice>)probe, queue, resources);
+        auto fragment = std::make_shared<platform::CompiledGraphicsStage>(*original);
+        fragment->entry_point = snorm ? "bc4_snorm_block" : "bc4_unorm_block";
+        fragment->identity = fragment->entry_point;
+        fragment->interface.color_output_mask = 0xf;
+        fragment->color_outputs = {{0, 15, platform::ColorOutputScalar::u32, 4}};
+        stages.fragment = fragment;
+        Recorder recorder; NVNprogram program{};
+        CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+        const NVNshaderData shaders[]{{1, nullptr}, {1, nullptr}};
+        CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, views, nullptr, nullptr);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        load<Entry::nvnCommandBufferSetViewport>()(&recorder.commands, 0, 0, 2, 2);
+        load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 0, 0, 2, 2);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+        const auto handle = recorder.finish();
+        const auto fence = backend->submit({&handle, 1});
+        CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+        CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+        @synchronized(probe) {
+            unsigned aliases = 0;
+            for (id<MTLTexture> texture in probe.textures)
+                if (texture.pixelFormat == MTLPixelFormatRGBA16Uint) {
+                    ++aliases;
+                    CHECK(texture.width == 2 && texture.height == 2);
+                    CHECK(texture.storageMode == MTLStorageModePrivate && !texture.allowGPUOptimizedContents);
+                }
+            CHECK(aliases == 1);
+        }
+        CHECK(storage.allowGPUOptimizedContents == original_optimization);
+        NSError* error = nil;
+        auto library = [device newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+            "kernel void read_bc4(texture2d<float, access::read> image [[texture(0)]], device float* output [[buffer(0)]], "
+            "uint2 id [[thread_position_in_grid]]) { output[id.y * 8 + id.x] = image.read(id).r; }"
+            options:nil error:&error];
+        auto pipeline = library ? [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"read_bc4"] error:&error] : nil;
+        CHECK(pipeline != nil);
+        if (pipeline) {
+            auto output = [device newBufferWithLength:64 * sizeof(float) options:MTLResourceStorageModeShared];
+            auto commands = [initializer commandBuffer];
+            auto compute = [commands computeCommandEncoder];
+            [compute setComputePipelineState:pipeline]; [compute setTexture:storage atIndex:0];
+            [compute setBuffer:output offset:0 atIndex:0];
+            [compute dispatchThreads:MTLSizeMake(8, 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+            [compute endEncoding]; [commands commit]; [commands waitUntilCompleted];
+            CHECK(commands.status == MTLCommandBufferStatusCompleted && !commands.error);
+            const auto* pixels = static_cast<const float*>(output.contents);
+            for (unsigned pixel = 0; pixel != 64; ++pixel) CHECK(pixels[pixel] == 1.0f);
+        }
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+        load<Entry::nvnProgramFinalize>()(&program);
+    }
+    stages.fragment = original;
+}
+
+void test_native_preinflight_failure(id<MTLDevice> device) {
+    auto queue=[device newMTL4CommandQueue];
+    auto owner=std::make_shared<replay::Metal4SubmissionOwner>(device,queue);
+    replay::Resources resources(device,owner);
+    auto proxy=[SubmissionAllocationFailureDevice alloc];proxy.target=device;proxy->fail_next=false;
+    auto backend=replay::create_replay_backend((id<MTLDevice>)proxy,queue,resources);
+    CHECK(backend!=nullptr);if(!backend)return;
+    Recorder recorder;load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);const auto handle=recorder.finish();
+    proxy->fail_next=true;
+    const auto failed=backend->submit({&handle,1});auto failed_result=backend->retain_native_producer_result(failed);
+    CHECK(backend->wait_fence(failed,3'000'000'000ull));
+    std::fprintf(stderr,"preinflight_result fence=%llu owner_issued=%llu error=%s\n",static_cast<unsigned long long>(failed),static_cast<unsigned long long>(owner->issued()),failed_result().c_str());
+    CHECK(owner->issued()==0);
+    CHECK(failed_result().find("submission allocation failed")!=std::string::npos);
+    const auto healthy=backend->submit({&handle,1});auto healthy_result=backend->retain_native_producer_result(healthy);
+    CHECK(backend->wait_fence(healthy,3'000'000'000ull));
+    CHECK(healthy_result().empty());CHECK(failed_result().find("submission allocation failed")!=std::string::npos);
+    CHECK(backend->stop_submission_workers(std::chrono::steady_clock::now()+std::chrono::seconds(3)));
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device,handle);
+}
+
+void test_native_capture_autorelease(id<MTLDevice> device) {
+    auto queue=[device newMTL4CommandQueue];auto owner=std::make_shared<replay::Metal4SubmissionOwner>(device,queue);
+    replay::Resources resources(device,owner);auto backend=replay::create_replay_backend(device,queue,resources);
+    constexpr std::size_t size=64*1024;
+    auto* bytes=static_cast<std::uint8_t*>(mmap(nullptr,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));CHECK(bytes!=MAP_FAILED);if(bytes==MAP_FAILED)return;
+    std::memset(bytes,0x61,size);MemoryPoolState pool{};pool.memory=bytes;pool.size=size;pool.flags=NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED|NVN_MEMORY_POOL_FLAGS_GPU_CACHED;CHECK(resources.register_pool(pool));
+    auto state=texture_state(981,4,4);state.description.flags=NVN_TEXTURE_FLAGS_LINEAR;state.description.stride=256;
+    const auto layout=resource_layout(state.description);state.size=layout->total_size;state.layer_size=layout->layer_stride;state.memory=bytes;state.pool=&pool;resources.register_texture(state);
+    auto count=std::make_shared<std::atomic<unsigned>>(0);
+    auto autorelease=reinterpret_cast<void*(*)(void*)>(dlsym(RTLD_DEFAULT,"objc_autorelease"));CHECK(autorelease!=nullptr);
+    std::promise<replay::Resources::NativeSnapshot> captured;auto future=captured.get_future();
+    CHECK(backend->enqueue_frame_capture(0,[&](bool admitted){CHECK(admitted);auto sentinel=[CapturePoolSentinel new];sentinel->destroyed=count;autorelease((__bridge_retained void*)sentinel);captured.set_value(resources.capture_native(state));}));
+    std::promise<unsigned> after;auto drained=after.get_future();
+    CHECK(backend->enqueue_frame_capture(0,[&](bool admitted){CHECK(admitted);after.set_value(count->load());}));
+    auto snapshot=future.get();CHECK(drained.wait_for(std::chrono::seconds(2))==std::future_status::ready);
+    const auto destroyed=drained.get();std::fprintf(stderr,"capture_pool destroyed_before_next=%u allocation_live=%u\n",destroyed,unsigned(bool(snapshot.allocation)));CHECK(destroyed==1 && snapshot.texture && snapshot.allocation);
+    resources.release_texture(state);
+    auto native=std::make_shared<replay::Metal4NativeSubmission>(owner,owner->reserve(),snapshot.producer_error,snapshot.allocation,snapshot.release_read);backend->track_native_submission(native);
+    auto allocator=[device newCommandAllocator];auto commands=[device newCommandBuffer];auto output=[device newBufferWithLength:1024 options:MTLResourceStorageModeShared];NSError* error=nil;auto residency=[device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:&error];
+    [residency addAllocation:snapshot.texture.buffer];[residency addAllocation:output];[residency commit];[commands beginCommandBufferWithAllocator:allocator];[commands useResidencySet:residency];auto copy=[commands computeCommandEncoder];[copy copyFromTexture:snapshot.texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(4,4,1) toBuffer:output destinationOffset:0 destinationBytesPerRow:256 destinationBytesPerImage:1024];[copy endEncoding];[commands endCommandBuffer];
+    auto ticket=native->publish(commands,^(id<MTL4CommitFeedback> feedback){static_cast<void>(allocator);static_cast<void>(residency);static_cast<void>(output);CHECK(!feedback.error);});CHECK(native->wait(ticket,std::chrono::seconds(3)));
+    const auto* pixels=static_cast<const std::uint8_t*>(output.contents);for(unsigned y=0;y!=4;++y)for(unsigned x=0;x!=16;++x)CHECK(pixels[y*256+x]==0x61);
+    CHECK(backend->stop_submission_workers(std::chrono::steady_clock::now()+std::chrono::seconds(3)));resources.release_pool(pool);munmap(bytes,size);
+}
+
+void test_native_snapshot_supersession(id<MTLDevice> device, bool failed_first) {
+    auto queue=[device newMTL4CommandQueue];
+    auto owner=std::make_shared<replay::Metal4SubmissionOwner>(device,queue,
+        [failed_first](std::uint64_t ticket,id<MTL4CommitFeedback> feedback)->id<MTL4CommitFeedback> {
+            return failed_first && ticket==1?failed_commit_feedback(feedback):feedback;
+        });
+    replay::Resources resources(device,owner);
+    auto backend=replay::create_replay_backend(device,queue,resources);
+    Recorder recorder;
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    const auto handle=recorder.finish();
+    constexpr std::uintptr_t identity=91;
+    const auto first=backend->submit_from(identity,{&handle,1});
+    CHECK(backend->wait_fence(first,3'000'000'000ull));
+    auto snapshot=backend->snapshot_native_producer(identity);
+    const auto selected=snapshot?snapshot->fence:first;
+    auto supersede=std::async(std::launch::async,[&] {
+        auto next=backend->submit_from(identity,{&handle,1});
+        CHECK(backend->wait_fence(next,3'000'000'000ull));return next;
+    });
+    const auto second=supersede.get();
+    auto captured=backend->retain_native_producer_result(selected);
+    const auto error=captured();
+    std::fprintf(stderr,"native_snapshot_supersession selected=%llu successor=%llu pinned=%u error=%s\n",
+        static_cast<unsigned long long>(selected),static_cast<unsigned long long>(second),unsigned(snapshot.has_value()),error.c_str());
+    CHECK(selected==first && second>first);
+    CHECK(failed_first?error.find("ArmigoSyntheticCommit")!=std::string::npos:error.empty());
+    snapshot.reset();captured={};
+    backend->forget_queue(identity);
+    std::promise<void> forgotten;auto done=forgotten.get_future();
+    CHECK(backend->enqueue_frame_capture(0,[&](bool){forgotten.set_value();}));
+    CHECK(done.wait_for(std::chrono::seconds(2))==std::future_status::ready);
+    CHECK(backend->retain_native_producer_result(first)().find("not retained")!=std::string::npos);
+    CHECK(backend->stop_submission_workers(std::chrono::steady_clock::now()+std::chrono::seconds(3)));
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device,handle);
+}
+
+// Each native frame owns the exact producer outcome after other submissions
+// retire and even after backend/history storage has been destroyed.
+void test_native_producer_result_isolation(id<MTLDevice> device, bool fail_first) {
+    auto queue=[device newMTL4CommandQueue];
+    const auto failed=fail_first?1u:2u;
+    auto owner=std::make_shared<replay::Metal4SubmissionOwner>(device,queue,
+        [failed](std::uint64_t ticket,id<MTL4CommitFeedback> feedback)->id<MTL4CommitFeedback> {
+            return ticket==failed?failed_commit_feedback(feedback):feedback;
+        });
+    replay::Resources resources(device,owner);
+    auto backend=replay::create_replay_backend(device,queue,resources);
+    Recorder recorder;
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    const auto handle=recorder.finish();
+    const auto first=backend->submit({&handle,1});
+    auto first_result=backend->retain_native_producer_result(first);
+    CHECK(backend->wait_fence(first,3'000'000'000ull));
+    CHECK(first_result().empty()!=fail_first);
+    const auto second=backend->submit({&handle,1});
+    auto second_result=backend->retain_native_producer_result(second);
+    CHECK(backend->wait_fence(second,3'000'000'000ull));
+    CHECK(second_result().empty()==fail_first);
+    CHECK(first_result().empty()!=fail_first);
+    CHECK(backend->stop_submission_workers(std::chrono::steady_clock::now()+std::chrono::seconds(3)));
+    backend.reset();
+    CHECK(first_result().empty()!=fail_first && second_result().empty()==fail_first);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device,handle);
+}
+
+// A native consumer must enter the GPU order without waiting for Resource
+// bookkeeping held by a later upload that is queued behind that consumer.
+void test_native_consumer_admission(id<MTLDevice> device, id<MTL4CommandQueue> queue, bool failed_producer = false) {
+    auto owner = std::make_shared<replay::Metal4SubmissionOwner>(device, queue,
+        [failed_producer](std::uint64_t ticket,id<MTL4CommitFeedback> feedback)->id<MTL4CommitFeedback> {
+            return failed_producer && ticket==1 ? failed_commit_feedback(feedback) : feedback;
+        });
+    replay::Resources resources(device, owner);
+    CHECK(resources.wait_for_gpu_deswizzle(std::chrono::seconds(10)));
+    constexpr std::size_t size = 64*1024;
+    auto* bytes = static_cast<std::uint8_t*>(mmap(nullptr,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));
+    CHECK(bytes != MAP_FAILED);
+    if (bytes == MAP_FAILED) return;
+    MemoryPoolState pool{};
+    pool.memory=bytes; pool.size=size; pool.flags=NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED|NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+    CHECK(resources.register_pool(pool));
+    const auto make = [&](std::uint64_t serial, std::size_t offset, bool linear) {
+        auto state=texture_state(serial,8,8);
+        if (linear) { state.description.flags=NVN_TEXTURE_FLAGS_LINEAR; state.description.stride=256; }
+        const auto layout=resource_layout(state.description);
+        state.size=layout->total_size; state.layer_size=layout->layer_stride;
+        state.pool=&pool; state.offset=offset; state.memory=bytes+offset;
+        std::memset(state.memory,int(serial),state.size);
+        resources.register_texture(state);
+        return state;
+    };
+    std::array<TextureState,2> native_states{make(210,0,true),make(211,0x2000,true)};
+    std::array<TextureState,4> uploads;
+    for (unsigned i=0;i!=uploads.size();++i) uploads[i]=make(220+i,0x4000+i*0x1000,false);
+    auto backend=replay::create_replay_backend(device,queue,resources);
+    auto exporter=replay::make_texture_exporter(device,resources,*backend);
+    std::array<services::vi::NativeTexture,2> exported;
+    for (unsigned i=0;i!=exported.size();++i) { auto value=exporter(native_states[i]); CHECK(value.has_value()); if(!value)return; exported[i]=std::move(*value); }
+    std::function<void()> release_native;
+    auto capture=exported[0].capture;
+    exported[0].capture=[&](std::uint64_t fence) {
+        auto value=capture(fence);
+        if(value) release_native=value->cancel;
+        return value;
+    };
+    horizon::HandleTable handles(16);
+    services::vi::DisplaySession display(handles);
+    display.set_vsync_source(std::make_shared<services::vi::VsyncSource>());
+    auto completed=std::make_shared<std::promise<void>>();
+    auto completed_future=completed->get_future();
+    std::atomic<bool> consumer_published{false}, producer_wait_entered{false}, upload_wait_entered{false};
+    display.set_presenter([&](const services::GraphicsPresentation& frame) {
+        auto native=std::static_pointer_cast<replay::Metal4NativeSubmission>(frame.native_submission);
+        CHECK(native != nullptr);
+        auto allocator=[device newCommandAllocator]; auto commands=[device newCommandBuffer];
+        id<MTLTexture> source=(__bridge id<MTLTexture>)frame.native_texture.get();
+        auto output=[device newBufferWithLength:256*8 options:MTLResourceStorageModeShared];
+        NSError* error=nil;
+        auto residency=[device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:&error];
+        [residency addAllocation:source.buffer ? (id<MTLAllocation>)source.buffer : (id<MTLAllocation>)source];
+        [residency addAllocation:output]; [residency commit];
+        [commands beginCommandBufferWithAllocator:allocator]; [commands useResidencySet:residency];
+        auto copy=[commands computeCommandEncoder];
+        [copy barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+        [copy copyFromTexture:source sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+            sourceSize:MTLSizeMake(8,8,1) toBuffer:output destinationOffset:0 destinationBytesPerRow:256 destinationBytesPerImage:2048];
+        [copy endEncoding]; [commands endCommandBuffer];
+        const auto ticket=native->publish(commands, ^(id<MTL4CommitFeedback> feedback) { static_cast<void>(allocator); static_cast<void>(residency); static_cast<void>(output); CHECK(!feedback.error); });
+        consumer_published.store(ticket!=0,std::memory_order_release);
+        const bool done=ticket && native->wait(ticket,std::chrono::seconds(3));
+        CHECK(done);
+        if(done) {
+            const auto* data=static_cast<const std::uint8_t*>(output.contents);
+            for(unsigned y=0;y!=8;++y) for(unsigned x=0;x!=32;++x) CHECK(data[y*256+x]==0xa5);
+            CHECK(frame.native_producer_ready && frame.native_producer_ready() != failed_producer);
+        }
+        completed->set_value();
+        const bool valid=done && (!frame.native_producer_ready || frame.native_producer_ready());
+        return services::GraphicsPresentationResult{valid,valid?"":"Synthetic native producer or consumer failed"};
+    });
+    int window;
+    CHECK(display.bind_native_window(&window));
+    auto producer=services::vi::find_native_window(&window);
+    CHECK(producer->register_textures(exported));
+    auto gate=[device newSharedEvent]; [queue waitForEvent:gate value:1];
+    Recorder recorder;
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    std::memset(bytes+0x9000,0xa5,2048);
+    load<Entry::nvnCommandBufferCopyBufferToBuffer>()(&recorder.commands,
+        reinterpret_cast<std::uint64_t>(bytes+0x9000),reinterpret_cast<std::uint64_t>(bytes),2048,0);
+    const auto handle=recorder.finish();
+    const auto first=backend->submit({&handle,1});
+    const auto slot=producer->dequeue(); CHECK(slot.slot==0);
+    CHECK(producer->present(slot.slot,first,[&](std::uint64_t fence) {
+        producer_wait_entered.store(true,std::memory_order_release);
+        return backend->wait_fence(fence,5'000'000'000ull);
+    },{},0).completed);
+    std::promise<void> at_reuse;
+    auto reuse=at_reuse.get_future();
+    resources.set_upload_observer([&](const replay::Resources::UploadObservation& value) {
+        if(value.kind==replay::Resources::UploadObservation::Kind::allocator_wait) {
+            upload_wait_entered.store(true,std::memory_order_release); at_reuse.set_value();
+        }
+    });
+    CHECK(backend->enqueue_frame_capture(first,[&](bool admitted) {
+        CHECK(admitted); resources.begin_walk();
+        for(const auto& texture:uploads) { CHECK(resources.texture(texture,nullptr)); CHECK(resources.publish_uploads()); }
+        resources.end_walk();
+    }));
+    CHECK(reuse.wait_for(std::chrono::seconds(3))==std::future_status::ready);
+    CHECK(owner->issued()>=5 && upload_wait_entered);
+    const auto busy=producer->dequeue(); CHECK(busy.slot!=slot.slot);
+    CHECK(!backend->wait_fence(first,1));
+    gate.signaledValue=1;
+    CHECK(owner->wait_gpu(1,std::chrono::seconds(2)));
+    const bool progressed=completed_future.wait_for(std::chrono::milliseconds(500))==std::future_status::ready;
+    std::fprintf(stderr,"native_admission_evidence live_slot=%u gpu_a_observed=%u cpu_a_retired=%u producer_wait=%u consumer_published=%u owner_published=%llu issued=%llu progress=%u\n",
+        unsigned(upload_wait_entered.load()),unsigned(owner->wait_gpu(1,std::chrono::nanoseconds(0))),
+        unsigned(backend->wait_fence(first,1)),unsigned(producer_wait_entered.load()),unsigned(consumer_published.load()),
+        static_cast<unsigned long long>(owner->published()),static_cast<unsigned long long>(owner->issued()),unsigned(progressed));
+    CHECK(progressed);
+    // Cleanup is deliberately after the assertion. Cancellation cannot make
+    // the normal-operation progress test pass.
+    if(!progressed && release_native) release_native();
+    CHECK(backend->wait_fence(first,3'000'000'000ull));
+    if (failed_producer && progressed) {
+        const auto until=std::chrono::steady_clock::now()+std::chrono::seconds(1);
+        int available=-1;
+        do { available=producer->dequeue().slot; if(available==-2)break;
+             CHECK(available!=slot.slot); std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } while(std::chrono::steady_clock::now()<until);
+        CHECK(available==-2);
+        CHECK(!producer->present(busy.slot,first,[](std::uint64_t){return true;},{},0).completed);
+    }
+    CHECK(producer->unregister_textures());
+    if (failed_producer) {
+        CHECK(producer->register_textures(exported));
+        CHECK(producer->dequeue().slot>=0);
+        CHECK(producer->unregister_textures());
+    }
+    services::vi::unbind_native_window(&window);
+    CHECK(backend->stop_submission_workers(std::chrono::steady_clock::now()+std::chrono::seconds(3)));
+    resources.set_upload_observer({});
+    CHECK(resources.flush_uploads()); resources.release_pool(pool);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device,handle);
+    munmap(bytes,size);
+}
+
+// The next native reservation must not strand a selected frame after its
+// original GPU readback completed and before its decoded pixels are presented.
+void test_native_readback_followup_progress(id<MTLDevice> device, id<MTL4CommandQueue> queue, bool bgra = false, unsigned failure = 0, bool srgb = false) {
+    auto owner = std::make_shared<replay::Metal4SubmissionOwner>(device, queue,
+        [failure](std::uint64_t ticket, id<MTL4CommitFeedback> feedback) -> id<MTL4CommitFeedback> {
+            return (failure == 1 && ticket == 1) || (failure == 2 && ticket == 2)
+                ? failed_commit_feedback(feedback) : feedback;
+        });
+    replay::Resources resources(device, owner);
+    constexpr std::size_t size = 64 * 1024;
+    auto* bytes = static_cast<std::uint8_t*>(mmap(nullptr, size, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    CHECK(bytes != MAP_FAILED);
+    if (bytes == MAP_FAILED) return;
+    MemoryPoolState pool{};
+    pool.memory = bytes; pool.size = size;
+    pool.flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+    CHECK(resources.register_pool(pool));
+    std::array<TextureState, 2> states;
+    for (unsigned index = 0; index != states.size(); ++index) {
+        auto state = texture_state(280 + index, 8, 8);
+        state.description.flags = NVN_TEXTURE_FLAGS_LINEAR;
+        if (bgra) state.description.format = NVN_FORMAT_BGRA8;
+        if (srgb) state.description.format = NVN_FORMAT_RGBA8_SRGB;
+        state.description.stride = 256;
+        const auto layout = resource_layout(state.description);
+        CHECK(layout.has_value());
+        if (!layout) return;
+        state.size = layout->total_size; state.layer_size = layout->layer_stride;
+        state.pool = &pool; state.offset = index * 0x2000; state.memory = bytes + state.offset;
+        for (unsigned y = 0; y != 8; ++y) for (unsigned x = 0; x != 8; ++x) {
+            const std::array<std::uint8_t, 4> pixel{std::uint8_t(10 + x), std::uint8_t(20 + y), std::uint8_t(30 + index), 255};
+            std::memcpy(state.memory + y * 256 + x * 4, pixel.data(), pixel.size());
+        }
+        resources.register_texture(state); states[index] = state;
+    }
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    CHECK(backend != nullptr);
+    if (!backend) return;
+    auto exporter = replay::make_texture_exporter(device, resources, *backend);
+    std::array<services::vi::NativeTexture, 2> exported;
+    for (unsigned index = 0; index != exported.size(); ++index) {
+        auto value = exporter(states[index]); CHECK(value.has_value());
+        if (!value) return;
+        exported[index] = std::move(*value);
+    }
+    std::promise<void> readback_done, resume_readback;
+    auto readback_done_future = readback_done.get_future();
+    auto resume = resume_readback.get_future().share();
+    std::shared_ptr<replay::Metal4NativeSubmission> first_native, next_native;
+    std::uint64_t readback_ticket = 0, next_ticket = 0;
+    for (unsigned index = 0; index != exported.size(); ++index) {
+        auto capture = exported[index].capture;
+        exported[index].capture = [&, capture, index](std::uint64_t fence)
+            -> std::optional<services::vi::NativeTexture> {
+            auto deferred = capture(fence);
+            if (!deferred || !deferred->resolve) return {};
+            auto value = deferred->resolve();
+            if (!value) return {};
+            if (index) {
+                next_native = std::static_pointer_cast<replay::Metal4NativeSubmission>(value->native_submission);
+                next_ticket = owner->issued();
+            } else {
+                first_native = std::static_pointer_cast<replay::Metal4NativeSubmission>(value->native_submission);
+                auto read = value->read_pixels;
+                value->read_pixels = [&, read](std::array<std::int32_t, 4> crop) {
+                    auto pixels = read(crop);
+                    readback_ticket = owner->issued();
+                    readback_done.set_value();
+                    resume.wait();
+                    return pixels;
+                };
+            }
+            return value;
+        };
+    }
+    platform::PresenterOptions options;
+    options.mode = platform::PresentationMode::headless;
+    auto created = platform::create_presenter(options);
+    CHECK(std::holds_alternative<std::shared_ptr<platform::Presenter>>(created));
+    if (!std::holds_alternative<std::shared_ptr<platform::Presenter>>(created)) return;
+    runtime::PresentationDependencies dependencies;
+    dependencies.presenter = std::get<std::shared_ptr<platform::Presenter>>(created);
+    auto guest_clock = runtime::create_guest_clock();
+    CHECK(std::holds_alternative<std::shared_ptr<runtime::GuestClock>>(guest_clock));
+    if (!std::holds_alternative<std::shared_ptr<runtime::GuestClock>>(guest_clock)) return;
+    auto clock = runtime::create_presentation_clock(std::get<std::shared_ptr<runtime::GuestClock>>(guest_clock),
+        {std::chrono::steady_clock::now(), std::chrono::nanoseconds(16'666'667)});
+    CHECK(std::holds_alternative<std::shared_ptr<runtime::PresentationClock>>(clock));
+    if (!std::holds_alternative<std::shared_ptr<runtime::PresentationClock>>(clock)) return;
+    dependencies.clock = std::get<std::shared_ptr<runtime::PresentationClock>>(clock);
+    dependencies.backing.lookup = [](std::uint32_t) -> std::optional<services::GraphicsBufferBacking> { CHECK(false); return {}; };
+    dependencies.backing.pin = [](const services::GraphicsBufferBacking&, std::uint64_t, std::uint64_t)
+        -> runtime::LaunchResult<runtime::GuestMemoryPin> { CHECK(false); return runtime::GuestMemoryPin{}; };
+    dependencies.backing.wait_fence = [](const services::GraphicsFence&, std::optional<runtime::ClockInstant>, std::stop_token)
+        -> runtime::LaunchStatus { CHECK(false); return std::monostate{}; };
+    dependencies.wants_readback = [](std::uint64_t frame) { return frame == 1; };
+    std::atomic<unsigned> observed{0};
+    dependencies.observe_frame = [&](const platform::PresentedFrame& frame) -> runtime::LaunchStatus {
+        if (frame.frame_number == 1) {
+            CHECK(frame.readback && frame.readback->width == 4 && frame.readback->height == 4);
+            if (frame.readback && frame.readback->pixels.size() == 64) {
+                const auto* data = reinterpret_cast<const std::uint8_t*>(frame.readback->pixels.data());
+                for (unsigned y = 0; y != 4; ++y) for (unsigned x = 0; x != 4; ++x) {
+                    const auto offset = (y * 4 + x) * 4;
+                    CHECK(data[offset] == (bgra ? 30 : 11 + x) && data[offset + 1] == 22 + y &&
+                          data[offset + 2] == (bgra ? 11 + x : 30) && data[offset + 3] == 255);
+                }
+            }
+        } else CHECK(frame.frame_number == 2 && !frame.readback);
+        observed.fetch_add(1, std::memory_order_release);
+        return std::monostate{};
+    };
+    auto bound = runtime::bind_presentation(std::move(dependencies));
+    CHECK(std::holds_alternative<std::shared_ptr<runtime::PresentationBinding>>(bound));
+    if (!std::holds_alternative<std::shared_ptr<runtime::PresentationBinding>>(bound)) return;
+    auto binding = std::get<std::shared_ptr<runtime::PresentationBinding>>(bound);
+    auto callback = binding->callback();
+    std::promise<services::GraphicsPresentationResult> first_done, next_done;
+    auto first_future = first_done.get_future(), next_future = next_done.get_future();
+    horizon::HandleTable handles(16);
+    services::vi::DisplaySession display(handles);
+    display.set_vsync_source(std::make_shared<services::vi::VsyncSource>());
+    display.set_presenter([&](const services::GraphicsPresentation& frame) {
+        auto result = callback(frame);
+        if (frame.frame_number == 1) first_done.set_value(result);
+        else next_done.set_value(result);
+        return result;
+    });
+    int window;
+    CHECK(display.bind_native_window(&window));
+    auto producer = services::vi::find_native_window(&window);
+    CHECK(producer->register_textures(exported));
+    Recorder recorder;
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    const auto first_slot = producer->dequeue(); CHECK(first_slot.slot == 0);
+    CHECK(producer->present(first_slot.slot, fence,
+        [&](std::uint64_t value) { return backend->wait_fence(value, UINT64_MAX); }, {1, 2, 5, 6}, 0).completed);
+    const bool read = readback_done_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+    CHECK(read);
+    if (!read) { resume_readback.set_value(); binding->request_stop(); return; }
+    CHECK(readback_ticket && owner->wait(readback_ticket, std::chrono::nanoseconds(0)));
+    const auto next_slot = producer->dequeue(); CHECK(next_slot.slot != first_slot.slot && next_slot.slot >= 0);
+    CHECK(producer->present(next_slot.slot, fence,
+        [&](std::uint64_t value) { return backend->wait_fence(value, UINT64_MAX); }, {}, 0).completed);
+    CHECK(next_native && next_ticket == readback_ticket + 1 && owner->published() == readback_ticket);
+    if (failure == 3) first_native->cancel();
+    resume_readback.set_value();
+    const bool progressed = first_future.wait_for(std::chrono::milliseconds(500)) == std::future_status::ready;
+    std::fprintf(stderr, "native_readback_followup_evidence bgra=%u srgb=%u failure=%u n=%llu next=%llu published=%llu issued=%llu readback_retired=%u next_cancelled=%u observed=%u progress=%u\n",
+        unsigned(bgra), unsigned(srgb), failure, static_cast<unsigned long long>(readback_ticket), static_cast<unsigned long long>(next_ticket),
+        static_cast<unsigned long long>(owner->published()), static_cast<unsigned long long>(owner->issued()),
+        unsigned(owner->wait(readback_ticket, std::chrono::nanoseconds(0))), unsigned(next_native && next_native->cancelled()),
+        observed.load(std::memory_order_acquire), unsigned(progressed));
+    CHECK(progressed);
+    // Only clean up a failed old implementation after the progress assertion.
+    if (!progressed && next_native) next_native->cancel();
+    CHECK(first_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+    if (progressed) {
+        const auto first_result = first_future.get();
+        CHECK(first_result.completed == (failure == 0));
+        CHECK(next_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+        const auto next_result = next_future.get();
+        if (failure) {
+            CHECK(!next_result.completed && observed.load(std::memory_order_acquire) == 0);
+            CHECK(binding->failure().has_value());
+            if (failure < 3) CHECK(first_result.diagnostic.find("producer or GPU work failed") != std::string::npos);
+            else CHECK(first_result.diagnostic.find("cancelled") != std::string::npos);
+        } else {
+            CHECK(next_result.completed && observed.load(std::memory_order_acquire) == 2);
+            CHECK(!binding->failure());
+        }
+        CHECK(owner->issued() == next_ticket);
+    }
+    CHECK(producer->unregister_textures());
+    services::vi::unbind_native_window(&window);
+    CHECK(std::holds_alternative<std::monostate>(binding->drain(std::chrono::steady_clock::now() + std::chrono::seconds(3))));
+    CHECK(backend->stop_submission_workers(std::chrono::steady_clock::now() + std::chrono::seconds(3)));
+    CHECK(owner->wait(owner->issued(), std::chrono::seconds(3)));
+    resources.release_pool(pool);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    munmap(bytes, size);
+}
+
+// Native frame capture belongs between CPU walks, without waiting for their
+// GPU fences. Its reserved position also cannot strand a later fence at stop.
+void test_native_capture_submission_order(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    std::atomic<unsigned> walks{0};
+    resources.on_begin_walk = [&] { walks.fetch_add(1); };
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    CHECK(backend != nullptr);
+    if (!backend) return;
+    auto owner = backend->submission_owner();
+    Recorder recorder;
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    const auto handle = recorder.finish();
+    auto gate = [device newSharedEvent];
+    [queue waitForEvent:gate value:1];
+    const auto first = backend->submit({&handle, 1});
+    auto captured = std::make_shared<std::promise<std::pair<unsigned, std::shared_ptr<replay::Metal4NativeSubmission>>>>();
+    auto snapshot = captured->get_future();
+    CHECK(backend->enqueue_frame_capture(first, [&, captured, owner](bool admitted) {
+        CHECK(admitted);
+        auto native = std::make_shared<replay::Metal4NativeSubmission>(owner, owner->reserve());
+        backend->track_native_submission(native);
+        captured->set_value({walks.load(), native});
+    }));
+    const auto second = backend->submit({&handle, 1});
+    CHECK(snapshot.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    auto [captured_walks, native] = snapshot.get();
+    CHECK(captured_walks == 1 && !backend->wait_fence(first, 1'000'000));
+    native->cancel();
+    gate.signaledValue = 1;
+    CHECK(backend->wait_fence(second, 5'000'000'000ull));
+    auto unfinished = std::make_shared<std::promise<std::shared_ptr<replay::Metal4NativeSubmission>>>();
+    auto unfinished_future = unfinished->get_future();
+    CHECK(backend->enqueue_frame_capture(second, [&, unfinished, owner](bool admitted) {
+        CHECK(admitted);
+        auto pending = std::make_shared<replay::Metal4NativeSubmission>(owner, owner->reserve());
+        backend->track_native_submission(pending);
+        unfinished->set_value(std::move(pending));
+    }));
+    const auto third = backend->submit({&handle, 1});
+    CHECK(unfinished_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    auto pending_native = unfinished_future.get();
+    CHECK(!backend->wait_fence(third, 1'000'000));
+    CHECK(backend->stop_submission_workers(std::chrono::steady_clock::now() + std::chrono::seconds(5)));
+    CHECK(backend->wait_fence(third, 0));
+    CHECK(!backend->last_error());
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+}
+
+// Shutdown must unblock a real fourth upload waiting to recycle allocator 0
+// behind an unfilled native position, including the encode-thread publisher.
+void test_native_capture_upload_wrap_shutdown(id<MTLDevice> device, id<MTL4CommandQueue> queue, bool shutdown) {
+    auto owner = std::make_shared<replay::Metal4SubmissionOwner>(device, queue);
+    replay::Resources resources(device, owner);
+    CHECK(resources.wait_for_gpu_deswizzle(std::chrono::seconds(10)));
+    constexpr std::size_t size = 64 * 1024;
+    auto* bytes = static_cast<std::uint8_t*>(mmap(nullptr, size, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    CHECK(bytes != MAP_FAILED);
+    if (bytes == MAP_FAILED) return;
+    MemoryPoolState pool{};
+    pool.memory = bytes; pool.size = size;
+    pool.flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+    CHECK(resources.register_pool(pool));
+    const auto make = [&](std::uint64_t serial, std::size_t offset, bool linear) {
+        auto state = texture_state(serial, 8, 8);
+        if (linear) { state.description.flags = NVN_TEXTURE_FLAGS_LINEAR; state.description.stride = 256; }
+        auto layout = resource_layout(state.description);
+        state.size = layout->total_size; state.layer_size = layout->layer_stride;
+        state.pool = &pool; state.offset = offset; state.memory = bytes + offset;
+        std::memset(state.memory, int(serial), state.size);
+        resources.register_texture(state);
+        return state;
+    };
+    auto native_state = make(170, 0, true);
+    auto pin = resources.capture_native(native_state);
+    CHECK(pin.texture && resources.flush_uploads());
+    id<MTLSharedEvent> gate = shutdown ? nil : [device newSharedEvent];
+    if (gate) [queue waitForEvent:gate value:1];
+    auto released = std::make_shared<std::atomic<unsigned>>(0);
+    auto native = std::make_shared<replay::Metal4NativeSubmission>(owner, owner->reserve(),
+        pin.producer_error, pin.allocation, [release=pin.release_read, released] { release(); ++*released; });
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    CHECK(backend != nullptr);
+    backend->track_native_submission(native);
+    std::array<TextureState, 4> states;
+    for (unsigned i = 0; i != states.size(); ++i) states[i] = make(180+i, 0x4000+i*0x1000, false);
+    struct Lifetime {
+        __weak id<MTLBuffer> staging;
+        __weak id<MTLTexture> target;
+    };
+    std::array<Lifetime, 4> lifetimes;
+    std::promise<void> entered_wait;
+    auto waiting = entered_wait.get_future();
+    resources.set_upload_observer([&](const replay::Resources::UploadObservation& observation) {
+        if (observation.kind == replay::Resources::UploadObservation::Kind::batch) {
+            CHECK(observation.batch >= 1 && observation.batch <= lifetimes.size());
+            if (observation.batch >= 1 && observation.batch <= lifetimes.size())
+                lifetimes[observation.batch-1] = {observation.staging, observation.target};
+            return;
+        }
+        CHECK(observation.batch == 1);
+        for (unsigned i=0; i != 3; ++i) CHECK(lifetimes[i].staging && lifetimes[i].target);
+        entered_wait.set_value();
+    });
+    std::atomic<unsigned> admitted{0};
+    std::atomic<bool> finished{false};
+    CHECK(backend->enqueue_frame_capture(0, [&](bool allowed) {
+        CHECK(allowed);
+        resources.begin_walk();
+        for (unsigned i = 0; i != states.size(); ++i) {
+            admitted.store(i+1, std::memory_order_release);
+            CHECK(resources.texture(states[i], nullptr));
+            CHECK(resources.publish_uploads());
+        }
+        resources.end_walk();
+        // A capture already executing at shutdown cannot add a new blocker.
+        auto late = std::make_shared<replay::Metal4NativeSubmission>(owner, owner->reserve());
+        backend->track_native_submission(late);
+        finished.store(true, std::memory_order_release);
+    }));
+    // The signal comes from the live-slot path immediately before its wait,
+    // with both the native frontier and optional GPU gate still closed.
+    CHECK(waiting.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+    CHECK(admitted == 4);
+    CHECK(owner->issued() >= 4 && owner->published() == 0 && released->load() == 0);
+    if (!shutdown) {
+        native->cancel();
+        const auto published_until = std::chrono::steady_clock::now()+std::chrono::seconds(2);
+        while (owner->published() < 4 && std::chrono::steady_clock::now() < published_until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // The encode ring exposed all three producers before allocator reuse
+        // waited, but GPU completion still gates that reuse and the fourth walk.
+        CHECK(owner->published() >= 4 && !finished.load(std::memory_order_acquire));
+        CHECK(!owner->wait_gpu(4, std::chrono::milliseconds(1)));
+        gate.signaledValue = 1;
+    }
+    CHECK(backend->stop_submission_workers(std::chrono::steady_clock::now()+std::chrono::seconds(3)));
+    CHECK(owner->retired() == owner->issued() && released->load() == 1);
+    native->cancel();
+    CHECK(released->load() == 1);
+    CHECK(resources.flush_uploads());
+    resources.set_upload_observer({});
+    for (const auto& lifetime : lifetimes) CHECK(!lifetime.staging && lifetime.target);
+    for (unsigned i = 0; i != states.size(); ++i) {
+        @autoreleasepool {
+        const auto pixels = read_private_texels(device, resources, resources.texture(states[i], nullptr), 4);
+        CHECK(pixels.size() == 4*4*4);
+        for (const auto value : pixels) CHECK(value == std::uint8_t(states[i].serial));
+        }
+    }
+    resources.release_pool(pool);
+    std::vector<replay::Resources::GuestMemoryPool> pools;
+    resources.claim_guest_memory_pools(0, pools);
+    CHECK(pools.empty());
+    for (const auto& lifetime : lifetimes) CHECK(!lifetime.staging && !lifetime.target);
+    munmap(bytes, size);
+}
+
+// Real upload execution with failed feedback must fail its replay/native
+// consumers once, release their leases, and allow a later healthy retry.
+void test_real_upload_feedback_failure(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    auto injected = std::make_shared<std::atomic<unsigned>>(0);
+    auto owner = std::make_shared<replay::Metal4SubmissionOwner>(device, queue,
+        [injected](std::uint64_t ticket, id<MTL4CommitFeedback> feedback) -> id<MTL4CommitFeedback> {
+            if (ticket != 1) return feedback;
+            ++*injected;
+            return failed_commit_feedback(feedback);
+        });
+    replay::Resources resources(device, owner);
+    CHECK(resources.wait_for_gpu_deswizzle(std::chrono::seconds(10)));
+    constexpr std::size_t size = 64*1024;
+    auto* bytes = static_cast<std::uint8_t*>(mmap(nullptr,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));
+    CHECK(bytes != MAP_FAILED);
+    if (bytes == MAP_FAILED) return;
+    MemoryPoolState pool{};
+    pool.memory=bytes; pool.size=size; pool.flags=NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED|NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+    CHECK(resources.register_pool(pool));
+    const auto make = [&](std::uint64_t serial, std::size_t offset, bool linear) {
+        auto state=texture_state(serial,8,8);
+        if (linear) { state.description.flags=NVN_TEXTURE_FLAGS_LINEAR; state.description.stride=256; }
+        auto layout=resource_layout(state.description);
+        state.size=layout->total_size; state.layer_size=layout->layer_stride;
+        state.pool=&pool; state.offset=offset; state.memory=bytes+offset;
+        std::memset(state.memory,int(serial),state.size);
+        resources.register_texture(state);
+        return state;
+    };
+    auto linear = make(191,0,true);
+    auto pool_pin = resources.capture_native(linear);
+    auto state = make(192,0x4000,false);
+    auto gate = [device newSharedEvent];
+    [queue waitForEvent:gate value:1];
+    CHECK(resources.texture(state,nullptr));
+    auto backend = replay::create_replay_backend(device,queue,resources);
+    Recorder recorder;
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    const auto handle=recorder.finish();
+    const auto first=backend->submit({&handle,1});
+    auto captured=std::make_shared<std::promise<replay::Resources::NativeSnapshot>>();
+    auto future=captured->get_future();
+    CHECK(backend->enqueue_frame_capture(first,[&](bool admitted) {
+        CHECK(admitted);
+        captured->set_value(resources.capture_native(state));
+    }));
+    CHECK(future.wait_for(std::chrono::seconds(3))==std::future_status::ready);
+    auto pin=future.get();
+    auto released=std::make_shared<std::atomic<unsigned>>(0);
+    auto native=std::make_shared<replay::Metal4NativeSubmission>(owner,owner->reserve(),pin.producer_error,pin.allocation,
+        [release=pin.release_read,pool_release=pool_pin.release_read,released] { release(); pool_release(); ++*released; });
+    backend->track_native_submission(native);
+    auto allocator=[device newCommandAllocator];
+    auto commands=[device newCommandBuffer];
+    auto output=[device newBufferWithLength:256*8 options:MTLResourceStorageModeShared];
+    NSError* error=nil;
+    auto residency=[device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:&error];
+    [residency addAllocation:pin.texture]; [residency addAllocation:output]; [residency commit];
+    [commands beginCommandBufferWithAllocator:allocator]; [commands useResidencySet:residency];
+    auto copy=[commands computeCommandEncoder];
+    [copy barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+    [copy copyFromTexture:pin.texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+        sourceSize:MTLSizeMake(8,8,1) toBuffer:output destinationOffset:0 destinationBytesPerRow:256 destinationBytesPerImage:2048];
+    [copy endEncoding]; [commands endCommandBuffer];
+    auto rejected=std::make_shared<std::atomic<unsigned>>(0);
+    const auto native_ticket=native->publish(commands, ^(id<MTL4CommitFeedback> feedback) {
+        static_cast<void>(allocator); static_cast<void>(residency); static_cast<void>(output);
+        CHECK(!feedback.error);
+        if (!native->producer_error().empty()) ++*rejected;
+    });
+    CHECK(native_ticket && !owner->wait_gpu(native_ticket,std::chrono::milliseconds(1)));
+    gate.signaledValue=1;
+    CHECK(backend->wait_fence(first,5'000'000'000ull));
+    CHECK(owner->wait(native_ticket,std::chrono::seconds(5)));
+    CHECK(injected->load()==1 && rejected->load()==1 && released->load()==1);
+    CHECK(backend->last_error().code==replay::ReplayErrorCode::execution);
+    CHECK(backend->last_error().detail.find("texture upload failed")!=std::string::npos);
+    CHECK(!resources.uploads_failed({1,0}));
+    native->cancel(); native->cancel();
+    CHECK(released->load()==1);
+    CHECK(!resources.flush_uploads() && resources.flush_uploads());
+    CHECK(backend->stop_submission_workers(std::chrono::steady_clock::now()+std::chrono::seconds(3)));
+    backend.reset();
+    // The failed destination is invalidated and uploaded by its next lookup.
+    CHECK(resources.texture(state,nullptr));
+    auto healthy=replay::create_replay_backend(device,queue,resources);
+    const auto next=healthy->submit({&handle,1});
+    CHECK(healthy->wait_fence(next,5'000'000'000ull) && !healthy->last_error());
+    CHECK(resources.flush_uploads() && injected->load()==1 && resources.upload_counts().gpu==2);
+    const auto pixels=read_private_texels(device,resources,resources.texture(state,nullptr),4);
+    for (auto value:pixels) CHECK(value==192);
+    CHECK(healthy->stop_submission_workers(std::chrono::steady_clock::now()+std::chrono::seconds(3)));
+    resources.release_pool(pool);
+    std::vector<replay::Resources::GuestMemoryPool> pools;
+    resources.claim_guest_memory_pools(0,pools);
+    CHECK(pools.empty() && released->load()==1);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device,handle);
+    munmap(bytes,size);
+}
+
+// Attachment reads use the image visible before a feedback draw. A snapshot
+// remains valid until the next guest barrier, including internal pass breaks.
+void test_attachment_feedback(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    const std::array<unsigned, 9> slots{0, 10, 128, 255, 0, 10, 10, 0, 0};
+    for (unsigned variant = 0; variant != slots.size(); ++variant) {
+        for (bool hdr : {false, true}) {
+            const bool image = variant == 4, other_mip = variant == 5, other_layer = variant == 6;
+            const bool down_mip = variant == 7, pinned_mip = variant == 8;
+            const bool disjoint = other_mip || other_layer || down_mip || pinned_mip;
+            const unsigned extent = down_mip ? 2 : 4;
+            TestResources resources(device);
+            auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+                hdr ? MTLPixelFormatRG11B10Float : MTLPixelFormatRGBA8Unorm
+                width:4 height:4 mipmapped:(other_mip || down_mip || pinned_mip)];
+            descriptor.storageMode = MTLStorageModePrivate;
+            descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            if (disjoint) descriptor.usage |= MTLTextureUsagePixelFormatView;
+            if (other_layer) { descriptor.textureType = MTLTextureType2DArray; descriptor.arrayLength = 2; }
+            resources.textures[190] = [device newTextureWithDescriptor:descriptor];
+            id<MTLTexture> source_root = resources.textures[190];
+            descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                width:extent height:extent mipmapped:NO];
+            descriptor.storageMode = MTLStorageModePrivate;
+            descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            descriptor.pixelFormat = MTLPixelFormatRGBA8Unorm;
+            resources.textures[191] = [device newTextureWithDescriptor:descriptor];
+            resources.texture_ids[300] = (other_mip || other_layer)
+                ? [resources.textures[190] newTextureViewWithPixelFormat:resources.textures[190].pixelFormat
+                    textureType:MTLTextureType2D levels:NSMakeRange(other_mip ? 1 : 0, 1)
+                    slices:NSMakeRange(other_layer ? 1 : 0, 1)] : resources.textures[190];
+            if (down_mip) resources.textures[190] = [source_root newTextureViewWithPixelFormat:source_root.pixelFormat
+                textureType:MTLTextureType2D levels:NSMakeRange(1, 1) slices:NSMakeRange(0, 1)];
+            if (pinned_mip) {
+                auto* sampler = [MTLSamplerDescriptor new];
+                sampler.minFilter = sampler.magFilter = MTLSamplerMinMagFilterNearest;
+                sampler.mipFilter = MTLSamplerMipFilterNearest;
+                sampler.lodMinClamp = sampler.lodMaxClamp = 1;
+                sampler.supportArgumentBuffers = YES;
+                resources.samplers[1] = [device newSamplerStateWithDescriptor:sampler];
+                resources.pinned_levels[1] = 1;
+            }
+            auto source_state = texture_state(190, extent, extent);
+            source_state.description.format = hdr ? NVN_FORMAT_R11G11B10F : NVN_FORMAT_RGBA8;
+            if (other_mip) source_state.description.levels = 3;
+            if (other_layer) { source_state.description.target = NVN_TEXTURE_TARGET_2D_ARRAY; source_state.description.depth = 2; }
+            auto result_state = texture_state(191, extent, extent);
+            auto source = texture_object(source_state), result = texture_object(result_state);
+            const NVNtexture* targets[]{&source, &result};
+            id<MTLCommandQueue> initializer = [device newCommandQueue];
+            id<MTLCommandBuffer> initial = [initializer commandBuffer];
+            auto* initial_pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            initial_pass.colorAttachments[0].texture = source_root;
+            initial_pass.colorAttachments[0].level = (other_mip || pinned_mip) ? 1 : 0;
+            initial_pass.colorAttachments[0].slice = other_layer ? 1 : 0;
+            initial_pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+            initial_pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            initial_pass.colorAttachments[0].clearColor = MTLClearColorMake(1, 0, 0, 1);
+            id<MTLRenderCommandEncoder> initial_encoder = [initial renderCommandEncoderWithDescriptor:initial_pass];
+            [initial_encoder endEncoding];
+            [initial commit];
+            [initial waitUntilCompleted];
+            CHECK(initial.status == MTLCommandBufferStatusCompleted && !initial.error);
+            Recorder recorder;
+            auto probe = [TextureAllocationProbeDevice alloc];
+            probe.target = device;
+            probe.textures = [NSMutableArray array];
+            auto backend = replay::create_replay_backend((id<MTLDevice>)probe, queue, resources);
+            NVNprogram program{};
+            CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+            const NVNshaderData shaders[]{{180 + variant, nullptr}, {180 + variant, nullptr}};
+            CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+            load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+            load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 2, targets, nullptr, nullptr, nullptr);
+            load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+            if (image)
+                load<Entry::nvnCommandBufferBindImage>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, 300);
+            else if (slots[variant] >= 128)
+                load<Entry::nvnCommandBufferBindSeparateTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT,
+                    slots[variant] - 128, NVNseparateTextureHandle{300});
+            else
+                load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, slots[variant], 300u | (pinned_mip ? 1ull << 20 : 0));
+            load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 0, 0, 4, 4);
+            NVNchannelMaskState channels{};
+            load<Entry::nvnChannelMaskStateSetDefaults>()(&channels);
+            load<Entry::nvnChannelMaskStateSetChannelMask>()(&channels, 0, 0, 0, 0, 0);
+            load<Entry::nvnCommandBufferBindChannelMaskState>()(&recorder.commands, &channels);
+            load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+            // An earlier read of attachment 0 must finish before a later draw
+            // in the same pass writes it; this draw itself reads a snapshot.
+            load<Entry::nvnChannelMaskStateSetDefaults>()(&channels);
+            load<Entry::nvnCommandBufferBindChannelMaskState>()(&recorder.commands, &channels);
+            load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+            NVNcopyRegion whole{0, 0, 0, static_cast<int>(extent), static_cast<int>(extent), 1};
+            load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands, &result, nullptr, &whole,
+                TestResources::base + 0x1000, 0);
+            // No guest barrier: reuse the original red snapshot after the
+            // original attachment has become green.
+            load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+            load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands, &result, nullptr, &whole,
+                TestResources::base + 0x2000, 0);
+            load<Entry::nvnCommandBufferBarrier>()(&recorder.commands, NVN_BARRIER_INVALIDATE_TEXTURE_BIT);
+            load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+            load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands, &result, nullptr, &whole,
+                TestResources::base + 0x3000, 0);
+            const auto handle = recorder.finish();
+            const auto fence = backend->submit({&handle, 1});
+            CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+            CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+            CHECK(backend->statistics().feedback_snapshots == (disjoint ? 0 : 2));
+            CHECK(disjoint || backend->statistics().feedback_snapshot_reuses >= 1);
+            @synchronized(probe) {
+                NSUInteger snapshots = 0;
+                for (id<MTLTexture> texture in probe.textures) {
+                    if (texture.usage != (MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView)) continue;
+                    ++snapshots;
+                    CHECK(!texture.allowGPUOptimizedContents);
+                    CHECK(texture.width == extent && texture.height == extent);
+                    CHECK(texture.pixelFormat == source_root.pixelFormat);
+                }
+                CHECK(disjoint || snapshots == 1);
+            }
+            CHECK(disjoint || backend->statistics().feedback_read_pass_splits >= 1);
+            CHECK(!(down_mip || pinned_mip) || backend->statistics().feedback_mip_view_narrows >= 1);
+            const auto* bytes = static_cast<const std::uint8_t*>(resources.memory.contents);
+            for (unsigned sample = 1; sample != 4; ++sample) {
+                const auto* pixels = bytes + sample * 0x1000;
+                for (unsigned pixel = 0; pixel != extent * extent; ++pixel) {
+                    CHECK(pixels[pixel * 4] == (!disjoint && sample == 3 ? 0 : 255));
+                    CHECK(pixels[pixel * 4 + 1] == (!disjoint && sample == 3 ? 255 : 0));
+                    CHECK(pixels[pixel * 4 + 2] == 0 && pixels[pixel * 4 + 3] == 255);
+                }
+            }
+            load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+            load<Entry::nvnProgramFinalize>()(&program);
+        }
+    }
+}
+
+// Full sampled views preserve every visible mip and array/cube layer while
+// the attachment changes. Nonzero parent offsets distinguish the view from
+// its root and catch snapshots that copy only the attached subresource.
+void test_attachment_feedback_views(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    for (unsigned kind = 0; kind != 4; ++kind) {
+        const MTLTextureType types[]{MTLTextureType2D, MTLTextureType2DArray,
+                                      MTLTextureTypeCube, MTLTextureTypeCubeArray};
+        const bool array = kind == 1 || kind == 3, cube = kind >= 2;
+        const NSUInteger first_slice = kind == 1 ? 1 : kind == 3 ? 6 : 0;
+        const NSUInteger layers = cube ? (array ? 12 : 6) : (array ? 2 : 1);
+        auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+            width:8 height:8 mipmapped:YES];
+        descriptor.textureType = types[kind];
+        descriptor.arrayLength = kind == 1 ? 4 : kind == 3 ? 3 : 1;
+        descriptor.storageMode = MTLStorageModePrivate;
+        descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
+        id<MTLTexture> root = [device newTextureWithDescriptor:descriptor];
+        id<MTLTexture> sampled = [root newTextureViewWithPixelFormat:root.pixelFormat textureType:types[kind]
+            levels:NSMakeRange(1, 2) slices:NSMakeRange(first_slice, layers)];
+        CHECK(root && sampled);
+        if (!root || !sampled) continue;
+        TestResources resources(device);
+        resources.textures[190] = sampled;
+        resources.texture_ids[300] = sampled;
+        auto* result_descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+            width:4 height:4 mipmapped:NO];
+        result_descriptor.storageMode = MTLStorageModePrivate;
+        result_descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        resources.textures[191] = [device newTextureWithDescriptor:result_descriptor];
+        auto source_state = texture_state(190, 4, 4), result_state = texture_state(191, 4, 4);
+        source_state.description.levels = 2;
+        source_state.description.target = kind == 0 ? NVN_TEXTURE_TARGET_2D : kind == 1 ? NVN_TEXTURE_TARGET_2D_ARRAY :
+            kind == 2 ? NVN_TEXTURE_TARGET_CUBEMAP : NVN_TEXTURE_TARGET_CUBEMAP_ARRAY;
+        source_state.description.depth = static_cast<std::uint32_t>(layers);
+        auto source = texture_object(source_state), result = texture_object(result_state);
+        const NVNtexture* targets[]{&source, &result};
+        id<MTLCommandQueue> initialize = [device newCommandQueue];
+        id<MTLCommandBuffer> initial = [initialize commandBuffer];
+        for (NSUInteger mip = 1; mip != 3; ++mip) {
+            for (NSUInteger layer = first_slice; layer != first_slice + layers; ++layer) {
+                auto* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+                auto* attachment = pass.colorAttachments[0];
+                attachment.texture = root; attachment.level = mip; attachment.slice = layer;
+                attachment.loadAction = MTLLoadActionClear; attachment.storeAction = MTLStoreActionStore;
+                // Base mip/layer is red; every other visible subresource blue.
+                attachment.clearColor = mip == 1 && layer == first_slice
+                    ? MTLClearColorMake(1, 0, 0, 1) : MTLClearColorMake(0, 0, 1, 1);
+                id<MTLRenderCommandEncoder> encoder = [initial renderCommandEncoderWithDescriptor:pass];
+                [encoder endEncoding];
+            }
+        }
+        [initial commit]; [initial waitUntilCompleted];
+        CHECK(initial.status == MTLCommandBufferStatusCompleted && !initial.error);
+        auto probe = [TextureAllocationProbeDevice alloc]; probe.target = device;
+        probe.textures = [NSMutableArray array];
+        auto backend = replay::create_replay_backend((id<MTLDevice>)probe, queue, resources);
+        Recorder recorder;
+        NVNprogram program{};
+        CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+        const NVNshaderData shaders[]{{0x7010u + kind, nullptr}, {0x7010u + kind, nullptr}};
+        CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 2, targets, nullptr, nullptr, nullptr);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, 300);
+        load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 0, 0, 4, 4);
+        const NVNcopyRegion whole{0, 0, 0, 4, 4, 1};
+        for (unsigned draw = 0; draw != 3; ++draw) {
+            if (draw == 2) load<Entry::nvnCommandBufferBarrier>()(&recorder.commands, NVN_BARRIER_INVALIDATE_TEXTURE_BIT);
+            load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+            load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands, &result, nullptr, &whole,
+                TestResources::base + (draw + 1) * 0x1000, 0);
+        }
+        const auto handle = recorder.finish();
+        const auto fence = backend->submit({&handle, 1});
+        CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+        CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+        CHECK(backend->statistics().feedback_snapshots == 2 && backend->statistics().feedback_snapshot_reuses >= 1);
+        const auto* memory = static_cast<const std::uint8_t*>(resources.memory.contents);
+        for (unsigned draw = 0; draw != 3; ++draw) {
+            const auto* pixels = memory + (draw + 1) * 0x1000;
+            for (unsigned pixel = 0; pixel != 16; ++pixel)
+                CHECK(pixels[4 * pixel] == (draw == 2 ? 0 : 255) && pixels[4 * pixel + 1] == 255 &&
+                      pixels[4 * pixel + 2] == 0 && pixels[4 * pixel + 3] == 255);
+        }
+        @synchronized(probe) {
+            unsigned snapshots = 0;
+            for (id<MTLTexture> texture in probe.textures) {
+                if (texture.usage != (MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView)) continue;
+                ++snapshots;
+                CHECK(texture.textureType == types[kind] && texture.width == 4 && texture.height == 4 &&
+                      texture.mipmapLevelCount == 2 && texture.arrayLength == (array ? 2 : 1));
+                CHECK(!texture.allowGPUOptimizedContents);
+            }
+            CHECK(snapshots == 1);
+        }
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+        load<Entry::nvnProgramFinalize>()(&program);
+    }
+}
+
+// Transfer writes and clears publish new attachment contents even without a
+// guest texture barrier; they cannot reuse a snapshot from before that write.
+// Sampling while writing depth or stencil reads the pre-draw snapshot until
+// the next guest barrier. A nonwriting reader after a depth write must instead
+// see the completed write. Storage output makes depth-only passes observable.
+void test_depth_attachment_feedback(id<MTLDevice> device, id<MTL4CommandQueue> queue,
+                                    bool color, bool combined, bool stencil, bool read_after_write,
+                                    bool read_before_write = false, unsigned invalidation = 0) {
+    TestResources resources(device);
+    auto probe = [TextureAllocationProbeDevice alloc];
+    probe.target = device;
+    probe.textures = [NSMutableArray array];
+    auto backend = replay::create_replay_backend((id<MTLDevice>)probe, queue, resources);
+    auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+        combined ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatDepth32Float
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModePrivate;
+    descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+    resources.textures[192] = [device newTextureWithDescriptor:descriptor];
+    resources.texture_ids[300] = [resources.textures[192] newTextureViewWithPixelFormat:descriptor.pixelFormat];
+    if (invalidation == 2) resources.textures[196] = [device newTextureWithDescriptor:descriptor];
+    descriptor.pixelFormat = MTLPixelFormatRGBA8Unorm;
+    resources.textures[193] = [device newTextureWithDescriptor:descriptor];
+    auto depth_state = texture_state(192, 4, 4), color_state = texture_state(193, 4, 4);
+    depth_state.description.format = combined ? NVN_FORMAT_DEPTH32F_STENCIL8 : NVN_FORMAT_DEPTH32F;
+    auto copy_state = depth_state;
+    copy_state.serial = 196;
+    auto copy_source = texture_object(copy_state);
+    auto depth = texture_object(depth_state), target = texture_object(color_state);
+    const NVNtexture* targets[]{&target};
+    id<MTLCommandQueue> initializer = [device newCommandQueue];
+    id<MTLCommandBuffer> initial = [initializer commandBuffer];
+    auto* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.depthAttachment.texture = resources.textures[192];
+    pass.depthAttachment.loadAction = MTLLoadActionClear;
+    pass.depthAttachment.storeAction = MTLStoreActionStore;
+    pass.depthAttachment.clearDepth = 0.75;
+    if (combined) {
+        pass.stencilAttachment.texture = resources.textures[192];
+        pass.stencilAttachment.loadAction = MTLLoadActionClear;
+        pass.stencilAttachment.storeAction = MTLStoreActionStore;
+        pass.stencilAttachment.clearStencil = 9;
+    }
+    id<MTLRenderCommandEncoder> encoder = [initial renderCommandEncoderWithDescriptor:pass];
+    [encoder endEncoding];
+    if (invalidation == 2) {
+        pass.depthAttachment.texture = resources.textures[196];
+        pass.depthAttachment.clearDepth = 0.5;
+        if (combined) {
+            pass.stencilAttachment.texture = resources.textures[196];
+            pass.stencilAttachment.clearStencil = 17;
+        }
+        encoder = [initial renderCommandEncoderWithDescriptor:pass];
+        [encoder endEncoding];
+    }
+    [initial commit];
+    [initial waitUntilCompleted];
+    CHECK(initial.status == MTLCommandBufferStatusCompleted && !initial.error);
+    Recorder recorder;
+    NVNprogram program{}, plain{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    CHECK(load<Entry::nvnProgramInitialize>()(&plain, &recorder.device));
+    const NVNshaderData shaders[]{{combined ? 191u : 190u, nullptr}, {combined ? 191u : 190u, nullptr}};
+    const NVNshaderData plain_shaders[]{{1, nullptr}, {1, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+    CHECK(load<Entry::nvnProgramSetShaders>()(&plain, 2, plain_shaders));
+    NVNdepthStencilState depth_test{};
+    load<Entry::nvnDepthStencilStateSetDefaults>()(&depth_test);
+    load<Entry::nvnDepthStencilStateSetDepthTestEnable>()(&depth_test, 1);
+    load<Entry::nvnDepthStencilStateSetDepthWriteEnable>()(&depth_test, !stencil);
+    load<Entry::nvnDepthStencilStateSetDepthFunc>()(&depth_test, NVN_DEPTH_FUNC_ALWAYS);
+    if (stencil) {
+        load<Entry::nvnDepthStencilStateSetStencilTestEnable>()(&depth_test, 1);
+        load<Entry::nvnDepthStencilStateSetStencilFunc>()(&depth_test, NVN_FACE_FRONT_AND_BACK, NVN_STENCIL_FUNC_ALWAYS);
+        load<Entry::nvnDepthStencilStateSetStencilOp>()(&depth_test, NVN_FACE_FRONT_AND_BACK,
+            NVN_STENCIL_OP_KEEP, NVN_STENCIL_OP_KEEP, NVN_STENCIL_OP_REPLACE);
+    }
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, color ? 1 : 0,
+        color ? targets : nullptr, nullptr, &depth, nullptr);
+    load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 0, 0, 4, 4);
+    load<Entry::nvnCommandBufferBindDepthStencilState>()(&recorder.commands, &depth_test);
+    if (read_after_write) {
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &plain, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+        load<Entry::nvnDepthStencilStateSetDepthWriteEnable>()(&depth_test, 0);
+        load<Entry::nvnCommandBufferBindDepthStencilState>()(&recorder.commands, &depth_test);
+    }
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, 300);
+    if (read_before_write) {
+        load<Entry::nvnDepthStencilStateSetDepthWriteEnable>()(&depth_test, 0);
+        load<Entry::nvnCommandBufferBindDepthStencilState>()(&recorder.commands, &depth_test);
+        load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+            TestResources::base + 0x1f00, 16 * sizeof(float));
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+        load<Entry::nvnDepthStencilStateSetDepthWriteEnable>()(&depth_test, 1);
+        load<Entry::nvnCommandBufferBindDepthStencilState>()(&recorder.commands, &depth_test);
+    }
+    for (unsigned draw = 0; draw != 3; ++draw) {
+        if (draw == 2) {
+            if (invalidation == 1)
+                load<Entry::nvnCommandBufferClearDepthStencil>()(&recorder.commands, 0.25f, 1, 83, combined ? 255 : 0);
+            else if (invalidation == 2) {
+                const NVNcopyRegion whole{0, 0, 0, 4, 4, 1};
+                load<Entry::nvnCommandBufferCopyTextureToTexture>()(&recorder.commands, &copy_source, nullptr, &whole,
+                    &depth, nullptr, &whole, NVN_COPY_FLAGS_NONE);
+            } else
+                load<Entry::nvnCommandBufferBarrier>()(&recorder.commands, NVN_BARRIER_INVALIDATE_TEXTURE_BIT);
+        }
+        load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+            TestResources::base + 0x2000 + draw * 0x100, 16 * sizeof(float));
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    }
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+    @synchronized(probe) {
+        for (id<MTLTexture> texture in probe.textures)
+            if (texture.usage == (MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView)) {
+                CHECK(texture.pixelFormat == resources.textures[192].pixelFormat);
+                CHECK(texture.allowGPUOptimizedContents == descriptor.allowGPUOptimizedContents);
+            }
+    }
+    if (read_after_write) {
+        CHECK(backend->statistics().feedback_snapshots == 0);
+        CHECK(backend->statistics().pass_break_depth_sampled >= 1);
+    } else {
+        CHECK(backend->statistics().feedback_snapshots == 2);
+        CHECK(backend->statistics().feedback_snapshot_reuses >= 1);
+    }
+    if (read_before_write) {
+        std::array<float, 16> values{};
+        std::memcpy(values.data(), static_cast<const std::byte*>(resources.memory.contents) + 0x1f00, sizeof values);
+        for (float value : values) CHECK(value == 0.75f);
+    }
+    for (unsigned draw = 0; draw != 3; ++draw) {
+        std::array<float, 16> values{};
+        std::memcpy(values.data(), static_cast<const std::byte*>(resources.memory.contents) +
+            0x2000 + draw * 0x100, sizeof values);
+        const float expected = read_after_write || (!stencil && draw == 2) ? 0.0f : 0.75f;
+        const float refreshed = draw == 2 && invalidation ? (invalidation == 1 ? 0.25f : 0.5f) : expected;
+        for (float value : values) CHECK(value == refreshed);
+    }
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnProgramFinalize>()(&plain);
+}
+
+// The same depth view bound through sampled and image access must be refused
+// in either reflection order, including when a sampled snapshot is cached.
+void test_depth_feedback_access_kind(id<MTLDevice> device, id<MTL4CommandQueue> queue,
+                                     bool color, bool image_first, unsigned unsupported_view = 0) {
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+        width:4 height:4 mipmapped:NO];
+    desc.storageMode = MTLStorageModePrivate;
+    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+    if (unsupported_view == 1) {
+        desc.textureType = MTLTextureType2DMultisample;
+        desc.sampleCount = 4;
+    } else if (unsupported_view == 2) desc.mipmapLevelCount = 2;
+    else if (unsupported_view == 3) {
+        desc.textureType = MTLTextureType2DArray;
+        desc.arrayLength = 2;
+    }
+    resources.textures[194] = [device newTextureWithDescriptor:desc];
+    CHECK(resources.textures[194] != nil);
+    if (!resources.textures[194]) return;
+    resources.texture_ids[300] = unsupported_view ? resources.textures[194]
+        : [resources.textures[194] newTextureViewWithPixelFormat:desc.pixelFormat];
+    auto* color_desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    color_desc.storageMode = MTLStorageModePrivate;
+    color_desc.usage = MTLTextureUsageRenderTarget;
+    if (unsupported_view == 1) {
+        color_desc.textureType = MTLTextureType2DMultisample;
+        color_desc.sampleCount = 4;
+    }
+    resources.textures[195] = [device newTextureWithDescriptor:color_desc];
+    auto depth_state = texture_state(194, 4, 4), color_state = texture_state(195, 4, 4);
+    depth_state.description.format = NVN_FORMAT_DEPTH32F;
+    if (unsupported_view == 1) {
+        depth_state.description.target = color_state.description.target = NVN_TEXTURE_TARGET_2D_MULTISAMPLE;
+        depth_state.description.samples = color_state.description.samples = 4;
+    } else if (unsupported_view == 2) depth_state.description.levels = 2;
+    else if (unsupported_view == 3) {
+        depth_state.description.target = NVN_TEXTURE_TARGET_2D_ARRAY;
+        depth_state.description.depth = 2;
+    }
+    auto depth = texture_object(depth_state), target = texture_object(color_state);
+    const NVNtexture* targets[]{&target};
+    id<MTLCommandQueue> initializer = [device newCommandQueue];
+    id<MTLCommandBuffer> initial = [initializer commandBuffer];
+    auto* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.depthAttachment.texture = resources.textures[194];
+    pass.depthAttachment.loadAction = MTLLoadActionClear;
+    pass.depthAttachment.storeAction = MTLStoreActionStore;
+    pass.depthAttachment.clearDepth = 0.75;
+    id<MTLRenderCommandEncoder> encoder = [initial renderCommandEncoderWithDescriptor:pass];
+    [encoder endEncoding];
+    [initial commit];
+    [initial waitUntilCompleted];
+    CHECK(initial.status == MTLCommandBufferStatusCompleted && !initial.error);
+    std::memset(static_cast<std::byte*>(resources.memory.contents) + 0x2000, 0, 64);
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const unsigned marker = unsupported_view ? 190 : image_first ? 193 : 192;
+    const NVNshaderData shaders[]{{marker, nullptr}, {marker, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+    NVNdepthStencilState state{};
+    load<Entry::nvnDepthStencilStateSetDefaults>()(&state);
+    load<Entry::nvnDepthStencilStateSetDepthTestEnable>()(&state, 1);
+    load<Entry::nvnDepthStencilStateSetDepthWriteEnable>()(&state, 1);
+    load<Entry::nvnDepthStencilStateSetDepthFunc>()(&state, NVN_DEPTH_FUNC_ALWAYS);
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, color ? 1 : 0,
+        color ? targets : nullptr, nullptr, &depth, nullptr);
+    load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 0, 0, 4, 4);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferBindDepthStencilState>()(&recorder.commands, &state);
+    load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, 300);
+    load<Entry::nvnCommandBufferBindImage>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, 300);
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+        TestResources::base + 0x2000, 64);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    const std::string_view message = unsupported_view
+        ? "attachment feedback snapshot does not support"
+        : "depth attachment image feedback while writing";
+    CHECK(fence && !backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(backend->fatal_error_detail().find(message) != std::string::npos);
+    CHECK(backend->stop_submission_workers(std::chrono::steady_clock::now() + std::chrono::seconds(5)));
+    CHECK(!backend->wait_fence(fence, 0));
+    CHECK(!backend->wait_fence(fence, UINT64_MAX));
+    const auto* output = reinterpret_cast<const float*>(static_cast<const std::byte*>(resources.memory.contents) + 0x2000);
+    for (unsigned pixel = 0; pixel != 16; ++pixel) CHECK(output[pixel] == 0.0f);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&program);
+}
+
+void test_stencil_feedback(id<MTLDevice> device, id<MTL4CommandQueue> queue, bool color) {
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
+        width:4 height:4 mipmapped:NO];
+    desc.storageMode = MTLStorageModePrivate;
+    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+    resources.textures[197] = [device newTextureWithDescriptor:desc];
+    resources.texture_ids[300] = [resources.textures[197] newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8
+        textureType:MTLTextureType2D levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
+    CHECK(resources.texture_ids[300] != nil);
+    if (!resources.texture_ids[300]) return;
+    desc.pixelFormat = MTLPixelFormatRGBA8Unorm;
+    resources.textures[198] = [device newTextureWithDescriptor:desc];
+    auto depth_state = texture_state(197, 4, 4), color_state = texture_state(198, 4, 4);
+    depth_state.description.format = NVN_FORMAT_DEPTH32F_STENCIL8;
+    auto depth = texture_object(depth_state), target = texture_object(color_state);
+    const NVNtexture* targets[]{&target};
+    id<MTLCommandQueue> initializer = [device newCommandQueue];
+    id<MTLCommandBuffer> initial = [initializer commandBuffer];
+    auto* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.depthAttachment.texture = pass.stencilAttachment.texture = resources.textures[197];
+    pass.depthAttachment.loadAction = pass.stencilAttachment.loadAction = MTLLoadActionClear;
+    pass.depthAttachment.storeAction = pass.stencilAttachment.storeAction = MTLStoreActionStore;
+    pass.depthAttachment.clearDepth = 0.75;
+    pass.stencilAttachment.clearStencil = 9;
+    id<MTLRenderCommandEncoder> encoder = [initial renderCommandEncoderWithDescriptor:pass];
+    [encoder endEncoding];
+    [initial commit];
+    [initial waitUntilCompleted];
+    CHECK(initial.status == MTLCommandBufferStatusCompleted && !initial.error);
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const NVNshaderData shaders[]{{197, nullptr}, {197, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+    NVNdepthStencilState state{};
+    load<Entry::nvnDepthStencilStateSetDefaults>()(&state);
+    load<Entry::nvnDepthStencilStateSetStencilTestEnable>()(&state, 1);
+    load<Entry::nvnDepthStencilStateSetStencilFunc>()(&state, NVN_FACE_FRONT_AND_BACK, NVN_STENCIL_FUNC_ALWAYS);
+    load<Entry::nvnDepthStencilStateSetStencilOp>()(&state, NVN_FACE_FRONT_AND_BACK,
+        NVN_STENCIL_OP_KEEP, NVN_STENCIL_OP_KEEP, NVN_STENCIL_OP_REPLACE);
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, color ? 1 : 0,
+        color ? targets : nullptr, nullptr, &depth, nullptr);
+    load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 0, 0, 4, 4);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferBindDepthStencilState>()(&recorder.commands, &state);
+    load<Entry::nvnCommandBufferSetStencilRef>()(&recorder.commands, NVN_FACE_FRONT_AND_BACK, 37);
+    load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, 300);
+    for (unsigned draw = 0; draw != 4; ++draw) {
+        if (draw == 2)
+            load<Entry::nvnCommandBufferClearDepthStencil>()(&recorder.commands, 0.75f, 0, 83, 255);
+        if (draw == 3) {
+            load<Entry::nvnDepthStencilStateSetStencilTestEnable>()(&state, 0);
+            load<Entry::nvnCommandBufferBindDepthStencilState>()(&recorder.commands, &state);
+        }
+        load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+            TestResources::base + 0x2000 + draw * 0x100, 64);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    }
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+    CHECK(backend->statistics().feedback_snapshots == 2);
+    CHECK(backend->statistics().feedback_snapshot_reuses >= 1);
+    const std::array<std::uint32_t, 4> expected{9, 9, 83, 37};
+    for (unsigned draw = 0; draw != 4; ++draw) {
+        std::array<std::uint32_t, 16> values{};
+        std::memcpy(values.data(), static_cast<const std::byte*>(resources.memory.contents) +
+            0x2000 + draw * 0x100, sizeof values);
+        for (auto value : values) CHECK(value == expected[draw]);
+    }
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&program);
+}
+
+void test_mixed_depth_feedback(id<MTLDevice> device, id<MTL4CommandQueue> queue, bool depth_first) {
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    desc.storageMode = MTLStorageModePrivate;
+    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+    resources.textures[203] = [device newTextureWithDescriptor:desc];
+    resources.texture_ids[300] = resources.textures[203];
+    desc.pixelFormat = MTLPixelFormatDepth32Float;
+    resources.textures[204] = [device newTextureWithDescriptor:desc];
+    resources.texture_ids[301] = resources.textures[204];
+    auto color_state = texture_state(203, 4, 4), depth_state = texture_state(204, 4, 4);
+    depth_state.description.format = NVN_FORMAT_DEPTH32F;
+    auto target = texture_object(color_state), depth = texture_object(depth_state);
+    const NVNtexture* targets[]{&target};
+    id<MTLCommandQueue> initializer = [device newCommandQueue];
+    id<MTLCommandBuffer> initial = [initializer commandBuffer];
+    auto* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = resources.textures[203];
+    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pass.colorAttachments[0].clearColor = MTLClearColorMake(1, 0, 0, 1);
+    pass.depthAttachment.texture = resources.textures[204];
+    pass.depthAttachment.loadAction = MTLLoadActionClear;
+    pass.depthAttachment.storeAction = MTLStoreActionStore;
+    pass.depthAttachment.clearDepth = 0.75;
+    id<MTLRenderCommandEncoder> encoder = [initial renderCommandEncoderWithDescriptor:pass];
+    [encoder endEncoding];
+    [initial commit];
+    [initial waitUntilCompleted];
+    CHECK(initial.status == MTLCommandBufferStatusCompleted && !initial.error);
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const unsigned marker = depth_first ? 196 : 195;
+    const NVNshaderData shaders[]{{marker, nullptr}, {marker, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+    NVNdepthStencilState state{};
+    load<Entry::nvnDepthStencilStateSetDefaults>()(&state);
+    load<Entry::nvnDepthStencilStateSetDepthTestEnable>()(&state, 1);
+    load<Entry::nvnDepthStencilStateSetDepthWriteEnable>()(&state, 1);
+    load<Entry::nvnDepthStencilStateSetDepthFunc>()(&state, NVN_DEPTH_FUNC_ALWAYS);
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, &depth, nullptr);
+    load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 0, 0, 4, 4);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferBindDepthStencilState>()(&recorder.commands, &state);
+    load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, 300);
+    load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 1, 301);
+    for (unsigned draw = 0; draw != 3; ++draw) {
+        if (draw == 2)
+            load<Entry::nvnCommandBufferBarrier>()(&recorder.commands, NVN_BARRIER_INVALIDATE_TEXTURE_BIT);
+        load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+            TestResources::base + 0x2000 + draw * 0x100, 128);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    }
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+    CHECK(backend->statistics().feedback_snapshots == 4);
+    for (unsigned draw = 0; draw != 3; ++draw) {
+        std::array<float, 32> values{};
+        std::memcpy(values.data(), static_cast<const std::byte*>(resources.memory.contents) +
+            0x2000 + draw * 0x100, sizeof values);
+        for (unsigned pixel = 0; pixel != 16; ++pixel) {
+            CHECK(values[pixel * 2] == (draw == 2 ? 0.0f : 1.0f));
+            CHECK(values[pixel * 2 + 1] == (draw == 2 ? 0.0f : 0.75f));
+        }
+    }
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&program);
+}
+
+void test_depth_resolve_diagnostic(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+        width:4 height:4 mipmapped:NO];
+    desc.textureType = MTLTextureType2DMultisample;
+    desc.sampleCount = 4;
+    desc.storageMode = MTLStorageModePrivate;
+    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    resources.textures[201] = [device newTextureWithDescriptor:desc];
+    desc.textureType = MTLTextureType2D;
+    desc.sampleCount = 1;
+    resources.textures[202] = [device newTextureWithDescriptor:desc];
+    CHECK(resources.textures[201] && resources.textures[202]);
+    if (!resources.textures[201] || !resources.textures[202]) return;
+    auto source_state = texture_state(201, 4, 4), destination_state = texture_state(202, 4, 4);
+    source_state.description.format = destination_state.description.format = NVN_FORMAT_DEPTH32F;
+    source_state.description.target = NVN_TEXTURE_TARGET_2D_MULTISAMPLE;
+    source_state.description.samples = 4;
+    auto source = texture_object(source_state), destination = texture_object(destination_state);
+    Recorder recorder;
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferDownsample>()(&recorder.commands, &source, &destination);
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && !backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(backend->fatal_error_detail().find("depth downsample requires an explicit resolve filter") != std::string::npos);
+    CHECK(backend->stop_submission_workers(std::chrono::steady_clock::now() + std::chrono::seconds(5)));
+    CHECK(!backend->wait_fence(fence, 0));
+    CHECK(!backend->wait_fence(fence, UINT64_MAX));
+    CHECK(backend->statistics().copies == 0);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+}
+
+void test_depth_feedback_review_contracts(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    for (bool color : {false, true}) {
+        for (bool image_first : {false, true})
+            test_depth_feedback_access_kind(device, queue, color, image_first);
+        for (unsigned view : {1u, 2u, 3u})
+            test_depth_feedback_access_kind(device, queue, color, false, view);
+        test_stencil_feedback(device, queue, color);
+    }
+    test_depth_resolve_diagnostic(device, queue);
+    for (bool depth_first : {false, true}) test_mixed_depth_feedback(device, queue, depth_first);
+}
+
+// A real attachment-less pass still runs both shader stages. Its raster
+// extent follows viewport/scissor bounds, including later viewport growth.
+void test_attachmentless_draws(id<MTLDevice> device, id<MTL4CommandQueue> queue, unsigned mode) {
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto* bytes = static_cast<std::byte*>(resources.memory.contents);
+    std::memset(bytes + 0x2000, 0, 4);
+    std::memset(bytes + 0x3000, 0, 12);
+    Recorder recorder;
+    NVNprogram vertex{}, fragment{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&vertex, &recorder.device));
+    CHECK(load<Entry::nvnProgramInitialize>()(&fragment, &recorder.device));
+    const NVNshaderData vertex_shaders[]{{194, nullptr}, {194, nullptr}};
+    const NVNshaderData fragment_shaders[]{{911, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&vertex, 2, vertex_shaders));
+    CHECK(load<Entry::nvnProgramSetShaders>()(&fragment, 1, fragment_shaders));
+    auto missing_state = texture_state(196, 4, 4);
+    auto missing = texture_object(missing_state);
+    const NVNtexture* missing_targets[]{&missing};
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, mode == 3 ? 1 : 0,
+        mode == 3 ? missing_targets : nullptr, nullptr, nullptr, nullptr);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &vertex, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &fragment, NVN_SHADER_STAGE_FRAGMENT_BIT);
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_VERTEX, 0,
+        TestResources::base + 0x3000, 12);
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+        TestResources::base + 0x2000, 4);
+    if (mode == 1)
+        load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 1, 1, 2, 2);
+    if (mode == 2)
+        load<Entry::nvnCommandBufferSetViewport>()(&recorder.commands, 1, 1, 2, 2);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    load<Entry::nvnCommandBufferSetViewport>()(&recorder.commands, 0, 0, 4, 4);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 1, 1, 2, 2);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    load<Entry::nvnCommandBufferSetViewport>()(&recorder.commands, 0, 0, 8, 8);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(backend->statistics().skipped == (mode == 3 ? 4 : 0));
+    CHECK(backend->statistics().draws == (mode == 3 ? 0 : 4));
+    std::uint32_t fragments = 0;
+    std::array<std::uint32_t, 3> vertices{};
+    std::memcpy(&fragments, bytes + 0x2000, sizeof fragments);
+    std::memcpy(vertices.data(), bytes + 0x3000, sizeof vertices);
+    const std::array<unsigned, 4> expected{25, 16, 28, 0};
+    CHECK(fragments == expected[mode]);
+    for (unsigned index = 0; index != 3; ++index)
+        CHECK(vertices[index] == (mode == 3 ? 0 : 16 + index));
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&vertex);
+    load<Entry::nvnProgramFinalize>()(&fragment);
+}
+
+// Normal/discard/normal draws share stage resources but select distinct PSOs.
+// The legacy void contract and missing declared entry remain explicit failures.
+void test_outputless_vertex_entries(id<MTLDevice> device, id<MTL4CommandQueue> queue, unsigned mode) {
+    TestResources resources(device);
+    auto td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:4 mipmapped:NO];
+    td.storageMode = MTLStorageModePrivate; td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    resources.textures[198] = [device newTextureWithDescriptor:td];
+    auto target_state = texture_state(198,4,4);
+    auto target = texture_object(target_state);
+    const NVNtexture* targets[]{&target};
+    auto backend = replay::create_replay_backend(device,queue,resources);
+    auto* bytes = static_cast<std::byte*>(resources.memory.contents);
+    std::memset(bytes+0x2000,0,4); std::memset(bytes+0x3000,0,4);
+    Recorder recorder; NVNprogram vertex{},fragment{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&vertex,&recorder.device));
+    CHECK(load<Entry::nvnProgramInitialize>()(&fragment,&recorder.device));
+    const NVNshaderData vertex_shaders[]{{900+mode,nullptr},{900+mode,nullptr}};
+    const NVNshaderData fragment_shaders[]{{911,nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&vertex,2,vertex_shaders));
+    CHECK(load<Entry::nvnProgramSetShaders>()(&fragment,1,fragment_shaders));
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands,1,targets,nullptr,nullptr,nullptr);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands,&vertex,NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands,&fragment,NVN_SHADER_STAGE_FRAGMENT_BIT);
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands,NVN_SHADER_STAGE_VERTEX,0,TestResources::base+0x3000,4);
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands,NVN_SHADER_STAGE_FRAGMENT,0,TestResources::base+0x2000,4);
+    load<Entry::nvnCommandBufferSetViewport>()(&recorder.commands,0,0,4,4);
+    const float clear[]{0,0,0,1}; const NVNcopyRegion whole{0,0,0,4,4,1};
+    for (unsigned draw=0;draw!=3;++draw) {
+        load<Entry::nvnCommandBufferSetRasterizerDiscard>()(&recorder.commands,draw==1);
+        load<Entry::nvnCommandBufferClearColor>()(&recorder.commands,0,clear,15);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands,NVN_DRAW_PRIMITIVE_POINTS,0,1);
+        load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands,&target,nullptr,&whole,TestResources::base+0x4000+draw*0x1000,0);
+    }
+    const auto handle=recorder.finish(); const auto fence=backend->submit({&handle,1});
+    CHECK(fence && backend->wait_fence(fence,10'000'000'000ull));
+    const unsigned expected_draws=mode==0 ? 3 : mode==1 ? 0 : 1;
+    CHECK(backend->statistics().draws==expected_draws);
+    CHECK(backend->statistics().skipped==3-expected_draws);
+    std::uint32_t vertices{},fragments{};
+    std::memcpy(&vertices,bytes+0x3000,4); std::memcpy(&fragments,bytes+0x2000,4);
+    CHECK(vertices==expected_draws); CHECK(fragments==(mode==0 ? 2 : 0));
+    for(unsigned draw=0;draw!=3;++draw) {
+        unsigned red=0;
+        const auto* pixels=reinterpret_cast<const unsigned char*>(bytes+0x4000+draw*0x1000);
+        for(unsigned i=0;i!=16;++i) {
+            CHECK(pixels[i*4+1]==0 && pixels[i*4+2]==0 && pixels[i*4+3]==255);
+            CHECK(pixels[i*4]==0 || pixels[i*4]==255);
+            red+=pixels[i*4]==255;
+        }
+        CHECK(red==(mode==0 && draw!=1 ? 1 : 0));
+    }
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device,handle);
+    load<Entry::nvnProgramFinalize>()(&vertex); load<Entry::nvnProgramFinalize>()(&fragment);
+}
+
+void test_depth_attachment_feedback_contracts(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    for (bool color : {false, true}) {
+        for (bool combined : {false, true}) {
+            test_depth_attachment_feedback(device, queue, color, combined, false, false);
+            test_depth_attachment_feedback(device, queue, color, combined, false, true);
+            test_depth_attachment_feedback(device, queue, color, combined, false, false, true);
+            for (unsigned invalidation : {1u, 2u})
+                test_depth_attachment_feedback(device, queue, color, combined, false, false, false, invalidation);
+        }
+        test_depth_attachment_feedback(device, queue, color, true, true, false);
+    }
+}
+
+void test_feedback_refresh_after_nondraw_write(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModePrivate;
+    descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    for (unsigned index = 0; index != 3; ++index)
+        resources.textures[190 + index] = [device newTextureWithDescriptor:descriptor];
+    resources.texture_ids[300] = resources.textures[190];
+    auto source_state = texture_state(190, 4, 4), result_state = texture_state(191, 4, 4),
+        blue_state = texture_state(192, 4, 4);
+    auto source = texture_object(source_state), result = texture_object(result_state), blue_texture = texture_object(blue_state);
+    id<MTLCommandQueue> initializer = [device newCommandQueue];
+    id<MTLCommandBuffer> initial = [initializer commandBuffer];
+    for (unsigned index : {190u, 192u}) {
+        auto* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = resources.textures[index];
+        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor = index == 190 ? MTLClearColorMake(1, 0, 0, 1) : MTLClearColorMake(0, 0, 1, 1);
+        id<MTLRenderCommandEncoder> encoder = [initial renderCommandEncoderWithDescriptor:pass];
+        [encoder endEncoding];
+    }
+    [initial commit]; [initial waitUntilCompleted];
+    CHECK(initial.status == MTLCommandBufferStatusCompleted && !initial.error);
+    const std::uint32_t packed_blue = 0xffff0000u;
+    std::memcpy(static_cast<std::byte*>(resources.memory.contents) + 0x8000, &packed_blue, sizeof packed_blue);
+    Recorder recorder;
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const NVNshaderData shaders[]{{180, nullptr}, {180, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+    const NVNtexture* targets[]{&source, &result};
+    const NVNtexture* source_target[]{&source};
+    NVNcopyRegion whole{0, 0, 0, 4, 4, 1}, center{2, 2, 0, 1, 1, 1};
+    const float blue[]{0, 0, 1, 1};
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 2, targets, nullptr, nullptr, nullptr);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, 300);
+    load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 0, 0, 4, 4);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands, &result, nullptr, &whole,
+        TestResources::base + 0x1000, 0);
+    for (unsigned operation = 0; operation != 4; ++operation) {
+        if (operation == 0)
+            load<Entry::nvnCommandBufferCopyBufferToTexture>()(&recorder.commands, TestResources::base + 0x8000,
+                &source, nullptr, &center, 0);
+        else if (operation == 1)
+            load<Entry::nvnCommandBufferCopyTextureToTexture>()(&recorder.commands, &blue_texture, nullptr, &center,
+                &source, nullptr, &center, 0);
+        else if (operation == 2)
+            load<Entry::nvnCommandBufferClearTexture>()(&recorder.commands, &source, nullptr, &center, blue, 15);
+        else {
+            load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, source_target, nullptr, nullptr, nullptr);
+            load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, blue, 15);
+            load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 2, targets, nullptr, nullptr, nullptr);
+        }
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+        load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands, &result, nullptr, &whole,
+            TestResources::base + (operation + 2) * 0x1000, 0);
+    }
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+    CHECK(backend->statistics().feedback_snapshots == 5);
+    const auto* bytes = static_cast<const std::uint8_t*>(resources.memory.contents);
+    for (unsigned sample = 1; sample != 6; ++sample)
+        for (unsigned pixel = 0; pixel != 16; ++pixel) {
+            const auto* value = bytes + sample * 0x1000 + pixel * 4;
+            CHECK(value[0] == (sample == 1 ? 255 : 0) && value[1] == 0 &&
+                  value[2] == (sample == 1 ? 0 : 255) && value[3] == 255);
+        }
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&program);
+}
+
+// Sampling outside the texture admits Metal's three exact border colors.
+// A registered custom border must fail explicitly, never sample a nearby color.
+void test_custom_border_diagnostic(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    for (unsigned item = 0; item != 6; ++item) {
+        constexpr std::size_t pool_size = 128 * 1024;
+        auto* bytes = static_cast<std::uint8_t*>(mmap(nullptr, pool_size, PROT_READ | PROT_WRITE,
+                                                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        CHECK(bytes != MAP_FAILED);
+        if (bytes == MAP_FAILED) return;
+        {
+            Recorder recorder;
+            replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
+            MemoryPoolState pool{};
+            pool.memory = bytes;
+            pool.size = pool_size;
+            pool.flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+            CHECK(resources.register_pool(pool));
+            std::size_t cursor = 0;
+            auto source = place_image(bytes, pool, cursor, 9101, NVN_FORMAT_RGBA8, 0, 0x11223344);
+            auto target = place_image(bytes, pool, cursor, 9102, NVN_FORMAT_RGBA8, 0, 0);
+            resources.register_texture(source.state);
+            resources.register_texture(target.state);
+            resources.register_texture_descriptor(80, source.state, nullptr);
+            SamplerParameters sampler{};
+            sampler.min_filter = NVN_MIN_FILTER_LINEAR;
+            sampler.mag_filter = NVN_MAG_FILTER_LINEAR;
+            sampler.wrap_s = sampler.wrap_t = sampler.wrap_r = NVN_WRAP_MODE_CLAMP_TO_BORDER;
+            sampler.max_anisotropy = 1;
+            sampler.reduction_filter = NVN_SAMPLER_REDUCTION_AVERAGE;
+            if (item == 1) sampler.border[3] = 1;
+            if (item == 2) std::fill(std::begin(sampler.border), std::end(sampler.border), 1);
+            if (item >= 3) {
+                const float custom[]{0.25f, 0.75f, 0.5f, 1.0f};
+                std::memcpy(sampler.border, custom, sizeof custom);
+            }
+            if (item == 4) sampler.wrap_s = sampler.wrap_t = sampler.wrap_r = NVN_WRAP_MODE_MIRROR_CLAMP_TO_BORDER;
+            if (item == 5) sampler.wrap_s = sampler.wrap_t = sampler.wrap_r = NVN_WRAP_MODE_CLAMP_TO_EDGE;
+            resources.register_sampler_descriptor(27, sampler);
+            auto backend = replay::create_replay_backend(device, queue, resources);
+            NVNprogram program{};
+            CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+            const NVNshaderData shaders[]{{176, nullptr}, {176, nullptr}};
+            CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+            auto object = texture_object(target.state);
+            const NVNtexture* targets[]{&object};
+            load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+            load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+            load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+            load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, 80u | (27ull << 20));
+            load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 0, 0, 4, 4);
+            load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+            const auto handle = recorder.finish();
+            const auto fence = backend->submit({&handle, 1});
+            if (item == 3 || item == 4) CHECK(drain_abandoned(*backend, fence));
+            else CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+            if (item == 3 || item == 4) {
+                CHECK(backend->last_error().code == replay::ReplayErrorCode::unsupported_resource);
+                CHECK(backend->last_error().detail.find("unsupported custom sampler border") != std::string::npos);
+                CHECK(backend->statistics().draws == 0);
+            } else {
+                CHECK(!backend->last_error());
+                const std::uint32_t expected = item == 0 ? 0u : item == 1 ? 0xff000000u :
+                    item == 2 ? 0xffffffffu : 0x11223344u;
+                expect_words(device, resources, resources.texture(target.state, nullptr), expected, "native border");
+            }
+            load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+            load<Entry::nvnProgramFinalize>()(&program);
+        }
+        munmap(bytes, pool_size);
+    }
+}
+
+// Exact border reconstruction must affect real pixels, not only accept the
+// descriptor. Edge texels distinguish filtered coverage from a color switch.
+void test_custom_border_coverage(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    for (unsigned variant = 0; variant != 15; ++variant) {
+        constexpr std::size_t pool_size = 128 * 1024;
+        auto* bytes = static_cast<std::uint8_t*>(mmap(nullptr, pool_size, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        CHECK(bytes != MAP_FAILED);
+        if (bytes == MAP_FAILED) return;
+        {
+            Recorder recorder;
+            replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
+            MemoryPoolState pool{}; pool.memory = bytes; pool.size = pool_size;
+            pool.flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+            CHECK(resources.register_pool(pool));
+            std::size_t cursor = 0;
+            const unsigned components = variant >= 7 && variant < 13 ? 1 + (variant - 7) % 3 : 4;
+            const auto format = components == 1 ? NVN_FORMAT_R8 : components == 2 ? NVN_FORMAT_RG8
+                : components == 3 ? NVN_FORMAT_RGB565 : NVN_FORMAT_RGBA8;
+            const std::uint32_t fill = components == 1 ? 0x44444444 : components == 2 ? 0x33443344
+                : components == 3 ? 0x84108410 : 0x11223344;
+            auto source = place_image(bytes, pool, cursor, 9201, format, 0, fill,
+                                      variant >= 4 && variant <= 6 ? 3 : 1);
+            auto target = place_image(bytes, pool, cursor, 9202, NVN_FORMAT_RGBA8, 0, 0);
+            resources.register_texture(source.state); resources.register_texture(target.state);
+            TextureViewState view{};
+            const bool swizzled = variant == 2 || variant == 3 || (variant >= 10 && variant < 13);
+            if (swizzled) {
+                view.sets_swizzle = 1;
+                view.swizzle[0] = NVN_TEXTURE_SWIZZLE_B; view.swizzle[1] = NVN_TEXTURE_SWIZZLE_G;
+                view.swizzle[2] = NVN_TEXTURE_SWIZZLE_R; view.swizzle[3] = NVN_TEXTURE_SWIZZLE_ONE;
+            }
+            resources.register_texture_descriptor(80, source.state, swizzled ? &view : nullptr);
+            SamplerParameters sampler{};
+            const bool nearest = variant == 1;
+            sampler.min_filter = nearest ? NVN_MIN_FILTER_NEAREST : NVN_MIN_FILTER_LINEAR;
+            sampler.mag_filter = nearest ? NVN_MAG_FILTER_NEAREST : NVN_MAG_FILTER_LINEAR;
+            sampler.wrap_s = sampler.wrap_t = sampler.wrap_r = NVN_WRAP_MODE_CLAMP_TO_BORDER;
+            sampler.max_anisotropy = 1; sampler.reduction_filter = NVN_SAMPLER_REDUCTION_AVERAGE;
+            if (variant >= 4 && variant <= 6) { sampler.min_filter = NVN_MIN_FILTER_LINEAR_MIPMAP_NEAREST; sampler.max_lod = 3; }
+            if (variant == 3) {
+                sampler.compare_mode = NVN_COMPARE_MODE_COMPARE_R_TO_TEXTURE;
+                sampler.compare_function = NVN_COMPARE_FUNC_LEQUAL;
+            }
+            const std::array<float, 4> border{0.25f, 0.75f, 0.5f, 0.125f};
+            std::copy(border.begin(), border.end(), std::begin(sampler.border));
+            resources.register_sampler_descriptor(27, sampler);
+            auto backend = replay::create_replay_backend(device, queue, resources);
+            NVNprogram program{}; CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+            const std::uint64_t marker = variant >= 13 ? 0x7214 + (variant - 13)
+                : variant >= 4 && variant <= 6 ? 0x7211 + (variant - 4) : 0x7210;
+            const NVNshaderData shaders[]{{marker, nullptr}, {marker, nullptr}};
+            CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+            auto object = texture_object(target.state); const NVNtexture* targets[]{&object};
+            load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+            load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+            load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+            load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, 80u | (27ull << 20));
+            load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 0, 0, 4, 4);
+            load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+            const auto handle = recorder.finish(); const auto fence = backend->submit({&handle, 1});
+            CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+            CHECK(!backend->last_error() && backend->statistics().draws == 1);
+            const auto pixels = read_private_texels(device, resources, resources.texture(target.state, nullptr), 4);
+            CHECK(pixels.size() == 64);
+            if (pixels.size() >= 64) {
+                const std::array<float, 4> inside = components == 1 ? std::array<float, 4>{68.f/255, 0, 0, 1}
+                    : components == 2 ? std::array<float, 4>{68.f/255, 51.f/255, 0, 1}
+                    : components == 3 ? std::array<float, 4>{16.f/31, 32.f/63, 16.f/31, 1}
+                    : std::array<float, 4>{68.f/255, 51.f/255, 34.f/255, 17.f/255};
+                for (unsigned y = 0; y != 4; ++y) for (unsigned x = 0; x != 4; ++x) {
+                    const float coverage = variant == 6 ? (x == 0 ? 0.25f : x == 1 ? 0.75f : 1.f)
+                        : x == 0 ? 0.f : x == 2 ? 1.f : nearest ? (x == 1 ? 1.f : 0.f)
+                        : variant >= 4 && variant <= 6 && x == 1 ? 0.75f : 0.5f;
+                    std::array<float, 4> expected{};
+                    for (unsigned c = 0; c != 4; ++c)
+                        expected[c] = c < components ? coverage * inside[c] + (1-coverage) * border[c] : inside[c];
+                    if (swizzled) { std::swap(expected[0], expected[2]); expected[3] = 1; }
+                    for (unsigned c = 0; c != 4; ++c)
+                        CHECK(std::abs(int(pixels[(y*4+x)*4+c]) - int(std::lround(expected[c]*255))) <= 1);
+                }
+            }
+            load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+            load<Entry::nvnProgramFinalize>()(&program);
+        }
+        munmap(bytes, pool_size);
+    }
+}
+
+// Image atomics on 32-bit colour storage, through an R32 view when Metal
+// requires one, and through the atomic stand-in when it cannot.
+void test_image_atomics(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    constexpr std::size_t pool_size = 256 * 1024;
+    constexpr float unit = 1.0f / 255.0f;
+    constexpr const char* moved = "texture moved to R32 storage for image atomics";
+    constexpr const char* refused = "image atomics on a texture Metal cannot run them on";
+    Recorder recorder;
+    std::array<std::byte, 0x100> or_control{}, add_control{}, mixed_control{};
+    or_control[0x56] = std::byte{NVN_SHADER_STAGE_COMPUTE};
+    or_control[0xb6] = std::byte{1};
+    or_control[0xba] = std::byte{0x18};
+    add_control[0x56] = std::byte{NVN_SHADER_STAGE_COMPUTE};
+    add_control[0xb2] = std::byte{1};
+    add_control[0xb6] = std::byte{1};
+    add_control[0xba] = std::byte{0x28};
+    // Two image handles at 0x10 and 0x18. image_base() + 8 * 2 == 0x20.
+    mixed_control[0x56] = std::byte{NVN_SHADER_STAGE_COMPUTE};
+    mixed_control[0xb6] = std::byte{2};
+    mixed_control[0xba] = std::byte{0x20};
+    NVNprogram or_program{}, add_program{}, min_program{}, sample_program{},
+        mixed_program{}, atomic_draw_program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&or_program, &recorder.device));
+    CHECK(load<Entry::nvnProgramInitialize>()(&add_program, &recorder.device));
+    CHECK(load<Entry::nvnProgramInitialize>()(&min_program, &recorder.device));
+    CHECK(load<Entry::nvnProgramInitialize>()(&sample_program, &recorder.device));
+    CHECK(load<Entry::nvnProgramInitialize>()(&mixed_program, &recorder.device));
+    CHECK(load<Entry::nvnProgramInitialize>()(&atomic_draw_program, &recorder.device));
+    const auto set_shaders = load<Entry::nvnProgramSetShaders>();
+    select_api_version({231, 40});
+    const NVNshaderData or_shaders[]{{98, or_control.data()}};
+    const NVNshaderData add_shaders[]{{99, add_control.data()}};
+    const NVNshaderData min_shaders[]{{100, add_control.data()}};
+    const NVNshaderData mixed_shaders[]{{102, mixed_control.data()}};
+    CHECK(set_shaders(&or_program, 1, or_shaders));
+    CHECK(set_shaders(&add_program, 1, add_shaders));
+    CHECK(set_shaders(&min_program, 1, min_shaders));
+    CHECK(set_shaders(&mixed_program, 1, mixed_shaders));
+    select_api_version({55, 15});
+    const NVNshaderData sample_shaders[]{{4, nullptr}, {4, nullptr}};
+    const NVNshaderData atomic_draw_shaders[]{{101, nullptr}, {101, nullptr}};
+    CHECK(set_shaders(&sample_program, 2, sample_shaders));
+    CHECK(set_shaders(&atomic_draw_program, 2, atomic_draw_shaders));
+
+    const auto submit = [](replay::MetalReplayBackend& backend, NVNcommandHandle handle, const char* label) {
+        const auto fence = backend.submit({&handle, 1});
+        const bool waited = fence && backend.wait_fence(fence, 10'000'000'000ull);
+        if (!waited || backend.last_error())
+            std::fprintf(stderr, "image atomic %s: %s\n", label,
+                         backend.last_error() ? backend.last_error().detail.c_str() : "submit failed");
+        CHECK(waited);
+        CHECK(!backend.last_error());
+    };
+    const auto map_pool = [&](MemoryPoolState& pool) -> std::uint8_t* {
+        auto* bytes = static_cast<std::uint8_t*>(mmap(nullptr, pool_size, PROT_READ | PROT_WRITE,
+                                                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        CHECK(bytes != MAP_FAILED);
+        if (bytes == MAP_FAILED) return nullptr;
+        pool.memory = bytes;
+        pool.size = pool_size;
+        pool.flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+        return bytes;
+    };
+
+    // RGBA8 colour target: clear 0x00000001, OR 0x80000000, sample the colour
+    // view, then a later clear is visible to the next atomic. An alias of the
+    // same storage sees the same texels.
+    {
+        const auto before = failures;
+        MemoryPoolState pool{};
+        auto* bytes = map_pool(pool);
+        if (bytes) {
+            {
+            replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
+            CHECK(resources.register_pool(pool));
+            std::size_t cursor = 0;
+            auto image = place_image(bytes, pool, cursor, 8101, NVN_FORMAT_RGBA8, 0, 0);
+            auto sampled = place_image(bytes, pool, cursor, 8102, NVN_FORMAT_RGBA8, 0, 0);
+            GuestImage alias;
+            alias.state = image.state;
+            alias.state.serial = 8103;
+            if (image.state.size && sampled.state.size && cursor <= pool_size) {
+                image.state.snapshot = &image.state;
+                sampled.state.snapshot = &sampled.state;
+                alias.state.snapshot = &alias.state;
+                resources.register_texture(image.state);
+                resources.register_texture(sampled.state);
+                resources.register_texture(alias.state);
+                id<MTLTexture> shared = resources.texture(image.state, nullptr);
+                id<MTLTexture> alias_storage = resources.texture(alias.state, nullptr);
+                CHECK(shared && shared == alias_storage && shared.parentTexture == nil);
+                resources.register_texture_descriptor(80, image.state, nullptr);
+                auto color = texture_object(image.state);
+                auto sample_target = texture_object(sampled.state);
+                const NVNtexture* color_targets[]{&color};
+                const NVNtexture* sample_targets[]{&sample_target};
+                const float red[]{unit, 0, 0, 0};
+                DiagCapture diagnostics;
+                auto backend = replay::create_replay_backend(device, queue, resources);
+                load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+                load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, color_targets, nullptr, nullptr, nullptr);
+                load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, red, 15);
+                load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &or_program, NVN_SHADER_STAGE_COMPUTE_BIT);
+                load<Entry::nvnCommandBufferBindImage>()(&recorder.commands, NVN_SHADER_STAGE_COMPUTE, 0, 80);
+                load<Entry::nvnCommandBufferDispatchCompute>()(&recorder.commands, 1, 1, 1);
+                load<Entry::nvnCommandBufferBarrier>()(&recorder.commands, NVN_BARRIER_INVALIDATE_TEXTURE_BIT);
+                load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, sample_targets, nullptr, nullptr, nullptr);
+                load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &sample_program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+                load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, 80);
+                load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 0, 0, 4, 4);
+                load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+                const auto first = recorder.finish();
+                submit(*backend, first, "rgba8 or");
+                CHECK(backend->statistics().dispatches == 1 && backend->statistics().draws == 1);
+                CHECK(backend->statistics().skipped == 0 && backend->statistics().image_atomic_sinks == 0);
+                CHECK(backend->statistics().image_atomic_upgrades == 1);
+                CHECK(backend->statistics().image_atomic_late_upgrades == 0);
+                CHECK(diagnostics.count(moved) == 1 && diagnostics.count(refused) == 0);
+                id<MTLTexture> view = resources.texture(image.state, nullptr);
+                id<MTLTexture> alias_view = resources.texture(alias.state, nullptr);
+                CHECK(view && view.parentTexture &&
+                      view.parentTexture.pixelFormat == MTLPixelFormatR32Uint);
+                CHECK(alias_view && alias_view.parentTexture == view.parentTexture);
+                expect_words(device, resources, view, 0x80000001u, "rgba8 colour");
+                expect_words(device, resources, alias_view, 0x80000001u, "rgba8 alias");
+                expect_words(device, resources, resources.texture(sampled.state, nullptr), 0x80000001u, "rgba8 sample");
+                const float green[]{0, unit, 0, 0};
+                load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+                load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, color_targets, nullptr, nullptr, nullptr);
+                load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, green, 15);
+                load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &or_program, NVN_SHADER_STAGE_COMPUTE_BIT);
+                load<Entry::nvnCommandBufferBindImage>()(&recorder.commands, NVN_SHADER_STAGE_COMPUTE, 0, 80);
+                load<Entry::nvnCommandBufferDispatchCompute>()(&recorder.commands, 1, 1, 1);
+                const auto second = recorder.finish();
+                submit(*backend, second, "rgba8 later clear");
+                CHECK(backend->statistics().image_atomic_upgrades == 1);
+                CHECK(backend->statistics().image_atomic_late_upgrades == 0);
+                CHECK(backend->statistics().image_atomic_sinks == 0 && backend->statistics().dispatches == 2);
+                CHECK(diagnostics.count(moved) == 1);
+                expect_words(device, resources, resources.texture(image.state, nullptr), 0x80000100u, "rgba8 later");
+                // An explicit CPU texel upload publishes another allocation, but
+                // the color view must retain its atomic-capable R32 parent.
+                std::array<id<MTLTexture>, 3> uploaded_roots{};
+                for (unsigned upload = 0; upload != uploaded_roots.size(); ++upload) {
+                    const unsigned byte = 0x20u + upload;
+                    std::array<std::byte, 64> pixels;
+                    pixels.fill(std::byte(byte));
+                    TexelTransfer transfer;
+                    transfer.region = {0, 0, 0, 4, 4, 1};
+                    CHECK(resources.write_texels(image.state, transfer, pixels.data()));
+                    id<MTLTexture> uploaded = resources.texture(image.state, nullptr);
+                    CHECK(uploaded && uploaded.parentTexture &&
+                          uploaded.parentTexture.pixelFormat == MTLPixelFormatR32Uint);
+                    CHECK(resources.image_atomic_capable(image.state.serial));
+                    uploaded_roots[upload] = uploaded.parentTexture;
+                    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+                    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &or_program, NVN_SHADER_STAGE_COMPUTE_BIT);
+                    load<Entry::nvnCommandBufferBindImage>()(&recorder.commands, NVN_SHADER_STAGE_COMPUTE, 0, 80);
+                    load<Entry::nvnCommandBufferDispatchCompute>()(&recorder.commands, 1, 1, 1);
+                    const auto rewritten = recorder.finish();
+                    submit(*backend, rewritten, "rgba8 atomic after CPU upload");
+                    CHECK(backend->statistics().image_atomic_sinks == 0);
+                    expect_words(device, resources, resources.texture(image.state, nullptr),
+                                 byte * 0x01010101u | 0x80000000u, "rgba8 CPU upload atomic");
+                    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, rewritten);
+                }
+                CHECK(uploaded_roots[0] && uploaded_roots[2] == uploaded_roots[0]);
+                load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, first);
+                load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, second);
+            }
+            }
+            munmap(bytes, pool_size);
+        }
+        if (failures != before)
+            std::fprintf(stderr, "image atomics rgba8 failures=%u\n", failures - before);
+    }
+
+    const auto native_or_add = [&](const char* label, std::uint32_t fill, std::uint32_t expected,
+                                   bool add, std::uint32_t prior_word) {
+        const auto before = failures;
+        MemoryPoolState pool{};
+        auto* bytes = map_pool(pool);
+        if (bytes) {
+            {
+            replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
+            CHECK(resources.register_pool(pool));
+            std::size_t cursor = 0;
+            auto image = place_image(bytes, pool, cursor, 8201, NVN_FORMAT_R32UI,
+                                     NVN_TEXTURE_FLAGS_IMAGE, fill);
+            cursor = (cursor + 255) & ~std::size_t{255};
+            const bool room = image.state.size && cursor + 64 <= pool_size;
+            CHECK(room);
+            if (room) {
+                std::memset(bytes + cursor, 0xA5, 64);
+                const auto prior = reinterpret_cast<NVNbufferAddress>(bytes + cursor);
+                image.state.snapshot = &image.state;
+                resources.register_texture(image.state);
+                resources.register_texture_descriptor(81, image.state, nullptr);
+                id<MTLTexture> original = resources.texture(image.state, nullptr);
+                CHECK(resources.flush_uploads());
+                expect_words(device, resources, original, fill, label);
+                CHECK(original && original.parentTexture == nil);
+                DiagCapture diagnostics;
+                auto backend = replay::create_replay_backend(device, queue, resources);
+                load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+                load<Entry::nvnCommandBufferBindProgram>()(
+                    &recorder.commands, add ? &add_program : &or_program, NVN_SHADER_STAGE_COMPUTE_BIT);
+                if (add)
+                    load<Entry::nvnCommandBufferBindStorageBuffer>()(
+                        &recorder.commands, NVN_SHADER_STAGE_COMPUTE, 0, prior, 64);
+                load<Entry::nvnCommandBufferBindImage>()(&recorder.commands, NVN_SHADER_STAGE_COMPUTE, 0, 81);
+                load<Entry::nvnCommandBufferDispatchCompute>()(&recorder.commands, 1, 1, 1);
+                const auto handle = recorder.finish();
+                submit(*backend, handle, label);
+                CHECK(backend->statistics().dispatches == 1 && backend->statistics().skipped == 0);
+                CHECK(backend->statistics().image_atomic_upgrades == 0);
+                CHECK(backend->statistics().image_atomic_late_upgrades == 0);
+                CHECK(backend->statistics().image_atomic_sinks == 0);
+                CHECK(diagnostics.count(moved) == 0 && diagnostics.count(refused) == 0);
+                id<MTLTexture> after = resources.texture(image.state, nullptr);
+                CHECK(after == original && after.parentTexture == nil);
+                expect_words(device, resources, after, expected, label);
+                if (add) {
+                    std::array<std::uint32_t, 16> words{};
+                    std::memcpy(words.data(), bytes + cursor, sizeof words);
+                    for (const auto word : words) CHECK(word == prior_word);
+                }
+                load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+            }
+            }
+            munmap(bytes, pool_size);
+        }
+        if (failures != before)
+            std::fprintf(stderr, "image atomics %s failures=%u\n", label, failures - before);
+    };
+    native_or_add("r32uint", 1u, 0x80000001u, false, 0);
+    native_or_add("fetch-add", 7u, 11u, true, 7u);
+
+    // RGBA16F is not a 32-bit alias. The dispatch still runs, on the stand-in.
+    {
+        const auto before = failures;
+        MemoryPoolState pool{};
+        auto* bytes = map_pool(pool);
+        if (bytes) {
+            {
+            replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
+            CHECK(resources.register_pool(pool));
+            std::size_t cursor = 0;
+            auto image = place_image(bytes, pool, cursor, 8301, NVN_FORMAT_RGBA16F, NVN_TEXTURE_FLAGS_IMAGE, 0);
+            if (image.state.size) {
+                image.state.snapshot = &image.state;
+                resources.register_texture(image.state);
+                resources.register_texture_descriptor(82, image.state, nullptr);
+                auto color = texture_object(image.state);
+                const NVNtexture* targets[]{&color};
+                const float red[]{1, 0, 0, 1};
+                DiagCapture diagnostics;
+                auto backend = replay::create_replay_backend(device, queue, resources);
+                load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+                load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+                load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, red, 15);
+                const auto cleared = recorder.finish();
+                submit(*backend, cleared, "rgba16f clear");
+                id<MTLTexture> view = resources.texture(image.state, nullptr);
+                const auto first = read_private_texels(device, resources, view, 8);
+                bool nonzero = false;
+                for (const auto byte : first) nonzero = nonzero || byte != 0;
+                CHECK(nonzero);
+                CHECK(view && view.parentTexture == nil && view.pixelFormat == MTLPixelFormatRGBA16Float);
+                load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+                load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &or_program, NVN_SHADER_STAGE_COMPUTE_BIT);
+                load<Entry::nvnCommandBufferBindImage>()(&recorder.commands, NVN_SHADER_STAGE_COMPUTE, 0, 82);
+                load<Entry::nvnCommandBufferDispatchCompute>()(&recorder.commands, 1, 1, 1);
+                const auto dispatched = recorder.finish();
+                submit(*backend, dispatched, "rgba16f sink");
+                const auto second = read_private_texels(device, resources, resources.texture(image.state, nullptr), 8);
+                CHECK(first == second);
+                id<MTLTexture> after = resources.texture(image.state, nullptr);
+                CHECK(after.parentTexture == nil && after.pixelFormat == MTLPixelFormatRGBA16Float);
+                CHECK(backend->statistics().dispatches == 1 && backend->statistics().skipped == 0);
+                CHECK(backend->statistics().image_atomic_sinks == 1);
+                CHECK(backend->statistics().image_atomic_upgrades == 0);
+                CHECK(backend->statistics().image_atomic_late_upgrades == 0);
+                CHECK(diagnostics.count(refused) == 1 && diagnostics.count(moved) == 0);
+                load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, cleared);
+                load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, dispatched);
+            }
+            }
+            munmap(bytes, pool_size);
+        }
+        if (failures != before)
+            std::fprintf(stderr, "image atomics rgba16f failures=%u\n", failures - before);
+    }
+
+    // Guest bytes uploaded into the texture stay there: the atomic uses the stand-in.
+    {
+        const auto before = failures;
+        MemoryPoolState pool{};
+        auto* bytes = map_pool(pool);
+        if (bytes) {
+            {
+            replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
+            CHECK(resources.register_pool(pool));
+            std::size_t cursor = 0;
+            auto image = place_image(bytes, pool, cursor, 8401, NVN_FORMAT_RGBA8, NVN_TEXTURE_FLAGS_IMAGE, 0x11223344u);
+            if (image.state.size) {
+                image.state.snapshot = &image.state;
+                resources.register_texture(image.state);
+                resources.register_texture_descriptor(83, image.state, nullptr);
+                id<MTLTexture> original = resources.texture(image.state, nullptr);
+                CHECK(resources.flush_uploads());
+                const auto uploaded = read_private_texels(device, resources, original, 4);
+                expect_words(device, resources, original, 0x11223344u, "uploaded before");
+                CHECK(original && original.parentTexture == nil);
+                DiagCapture diagnostics;
+                auto backend = replay::create_replay_backend(device, queue, resources);
+                load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+                load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &or_program, NVN_SHADER_STAGE_COMPUTE_BIT);
+                load<Entry::nvnCommandBufferBindImage>()(&recorder.commands, NVN_SHADER_STAGE_COMPUTE, 0, 83);
+                load<Entry::nvnCommandBufferDispatchCompute>()(&recorder.commands, 1, 1, 1);
+                const auto handle = recorder.finish();
+                submit(*backend, handle, "uploaded sink");
+                id<MTLTexture> after = resources.texture(image.state, nullptr);
+                const auto kept = read_private_texels(device, resources, after, 4);
+                CHECK(uploaded == kept);
+                CHECK(after == original && after.parentTexture == nil);
+                CHECK(after.pixelFormat == MTLPixelFormatRGBA8Unorm);
+                CHECK(backend->statistics().dispatches == 1 && backend->statistics().skipped == 0);
+                CHECK(backend->statistics().image_atomic_sinks == 1);
+                CHECK(backend->statistics().image_atomic_upgrades == 0);
+                CHECK(backend->statistics().image_atomic_late_upgrades == 0);
+                CHECK(diagnostics.count(refused) == 1 && diagnostics.count(moved) == 0);
+                load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+            }
+            }
+            munmap(bytes, pool_size);
+        }
+        if (failures != before)
+            std::fprintf(stderr, "image atomics uploaded failures=%u\n", failures - before);
+    }
+
+    // An s32 atomic reinterprets the colour target as R32Sint and returns the old word.
+    {
+        const auto before = failures;
+        MemoryPoolState pool{};
+        auto* bytes = map_pool(pool);
+        if (bytes) {
+            {
+            replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
+            CHECK(resources.register_pool(pool));
+            std::size_t cursor = 0;
+            auto image = place_image(bytes, pool, cursor, 8501, NVN_FORMAT_RGBA8, 0, 0);
+            cursor = (cursor + 255) & ~std::size_t{255};
+            const bool room = image.state.size && cursor + 64 <= pool_size;
+            CHECK(room);
+            if (room) {
+                std::memset(bytes + cursor, 0xA5, 64);
+                const auto prior = reinterpret_cast<NVNbufferAddress>(bytes + cursor);
+                image.state.snapshot = &image.state;
+                resources.register_texture(image.state);
+                resources.register_texture_descriptor(84, image.state, nullptr);
+                auto color = texture_object(image.state);
+                const NVNtexture* targets[]{&color};
+                const float red[]{unit, 0, 0, 0};
+                DiagCapture diagnostics;
+                auto backend = replay::create_replay_backend(device, queue, resources);
+                load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+                load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+                load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, red, 15);
+                load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &min_program, NVN_SHADER_STAGE_COMPUTE_BIT);
+                load<Entry::nvnCommandBufferBindStorageBuffer>()(
+                    &recorder.commands, NVN_SHADER_STAGE_COMPUTE, 0, prior, 64);
+                load<Entry::nvnCommandBufferBindImage>()(&recorder.commands, NVN_SHADER_STAGE_COMPUTE, 0, 84);
+                load<Entry::nvnCommandBufferDispatchCompute>()(&recorder.commands, 1, 1, 1);
+                const auto handle = recorder.finish();
+                submit(*backend, handle, "signed min");
+                CHECK(backend->statistics().dispatches == 1 && backend->statistics().skipped == 0);
+                CHECK(backend->statistics().image_atomic_upgrades == 1);
+                CHECK(backend->statistics().image_atomic_late_upgrades == 0);
+                CHECK(backend->statistics().image_atomic_sinks == 0);
+                CHECK(diagnostics.count(moved) == 1 && diagnostics.count(refused) == 0);
+                id<MTLTexture> view = resources.texture(image.state, nullptr);
+                CHECK(view && view.parentTexture &&
+                      view.parentTexture.pixelFormat == MTLPixelFormatR32Sint);
+                expect_words(device, resources, view, 0xfffffffdU, "signed colour");
+                std::array<std::int32_t, 16> words{};
+                std::memcpy(words.data(), bytes + cursor, sizeof words);
+                for (const auto word : words) CHECK(word == 1);
+                load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+            }
+            }
+            munmap(bytes, pool_size);
+        }
+        if (failures != before)
+            std::fprintf(stderr, "image atomics signed failures=%u\n", failures - before);
+    }
+
+    // The ordinary image is reflected first. Its store and the atomic or both
+    // have to land in the storage the atomic bind moved.
+    {
+        const auto before = failures;
+        MemoryPoolState pool{};
+        auto* bytes = map_pool(pool);
+        if (bytes) {
+            {
+            replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
+            CHECK(resources.register_pool(pool));
+            std::size_t cursor = 0;
+            auto image = place_image(bytes, pool, cursor, 8701, NVN_FORMAT_RGBA8, 0, 0);
+            if (image.state.size) {
+                image.state.snapshot = &image.state;
+                resources.register_texture(image.state);
+                resources.register_texture_descriptor(85, image.state, nullptr);
+                auto color = texture_object(image.state);
+                const NVNtexture* targets[]{&color};
+                const float red[]{unit, 0, 0, 0};
+                DiagCapture diagnostics;
+                auto backend = replay::create_replay_backend(device, queue, resources);
+                load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+                load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+                load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, red, 15);
+                load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &mixed_program, NVN_SHADER_STAGE_COMPUTE_BIT);
+                load<Entry::nvnCommandBufferBindImage>()(&recorder.commands, NVN_SHADER_STAGE_COMPUTE, 0, 85);
+                load<Entry::nvnCommandBufferBindImage>()(&recorder.commands, NVN_SHADER_STAGE_COMPUTE, 1, 85);
+                load<Entry::nvnCommandBufferDispatchCompute>()(&recorder.commands, 1, 1, 1);
+                const auto handle = recorder.finish();
+                submit(*backend, handle, "mixed image");
+                CHECK(backend->statistics().dispatches == 1 && backend->statistics().skipped == 0);
+                CHECK(backend->statistics().image_atomic_upgrades == 1);
+                CHECK(backend->statistics().image_atomic_late_upgrades == 0);
+                CHECK(backend->statistics().image_atomic_sinks == 0);
+                CHECK(diagnostics.count(moved) == 1 && diagnostics.count(refused) == 0);
+                id<MTLTexture> view = resources.texture(image.state, nullptr);
+                CHECK(view && view.parentTexture &&
+                      view.parentTexture.pixelFormat == MTLPixelFormatR32Uint);
+                std::array<std::uint32_t, 16> words{};
+                words.fill(0x80000001u);
+                words[0] = 0xff00ff00u;
+                expect_words_at(device, resources, view, words.data(), "mixed image");
+                load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+            }
+            }
+            munmap(bytes, pool_size);
+        }
+        if (failures != before)
+            std::fprintf(stderr, "image atomics mixed failures=%u\n", failures - before);
+    }
+
+    // The vertex stage samples the texture the fragment stage runs the atomic
+    // on. Cover an earlier submission and a pending clear in this submission.
+    // The sample is texel (0, 0), which the atomic does not change.
+    for (const bool pending_clear : {false, true}) {
+        const auto before = failures;
+        MemoryPoolState pool{};
+        auto* bytes = map_pool(pool);
+        if (bytes) {
+            {
+            replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
+            CHECK(resources.register_pool(pool));
+            std::size_t cursor = 0;
+            auto image = place_image(bytes, pool, cursor, 8601, NVN_FORMAT_RGBA8, 0, 0);
+            auto sampled = place_image(bytes, pool, cursor, 8602, NVN_FORMAT_RGBA8, 0, 0);
+            if (image.state.size && sampled.state.size) {
+                image.state.snapshot = &image.state;
+                sampled.state.snapshot = &sampled.state;
+                resources.register_texture(image.state);
+                resources.register_texture(sampled.state);
+                resources.register_texture_descriptor(86, image.state, nullptr);
+                resources.register_texture_descriptor(87, sampled.state, nullptr);
+                auto color = texture_object(image.state);
+                auto sample_target = texture_object(sampled.state);
+                const NVNtexture* color_targets[]{&color};
+                const NVNtexture* sample_targets[]{&sample_target};
+                const float red[]{unit, 0, 0, 0};
+                DiagCapture diagnostics;
+                auto backend = replay::create_replay_backend(device, queue, resources);
+                load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+                load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, color_targets, nullptr, nullptr, nullptr);
+                load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, red, 15);
+                NVNcommandHandle cleared = 0;
+                if (!pending_clear) {
+                    cleared = recorder.finish();
+                    submit(*backend, cleared, "atomic sample clear");
+                    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+                }
+                load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, sample_targets, nullptr, nullptr, nullptr);
+                load<Entry::nvnCommandBufferBindProgram>()(
+                    &recorder.commands, &atomic_draw_program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+                load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_VERTEX, 0, 86);
+                load<Entry::nvnCommandBufferBindImage>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, 86);
+                load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 32, 87);
+                load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 0, 0, 4, 4);
+                load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+                const auto drawn = recorder.finish();
+                submit(*backend, drawn, "atomic sample draw");
+                CHECK(backend->statistics().draws == 1 && backend->statistics().skipped == 0);
+                CHECK(backend->statistics().image_atomic_upgrades == 1);
+                CHECK(backend->statistics().image_atomic_late_upgrades == 0);
+                CHECK(backend->statistics().image_atomic_sinks == 0);
+                CHECK(diagnostics.count(moved) == 1 && diagnostics.count(refused) == 0);
+                id<MTLTexture> view = resources.texture(image.state, nullptr);
+                CHECK(view && view.parentTexture &&
+                      view.parentTexture.pixelFormat == MTLPixelFormatR32Uint);
+                std::array<std::uint32_t, 16> source{};
+                source.fill(0x00000001u);
+                source[1] = 0x80000001u;
+                expect_words_at(device, resources, view, source.data(), "atomic sample source");
+                expect_words(device, resources, resources.texture(sampled.state, nullptr),
+                             0x00000001u, "atomic sample target");
+                if (cleared) load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, cleared);
+                load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, drawn);
+            }
+            }
+            munmap(bytes, pool_size);
+        }
+        if (failures != before)
+            std::fprintf(stderr, "image atomics atomic sample failures=%u\n", failures - before);
+    }
+
+    // Two sink binds of an uploaded texture publish no write of it, so the
+    // second bind still uses the stand-in and the texels stay uploaded.
+    {
+        const auto before = failures;
+        MemoryPoolState pool{};
+        auto* bytes = map_pool(pool);
+        if (bytes) {
+            {
+            replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
+            CHECK(resources.register_pool(pool));
+            std::size_t cursor = 0;
+            auto image = place_image(bytes, pool, cursor, 8801, NVN_FORMAT_RGBA8,
+                                     NVN_TEXTURE_FLAGS_IMAGE, 0x11223344u);
+            if (image.state.size) {
+                image.state.snapshot = &image.state;
+                resources.register_texture(image.state);
+                resources.register_texture_descriptor(87, image.state, nullptr);
+                id<MTLTexture> original = resources.texture(image.state, nullptr);
+                CHECK(resources.flush_uploads());
+                expect_words(device, resources, original, 0x11223344u, "uploaded twice before");
+                CHECK(original && original.parentTexture == nil);
+                DiagCapture diagnostics;
+                auto backend = replay::create_replay_backend(device, queue, resources);
+                NVNcommandHandle handles[2]{};
+                for (int pass = 0; pass < 2; ++pass) {
+                    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+                    load<Entry::nvnCommandBufferBindProgram>()(
+                        &recorder.commands, &or_program, NVN_SHADER_STAGE_COMPUTE_BIT);
+                    load<Entry::nvnCommandBufferBindImage>()(&recorder.commands, NVN_SHADER_STAGE_COMPUTE, 0, 87);
+                    load<Entry::nvnCommandBufferDispatchCompute>()(&recorder.commands, 1, 1, 1);
+                    handles[pass] = recorder.finish();
+                    submit(*backend, handles[pass], pass ? "uploaded sink second" : "uploaded sink first");
+                }
+                id<MTLTexture> after = resources.texture(image.state, nullptr);
+                CHECK(after == original && after.parentTexture == nil);
+                CHECK(after.pixelFormat == MTLPixelFormatRGBA8Unorm);
+                expect_words(device, resources, after, 0x11223344u, "uploaded twice");
+                CHECK(backend->statistics().dispatches == 2 && backend->statistics().skipped == 0);
+                CHECK(backend->statistics().image_atomic_sinks == 2);
+                CHECK(backend->statistics().image_atomic_upgrades == 0);
+                CHECK(backend->statistics().image_atomic_late_upgrades == 0);
+                CHECK(diagnostics.count(refused) == 2 && diagnostics.count(moved) == 0);
+                load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handles[0]);
+                load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handles[1]);
+            }
+            }
+            munmap(bytes, pool_size);
+        }
+        if (failures != before)
+            std::fprintf(stderr, "image atomics uploaded twice failures=%u\n", failures - before);
+    }
+
+    load<Entry::nvnProgramFinalize>()(&atomic_draw_program);
+    load<Entry::nvnProgramFinalize>()(&mixed_program);
+    load<Entry::nvnProgramFinalize>()(&sample_program);
+    load<Entry::nvnProgramFinalize>()(&min_program);
+    load<Entry::nvnProgramFinalize>()(&add_program);
+    load<Entry::nvnProgramFinalize>()(&or_program);
     load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
 }
 
@@ -4946,7 +9918,7 @@ void test_compute_storage_image(id<MTLDevice> device, id<MTL4CommandQueue> queue
 
 // A driver data layout that fills the replay's 0xa00-byte block: 64 push
 // words, 16 uniform and 16 storage entries, 128 texture and 94 separate
-// texture handles, the last at 0x9f8 (bound texture slot 93). One more
+// texture handles, the last at 0x9f8 (separate texture slot 93). One more
 // separate texture (0xa08 bytes) leaves the program without a layout, and
 // its API 231 dispatch is refused.
 void test_compute_driver_layout_limit(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
@@ -4978,7 +9950,7 @@ void test_compute_driver_layout_limit(id<MTLDevice> device, id<MTL4CommandQueue>
     constexpr auto output = TestResources::base + 0x1000;
     load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
     load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_COMPUTE_BIT);
-    load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_COMPUTE, 93, 0x7e57);
+    load<Entry::nvnCommandBufferBindSeparateTexture>()(&recorder.commands, NVN_SHADER_STAGE_COMPUTE, 93, NVNseparateTextureHandle{0x7e57});
     load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_COMPUTE, 0, output, 16);
     load<Entry::nvnCommandBufferDispatchCompute>()(&recorder.commands, 3, 2, 1);
     load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &refused, NVN_SHADER_STAGE_COMPUTE_BIT);
@@ -5104,7 +10076,11 @@ void test_relaxed_barrier_hazards(id<MTLDevice> device, id<MTL4CommandQueue> que
     std::memcpy(bytes + 0x300, indirect.data(), sizeof indirect);
     const auto pass = [&](const NVNtexture* const* target, NVNprogram& program) {
         load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, target, nullptr, nullptr, nullptr);
-        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        if (&program == &mesh) bind_mesh_program(&recorder.commands, &program, false);
+        else {
+            load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+            command_geometry_processing_mode(&recorder.commands, 0);
+        }
     };
     const auto draw = [&] {
         load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
@@ -5355,6 +10331,548 @@ void test_compute_driver_layout(id<MTLDevice> device, id<MTL4CommandQueue> queue
     load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
 }
 
+// A normal mask63 bind must not erase an inactive standalone mesh program
+// or its resources. Queued and carried state own immutable program snapshots.
+void test_retained_standalone_mesh(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    std::memset(resources.memory.contents, 0, resources.memory.length);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                 width:4
+                                                                height:4
+                                                             mipmapped:NO];
+    td.storageMode = MTLStorageModeShared;
+    td.usage = MTLTextureUsageRenderTarget;
+    resources.textures[95] = [device newTextureWithDescriptor:td];
+    auto target_state = texture_state(95, 4, 4);
+    auto target = texture_object(target_state);
+    const NVNtexture *targets[]{&target};
+    Recorder recorder;
+    ScopedApi231 api(true);
+    NVNprogram mesh{}, ordinary{};
+    const NVNshaderData mesh_code[]{{904, nullptr}, {904, nullptr}};
+    const NVNshaderData ordinary_code[]{{903, nullptr}, {903, nullptr}};
+    CHECK(initialize_graphics_program(mesh, recorder.device, mesh_code));
+    CHECK(initialize_graphics_program(ordinary, recorder.device, ordinary_code));
+    const auto mesh_serial = reinterpret_cast<const ProgramState *>(&mesh)->serial;
+    auto mode = reinterpret_cast<void (*)(NVNcommandBuffer *, int)>(
+        armigo_nvn231_bootstrap_loader("nvnCommandBufferSetGeometryProcessingMode"));
+    auto draw_mesh = reinterpret_cast<void (*)(NVNcommandBuffer *, int, int)>(
+        armigo_nvn231_bootstrap_loader("nvnCommandBufferDrawMeshTasks"));
+    const float black[]{0, 0, 0, 0};
+    const NVNcopyRegion whole{0, 0, 0, 4, 4, 1};
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr,
+                                                    nullptr);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &mesh, 0x80);
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_MESH, 0,
+                                                     TestResources::base + 0x600, 64);
+    // Ordinary tessellation storage is an independent, deliberately poisoned bank.
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_TESS_EVALUATION, 0,
+                                                     TestResources::base + 0x700, 64);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &ordinary, 63);
+    mode(&recorder.commands, 2);
+    load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, black, 15);
+    draw_mesh(&recorder.commands, 1, 1);
+    load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands, &target, nullptr, &whole,
+                                                       TestResources::base + 0x1000, 0);
+    mode(&recorder.commands, 0);
+    load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, black, 15);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands, &target, nullptr, &whole,
+                                                       TestResources::base + 0x2000, 0);
+    const auto first = recorder.finish();
+    load<Entry::nvnProgramFinalize>()(&mesh);
+    CHECK(load<Entry::nvnProgramInitialize>()(&mesh, &recorder.device));
+    CHECK(reinterpret_cast<const ProgramState *>(&mesh)->serial != mesh_serial);
+    auto fence = backend->submit({&first, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_MESH, 0,
+                                                     TestResources::base + 0xb00, 64);
+    mode(&recorder.commands, 2);
+    mode(&recorder.commands, 2);
+    load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, black, 15);
+    draw_mesh(&recorder.commands, 2, 1);
+    load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands, &target, nullptr, &whole,
+                                                       TestResources::base + 0x3000, 0);
+    const auto second = recorder.finish();
+    fence = backend->submit({&second, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().skipped == 0 && backend->statistics().draws == 3);
+    const auto *words = static_cast<const std::uint32_t *>(resources.memory.contents);
+    CHECK(words[0x600 / 4] == 0x101 && words[0xb00 / 4] == 0x102 && words[0x700 / 4] == 0);
+    const auto *bytes = static_cast<const unsigned char *>(resources.memory.contents);
+    for (unsigned sample = 1; sample != 4; ++sample)
+        for (unsigned pixel = 0; pixel != 16; ++pixel) {
+            const bool drawn = sample == 2 || pixel % 4 == (sample == 1 ? 1u : 2u);
+            CHECK(bytes[sample * 0x1000 + pixel * 4] == 0);
+            CHECK(bytes[sample * 0x1000 + pixel * 4 + 1] == (drawn ? 255 : 0));
+        }
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, first);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, second);
+    load<Entry::nvnProgramFinalize>()(&mesh);
+    load<Entry::nvnProgramFinalize>()(&ordinary);
+}
+
+// Modes select retained mesh variants; explicit clears invalidate programs
+// while retaining the independent task and mesh resource banks.
+void test_retained_mesh_routes(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    std::memset(resources.memory.contents, 0, resources.memory.length);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget;
+    resources.textures[95] = [device newTextureWithDescriptor:descriptor];
+    auto state = texture_state(95, 4, 4);
+    auto target = texture_object(state);
+    const NVNtexture* targets[]{&target};
+    Recorder recorder;
+    ScopedApi231 api(true);
+    NVNprogram standalone{}, task{}, ordinary{};
+    std::array<std::byte, 0xe0> standalone_control{};
+    standalone_control[0x56] = std::byte{7};
+    const NVNshaderData standalone_code[]{{904, standalone_control.data()}, {904, nullptr}};
+    const NVNshaderData task_code[]{{95, nullptr}, {95, nullptr}, {95, nullptr}};
+    const NVNshaderData ordinary_code[]{{903, nullptr}, {903, nullptr}};
+    CHECK(initialize_graphics_program(standalone, recorder.device, standalone_code));
+    CHECK(initialize_graphics_program(task, recorder.device, task_code));
+    CHECK(initialize_graphics_program(ordinary, recorder.device, ordinary_code));
+    const float black[]{0, 0, 0, 0};
+    const NVNcopyRegion whole{0, 0, 0, 4, 4, 1};
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_TASK, 0,
+        TestResources::base + 0x800, 32);
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_MESH, 0,
+        TestResources::base + 0x900, 64);
+    // Poison ordinary slots to expose either direction of resource aliasing.
+    for (const auto stage : {NVN_SHADER_STAGE_TESS_CONTROL, NVN_SHADER_STAGE_TESS_EVALUATION})
+        load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, stage, 0,
+            TestResources::base + 0xa00, 32);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &standalone, 0x80);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &task, 0xc0);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &ordinary, 63);
+    const auto draw = [&](unsigned sample, int mode, int first) {
+        command_geometry_processing_mode(&recorder.commands, mode);
+        load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, black, 15);
+        command_draw_mesh_tasks(&recorder.commands, first, 1);
+        load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands, &target, nullptr, &whole,
+            TestResources::base + sample * 0x1000, 0);
+    };
+    draw(1, 1, 0);  // Task writes 0x22 and emits column 1.
+    load<Entry::nvnCommandBufferCopyBufferToBuffer>()(&recorder.commands, TestResources::base + 0x800,
+        TestResources::base + 0xc00, 4, 0);
+    load<Entry::nvnCommandBufferClearBuffer>()(&recorder.commands, TestResources::base + 0x800, 4, 0);
+    draw(2, 2, 2);  // Publishing the task-fed route cleared standalone.
+    load<Entry::nvnCommandBufferCopyBufferToBuffer>()(&recorder.commands, TestResources::base + 0x800,
+        TestResources::base + 0xc04, 4, 0);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, nullptr, 0x40);
+    draw(3, 2, 3);  // Clearing task does not recreate standalone.
+    draw(4, 1, 0);  // Task-fed mesh remains cached, but its task is absent.
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &task, 0x40);
+    draw(5, 1, 0);  // Rebinding task alone restores the task-fed route.
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, nullptr, 0x80);
+    draw(6, 1, 0);
+    draw(7, 2, 0);  // Clearing mesh invalidates both mode variants.
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &standalone, 0x80);
+    draw(8, 2, 0);  // The mesh resource bank survived the explicit clear.
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().draws == 3 && backend->statistics().skipped == 5);
+    const auto* words = static_cast<const std::uint32_t*>(resources.memory.contents);
+    CHECK(words[0x800 / 4] == 0x22 && words[0x900 / 4] == 0x100);
+    CHECK(words[0xa00 / 4] == 0 && words[0xc00 / 4] == 0x22 && words[0xc04 / 4] == 0);
+    const auto* bytes = static_cast<const unsigned char*>(resources.memory.contents);
+    const std::array<int, 8> columns{1, -1, -1, -1, 1, -1, -1, 0};
+    for (unsigned sample = 0; sample != columns.size(); ++sample)
+        for (unsigned pixel = 0; pixel != 16; ++pixel) {
+            const bool drawn = int(pixel % 4) == columns[sample];
+            CHECK(bytes[(sample + 1) * 0x1000 + pixel * 4] == 0);
+            CHECK(bytes[(sample + 1) * 0x1000 + pixel * 4 + 1] == (drawn ? 255 : 0));
+        }
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    for (auto* program : {&standalone, &task, &ordinary}) load<Entry::nvnProgramFinalize>()(program);
+}
+
+void test_mesh_constants(id<MTLDevice> device, id<MTL4CommandQueue> queue, bool task) {
+    TestResources resources(device);
+    std::memset(resources.memory.contents, 0, resources.memory.length);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget;
+    resources.textures[95] = [device newTextureWithDescriptor:descriptor];
+    auto state = texture_state(95, 4, 4);
+    auto target = texture_object(state);
+    const NVNtexture* targets[]{&target};
+    Recorder recorder;
+    ScopedApi231 api(true);
+    std::array<std::byte, 0xe0> control{}, mesh_control{};
+    const auto put = [&](unsigned offset, std::uint32_t value) { std::memcpy(control.data() + offset, &value, 4); };
+    put(0x10, 0xc1);  // Independently authored fixture selector for the resolver.
+    put(0x3c, 4);
+    put(0x40, 0x100);
+    control[0x56] = std::byte(task ? 6 : 7);
+    mesh_control[0x56] = std::byte{7};
+    mesh_control[0x5e] = std::byte{1};
+    const std::uint32_t constant = task ? 0x61616161 : 0x71717171;
+    std::memcpy(static_cast<std::byte*>(resources.memory.contents) + 0x4100, &constant, 4);
+    std::vector<NVNshaderData> shaders{{TestResources::base + 0x4000, control.data()}};
+    if (task) shaders.push_back({0, mesh_control.data()});
+    shaders.push_back({0, nullptr});
+    NVNprogram program{};
+    CHECK(initialize_graphics_program(program, recorder.device, shaders));
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+    bind_mesh_program(&recorder.commands, &program, task);
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands,
+        task ? NVN_SHADER_STAGE_TASK : NVN_SHADER_STAGE_MESH, 0, TestResources::base + 0x800, 64);
+    command_draw_mesh_tasks(&recorder.commands, 1, 1);
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().draws == 1 && backend->statistics().skipped == 0);
+    CHECK(static_cast<const std::uint32_t*>(resources.memory.contents)[0x800 / 4] == constant);
+    std::array<std::uint8_t, 64> pixels{};
+    [resources.textures[95] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+    for (unsigned pixel = 0; pixel != 16; ++pixel) CHECK(pixels[pixel * 4 + 1] == (pixel % 4 == 1 ? 255 : 0));
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&program);
+}
+
+// A nonzero graphics bind publishes present stages outside its requested
+// mask. A zero mask is inert; missing requested stages still clear.
+void test_graphics_program_publication(id<MTLDevice> device, id<MTL4CommandQueue> queue, Stages& stages) {
+    TestResources resources(device);
+    std::memset(resources.memory.contents, 0, resources.memory.length);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget;
+    resources.textures[95] = [device newTextureWithDescriptor:descriptor];
+    auto state = texture_state(95, 4, 4);
+    auto target = texture_object(state);
+    const NVNtexture* targets[]{&target};
+    Recorder recorder;
+    ScopedApi231 api(true);
+    NVNprogram green{}, red{}, mesh{}, inert{};
+    const NVNshaderData green_code[]{{903, nullptr}, {903, nullptr}};
+    const NVNshaderData red_code[]{{908, nullptr}, {908, nullptr}};
+    const NVNshaderData mesh_code[]{{904, nullptr}, {904, nullptr}};
+    CHECK(initialize_graphics_program(green, recorder.device, green_code));
+    CHECK(initialize_graphics_program(red, recorder.device, red_code));
+    CHECK(initialize_graphics_program(mesh, recorder.device, mesh_code));
+    std::atomic_uint inert_waits{0};
+    struct InertStage final : PendingStage {
+        std::atomic_uint* waits;
+        std::shared_ptr<const platform::CompiledGraphicsStage> stage;
+        std::shared_ptr<const platform::CompiledGraphicsStage> wait() override { ++*waits; return stage; }
+    };
+    struct InertContext { Stages& stages; std::atomic_uint& waits; } inert_context{stages, inert_waits};
+    set_deferred_program_resolver([](void* raw, const DeviceState*, std::span<const NVNshaderData>,
+        std::array<std::shared_ptr<const platform::CompiledGraphicsStage>, 6>&,
+        std::array<std::shared_ptr<PendingStage>, 6>& pending, std::string&) {
+        auto& context = *static_cast<InertContext*>(raw);
+        auto stage = std::make_shared<InertStage>();
+        stage->waits = &context.waits;
+        stage->stage = context.stages.vertex;
+        pending[NVN_SHADER_STAGE_VERTEX] = stage;
+        return true;
+    }, &inert_context);
+    const NVNshaderData inert_code{0, nullptr};
+    CHECK(initialize_graphics_program(inert, recorder.device, {&inert_code, 1}));
+    set_program_resolver(Stages::resolve, &stages);
+
+    const NVNcopyRegion whole{0, 0, 0, 4, 4, 1};
+    const float black[]{0, 0, 0, 0};
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &green, 31);
+    const auto ordinary = [&](const NVNprogram* program, int mask, unsigned sample) {
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, program, mask);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+        load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands, &target, nullptr, &whole,
+            TestResources::base + sample * 0x1000, 0);
+    };
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &inert, 0);
+    ordinary(&red, 0, 1);  // No publication: remains green.
+    ordinary(&red, NVN_SHADER_STAGE_VERTEX_BIT, 2);  // Publishes red FS as well as VS.
+    ordinary(&green, NVN_SHADER_STAGE_FRAGMENT_BIT, 3);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, nullptr, NVN_SHADER_STAGE_VERTEX_BIT);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_MESH, 0,
+        TestResources::base + 0x600, 64);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &mesh, NVN_SHADER_STAGE_FRAGMENT_BIT);
+    command_geometry_processing_mode(&recorder.commands, 2);
+    for (unsigned sample = 4; sample != 6; ++sample) {
+        load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, black, 15);
+        if (sample == 5) load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &red, 0);
+        command_draw_mesh_tasks(&recorder.commands, int(sample - 3), 1);
+        load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands, &target, nullptr, &whole,
+            TestResources::base + sample * 0x1000, 0);
+    }
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().draws == 5 && backend->statistics().skipped == 1);
+    CHECK(inert_waits.load() == 0);
+    CHECK(static_cast<const std::uint32_t*>(resources.memory.contents)[0x600 / 4] == 0x102);
+    const auto* pixels = static_cast<const std::uint8_t*>(resources.memory.contents);
+    for (unsigned sample = 1; sample != 6; ++sample)
+        for (unsigned pixel = 0; pixel != 16; ++pixel) {
+            const bool red_pixel = sample == 2;
+            const bool green_pixel = sample < 4 ? !red_pixel : pixel % 4 == sample - 3;
+            CHECK(pixels[sample * 0x1000 + pixel * 4] == (red_pixel ? 255 : 0));
+            CHECK(pixels[sample * 0x1000 + pixel * 4 + 1] == (green_pixel ? 255 : 0));
+        }
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    for (auto* program : {&green, &red, &mesh, &inert}) load<Entry::nvnProgramFinalize>()(program);
+}
+
+// Selecting compute does not publish the program's graphics list; selecting
+// graphics does not replace an existing compute stage outside the mask.
+void test_program_publication_compute_branch(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    std::memset(resources.memory.contents, 0, resources.memory.length);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget;
+    resources.textures[95] = [device newTextureWithDescriptor:descriptor];
+    auto state = texture_state(95, 4, 4);
+    auto target = texture_object(state);
+    const NVNtexture* targets[]{&target};
+    Recorder recorder;
+    NVNprogram green{}, combined{}, compute{};
+    const NVNshaderData green_code[]{{903, nullptr}, {903, nullptr}};
+    const NVNshaderData combined_code[]{{910, nullptr}, {910, nullptr}, {910, nullptr}};
+    const NVNshaderData compute_code{2, nullptr};
+    CHECK(initialize_graphics_program(green, recorder.device, green_code));
+    CHECK(initialize_graphics_program(combined, recorder.device, combined_code));
+    CHECK(initialize_graphics_program(compute, recorder.device, {&compute_code, 1}));
+    const NVNcopyRegion whole{0, 0, 0, 4, 4, 1};
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &green, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &combined, NVN_SHADER_STAGE_COMPUTE_BIT);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands, &target, nullptr, &whole,
+        TestResources::base + 0x1000, 0);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &compute, NVN_SHADER_STAGE_COMPUTE_BIT);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &combined, NVN_SHADER_STAGE_VERTEX_BIT);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands, &target, nullptr, &whole,
+        TestResources::base + 0x2000, 0);
+    for (int slot = 0; slot != 2; ++slot)
+        load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_COMPUTE, slot,
+            TestResources::base + 0x600 + slot * 0x100, 16);
+    load<Entry::nvnCommandBufferDispatchCompute>()(&recorder.commands, 1, 1, 1);
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().draws == 2 && backend->statistics().dispatches == 1);
+    const auto* bytes = static_cast<const std::uint8_t*>(resources.memory.contents);
+    for (unsigned pixel = 0; pixel != 16; ++pixel) {
+        CHECK(bytes[0x1000 + pixel * 4] == 0 && bytes[0x1000 + pixel * 4 + 1] == 255);
+        CHECK(bytes[0x2000 + pixel * 4] == 255 && bytes[0x2000 + pixel * 4 + 1] == 0);
+    }
+    const auto* words = static_cast<const std::uint32_t*>(resources.memory.contents);
+    for (unsigned index = 0; index != 4; ++index) CHECK(words[0x600 / 4 + index] == 10 + index && words[0x700 / 4 + index] == 0);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    for (auto* program : {&green, &combined, &compute}) load<Entry::nvnProgramFinalize>()(program);
+}
+
+// The look-ahead must stop batching before a writer published outside the
+// requested mask. That writer changes the later indirect count from zero.
+void test_mesh_publication_writer(id<MTLDevice> device, id<MTL4CommandQueue> queue, Stages& stages, bool pending_writer) {
+    TestResources resources(device);
+    std::memset(resources.memory.contents, 0, resources.memory.length);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget;
+    resources.textures[95] = [device newTextureWithDescriptor:descriptor];
+    auto state = texture_state(95, 4, 4);
+    auto target = texture_object(state);
+    const NVNtexture* targets[]{&target};
+    Recorder recorder;
+    ScopedApi231 api(true);
+    NVNprogram reader{}, writer{};
+    const NVNshaderData reader_code[]{{906, nullptr}, {906, nullptr}};
+    const NVNshaderData writer_code[]{{909, nullptr}, {909, nullptr}};
+    CHECK(initialize_graphics_program(reader, recorder.device, reader_code));
+    std::atomic_uint writer_waits{0};
+    struct WriterStage final : PendingStage {
+        std::atomic_uint* waits;
+        std::shared_ptr<const platform::CompiledGraphicsStage> stage;
+        std::shared_ptr<const platform::CompiledGraphicsStage> wait() override { ++*waits; return stage; }
+    };
+    struct WriterContext { Stages& stages; std::atomic_uint& waits; } writer_context{stages, writer_waits};
+    if (pending_writer) set_deferred_program_resolver([](void* raw, const DeviceState*,
+        std::span<const NVNshaderData>, std::array<std::shared_ptr<const platform::CompiledGraphicsStage>, 6>& ready,
+        std::array<std::shared_ptr<PendingStage>, 6>& pending, std::string&) {
+        auto& context = *static_cast<WriterContext*>(raw);
+        auto stage = std::make_shared<WriterStage>();
+        stage->waits = &context.waits;
+        stage->stage = context.stages.publication_writer_mesh;
+        pending[NVN_SHADER_STAGE_TESS_EVALUATION] = stage;
+        ready[NVN_SHADER_STAGE_FRAGMENT] = context.stages.api231_fragment;
+        return true;
+    }, &writer_context);
+    CHECK(initialize_graphics_program(writer, recorder.device, writer_code));
+    set_program_resolver(Stages::resolve, &stages);
+    auto* bytes = static_cast<std::byte*>(resources.memory.contents);
+    const std::array<std::uint32_t, 4> records{1, 0, 0, 0};
+    std::memcpy(bytes + 0x300, records.data(), sizeof records);
+    const std::uint32_t column = 0;
+    std::memcpy(bytes + 0x500, &column, sizeof column);
+    const float black[]{0, 0, 0, 0};
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+    load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, black, 15);
+    load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_MESH, 0,
+        TestResources::base + 0x500, 4);
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_MESH, 0,
+        TestResources::base + 0x308, 8);
+    bind_mesh_program(&recorder.commands, &reader, false);
+    command_draw_mesh_tasks_indirect(&recorder.commands, TestResources::base + 0x300);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &writer, NVN_SHADER_STAGE_FRAGMENT_BIT);
+    command_draw_mesh_tasks(&recorder.commands, 1, 1);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &reader, NVN_SHADER_STAGE_FRAGMENT_BIT);
+    const std::uint32_t next_column = 2;
+    load<Entry::nvnCommandBufferUpdateUniformBuffer>()(&recorder.commands, TestResources::base + 0x500, 4, 0, 4, &next_column);
+    command_draw_mesh_tasks_indirect(&recorder.commands, TestResources::base + 0x308);
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().draws == 3 && backend->statistics().skipped == 0);
+    CHECK(writer_waits.load() == unsigned(pending_writer));
+    CHECK(static_cast<const std::uint32_t*>(resources.memory.contents)[0x308 / 4] == 1);
+    std::array<std::uint8_t, 64> pixels{};
+    [resources.textures[95] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+    for (unsigned pixel = 0; pixel != 16; ++pixel) CHECK(pixels[pixel * 4 + 1] == (pixel % 4 < 3 ? 255 : 0));
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&reader);
+    load<Entry::nvnProgramFinalize>()(&writer);
+}
+
+// A version candidate must account for partially overlapping inactive banks
+// in either direction, including an update crossing a binding's start.
+void test_retained_mesh_uniform_overlap(id<MTLDevice> device, id<MTL4CommandQueue> queue, bool to_mesh) {
+    TestResources resources(device);
+    std::memset(resources.memory.contents, 0, resources.memory.length);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget;
+    resources.textures[95] = [device newTextureWithDescriptor:descriptor];
+    auto state = texture_state(95, 4, 4);
+    auto target = texture_object(state);
+    const NVNtexture* targets[]{&target};
+    Recorder recorder;
+    ScopedApi231 api(true);
+    NVNprogram mesh{}, ordinary{};
+    const NVNshaderData mesh_code[]{{906, nullptr}, {906, nullptr}};
+    const NVNshaderData ordinary_code[]{{907, nullptr}, {907, nullptr}};
+    CHECK(initialize_graphics_program(mesh, recorder.device, mesh_code));
+    CHECK(initialize_graphics_program(ordinary, recorder.device, ordinary_code));
+    const float black[]{0, 0, 0, 0};
+    const std::array<std::uint32_t, 2> update{to_mesh ? 1u : 0u, 1u};
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &mesh, 0x80);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &ordinary, 63);
+    load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_VERTEX, 0,
+        TestResources::base + (to_mesh ? 0x1000 : 0x1020), 64);
+    load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_MESH, 0,
+        TestResources::base + (to_mesh ? 0x1020 : 0x1000), 64);
+    command_geometry_processing_mode(&recorder.commands, to_mesh ? 0 : 2);
+    load<Entry::nvnCommandBufferUpdateUniformBuffer>()(&recorder.commands,
+        TestResources::base + (to_mesh ? 0x1020 : 0x101c), to_mesh ? 4 : 8, 0, to_mesh ? 4 : 8, update.data());
+    command_geometry_processing_mode(&recorder.commands, to_mesh ? 2 : 0);
+    load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, black, 15);
+    if (to_mesh) command_draw_mesh_tasks(&recorder.commands, 0, 1);
+    else load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 6);
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().draws == 1 && backend->statistics().skipped == 0);
+    std::array<std::uint8_t, 64> pixels{};
+    [resources.textures[95] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+    for (unsigned pixel = 0; pixel != 16; ++pixel) CHECK(pixels[pixel * 4 + 1] == (pixel % 4 == 1 ? 255 : 0));
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&mesh);
+    load<Entry::nvnProgramFinalize>()(&ordinary);
+}
+
+// Publishing the other route clears the selected mesh, including in the
+// same pass. Rebinding standalone also invalidates the task-fed route.
+void test_mesh_route_rebind(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    std::memset(resources.memory.contents, 0, resources.memory.length);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget;
+    resources.textures[95] = [device newTextureWithDescriptor:descriptor];
+    auto state = texture_state(95, 4, 4);
+    auto target = texture_object(state);
+    const NVNtexture* targets[]{&target};
+    Recorder recorder;
+    ScopedApi231 api(true);
+    NVNprogram standalone{}, task{};
+    std::array<std::byte, 0xe0> control{};
+    control[0x56] = std::byte{7};
+    const NVNshaderData standalone_code[]{{904, control.data()}, {904, nullptr}};
+    const NVNshaderData task_code[]{{95, nullptr}, {95, nullptr}, {95, nullptr}};
+    CHECK(initialize_graphics_program(standalone, recorder.device, standalone_code));
+    CHECK(initialize_graphics_program(task, recorder.device, task_code));
+    const float black[]{0, 0, 0, 0};
+    const NVNcopyRegion whole{0, 0, 0, 4, 4, 1};
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+    load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, black, 15);
+    bind_mesh_program(&recorder.commands, &standalone, false);
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_MESH, 0,
+        TestResources::base + 0x800, 64);
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_TASK, 0,
+        TestResources::base + 0x900, 32);
+    command_draw_mesh_tasks(&recorder.commands, 0, 1);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &task, 0xc0);
+    command_draw_mesh_tasks(&recorder.commands, 1, 1);  // No setter, clear or pass boundary before this draw.
+    load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands, &target, nullptr, &whole,
+        TestResources::base + 0x1000, 0);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &standalone, 0x80);
+    command_draw_mesh_tasks(&recorder.commands, 2, 1);
+    command_geometry_processing_mode(&recorder.commands, 1);
+    command_draw_mesh_tasks(&recorder.commands, 0, 1);
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().draws == 2 && backend->statistics().skipped == 2);
+    CHECK(static_cast<const std::uint32_t*>(resources.memory.contents)[0x900 / 4] == 0);
+    const auto* snapshot = static_cast<const std::uint8_t*>(resources.memory.contents) + 0x1000;
+    std::array<std::uint8_t, 64> pixels{};
+    [resources.textures[95] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+    for (unsigned pixel = 0; pixel != 16; ++pixel) {
+        CHECK(snapshot[pixel * 4 + 1] == (pixel % 4 == 0 ? 255 : 0));
+        CHECK(pixels[pixel * 4 + 1] == (pixel % 4 == 0 || pixel % 4 == 2 ? 255 : 0));
+    }
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&standalone);
+    load<Entry::nvnProgramFinalize>()(&task);
+}
+
 // Mesh draws without and with a task stage. The direct draw launches
 // workgroups 1 and 2 (first 1, count 2); the indirect record {count 1,
 // first 3} launches task workgroup 3, which hands its column to one mesh
@@ -5386,9 +10904,9 @@ void test_mesh_draws(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
     load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
     load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
     load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, black, 15);
-    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &mesh_only, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    bind_mesh_program(&recorder.commands, &mesh_only, false);
     command_draw_mesh_tasks(&recorder.commands, 1, 2);
-    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &with_task, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    bind_mesh_program(&recorder.commands, &with_task, true);
     command_draw_mesh_tasks_indirect(&recorder.commands, TestResources::base + 0x300);
     // A record that is not word-aligned is refused before any copy or draw.
     command_draw_mesh_tasks_indirect(&recorder.commands, TestResources::base + 0x301);
@@ -5410,10 +10928,17 @@ void test_mesh_draws(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
     load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
 }
 
-// A mesh stage finds the storage buffer bound to it in its driver data's
-// table at 0x770, and a task stage in its table at 0x670: each places a column
-// only when its table holds the bound buffer.
-void test_mesh_storage_tables(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+bool mesh_record_batch() {
+    const char* value = std::getenv("ARMIGO_NVN_MESH_RECORD_BATCH");
+    return !(value && *value == '0');
+}
+
+// Indirect mesh records are copied ahead of the render pass, up to the next
+// record that may write one. The first draw's record {count 0, first 3} draws
+// nothing; the second's {1, 2} draws column 2 in the same pass. A buffer copy
+// then rewrites the first record to {1, 3}, and the draw after it reads the new
+// count: column 3. A direct draw places column 1; column 0 stays clear.
+void test_mesh_record_batch(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
     TestResources resources(device);
     std::memset(resources.memory.contents, 0, resources.memory.length);
     auto backend = replay::create_replay_backend(device, queue, resources);
@@ -5426,29 +10951,215 @@ void test_mesh_storage_tables(id<MTLDevice> device, id<MTL4CommandQueue> queue) 
     auto target = texture_object(state);
     const NVNtexture* targets[]{&target};
     Recorder recorder;
-    NVNprogram mesh_only{}, with_task{};
-    CHECK(load<Entry::nvnProgramInitialize>()(&mesh_only, &recorder.device));
+    NVNprogram with_task{};
     CHECK(load<Entry::nvnProgramInitialize>()(&with_task, &recorder.device));
-    const NVNshaderData mesh_shaders[]{{93, nullptr}, {93, nullptr}};
-    const NVNshaderData task_shaders[]{{95, nullptr}, {95, nullptr}, {95, nullptr}};
-    CHECK(load<Entry::nvnProgramSetShaders>()(&mesh_only, 2, mesh_shaders));
+    const NVNshaderData task_shaders[]{{82, nullptr}, {82, nullptr}, {82, nullptr}};
     CHECK(load<Entry::nvnProgramSetShaders>()(&with_task, 3, task_shaders));
+    auto* bytes = static_cast<std::byte*>(resources.memory.contents);
+    const std::array<std::uint32_t, 6> records{0, 3, 1, 2, 1, 3};
+    std::memcpy(bytes + 0x300, records.data(), sizeof records);
+    constexpr auto first = TestResources::base + 0x300, second = TestResources::base + 0x308;
     const float black[]{0, 0, 0, 0};
     load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
     load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
     load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, black, 15);
-    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &mesh_only, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
-    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_TESS_EVALUATION, 0,
+    bind_mesh_program(&recorder.commands, &with_task, true);
+    command_draw_mesh_tasks_indirect(&recorder.commands, first);
+    command_draw_mesh_tasks(&recorder.commands, 1, 1);
+    command_draw_mesh_tasks_indirect(&recorder.commands, second);
+    load<Entry::nvnCommandBufferCopyBufferToBuffer>()(&recorder.commands, TestResources::base + 0x310, first, 8, 0);
+    command_draw_mesh_tasks_indirect(&recorder.commands, first);
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().draws == 4);
+    // One copy pass before the shared render pass, one for the buffer copy and
+    // the third draw's record, then the third draw's pass. Each record alone:
+    // a copy pass and a render pass for each indirect draw.
+    const auto passes = mesh_record_batch() ? 2u : 3u;
+    CHECK(backend->statistics().render_passes == passes && backend->statistics().compute_passes == passes);
+    std::array<std::uint8_t, 64> pixels{};
+    [resources.textures[95] getBytes:pixels.data() bytesPerRow:16
+        fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+    for (unsigned pixel = 0; pixel < 16; ++pixel) {
+        const bool drawn = pixel % 4 != 0;
+        CHECK(pixels[pixel * 4] == 0 && pixels[pixel * 4 + 1] == (drawn ? 255 : 0));
+    }
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&with_task);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+// A later indirect mesh record is copied at its own draw when a write may
+// reach it with no record between the draws: a uniform update of it still
+// pending when the first draw copies (it lands only before the record is
+// read), or texture storage over it. The first record {1, 1} draws column 1;
+// the second, {0, 2} in memory, draws column 2 from the update {1, 2}, or
+// from memory when it is texture storage.
+void test_mesh_record_exclusions(id<MTLDevice> device, id<MTL4CommandQueue> queue, bool texture_storage) {
+    TestResources resources(device);
+    std::memset(resources.memory.contents, 0, resources.memory.length);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget;
+    resources.textures[95] = [device newTextureWithDescriptor:descriptor];
+    auto state = texture_state(95, 4, 4);
+    auto target = texture_object(state);
+    const NVNtexture* targets[]{&target};
+    Recorder recorder;
+    NVNprogram with_task{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&with_task, &recorder.device));
+    const NVNshaderData task_shaders[]{{82, nullptr}, {82, nullptr}, {82, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&with_task, 3, task_shaders));
+    // The second record has a uniform binding of its own.
+    const std::array<std::uint32_t, 2> first_record{1, 1}, second_record{texture_storage ? 1u : 0u, 2};
+    auto* bytes = static_cast<std::byte*>(resources.memory.contents);
+    std::memcpy(bytes + 0x300, first_record.data(), sizeof first_record);
+    std::memcpy(bytes + 0x400, second_record.data(), sizeof second_record);
+    constexpr auto first = TestResources::base + 0x300, second = TestResources::base + 0x400;
+    if (texture_storage) {
+        resources.backing_begin = second;
+        resources.backing_end = second + 8;
+    }
+    const std::array<std::uint32_t, 2> update{1, 2};
+    const float black[]{0, 0, 0, 0};
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+    load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, black, 15);
+    bind_mesh_program(&recorder.commands, &with_task, true);
+    if (!texture_storage) {
+        load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, second, 64);
+        load<Entry::nvnCommandBufferUpdateUniformBuffer>()(&recorder.commands, second, 64, 0, sizeof update,
+                                                          update.data());
+    }
+    command_draw_mesh_tasks_indirect(&recorder.commands, first);
+    command_draw_mesh_tasks_indirect(&recorder.commands, second);
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().draws == 2);
+    if (!texture_storage) CHECK(backend->statistics().uniform_versions >= 1);
+    // The second record gets a copy pass of its own, splitting the pass.
+    CHECK(backend->statistics().render_passes == 2 && backend->statistics().compute_passes == 2);
+    std::array<std::uint8_t, 64> pixels{};
+    [resources.textures[95] getBytes:pixels.data() bytesPerRow:16
+        fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+    for (unsigned pixel = 0; pixel < 16; ++pixel) {
+        const bool drawn = pixel % 4 == 1 || pixel % 4 == 2;
+        CHECK(pixels[pixel * 4] == 0 && pixels[pixel * 4 + 1] == (drawn ? 255 : 0));
+    }
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&with_task);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+// A mesh stage finds the storage buffer bound to it in its driver data's
+// table at 0x770, and a task stage in its table at 0x670: each places a column
+// only when its table holds the bound buffer.
+void test_texture_prefix_api231(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget;
+    resources.textures[96] = [device newTextureWithDescriptor:descriptor];
+    auto state = texture_state(96,4,4); auto target = texture_object(state);
+    const NVNtexture* targets[]{&target};
+    Recorder recorder;
+    ScopedApi231 api(true);
+    NVNprogram program{};
+    const NVNshaderData shaders[]{{411,nullptr},{411,nullptr}};
+    CHECK(initialize_graphics_program(program,recorder.device,shaders));
+    NVNevent event{};
+    auto& event_state = *reinterpret_cast<EventState*>(&event);
+    event_state.tag = object_tag('E','V','N','T');
+    event_state.value = reinterpret_cast<volatile std::uint32_t*>(
+        static_cast<std::byte*>(resources.memory.contents)+0x4000);
+    *event_state.value=0;
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands,1,targets,nullptr,nullptr,nullptr);
+    const float clear[]{0,0,0,0};
+    load<Entry::nvnCommandBufferClearColor>()(&recorder.commands,0,clear,15);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands,&program,NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferBindSeparateTexture>()(&recorder.commands,NVN_SHADER_STAGE_VERTEX,127,{127});
+    load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands,NVN_SHADER_STAGE_FRAGMENT,0,123);
+    const auto draw = [&](int column) {
+        load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands,column,0,1,4);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands,NVN_DRAW_PRIMITIVE_TRIANGLES,0,3);
+    };
+    draw(0);
+    const NVNtextureHandle first[]{0x0000002200000011ull};
+    load<Entry::nvnCommandBufferBindTextures>()(&recorder.commands,NVN_SHADER_STAGE_FRAGMENT,-1,1,first);
+    draw(1);
+    load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands,NVN_SHADER_STAGE_FRAGMENT,-1,0xdeadbeef00000033ull);
+    draw(2);
+    const NVNtextureHandle both[]{0x0000006600000055ull,103};
+    load<Entry::nvnCommandBufferBindTextures>()(&recorder.commands,NVN_SHADER_STAGE_FRAGMENT,-1,2,both);
+    draw(3);
+    load<Entry::nvnCommandBufferSignalEvent>()(&recorder.commands,&event,NVN_EVENT_SIGNAL_MODE_WRITE,
+        NVN_EVENT_SIGNAL_LOCATION_BOTTOM,0,77);
+    const auto handle=recorder.finish(); const auto fence=backend->submit({&handle,1});
+    CHECK(fence && backend->wait_fence(fence,10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().skipped==0 && backend->statistics().draws==4);
+    CHECK(*event_state.value==77);
+    std::array<std::uint8_t,64> pixels{};
+    [resources.textures[96] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0,0,4,4) mipmapLevel:0];
+    const std::array<std::array<unsigned,4>,4> expected{{{0,0,127,123},{17,34,127,123},{51,34,127,123},{85,102,127,103}}};
+    for(unsigned i=0;i<16;++i)for(unsigned c=0;c<4;++c)CHECK(pixels[i*4+c]==expected[i%4][c]);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device,handle);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+void test_mesh_storage_tables(id<MTLDevice> device, id<MTL4CommandQueue> queue, bool api231 = false) {
+    struct RestorePolicy { ~RestorePolicy() { nvn::set_title_policy({}); } } restore;
+    nvn::TitlePolicy policy;
+    policy.handle_reads = nvn::TitlePolicy::HandleReads::current;
+    nvn::set_title_policy(policy);
+    TestResources resources(device);
+    std::memset(resources.memory.contents, 0, resources.memory.length);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget;
+    resources.textures[95] = [device newTextureWithDescriptor:descriptor];
+    auto state = texture_state(95, 4, 4);
+    auto target = texture_object(state);
+    const NVNtexture* targets[]{&target};
+    Recorder recorder;
+    ScopedApi231 api(api231);
+    NVNprogram mesh_only{}, with_task{};
+    const NVNshaderData mesh_shaders[]{{93, nullptr}, {93, nullptr}};
+    const NVNshaderData task_shaders[]{{95, nullptr}, {95, nullptr}, {95, nullptr}};
+    CHECK(initialize_graphics_program(mesh_only, recorder.device, mesh_shaders));
+    CHECK(initialize_graphics_program(with_task, recorder.device, task_shaders));
+    const auto draw_mesh = api231 ? reinterpret_cast<void (*)(NVNcommandBuffer*, int, int)>(
+        armigo_nvn231_bootstrap_loader("nvnCommandBufferDrawMeshTasks")) : &command_draw_mesh_tasks;
+    const float black[]{0, 0, 0, 0};
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+    load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, black, 15);
+    bind_mesh_program(&recorder.commands, &mesh_only, false);
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_MESH, 0,
                                                     TestResources::base + 0x100, 64);
-    command_draw_mesh_tasks(&recorder.commands, 0, 1);
-    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &with_task, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
-    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_TESS_CONTROL, 0,
+    draw_mesh(&recorder.commands, 0, 1);
+    bind_mesh_program(&recorder.commands, &with_task, true);
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_TASK, 0,
                                                     TestResources::base + 0x200, 32);
-    command_draw_mesh_tasks(&recorder.commands, 0, 1);
+    draw_mesh(&recorder.commands, 0, 1);
     const auto handle = recorder.finish();
     const auto fence = backend->submit({&handle, 1});
     CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
     CHECK(!backend->last_error() && backend->statistics().skipped == 0 && backend->statistics().draws == 2);
+    const auto* words = static_cast<const std::uint32_t*>(resources.memory.contents);
+    CHECK(words[0x100 / 4] == 0x11u && words[0x200 / 4] == 0x22u);
+    // Both actual GPU stores must notify the resource provider; those same
+    // ranges invalidate later handle reads and captured uniform contents.
+    CHECK(resources.buffer_writes == 2);
     std::array<std::uint8_t, 64> pixels{};
     [resources.textures[95] getBytes:pixels.data() bytesPerRow:16
         fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
@@ -5508,6 +11219,119 @@ nt::Fixture native_stage(std::vector<shader_native::Instruction> code, shader_na
     return fixture;
 }
 
+// Real native decode, proof selection, reflection serialization and package
+// parsing feed the same replay path as a prepared shader.
+void test_generated_proven_window(id<MTLDevice> device, id<MTL4CommandQueue> queue, Stages& stages) {
+    namespace sn = shader_native;
+    namespace pl = shader::pipeline;
+    std::vector<sn::Instruction> instructions;
+    for (unsigned n = 0; n < 4; ++n) {
+        auto instruction = nt::raw(0xb82);
+        nt::field(instruction, 16, 8, n); nt::field(instruction, 24, 8, 255);
+        nt::field(instruction, 38, 16, n == 3 ? 16 : n * 4);
+        nt::field(instruction, 54, 5, 3); nt::field(instruction, 73, 3, 4);
+        instructions.push_back(instruction);
+    }
+    instructions.push_back(nt::exit_instruction());
+    nt::Fixture fixture(std::move(instructions), sn::Stage::fragment);
+    nt::put(fixture.code, 0x48, 15);
+    const auto program = fixture.program();
+    sn::FrontendOptions options; options.pixel_rate = sn::PixelRateState::disabled;
+    options.fragment_position = pl::FragmentPositionConvention::metal_position_w_matches_guest_position_w;
+    const auto translated = sn::translate_native(program, options);
+    CHECK(std::holds_alternative<pl::MslArtifact>(translated));
+    if (!std::holds_alternative<pl::MslArtifact>(translated)) return;
+    const auto& artifact = std::get<pl::MslArtifact>(translated);
+    const pl::BufferUse* constant = nullptr;
+    for (const auto& resource : artifact.reflection.resources)
+        if (const auto* use = std::get_if<pl::BufferUse>(&resource.use))
+            if (const auto* source = std::get_if<pl::ConstantBufferSource>(&use->source); source && source->slot == 3) constant = use;
+    CHECK(constant && constant->size.bytes == 20 && constant->size.constant_buffer_policy == pl::ConstantBufferPolicy::proven_zero_words_v2);
+    CHECK(artifact.source.find("armigo_cbuf_word") == std::string::npos);
+    shader::graphics_msl::EmitOptions emission;
+    emission.fragment_position = shader::graphics_msl::FragmentPositionConvention::MetalPositionWMatchesGuestPositionW;
+    const auto reflection = platform::metal::native_stage_reflection(artifact, emission, pl::Stage::fragment, program.image);
+    const auto library = build_library(artifact.source); CHECK(!library.empty());
+    const auto original = stages.far_uniform_fragment;
+    for (const std::string policy : {"proven_zero_words_v2", "runtime_zero_words_v1", "padded_zero_words_v2"}) {
+        auto metadata = reflection;
+        const auto at = metadata.find("proven_zero_words_v2"); CHECK(at != std::string::npos);
+        if (at == std::string::npos) continue;
+        metadata.replace(at, std::string("proven_zero_words_v2").size(), policy);
+        auto made = platform::make_source_stage(shader_input::Stage::Fragment, program.image,
+            std::as_bytes(std::span(metadata.data(), metadata.size())), artifact.source);
+        CHECK(std::holds_alternative<std::shared_ptr<const platform::CompiledGraphicsStage>>(made));
+        if (!std::holds_alternative<std::shared_ptr<const platform::CompiledGraphicsStage>>(made)) continue;
+        auto fragment = std::make_shared<platform::CompiledGraphicsStage>(*std::get<std::shared_ptr<const platform::CompiledGraphicsStage>>(made));
+        fragment->metallib = library;
+        CHECK(fragment->constant_buffer_windows.size() == 1);
+        stages.far_uniform_fragment = fragment;
+        TestResources resources(device);
+        auto* memory = static_cast<std::uint32_t*>(resources.memory.contents);
+        const std::array<std::uint32_t, 6> before{0x11223344,0x55667788,0x99aabbcc,0xdeadbeef,0x13579bdf,0xdecafbad};
+        std::memcpy(memory + 0x200 / 4, before.data(), sizeof before);
+        auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Uint
+            width:8 height:4 mipmapped:NO]; descriptor.storageMode = MTLStorageModeShared;
+        descriptor.usage = MTLTextureUsageRenderTarget; resources.textures[92] = [device newTextureWithDescriptor:descriptor];
+        auto target_state = texture_state(92, 8, 4); target_state.description.format = NVN_FORMAT_RGBA32UI;
+        auto target = texture_object(target_state); const NVNtexture* targets[]{&target};
+        auto backend = replay::create_replay_backend(device, queue, resources);
+        const auto submit = [&](unsigned size, bool transitions) {
+            Recorder recorder; NVNprogram draw_program{};
+            CHECK(load<Entry::nvnProgramInitialize>()(&draw_program, &recorder.device));
+            const NVNshaderData shaders[]{{8,nullptr},{8,nullptr}};
+            CHECK(load<Entry::nvnProgramSetShaders>()(&draw_program, 2, shaders));
+            load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+            const auto target_and_draw = [&](unsigned x, unsigned width) {
+                load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+                load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, x, 0, width, 4);
+                load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+            };
+            load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &draw_program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+            load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, TestResources::base + 0x200, size);
+            target_and_draw(0, transitions ? 2 : 8);
+            if (transitions) {
+                const std::uint32_t updated = 0x2468ace0;
+                load<Entry::nvnCommandBufferUpdateUniformBuffer>()(&recorder.commands, TestResources::base + 0x200, size, 16, 4, &updated);
+                target_and_draw(2, 2);
+                load<Entry::nvnCommandBufferCopyBufferToBuffer>()(&recorder.commands, TestResources::base + 0x400, TestResources::base + 0x200, 20, 0);
+                target_and_draw(4, 2);
+                load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, TestResources::base + 0x200, 19);
+                target_and_draw(6, 2);
+            }
+            const auto handle = recorder.finish(); const auto fence = backend->submit({&handle,1});
+            CHECK(fence && backend->wait_fence(fence,10'000'000'000ull)); CHECK(!backend->last_error());
+            std::array<std::uint32_t,128> pixels{};
+            [resources.textures[92] getBytes:pixels.data() bytesPerRow:128 fromRegion:MTLRegionMake2D(0,0,8,4) mipmapLevel:0];
+            load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device,handle);
+            load<Entry::nvnProgramFinalize>()(&draw_program); load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+            return pixels;
+        };
+        for (const unsigned size : {0u,1u,3u,19u,20u,24u}) {
+            const auto uploaded = backend->statistics().upload_bytes;
+            const auto pixels = submit(size,false);
+            for (unsigned n = 0; n < 32; ++n) for (unsigned c = 0; c < 4; ++c) {
+                const unsigned index = c == 3 ? 4 : c;
+                CHECK(pixels[n*4+c] == (size >= (index+1)*4 ? before[index] : 0u));
+            }
+            const auto window_bytes = policy == "padded_zero_words_v2" ? 36u : size < 20 ? 20u : 0u;
+            CHECK(backend->statistics().upload_bytes - uploaded == 72u + window_bytes);
+        }
+        const std::array<std::uint32_t,5> gpu{0xabcdef01,0x12345678,0x87654321,0xdeadbeef,0xfedcba98};
+        std::memcpy(memory + 0x400/4,gpu.data(),sizeof gpu);
+        const auto copies = backend->statistics().copies;
+        const auto pixels = submit(24,true);
+        for (unsigned y = 0; y < 4; ++y) for (unsigned x = 0; x < 8; ++x) for (unsigned c = 0; c < 4; ++c) {
+            const unsigned index = c == 3 ? 4 : c;
+            const auto expected = x < 2 ? before[index] : x < 4 ? (c == 3 ? 0x2468ace0u : before[index])
+                : x < 6 ? gpu[index] : c == 3 ? 0u : gpu[index];
+            CHECK(pixels[(y*8+x)*4+c] == expected);
+        }
+        CHECK(backend->statistics().copies >= copies + 2);
+    }
+    stages.far_uniform_fragment = original;
+}
+
 // The four vertices of a full-target quad: x -1 or 1 by bit 0, y by bit 1,
 // z 0, w 1. R1 holds -1.0 and R2 1.0.
 void quad_vertices(std::vector<shader_native::Instruction>& code) {
@@ -5528,17 +11352,30 @@ void quad_vertices(std::vector<shader_native::Instruction>& code) {
 // each draw one triangle of the quad by their own number. A task asking for
 // 1,025 mesh workgroups launches none (its green fragment never shows) and is
 // reported once with its program; a mesh stage reading more payload than its
-// task passes, and a mesh stage translated without a task under one, are
+// task passes, and a retained task-fed mesh stage without its task, are
 // refused. The depth target shows the depth convention: clip z 0 is depth
 // 0.5 with near at -w and 0 with near at zero.
-void test_native_mesh_draws(id<MTLDevice> device, id<MTL4CommandQueue> queue, Stages& stages, bool near_is_zero) {
+void test_native_mesh_draws(id<MTLDevice> device, id<MTL4CommandQueue> queue, Stages& stages, bool near_is_zero,
+                            std::uint32_t fragment_size, bool capture_inputs = false) {
     namespace sn = shader_native;
-    const auto red = native_stage({nt::move(0, 0x3f800000u), nt::move(1, 0), nt::move(2, 0), nt::move(3, 0x3f800000u)},
-                                  sn::Stage::fragment);
+    auto pair = nt::raw(0xb82);
+    for (auto [at, width, value] : {std::tuple{16u, 8u, 8u}, {24u, 8u, 255u}, {54u, 5u, 0u},
+                                  {38u, 16u, 0x510u}, {73u, 3u, 5u}}) nt::field(pair, at, width, value);
+    auto storage_load = nt::raw(0x381);
+    for (auto [at, width, value] : {std::tuple{16u, 8u, 0u}, {24u, 8u, 8u}, {72u, 1u, 1u},
+                                  {73u, 3u, 6u}, {77u, 4u, 5u}, {81u, 3u, 7u}}) nt::field(storage_load, at, width, value);
+    const auto red = native_stage({pair, storage_load}, sn::Stage::fragment);
     const auto green = native_stage({nt::move(0, 0), nt::move(1, 0x3f800000u), nt::move(2, 0), nt::move(3, 0x3f800000u)},
                                     sn::Stage::fragment);
+    auto mesh_pair = pair;
+    nt::field(mesh_pair, 16, 8, 20); nt::field(mesh_pair, 38, 16, 0x7a0);
+    auto mesh_load = storage_load;
+    nt::field(mesh_load, 16, 8, 4); nt::field(mesh_load, 24, 8, 20); nt::field(mesh_load, 73, 3, 4);
+    auto task_pair = mesh_pair; nt::field(task_pair, 38, 16, 0x690);
+    auto task_load = mesh_load; nt::field(task_load, 16, 8, 1);
     std::vector<sn::Instruction> alone{nt::move(1, 0xbf800000u), nt::move(2, 0x3f800000u), nt::move(4, 2),
                                        nt::move(6, 1), nt::move(7, 2), nt::move(8, 3)};
+    alone.push_back(mesh_pair); alone.push_back(mesh_load);
     quad_vertices(alone);
     alone.push_back(stage_buffer(0x927, 4, 3, 0x88));
     for (unsigned at = 0; const unsigned index : {255u, 6u, 7u, 7u, 6u, 8u})
@@ -5547,6 +11384,7 @@ void test_native_mesh_draws(id<MTLDevice> device, id<MTL4CommandQueue> queue, St
     // Mesh workgroup n (input word 0) draws triangle (2n, 1, n + 2).
     std::vector<sn::Instruction> launched{nt::move(1, 0xbf800000u), nt::move(2, 0x3f800000u), nt::move(4, 1),
                                           nt::move(6, 1), nt::move(7, 2), stage_buffer(0x923, 10, 0, 0x38)};
+    launched.push_back(mesh_pair); launched.push_back(mesh_load);
     quad_vertices(launched);
     for (const auto& i : {stage_buffer(0x927, 4, 3, 0x88), multiply_add(12, 10, 7, 255), multiply_add(13, 10, 6, 7),
                           stage_buffer(0x927, 12, 4, 0x80), stage_buffer(0x927, 6, 5, 0x80), stage_buffer(0x927, 13, 6, 0x80)})
@@ -5556,15 +11394,52 @@ void test_native_mesh_draws(id<MTLDevice> device, id<MTL4CommandQueue> queue, St
     const auto task = [](std::uint32_t launches, std::uint32_t payload) {
         return native_stage({nt::move(1, launches), stage_buffer(0x927, 1, 4, 0xb8)}, sn::Stage::task, payload);
     };
-    const auto two = task(2, 0x20), too_many = task(1025, 0x20), short_payload = task(2, 8);
+    const auto two = native_stage({task_pair, task_load, stage_buffer(0x927, 1, 4, 0xb8)}, sn::Stage::task, 0x20);
+    const auto too_many = task(1025, 0x20), short_payload = task(2, 8);
     // The program tag is the stage identity's first four bytes; the identity
     // ignores the container extents a file record has.
     auto record = too_many;
     nt::put(record.control, 0x30, static_cast<std::uint32_t>(record.control.size()));
     const auto too_many_tag = static_cast<std::uint32_t>(std::stoul(record.program().stage_identity.substr(0, 8), nullptr, 16));
 
+    const auto runtime_program = [](const nt::Fixture& fixture) {
+        sn::Record input; input.kind = sn::ContainerKind::runtime;
+        input.control = fixture.control; input.code = fixture.code;
+        auto parsed = sn::parse_program(input);
+        CHECK(std::holds_alternative<sn::Program>(parsed));
+        return std::get<sn::Program>(std::move(parsed));
+    };
+    auto mesh_variant = mesh_only, red_variant = red;
+    nt::put(mesh_variant.control, 0x30, 0xe0);
+    nt::put(red_variant.control, 0xd4, 4);
     set_native_program_resolver();
+    namespace pc = program_capture;
+    const auto capture_root = std::filesystem::temp_directory_path() /
+        ("armigo-native-inputs-" + std::to_string(getpid()));
+    pc::RunBinding capture_binding;
+    if (capture_inputs) {
+        std::filesystem::remove_all(capture_root);
+        pc::Configuration configuration;
+        configuration.output = capture_root;
+        configuration.payload_digests = {runtime_program(mesh_only).payload_digest};
+        configuration.first = 0;
+        configuration.count = 1;
+        pc::configure(std::move(configuration), [](void*, std::uint64_t address, std::span<std::byte> output) {
+            // Synthetic fixtures stay alive until the backend and writer finish.
+            if (!address) return false;
+            std::memcpy(output.data(), reinterpret_cast<const void*>(address), output.size());
+            return true;
+        });
+        capture_binding = pc::bind_run({});
+    }
     TestResources resources(device);
+    const std::array<std::uint32_t, 4> red_words{0x3f800000u, 0, 0, 0x3f800000u};
+    const std::array<std::uint32_t, 4> blue_words{0, 0, 0x3f800000u, 0x3f800000u};
+    std::memcpy(static_cast<std::byte*>(resources.memory.contents) + 0x100, red_words.data(), sizeof red_words);
+    std::memcpy(static_cast<std::byte*>(resources.memory.contents) + 0x200, red_words.data(), sizeof red_words);
+    const std::uint32_t primitive_count = 2, launch_count = 2;
+    std::memcpy(static_cast<std::byte*>(resources.memory.contents) + 0x300, &primitive_count, 4);
+    std::memcpy(static_cast<std::byte*>(resources.memory.contents) + 0x304, &launch_count, 4);
     auto backend = replay::create_replay_backend(device, queue, resources);
     auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
         width:4 height:4 mipmapped:NO];
@@ -5593,12 +11468,20 @@ void test_native_mesh_draws(id<MTLDevice> device, id<MTL4CommandQueue> queue, St
     const NVNshaderData task_shaders[]{shader(two), shader(under_task), shader(red)};
     const NVNshaderData refused_launch[]{shader(too_many), shader(under_task), shader(green)};
     const NVNshaderData short_shaders[]{shader(short_payload), shader(under_task), shader(green)};
-    const NVNshaderData unlaunched[]{shader(two), shader(mesh_only), shader(green)};
     CHECK(set_shaders(&programs[0], 2, mesh_shaders) == 1);
+    if (capture_inputs) {
+        const auto first = retain_program_snapshot(*reinterpret_cast<ProgramState*>(&programs[0]));
+        const NVNshaderData variant[]{shader(mesh_variant), shader(red_variant)};
+        CHECK(set_shaders(&programs[0], 2, variant) == 1);
+        const auto second = retain_program_snapshot(*reinterpret_cast<ProgramState*>(&programs[0]));
+        CHECK(first && second && first->state.serial != second->state.serial);
+        CHECK(first && second && first->pending && second->pending &&
+              first->pending->stages == second->pending->stages);
+    }
     CHECK(set_shaders(&programs[1], 3, task_shaders) == 1);
     CHECK(set_shaders(&programs[2], 3, refused_launch) == 1);
     CHECK(set_shaders(&programs[3], 3, short_shaders) == 1);
-    CHECK(set_shaders(&programs[4], 3, unlaunched) == 1);
+    CHECK(set_shaders(&programs[4], 3, task_shaders) == 1);
     select_api_version({55, 15});
 
     NVNdepthStencilState depth_write{};
@@ -5613,15 +11496,29 @@ void test_native_mesh_draws(id<MTLDevice> device, id<MTL4CommandQueue> queue, St
     load<Entry::nvnCommandBufferClearDepthStencil>()(&recorder.commands, 1.0f, 1, 0, 0);
     load<Entry::nvnCommandBufferBindDepthStencilState>()(&recorder.commands, &depth_write);
     load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 0, 0, 2, 4);
-    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &programs[0], NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    bind_mesh_program(&recorder.commands, &programs[0], false);
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+                                                    TestResources::base + 0x100, fragment_size);
+    // Nonzero indices distinguish the task/mesh descriptor tables from a
+    // fallback that treats reflection order as the guest binding index.
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_MESH, 3,
+                                                    TestResources::base + 0x300, 4);
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_TASK, 2,
+                                                    TestResources::base + 0x304, 4);
     command_draw_mesh_tasks(&recorder.commands, 0, 1);
     load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 2, 0, 2, 4);
-    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &programs[1], NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    bind_mesh_program(&recorder.commands, &programs[1], true);
+    load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+                                                    TestResources::base + 0x200, fragment_size);
+    // A queued uniform update aliases this storage binding. The direct read
+    // must use the updated version even without a driver constant window.
+    load<Entry::nvnCommandBufferUpdateUniformBuffer>()(&recorder.commands, TestResources::base + 0x200,
+        sizeof blue_words, 0, sizeof blue_words, blue_words.data());
     command_draw_mesh_tasks(&recorder.commands, 0, 1);
     load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 0, 0, 4, 4);
     for (std::size_t refused = 2; refused != programs.size(); ++refused) {
-        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &programs[refused],
-                                                   NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        bind_mesh_program(&recorder.commands, &programs[refused], true);
+        if (refused == 4) load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, nullptr, 0x40);
         command_draw_mesh_tasks(&recorder.commands, 0, 1);
     }
     const auto handle = recorder.finish();
@@ -5646,7 +11543,8 @@ void test_native_mesh_draws(id<MTLDevice> device, id<MTL4CommandQueue> queue, St
     std::array<std::uint8_t, 64> pixels{};
     [resources.textures[96] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
     for (unsigned pixel = 0; pixel < 16; ++pixel)
-        CHECK(pixels[pixel * 4] == 255 && pixels[pixel * 4 + 1] == 0 && pixels[pixel * 4 + 3] == 255);
+        CHECK(pixels[pixel * 4] == (pixel % 4 < 2 ? 255 : 0) && pixels[pixel * 4 + 1] == 0 &&
+              pixels[pixel * 4 + 2] == (pixel % 4 < 2 ? 0 : 255) && pixels[pixel * 4 + 3] == 255);
     std::array<float, 16> depths{};
     [resources.textures[97] getBytes:depths.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
     for (const auto value : depths) CHECK(value == (near_is_zero ? 0.0f : 0.5f));
@@ -5656,7 +11554,7 @@ void test_native_mesh_draws(id<MTLDevice> device, id<MTL4CommandQueue> queue, St
     for (const auto& line : lines.written) {
         reports += line.find(expected) != std::string::npos;
         payload_refusals += line.find("reads more payload than its task stage passes") != std::string::npos;
-        relation_refusals += line.find("translated to run without a task stage") != std::string::npos;
+        relation_refusals += line.find("translated to run under a task stage") != std::string::npos;
     }
     CHECK(reports == 1 && payload_refusals == 1 && relation_refusals == 1);
     const auto retained = retain_program(*reinterpret_cast<const ProgramState*>(&programs[1]));
@@ -5667,11 +11565,345 @@ void test_native_mesh_draws(id<MTLDevice> device, id<MTL4CommandQueue> queue, St
         CHECK(task_stage.task && task_stage.task->payload_bytes == 0x20 && task_stage.task->local_size[0] == 32);
         CHECK(mesh_stage.mesh && mesh_stage.mesh->launched_by_task && mesh_stage.mesh->payload_bytes == 0x20);
     }
+    if (capture_inputs) {
+        capture_binding.finish(true);
+        NSData* data = [NSData dataWithContentsOfFile:@( (capture_root / "capture.json").c_str())];
+        NSDictionary* manifest = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        CHECK(manifest && [manifest[@"inputs_complete"] boolValue]);
+        CHECK(![manifest[@"original_driver_execution_observed"] boolValue]);
+        NSArray* captured_programs = manifest[@"programs"];
+        CHECK(captured_programs.count == 2);
+        NSDictionary* input = captured_programs.lastObject;
+        for (unsigned call = 0; call != captured_programs.count; ++call) {
+            NSDictionary* observed_call = captured_programs[call];
+            CHECK([observed_call[@"count"] unsignedIntValue] == 2 && [observed_call[@"result"] boolValue]);
+            CHECK([observed_call[@"api_major"] unsignedIntValue] == 231 && [observed_call[@"api_minor"] unsignedIntValue] == 40);
+            CHECK([observed_call[@"generation_before_observed"] boolValue] && [observed_call[@"generation_after_observed"] boolValue]);
+            NSArray* descriptors = observed_call[@"descriptors"];
+            CHECK(descriptors.count == 2);
+            for (unsigned i = 0; i != descriptors.count; ++i) {
+                const auto& fixture = i == 0 ? (call == 0 ? mesh_only : mesh_variant) : (call == 0 ? red : red_variant);
+                NSDictionary* observed = descriptors[i];
+                const auto payload = runtime_program(fixture);
+                CHECK([observed[@"payload_digest"] isEqualToString:@(payload.payload_digest.c_str())]);
+                CHECK([observed[@"stage_identity"] isEqualToString:@(payload.stage_identity.c_str())]);
+                for (const auto& [name, expected] : {
+                        std::pair{"control_file", std::span<const std::byte>(fixture.control)},
+                        std::pair{"code_file", std::span<const std::byte>(fixture.code)}}) {
+                    NSString* relative = observed[@(name)];
+                    NSData* bytes = [NSData dataWithContentsOfFile:@((capture_root / relative.UTF8String).c_str())];
+                    CHECK(bytes && bytes.length == expected.size());
+                    if (bytes && bytes.length == expected.size())
+                        CHECK(std::memcmp(bytes.bytes, expected.data(), expected.size()) == 0);
+                }
+            }
+        }
+        NSArray* events = manifest[@"events"];
+        CHECK(events.count >= 2);
+        NSDictionary* bind = events.firstObject;
+        NSDictionary* draw = events.lastObject;
+        CHECK([bind[@"kind"] isEqualToString:@"bind"] && [bind[@"present_observed"] boolValue]);
+        CHECK([draw[@"kind"] isEqualToString:@"direct_draw"] && [draw[@"encoded"] boolValue]);
+        CHECK([draw[@"first"] intValue] == 0 && [draw[@"count"] intValue] == 1 && [draw[@"mode_after"] intValue] == 2);
+        CHECK([draw[@"generation"] isEqual:input[@"generation_after"]]);
+        CHECK([draw[@"capture_call"] isEqual:input[@"call"]]);
+        NSArray* caches = draw[@"after"];
+        CHECK(caches.count == 10 && [caches[8][@"generation"] isEqual:input[@"generation_after"]]);
+        CHECK([caches[8][@"role"] isEqualToString:@"standalone-mesh"]);
+        CHECK([draw[@"metadata_route_byte"] unsignedIntValue] ==
+              std::to_integer<unsigned>(mesh_only.control[0x5e]));
+        std::filesystem::remove_all(capture_root);
+        unsetenv("ARMIGO_NVN_PROGRAM_CAPTURE_CONFIG");
+        pc::configure_from_environment(nullptr);
+    }
     load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
     for (auto& program : programs) load<Entry::nvnProgramFinalize>()(&program);
     load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
     set_program_resolver(Stages::resolve, &stages);
 }
+// Mesh PSOs survive an archive round trip, including the optional task stage.
+// A package-backed warm-up consumes the recorded M rows before either draw;
+// the later draws must add no archive miss and render the same pixels.
+void test_native_mesh_archive(id<MTLDevice> device, id<MTL4CommandQueue> queue, Stages& stages) {
+    namespace sn = shader_native;
+    namespace pl = shader::pipeline;
+    namespace gm = shader::graphics_msl;
+    namespace pso = platform::metal::nvn_driver;
+    struct Restore {
+        Stages& current;
+        Stages saved;
+        ~Restore() { current = std::move(saved); }
+    } restore{stages, stages};
+    const auto root = std::filesystem::temp_directory_path() / ("armigo-mesh-archive-" + std::to_string(getpid()));
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    const auto hash = [](std::string_view text) {
+        std::array<unsigned char, CC_SHA256_DIGEST_LENGTH> digest{};
+        CC_SHA256(text.data(), static_cast<CC_LONG>(text.size()), digest.data());
+        return pso::pso_hex_encode(digest.data(), digest.size());
+    };
+    const std::string profile = std::string("{\"platform\":\"macos-metal4\",\"source_version\":\"") +
+        shader::source_version + "\",\"tool_version\":\"synthetic-mesh-archive\"}";
+    const auto chain = hash("armigo-metal-chain-v1\n" + profile);
+    NSDictionary* shell = @{@"schema":@"armigo-metal-package-v1", @"platform":@"macos-metal4",
+        @"source_version":@(shader::source_version), @"chain_id":@(chain.c_str()),
+        @"profile_text":@(profile.c_str()), @"entries":@[], @"runnable":@NO, @"complete_inventory":@NO};
+    NSData* shell_bytes = [NSJSONSerialization dataWithJSONObject:shell options:0 error:nil];
+    std::ofstream(root / "manifest.json", std::ios::binary).write(static_cast<const char*>(shell_bytes.bytes), shell_bytes.length);
+    auto made_writer = sn::NativeSectionWriter::create(root);
+    CHECK(std::holds_alternative<sn::NativeSectionWriter>(made_writer));
+    if (!std::holds_alternative<sn::NativeSectionWriter>(made_writer)) return;
+    auto& writer = std::get<sn::NativeSectionWriter>(made_writer);
+    const auto add = [&](nt::Fixture fixture, std::string* native_identity = nullptr) -> std::shared_ptr<const platform::CompiledGraphicsStage> {
+        nt::put(fixture.control, 0x30, static_cast<std::uint32_t>(fixture.control.size()));
+        const auto program = fixture.program();
+        if (native_identity) *native_identity = program.stage_identity;
+        const bool mesh = program.stage == sn::Stage::mesh, task = program.stage == sn::Stage::task;
+        sn::FrontendOptions options;
+        options.pixel_rate = sn::PixelRateState::disabled;
+        options.vertex_fetch = false;
+        gm::EmitOptions emission;
+        emission.vertex_fetch = false;
+        if (mesh) {
+            options.vertex_depth = pl::DepthConvention::zero_to_one;
+            emission.vertex_depth = gm::VertexDepthConvention::ZeroToOne;
+        } else if (!task) {
+            options.fragment_position = pl::FragmentPositionConvention::metal_position_w_matches_guest_position_w;
+            emission.fragment_position = gm::FragmentPositionConvention::MetalPositionWMatchesGuestPositionW;
+        }
+        auto translated = sn::translate_native(program, options);
+        CHECK(std::holds_alternative<pl::MslArtifact>(translated));
+        if (!std::holds_alternative<pl::MslArtifact>(translated)) return nullptr;
+        const auto& artifact = std::get<pl::MslArtifact>(translated);
+        const auto launch = platform::metal::native_mesh_launch(program);
+        const auto reflected = platform::metal::native_stage_reflection(artifact, emission,
+            mesh ? pl::Stage::vertex : task ? pl::Stage::compute : pl::Stage::fragment,
+            program.image, launch ? &*launch : nullptr);
+        auto library = build_library(artifact.source);
+        CHECK(!library.empty());
+        sn::NativeStageWrite stage;
+        stage.stage_identity = program.stage_identity;
+        stage.stage = mesh ? sn::NativeStageKind::mesh : task ? sn::NativeStageKind::task : sn::NativeStageKind::fragment;
+        stage.program.assign(program.image.begin(), program.image.end());
+        sn::NativeVariantWrite variant;
+        variant.depth = mesh ? sn::NativeDepth::zero_to_one : sn::NativeDepth::stage;
+        const auto reflection_bytes = std::as_bytes(std::span(reflected.data(), reflected.size()));
+        variant.reflection.assign(reflection_bytes.begin(), reflection_bytes.end());
+        variant.source = artifact.source;
+        variant.library = library;
+        stage.variants.push_back(std::move(variant));
+        CHECK(std::holds_alternative<std::monostate>(writer.add(stage)));
+        const auto kind = mesh ? shader_input::Stage::TessellationEvaluation
+            : task ? shader_input::Stage::TessellationControl : shader_input::Stage::Fragment;
+        auto source = platform::make_source_stage(kind, program.image, reflection_bytes, artifact.source);
+        CHECK(std::holds_alternative<std::shared_ptr<const platform::CompiledGraphicsStage>>(source));
+        if (!std::holds_alternative<std::shared_ptr<const platform::CompiledGraphicsStage>>(source)) return nullptr;
+        auto compiled = std::make_shared<platform::CompiledGraphicsStage>(
+            *std::get<std::shared_ptr<const platform::CompiledGraphicsStage>>(source));
+        compiled->native_stage_identity = program.stage_identity;
+        compiled->metallib = std::move(library);
+        compiled->msl_source.clear();
+        return compiled;
+    };
+    std::vector<sn::Instruction> quad{nt::move(1, 0xbf800000u), nt::move(2, 0x3f800000u), nt::move(4, 2),
+        nt::move(6, 1), nt::move(7, 2), nt::move(8, 3)};
+    quad_vertices(quad);
+    quad.push_back(stage_buffer(0x927, 4, 3, 0x88));
+    for (unsigned at = 0; const unsigned index : {255u, 6u, 7u, 7u, 6u, 8u})
+        quad.push_back(stage_buffer(0x927, index, 4 + at++, 0x80));
+    const auto mesh_fixture = native_stage(quad, sn::Stage::mesh);
+    stages.column_mesh = add(mesh_fixture);
+    // Give the task-launched variant a distinct image identity as well as
+    // distinct launch facts; the unused register leaves its quad unchanged.
+    quad.push_back(nt::move(9, 13));
+    std::string first_identity, second_identity;
+    const auto first_fixture = native_stage(quad, sn::Stage::mesh, 16, true);
+    const auto first = add(first_fixture, &first_identity);
+    auto alias_fixture = first_fixture;
+    nt::put(alias_fixture.control, 0x90, 1);
+    const auto alias = add(alias_fixture, &second_identity);
+    const auto different_source = add(native_stage(quad, sn::Stage::mesh, 32, true));
+    // The runtime deliberately selects the later entry for an identical
+    // program image. A source-qualified row must not warm the first one.
+    stages.payload_mesh = first_identity < second_identity ? alias : first;
+    CHECK(first && alias && different_source && first->identity == alias->identity &&
+          first->native_stage_identity != alias->native_stage_identity &&
+          first->msl_source_digest == alias->msl_source_digest &&
+          first->msl_source_digest != different_source->msl_source_digest);
+    stages.column_task = add(native_stage({nt::move(1, 1), stage_buffer(0x927, 1, 4, 0xb8)}, sn::Stage::task, 32));
+    stages.fragment = add(native_stage({nt::move(0, 0x3f800000u), nt::move(1, 0), nt::move(2, 0),
+        nt::move(3, 0x3f800000u)}, sn::Stage::fragment));
+    auto ipa = nt::raw(0x326);
+    nt::field(ipa, 16, 8, 1); nt::field(ipa, 32, 8, 255);
+    nt::field(ipa, 64, 8, 0x27c / 4); nt::field(ipa, 81, 3, 7);
+    auto padded_fixture = native_stage({nt::move(0, 0), nt::move(1, 0), nt::move(2, 0),
+        nt::move(3, 0x3f800000u), ipa}, sn::Stage::fragment);
+    padded_fixture.code[0x18 + 31] = std::byte{0x40}; // Flat generic 31.w.
+    const auto padded_fragment = add(padded_fixture);
+    if (!stages.column_mesh || !stages.payload_mesh || !stages.column_task || !stages.fragment || !padded_fragment) return;
+    sn::NativeCounts counts;
+    counts.by_stage = counts.translated_by_stage = counts.compiled_by_stage = {{"vertex", 4}, {"fragment", 2}, {"compute", 1}};
+    counts.enumerated = counts.unique = counts.translated = counts.compiled = 7;
+    sn::NativeSpecialization specialization;
+    specialization.vertex_depth_minus_one_to_one = false;
+    CHECK(std::holds_alternative<sn::NativeSection>(writer.finish(counts, specialization)));
+    platform::MetalShaderPackage::Options package_options;
+    package_options.expected_chain_id = chain;
+    package_options.allow_development_subset = true;
+    auto opened = platform::MetalShaderPackage::open(root, package_options);
+    CHECK(std::holds_alternative<std::shared_ptr<platform::MetalShaderPackage>>(opened));
+    if (!std::holds_alternative<std::shared_ptr<platform::MetalShaderPackage>>(opened)) {
+        std::fprintf(stderr, "mesh package: %s\n", std::get<platform::MetalShaderPackageError>(opened).detail.c_str());
+        return;
+    }
+    const auto package = std::get<std::shared_ptr<platform::MetalShaderPackage>>(opened);
+    const auto recorded = root / "record.tsv";
+    struct Result { std::array<std::uint8_t, 64> pixels; replay::PipelineWarmupReport report; };
+    const auto draw = [&](bool archive, bool capture, bool warm, bool padded = false) {
+        TestResources resources(device);
+        auto backend = replay::create_replay_backend(device, queue, resources);
+        replay::PipelineWarmupConfig config;
+        config.package = package;
+        config.warm = warm;
+        if (capture) config.record_manifest = recorded.string();
+        if (warm) config.seed_manifest = recorded.string();
+        if (archive) { config.archive_root = (root / "pso").string(); config.archive_capture = capture; }
+        backend->configure_pipeline_warmup(config);
+        if (warm) {
+            const auto ready = backend->finish_pipeline_warmup();
+            CHECK(ready.finished && ready.failed == 0 && ready.unresolved == 0 && ready.undecodable == 0);
+            CHECK(ready.archive_hits == 2 && ready.archive_misses == 0);
+        }
+        auto* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:4 mipmapped:NO];
+        td.storageMode = MTLStorageModeShared; td.usage = MTLTextureUsageRenderTarget;
+        resources.textures[96] = [device newTextureWithDescriptor:td];
+        auto state = texture_state(96, 4, 4); auto target = texture_object(state);
+        const NVNtexture* targets[]{&target};
+        Recorder recorder;
+        NVNprogram alone{}, task{};
+        CHECK(load<Entry::nvnProgramInitialize>()(&alone, &recorder.device));
+        CHECK(load<Entry::nvnProgramInitialize>()(&task, &recorder.device));
+        const NVNshaderData mesh_shaders[]{{81, nullptr}, {81, nullptr}};
+        const NVNshaderData task_shaders[]{{82, nullptr}, {82, nullptr}, {82, nullptr}};
+        CHECK(load<Entry::nvnProgramSetShaders>()(&alone, 2, mesh_shaders));
+        CHECK(load<Entry::nvnProgramSetShaders>()(&task, 3, task_shaders));
+        const float black[]{0, 0, 0, 0};
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+        load<Entry::nvnCommandBufferClearColor>()(&recorder.commands, 0, black, 15);
+        load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 0, 0, padded ? 4 : 2, 4);
+        bind_mesh_program(&recorder.commands, &alone, false);
+        command_draw_mesh_tasks(&recorder.commands, 0, 1);
+        if (!padded) {
+            load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 2, 0, 2, 4);
+            bind_mesh_program(&recorder.commands, &task, true);
+            command_draw_mesh_tasks(&recorder.commands, 0, 1);
+        }
+        const auto handle = recorder.finish();
+        const auto fence = backend->submit({&handle, 1});
+        CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+        CHECK(!backend->last_error() && backend->statistics().draws == (padded ? 1u : 2u) && backend->statistics().skipped == 0);
+        Result result{};
+        [resources.textures[96] getBytes:result.pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+        result.report = backend->finish_pipeline_warmup();
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+        load<Entry::nvnProgramFinalize>()(&alone); load<Entry::nvnProgramFinalize>()(&task);
+        load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+        return result;
+    };
+    const auto captured = draw(true, true, false);
+    CHECK(!captured.report.archive.empty() && std::filesystem::exists(captured.report.archive));
+    std::ifstream rows_file(recorded);
+    const std::string rows_text{std::istreambuf_iterator<char>(rows_file), std::istreambuf_iterator<char>()};
+    const auto rows = pso::parse_pso_manifest(rows_text);
+    unsigned mesh_rows = 0, task_rows = 0;
+    for (const auto& row : rows) if (row.kind == 'M') {
+        ++mesh_rows; task_rows += row.fields[0] != "-";
+        const auto expected = row.fields[0] == "-" ? stages.column_mesh : stages.payload_mesh;
+        CHECK(row.fields[1] == expected->identity + "@" + expected->msl_source_digest + "#" + expected->native_stage_identity);
+        CHECK(row.fields[2] == stages.fragment->identity + "@" + stages.fragment->msl_source_digest + "#" + stages.fragment->native_stage_identity);
+    }
+    CHECK(mesh_rows == 2 && task_rows == 1);
+    const auto lookup = draw(true, false, true);
+    CHECK(lookup.report.archive_hits == 2 && lookup.report.archive_misses == 0);
+    const auto plain = draw(false, false, false);
+    CHECK(plain.report.archive_hits == 0 && plain.report.archive_misses == 0);
+    CHECK(lookup.pixels == plain.pixels && captured.pixels == plain.pixels);
+    for (unsigned pixel = 0; pixel < 16; ++pixel)
+        CHECK(plain.pixels[pixel * 4] == 255 && plain.pixels[pixel * 4 + 1] == 0 && plain.pixels[pixel * 4 + 3] == 255);
+    // Missing programs and invalid launch/state rows stay explicit preparation
+    // failures; none can be mistaken for a successfully warmed mesh pipeline.
+    if (mesh_rows == 2) {
+        std::vector<pso::PsoRow> invalid;
+        for (const auto& row : rows) if (row.kind == 'M') {
+            auto missing = row; missing.fields[1] = "absent-mesh"; invalid.push_back(std::move(missing));
+            auto wrong_task = row; wrong_task.fields[0] = stages.fragment->identity; invalid.push_back(std::move(wrong_task));
+            auto bad_state = row; bad_state.fields[3] = "v1:00"; invalid.push_back(std::move(bad_state));
+            break;
+        }
+        const auto path = root / "invalid.tsv";
+        { std::ofstream out(path); for (const auto& row : invalid) out << row.text() << '\n'; }
+        TestResources resources(device);
+        auto backend = replay::create_replay_backend(device, queue, resources);
+        replay::PipelineWarmupConfig config;
+        config.package = package; config.seed_manifest = path.string();
+        backend->configure_pipeline_warmup(config);
+        const auto rejected = backend->finish_pipeline_warmup();
+        CHECK(rejected.finished && rejected.rows == 3 && rejected.built == 0 && rejected.failed == 0 &&
+              rejected.unresolved == 1 && rejected.undecodable == 2);
+    }
+    // Register an actual native mesh, then pair it with a fragment reading
+    // an unwritten W component. Runtime supplies its defined default (1).
+    // The recorder must name that tailored source, not the base library.
+    Recorder native_recorder;
+    reinterpret_cast<DeviceState*>(&native_recorder.device)->depth_mode = NVN_DEPTH_MODE_NEAR_IS_ZERO;
+    NVNprogram native_program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&native_program, &native_recorder.device));
+    set_native_program_resolver();
+    const auto set_native_shader = load<Entry::nvnProgramSetShaders>();
+    select_api_version({231, 40});
+    const NVNshaderData native_shader{reinterpret_cast<std::uint64_t>(mesh_fixture.code.data()), mesh_fixture.control.data()};
+    CHECK(set_native_shader(&native_program, 1, &native_shader));
+    const auto retained = retain_program(*reinterpret_cast<const ProgramState*>(&native_program));
+    select_api_version({55, 15});
+    set_program_resolver(Stages::resolve, &stages);
+    CHECK(retained && retained->stages[NVN_SHADER_STAGE_TESS_EVALUATION]);
+    if (retained && retained->stages[NVN_SHADER_STAGE_TESS_EVALUATION]) {
+        stages.column_mesh = retained->stages[NVN_SHADER_STAGE_TESS_EVALUATION];
+        stages.fragment = padded_fragment;
+        std::string detail;
+        const auto tailored = mesh_stage_for(stages.column_mesh, *padded_fragment, detail);
+        CHECK(tailored && tailored->msl_source_digest != stages.column_mesh->msl_source_digest);
+        const auto padded = draw(false, true, false, true);
+        for (unsigned pixel = 0; pixel < 16; ++pixel)
+            CHECK(padded.pixels[pixel * 4] == 0 && padded.pixels[pixel * 4 + 1] == 255);
+        std::ifstream all_file(recorded);
+        const std::string all_text{std::istreambuf_iterator<char>(all_file), std::istreambuf_iterator<char>()};
+        std::optional<pso::PsoRow> padded_row;
+        for (const auto& row : pso::parse_pso_manifest(all_text))
+            if (row.kind == 'M' && row.fields[2] == padded_fragment->identity + "@" + padded_fragment->msl_source_digest + "#" + padded_fragment->native_stage_identity)
+                padded_row = row;
+        CHECK(padded_row && tailored);
+        if (padded_row && tailored) {
+            CHECK(padded_row->fields[1] == tailored->identity + "@" + tailored->msl_source_digest + "#" + tailored->native_stage_identity);
+            const auto path = root / "unavailable-variant.tsv";
+            { std::ofstream out(path); out << padded_row->text() << '\n'; }
+            TestResources resources(device);
+            auto backend = replay::create_replay_backend(device, queue, resources);
+            replay::PipelineWarmupConfig config;
+            config.package = package; config.seed_manifest = path.string();
+            backend->configure_pipeline_warmup(config);
+            const auto unavailable = backend->finish_pipeline_warmup();
+            CHECK(unavailable.finished && unavailable.rows == 1 && unavailable.built == 0 &&
+                  unavailable.unresolved == 1 && unavailable.failed == 0 && unavailable.archive_misses == 0);
+        }
+    }
+    load<Entry::nvnProgramFinalize>()(&native_program);
+    load<Entry::nvnCommandBufferFinalize>()(&native_recorder.commands);
+    std::filesystem::remove_all(root);
+}
+
+
 #endif
 
 // A mesh draw without a translated mesh stage is left out, counted, and the
@@ -6752,6 +12984,120 @@ void test_vertex_stream_beside_guest_table(id<MTLDevice> device, id<MTL4CommandQ
     load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
 }
 
+// A raw store into a pool an address was handed out from lands. A store aimed
+// at a pool with no such address misses and names that pool. Handing out an
+// address in it puts the pool in the next submission's table, and the store
+// lands. The params pool is registered and left unaddressed: the binding
+// lookup does not require a handed-out address.
+void test_unaddressed_guest_pool(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    struct Lines {
+        mutable std::mutex mutex;
+        std::vector<std::pair<diag::Level, std::string>> written;
+        const diag::Level saved = diag::minimum_level();
+        Lines() {
+            diag::testing_set_level(diag::Level::info);
+            diag::testing_set_sink([](diag::Level level, std::string_view line, void* context) {
+                auto& self = *static_cast<Lines*>(context);
+                const std::lock_guard lock(self.mutex);
+                self.written.emplace_back(level, std::string(line));
+            }, this);
+        }
+        ~Lines() {
+            diag::testing_set_sink(nullptr, nullptr);
+            diag::testing_set_level(saved);
+        }
+        std::size_t count(std::string_view needle, diag::Level level) const {
+            const std::lock_guard lock(mutex);
+            std::size_t found = 0;
+            for (const auto& [line_level, line] : written)
+                found += line_level == level && line.find(needle) != std::string::npos;
+            return found;
+        }
+    } lines;
+
+    struct Mapped {
+        void* memory = nullptr;
+        std::size_t size = 0;
+        explicit Mapped(std::size_t bytes) : size(bytes) {
+            memory = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (memory == MAP_FAILED) memory = nullptr;
+        }
+        ~Mapped() { if (memory) munmap(memory, size); }
+        Mapped(const Mapped&) = delete;
+        Mapped& operator=(const Mapped&) = delete;
+    };
+    const auto page = static_cast<std::size_t>(getpagesize());
+    Mapped pool_a(page), pool_c(page), params(page);
+    CHECK(pool_a.memory && pool_c.memory && params.memory);
+    if (!pool_a.memory || !pool_c.memory || !params.memory) return;
+    std::memset(pool_a.memory, 0, page);
+    std::memset(pool_c.memory, 0, page);
+    std::memset(params.memory, 0, page);
+
+    replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
+    MemoryPoolState state_a{}, state_c{}, state_params{};
+    state_a.memory = static_cast<std::uint8_t*>(pool_a.memory);
+    state_a.size = page;
+    state_c.memory = static_cast<std::uint8_t*>(pool_c.memory);
+    state_c.size = page;
+    state_params.memory = static_cast<std::uint8_t*>(params.memory);
+    state_params.size = page;
+    CHECK(resources.register_pool(state_a));
+    CHECK(resources.register_pool(state_c));
+    CHECK(resources.register_pool(state_params));
+    const auto address_a = reinterpret_cast<std::uint64_t>(state_a.memory);
+    const auto address_c = reinterpret_cast<std::uint64_t>(state_c.memory);
+    resources.note_addressed(address_a, state_a.size);
+
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    CHECK(backend != nullptr);
+    if (!backend) return;
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const NVNshaderData shaders[]{{112, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 1, shaders));
+
+    const auto word_at = [](void* memory, std::uint64_t offset) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, static_cast<const std::byte*>(memory) + offset, sizeof word);
+        return word;
+    };
+    const auto store_at = [&](std::uint64_t address) {
+        auto* words = static_cast<std::uint32_t*>(params.memory);
+        words[0] = static_cast<std::uint32_t>(address);
+        words[1] = static_cast<std::uint32_t>(address >> 32);
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_COMPUTE_BIT);
+        load<Entry::nvnCommandBufferBindStorageBuffer>()(
+            &recorder.commands, NVN_SHADER_STAGE_COMPUTE, 0,
+            reinterpret_cast<std::uint64_t>(params.memory), 16);
+        load<Entry::nvnCommandBufferDispatchCompute>()(&recorder.commands, 1, 1, 1);
+        const auto handle = recorder.finish();
+        const auto fence = backend->submit({&handle, 1});
+        CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+        CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    };
+
+    store_at(address_a + 64);
+    CHECK(word_at(pool_a.memory, 64) == 0x77);
+    store_at(address_c + 64);
+    CHECK(word_at(pool_c.memory, 64) == 0);
+    CHECK(lines.count("unaddressed pool", diag::Level::warning) == 1);
+    CHECK(lines.count("left out as never addressed", diag::Level::info) >= 1);
+
+    resources.note_addressed(address_c + 32, 16);
+    store_at(address_c + 64);
+    CHECK(word_at(pool_c.memory, 64) == 0x77);
+    CHECK(lines.count("unaddressed pool", diag::Level::warning) == 1);
+
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+    backend.reset();
+    resources.complete_gpu_writes(resources.gpu_write_generation());
+}
+
 void test_guest_memory_table(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
     TestResources resources(device);
     resources.list_guest_pools = true;
@@ -6987,7 +13333,9 @@ void test_graphics_base_instance(id<MTLDevice> device, id<MTL4CommandQueue> queu
 // waits for that retirement, which publishes before it completes the
 // submission's writes. A writer held at an event wait on another queue has
 // not run, so a use passing it does not wait. A load-only stage makes no use
-// wait, and a reused submission slot starts with an empty log.
+// wait, and a reused submission slot starts with an empty log. Under the
+// title policy that takes stores at retirement, a use after a writer does not
+// wait and retirement publishes.
 void test_guest_write_consumers(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
     TestResources resources(device);
     resources.list_guest_pools = true;
@@ -7127,7 +13475,430 @@ void test_guest_write_consumers(id<MTLDevice> device, id<MTL4CommandQueue> queue
     resources.completed_writes.clear();
     for (int index = 0; index != 7; ++index) run(read);
     CHECK(resources.completed_writes.empty());
+
+    // A title whose stores reach textures at retirement: a use after a
+    // writer in the same submission reads the texture as it is, without a
+    // GPU wait, and the submission's retirement publishes the stores.
+    {
+        struct RestorePolicy {
+            ~RestorePolicy() { nvn::set_title_policy({}); }
+        } restore_policy;
+        nvn::TitlePolicy policy;
+        policy.guest_store_textures = nvn::TitlePolicy::GuestStoreTextures::retired;
+        nvn::set_title_policy(policy);
+        take_events();
+        const auto drains = backend->statistics().synchronize_gpu_waits;
+        run([&] { write(); sample(); });
+        events = take_events();
+        CHECK(backend->statistics().guest_write_texture_waits == waits);
+        CHECK(backend->statistics().synchronize_gpu_waits == drains);
+        CHECK(resources.completed_writes.size() == 1);
+        CHECK(std::ranges::count(events, 'p') == 1 && events.find('t') < events.find('p') &&
+              events.find('p') < events.find('c'));
+        // The next use after retirement resolves the texture again, which
+        // takes the published stores, and publishes nothing more.
+        run(sample);
+        events = take_events();
+        CHECK(std::ranges::count(events, 't') >= 1 && std::ranges::count(events, 'p') == 0);
+        CHECK(backend->statistics().guest_write_texture_waits == waits);
+        CHECK(backend->statistics().synchronize_gpu_waits == drains);
+    }
     for (auto* program : {&reader, &writer, &textured}) load<Entry::nvnProgramFinalize>()(program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+// Learned guest-memory stores. Two storing submissions that drain teach one
+// pool; the third is encoded from that pool, so a CPU read in another pool
+// does not drain and a read in the learned pool does. A byte-index draw uses
+// the same decision. A store into a new pool is a miss, and the read that
+// relied on the old set is reported. ARMIGO_NVN_PREDICT_GUEST_WRITES=0 keeps
+// a write anywhere. Past the learned-pool cap, stores count as a write
+// anywhere again.
+void test_learned_guest_writes(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    struct Lines {
+        mutable std::mutex mutex;
+        std::vector<std::pair<diag::Level, std::string>> written;
+        const diag::Level saved = diag::minimum_level();
+        Lines() {
+            diag::testing_set_level(diag::Level::info);
+            diag::testing_set_sink([](diag::Level level, std::string_view line, void* context) {
+                auto& self = *static_cast<Lines*>(context);
+                const std::lock_guard lock(self.mutex);
+                self.written.emplace_back(level, std::string(line));
+            }, this);
+        }
+        ~Lines() {
+            diag::testing_set_sink(nullptr, nullptr);
+            diag::testing_set_level(saved);
+        }
+        std::size_t count(std::string_view needle, diag::Level level) const {
+            const std::lock_guard lock(mutex);
+            std::size_t found = 0;
+            for (const auto& [line_level, line] : written)
+                found += line_level == level && line.find(needle) != std::string::npos;
+            return found;
+        }
+    } lines;
+    const char* previous = std::getenv("ARMIGO_NVN_PREDICT_GUEST_WRITES");
+    const std::string saved_env = previous ? previous : "";
+    const bool had_env = previous != nullptr;
+    struct RestoreEnv {
+        std::string saved;
+        bool had;
+        ~RestoreEnv() {
+            if (had) setenv("ARMIGO_NVN_PREDICT_GUEST_WRITES", saved.c_str(), 1);
+            else unsetenv("ARMIGO_NVN_PREDICT_GUEST_WRITES");
+        }
+    } restore{saved_env, had_env};
+
+    constexpr std::uint64_t pool_a = 0x100000000ull, pool_b = 0x200000000ull, pool_c = 0x300000000ull;
+    std::array<id<MTLBuffer>, 3> pools{};
+    for (auto& buffer : pools) {
+        buffer = [device newBufferWithLength:0x1000 options:MTLResourceStorageModeShared];
+        CHECK(buffer != nil);
+        if (!buffer) return;
+        std::memset(buffer.contents, 0, buffer.length);
+        const auto handle = static_cast<std::uint32_t>(combined_handle(31, 0));
+        std::memcpy(buffer.contents, &handle, sizeof handle);
+        const std::array<std::uint8_t, 3> indices{0, 1, 2};
+        std::memcpy(static_cast<std::byte*>(buffer.contents) + 0x100, indices.data(), indices.size());
+    }
+    auto* color = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    color.storageMode = MTLStorageModeShared;
+    color.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    id<MTLTexture> target_texture = [device newTextureWithDescriptor:color];
+    id<MTLTexture> sampled = [device newTextureWithDescriptor:color];
+    CHECK(target_texture != nil && sampled != nil);
+    if (!target_texture || !sampled) return;
+    std::array<std::uint32_t, 16> red{};
+    red.fill(0xff0000ffu);
+    [sampled replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:red.data() bytesPerRow:16];
+
+    Recorder recorder;
+    std::array<NVNprogram, 4> programs{};
+    const std::array<std::array<NVNshaderData, 2>, 4> shaders{{{{{84, nullptr}}}, {{{110, nullptr}}},
+        {{{15, nullptr}, {15, nullptr}}}, {{{1, nullptr}, {1, nullptr}}}}};
+    for (std::size_t index = 0; index != programs.size(); ++index) {
+        CHECK(load<Entry::nvnProgramInitialize>()(&programs[index], &recorder.device));
+        CHECK(load<Entry::nvnProgramSetShaders>()(&programs[index], index < 2 ? 1 : 2, shaders[index].data()));
+    }
+    auto& store = programs[0];
+    auto& third = programs[1];
+    auto& handle_program = programs[2];
+    auto& index_program = programs[3];
+
+    const auto word_at = [](id<MTLBuffer> buffer, std::uint64_t offset) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, static_cast<const std::byte*>(buffer.contents) + offset, sizeof word);
+        return word;
+    };
+    const auto session = [&](const char* predict, std::size_t cap, auto&& checks) {
+        setenv("ARMIGO_NVN_PREDICT_GUEST_WRITES", predict, 1);
+        TestResources resources(device);
+        resources.guest_pools = {{pool_a, pools[0]}, {pool_b, pools[1]}, {pool_c, pools[2]}};
+        std::memset(resources.memory.contents, 0, resources.memory.length);
+        const std::array<float, 4> white{1, 1, 1, 1};
+        std::memcpy(resources.memory.contents, white.data(), sizeof white);
+        resources.textures[96] = target_texture;
+        resources.texture_ids[31] = sampled;
+        auto backend = replay::create_replay_backend(device, queue, resources);
+        CHECK(backend != nullptr);
+        if (!backend) return;
+        if (cap) backend->set_learned_guest_write_cap(cap);
+        auto state = texture_state(96, 4, 4);
+        auto target = texture_object(state);
+        const NVNtexture* targets[]{&target};
+        const auto submit = [&](auto&& record, std::uint64_t want) {
+            load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+            record();
+            const auto handle = recorder.finish();
+            const auto before = backend->statistics();
+            const auto fence = backend->submit({&handle, 1});
+            const bool waited = fence && backend->wait_fence(fence, 10'000'000'000ull);
+            const auto stats = backend->statistics();
+            const auto delta = stats.synchronize_gpu_waits - before.synchronize_gpu_waits;
+            if (!fence || !waited || backend->last_error() || delta != want || stats.skipped ||
+                stats.dispatches != before.dispatches + 1 || stats.draws != before.draws + 1) {
+                std::fprintf(stderr,
+                    "learned guest writes: fence %llu waited %d drain %llu want %llu logs %llu pools %llu "
+                    "misses %llu predicted %llu skipped %llu draws %llu dispatches %llu: %s\n",
+                    static_cast<unsigned long long>(fence), waited ? 1 : 0,
+                    static_cast<unsigned long long>(delta), static_cast<unsigned long long>(want),
+                    static_cast<unsigned long long>(stats.guest_write_logs),
+                    static_cast<unsigned long long>(stats.guest_write_pools_learned),
+                    static_cast<unsigned long long>(stats.guest_write_misses),
+                    static_cast<unsigned long long>(stats.guest_write_predicted_submissions),
+                    static_cast<unsigned long long>(stats.skipped),
+                    static_cast<unsigned long long>(stats.draws),
+                    static_cast<unsigned long long>(stats.dispatches),
+                    backend->last_error() ? backend->last_error().detail.c_str() : "");
+            }
+            CHECK(fence && waited && !backend->last_error());
+            CHECK(stats.skipped == 0);
+            CHECK(stats.dispatches == before.dispatches + 1 && stats.draws == before.draws + 1);
+            CHECK(delta == want);
+            load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+        };
+        const auto read_handle = [&](std::uint64_t pool) {
+            load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+            load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &handle_program,
+                                                       NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+            load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, pool, 64);
+            load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 1,
+                                                             TestResources::base, 16);
+            load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+        };
+        const auto read_indices = [&](std::uint64_t pool) {
+            load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+            load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &index_program,
+                                                       NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+            load<Entry::nvnCommandBufferDrawElements>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES,
+                                                        NVN_INDEX_TYPE_UNSIGNED_BYTE, 3, pool + 0x100);
+        };
+        const auto store_then = [&](NVNprogram& program, auto&& after) {
+            load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_COMPUTE_BIT);
+            load<Entry::nvnCommandBufferDispatchCompute>()(&recorder.commands, 1, 1, 1);
+            after();
+        };
+        checks(backend, submit, read_handle, read_indices, store_then);
+    };
+
+    const auto predicted_from = "guest-memory stores are predicted from 1 learned pools after 4 logs";
+    const auto relied = "relied on one";
+    const auto anywhere = "write anywhere from now on";
+    session("1", 0, [&](auto& backend, auto&& submit, auto&& read_handle, auto&& read_indices, auto&& store_then) {
+        submit([&] { store_then(store, [&] { read_handle(pool_b); }); }, 1);
+        submit([&] { store_then(store, [&] { read_handle(pool_b); }); }, 1);
+        CHECK(word_at(pools[0], 64) == 0x77);
+        const auto taught = backend->statistics();
+        CHECK(taught.guest_write_logs == 4 && taught.guest_write_pools_learned == 1);
+        CHECK(taught.guest_write_predicted_submissions == 0 && taught.guest_write_misses == 0);
+        submit([&] { store_then(store, [&] { read_handle(pool_b); }); }, 0);
+        CHECK(lines.count(predicted_from, diag::Level::info) == 1);
+        const auto predicting = backend->statistics();
+        CHECK(predicting.guest_write_predicted_submissions == 1 && predicting.guest_write_logs == 5);
+        submit([&] { store_then(store, [&] { read_handle(pool_a); }); }, 1);
+        submit([&] { store_then(store, [&] { read_indices(pool_b); }); }, 0);
+        submit([&] { store_then(store, [&] { read_indices(pool_a); }); }, 1);
+        submit([&] { store_then(third, [&] { read_handle(pool_c); }); }, 0);
+        CHECK(word_at(pools[2], 64) == 0x77);
+        const auto missed = backend->statistics();
+        CHECK(missed.guest_write_misses == 1 && missed.guest_write_pools_learned == 2);
+        CHECK(lines.count(relied, diag::Level::warning) == 1);
+        CHECK(lines.count("had not learned", diag::Level::warning) == 1);
+        submit([&] { store_then(store, [&] { read_handle(pool_c); }); }, 1);
+        const auto learned_c = backend->statistics();
+        CHECK(learned_c.guest_write_misses == 1 && learned_c.guest_write_pools_learned == 2);
+        CHECK(lines.count(anywhere, diag::Level::warning) == 0);
+    });
+
+    const auto from_after_enabled = lines.count(predicted_from, diag::Level::info);
+    session("0", 0, [&](auto& backend, auto&& submit, auto&& read_handle, auto&&, auto&& store_then) {
+        for (int repeat = 0; repeat != 3; ++repeat)
+            submit([&] { store_then(store, [&] { read_handle(pool_b); }); }, 1);
+        const auto stats = backend->statistics();
+        CHECK(stats.guest_write_predicted_submissions == 0 && stats.guest_write_logs == 0);
+        CHECK(stats.guest_write_pools_learned == 0 && stats.guest_write_misses == 0);
+    });
+    CHECK(lines.count(predicted_from, diag::Level::info) == from_after_enabled);
+
+    const auto anywhere_before = lines.count(anywhere, diag::Level::warning);
+    session("1", 1, [&](auto& backend, auto&& submit, auto&& read_handle, auto&&, auto&& store_then) {
+        submit([&] { store_then(store, [&] { read_handle(pool_b); }); }, 1);
+        submit([&] { store_then(store, [&] { read_handle(pool_b); }); }, 1);
+        submit([&] { store_then(store, [&] { read_handle(pool_b); }); }, 0);
+        CHECK(lines.count(predicted_from, diag::Level::info) == from_after_enabled + 1);
+        submit([&] { store_then(third, [&] { read_handle(pool_b); }); }, 0);
+        const auto overflowed = backend->statistics();
+        CHECK(overflowed.guest_write_pools_learned == 1 && overflowed.guest_write_misses == 0);
+        CHECK(lines.count(anywhere, diag::Level::warning) == anywhere_before + 1);
+        const auto predicted = overflowed.guest_write_predicted_submissions;
+        submit([&] { store_then(store, [&] { read_handle(pool_b); }); }, 1);
+        CHECK(backend->statistics().guest_write_predicted_submissions == predicted);
+        CHECK(lines.count(anywhere, diag::Level::warning) == anywhere_before + 1);
+        submit([&] { store_then(third, [&] { read_handle(pool_b); }); }, 1);
+        const auto after = backend->statistics();
+        CHECK(after.guest_write_pools_learned == 1 && after.guest_write_misses == 0);
+        CHECK(after.guest_write_predicted_submissions == predicted);
+        CHECK(lines.count(anywhere, diag::Level::warning) == anywhere_before + 1);
+        CHECK(lines.count(relied, diag::Level::warning) == 1);
+    });
+
+    const auto encoded = [](auto& backend, std::uint64_t count) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (backend->statistics().submissions < count && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return backend->statistics().submissions >= count;
+    };
+    const auto teach = [&](auto&& submit, auto&& read_handle, auto&& store_then) {
+        submit([&] { store_then(store, [&] { read_handle(pool_b); }); }, 1);
+        submit([&] { store_then(store, [&] { read_handle(pool_b); }); }, 1);
+        submit([&] { store_then(store, [&] { read_handle(pool_b); }); }, 0);
+    };
+
+    // A reader that never stores still relies on an earlier predicted writer
+    // whose learned pools exclude the read. The writer stays unretired behind
+    // a shared event until the reader has encoded.
+    session("1", 0, [&](auto& backend, auto&& submit, auto&& read_handle, auto&&, auto&& store_then) {
+        teach(submit, read_handle, store_then);
+        const auto relied_before = lines.count(relied, diag::Level::warning);
+        const auto waits_before = backend->statistics().synchronize_gpu_waits;
+        const auto encoded_before = backend->statistics().submissions;
+        id<MTLSharedEvent> gate = [device newSharedEvent];
+        [queue waitForEvent:gate value:1];
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &third, NVN_SHADER_STAGE_COMPUTE_BIT);
+        load<Entry::nvnCommandBufferDispatchCompute>()(&recorder.commands, 1, 1, 1);
+        const auto writer = recorder.finish();
+        const auto fence_writer = backend->submit({&writer, 1});
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        read_handle(pool_c);
+        const auto reader = recorder.finish();
+        const auto fence_reader = backend->submit({&reader, 1});
+        CHECK(fence_writer && fence_reader && fence_writer < fence_reader);
+        CHECK(encoded(backend, encoded_before + 2));
+        CHECK(backend->completed_fence() < fence_writer);
+        CHECK(lines.count(relied, diag::Level::warning) == relied_before);
+        gate.signaledValue = 1;
+        CHECK(backend->wait_fence(fence_writer, 10'000'000'000ull));
+        CHECK(backend->wait_fence(fence_reader, 10'000'000'000ull));
+        CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+        CHECK(backend->statistics().synchronize_gpu_waits == waits_before);
+        CHECK(lines.count(relied, diag::Level::warning) == relied_before + 1);
+        CHECK(word_at(pools[2], 64) == 0x77);
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, writer);
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, reader);
+    });
+
+    // Queue 1 is held on an unmet leading wait, so queue 2 encodes first even
+    // though its fence is later. Released, the held submission passes its
+    // wait and predicts, writes pool C and reads it without draining; that
+    // later-encoded reliance is still reported when the submission retires.
+    session("1", 0, [&](auto& backend, auto&& submit, auto&& read_handle, auto&&, auto&& store_then) {
+        teach(submit, read_handle, store_then);
+        auto* event_word = reinterpret_cast<volatile std::uint32_t*>(
+            static_cast<std::byte*>(pools[0].contents) + 0x800);
+        *event_word = 0;
+        NVNevent event{};
+        auto& event_state = *reinterpret_cast<EventState*>(&event);
+        event_state.tag = object_tag('E', 'V', 'N', 'T');
+        event_state.value = event_word;
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        load<Entry::nvnCommandBufferWaitEvent>()(&recorder.commands, &event, NVN_EVENT_WAIT_MODE_EQUAL, 1);
+        store_then(third, [&] { read_handle(pool_c); });
+        const auto held = recorder.finish();
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        store_then(store, [&] { read_handle(pool_b); });
+        const auto earlier = recorder.finish();
+        const auto encoded_before = backend->statistics().submissions;
+        const auto fence_held = backend->submit_from(1, {&held, 1});
+        const auto fence_earlier = backend->submit_from(2, {&earlier, 1});
+        CHECK(fence_held && fence_earlier && fence_held < fence_earlier);
+        CHECK(backend->wait_fence(fence_earlier, 10'000'000'000ull));
+        CHECK(backend->completed_fence() < fence_held);
+        CHECK(backend->statistics().submissions == encoded_before + 1);
+        const auto relied_before = lines.count(relied, diag::Level::warning);
+        const auto waits_before = backend->statistics().synchronize_gpu_waits;
+        *event_word = 1;
+        notify_event_signal_observer(event_word, 1);
+        CHECK(backend->wait_fence(fence_held, 10'000'000'000ull));
+        CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+        CHECK(backend->statistics().submissions == encoded_before + 2);
+        // A released leading wait does not drain prior work; nor does the
+        // read of pool C.
+        CHECK(backend->statistics().synchronize_gpu_waits == waits_before);
+        CHECK(lines.count(relied, diag::Level::warning) == relied_before + 1);
+        CHECK(word_at(pools[2], 64) == 0x77);
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, held);
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, earlier);
+    });
+
+    // A submission split at a mid-submission wait: part 1 stores to pool C
+    // behind a shared event, part 2 reads pool C. The CPU signal releases
+    // part 2 while part 1 is still running; part 2 encodes without draining
+    // and relies on the prediction that excluded pool C, which part 1's
+    // retirement then reports.
+    session("1", 0, [&](auto& backend, auto&& submit, auto&& read_handle, auto&&, auto&& store_then) {
+        teach(submit, read_handle, store_then);
+        auto* event_word = reinterpret_cast<volatile std::uint32_t*>(
+            static_cast<std::byte*>(pools[0].contents) + 0x800);
+        *event_word = 0;
+        NVNevent event{};
+        auto& event_state = *reinterpret_cast<EventState*>(&event);
+        event_state.tag = object_tag('E', 'V', 'N', 'T');
+        event_state.value = event_word;
+        id<MTLSharedEvent> gate = [device newSharedEvent];
+        [queue waitForEvent:gate value:1];
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &third, NVN_SHADER_STAGE_COMPUTE_BIT);
+        load<Entry::nvnCommandBufferDispatchCompute>()(&recorder.commands, 1, 1, 1);
+        load<Entry::nvnCommandBufferWaitEvent>()(&recorder.commands, &event, NVN_EVENT_WAIT_MODE_EQUAL, 1);
+        read_handle(pool_c);
+        const auto split = recorder.finish();
+        const auto relied_before = lines.count(relied, diag::Level::warning);
+        const auto waits_before = backend->statistics().synchronize_gpu_waits;
+        const auto encoded_before = backend->statistics().submissions;
+        const auto fence_split = backend->submit_from(1, {&split, 1});
+        CHECK(fence_split && encoded(backend, encoded_before + 1));
+        *event_word = 1;
+        notify_event_signal_observer(event_word, 1);
+        CHECK(encoded(backend, encoded_before + 2));
+        CHECK(backend->completed_fence() < fence_split);
+        gate.signaledValue = 1;
+        CHECK(backend->wait_fence(fence_split, 10'000'000'000ull));
+        CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+        CHECK(backend->statistics().synchronize_gpu_waits == waits_before);
+        CHECK(lines.count(relied, diag::Level::warning) == relied_before + 1);
+        CHECK(word_at(pools[2], 64) == 0x77);
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, split);
+    });
+
+    // A uniform capture outside the learned pools survives the predicted
+    // store. The draw that reads it relies on that prediction, and retirement
+    // of the store that actually wrote pool C reports the miss as a warning.
+    session("1", 0, [&](auto& backend, auto&& submit, auto&& read_handle, auto&&, auto&& store_then) {
+        teach(submit, read_handle, store_then);
+        const auto relied_before = lines.count(relied, diag::Level::warning);
+        const auto handle = static_cast<std::uint32_t>(combined_handle(31, 0));
+        submit([&] {
+            load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+                                                             pool_c, 64);
+            load<Entry::nvnCommandBufferUpdateUniformBuffer>()(&recorder.commands, pool_c, 64, 0,
+                                                               sizeof handle, &handle);
+            store_then(third, [&] { read_handle(pool_c); });
+        }, 0);
+        CHECK(!backend->last_error());
+        CHECK(lines.count(relied, diag::Level::warning) == relied_before + 1);
+        CHECK(word_at(pools[2], 64) == 0x77);
+        CHECK(backend->statistics().guest_write_pools_learned == 2);
+    });
+
+    // Cap overflow at an internal drain reinstalls write-anywhere ranges, so
+    // a later read of the new pool in the same submission drains too.
+    session("1", 1, [&](auto& backend, auto&& submit, auto&& read_handle, auto&&, auto&& store_then) {
+        teach(submit, read_handle, store_then);
+        const auto relied_before = lines.count(relied, diag::Level::warning);
+        const auto anywhere_at = lines.count(anywhere, diag::Level::warning);
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        store_then(third, [&] { read_handle(pool_a); });
+        store_then(store, [&] { read_handle(pool_c); });
+        const auto handle = recorder.finish();
+        const auto before = backend->statistics();
+        const auto fence = backend->submit({&handle, 1});
+        CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+        const auto stats = backend->statistics();
+        CHECK(!backend->last_error() && stats.skipped == 0);
+        CHECK(stats.dispatches == before.dispatches + 2 && stats.draws == before.draws + 2);
+        CHECK(stats.synchronize_gpu_waits == before.synchronize_gpu_waits + 2);
+        CHECK(stats.guest_write_pools_learned == 1 && stats.guest_write_misses == 0);
+        CHECK(lines.count(anywhere, diag::Level::warning) == anywhere_at + 1);
+        CHECK(lines.count(relied, diag::Level::warning) == relied_before);
+        CHECK(word_at(pools[2], 64) == 0x77);
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    });
+
+    for (auto& program : programs) load<Entry::nvnProgramFinalize>()(&program);
     load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
 }
 
@@ -7861,13 +14632,15 @@ void test_handle_program_draws(id<MTLDevice> device, id<MTL4CommandQueue> queue)
         return std::array<std::uint8_t, 4>{pixels[x * 4], pixels[x * 4 + 1], pixels[x * 4 + 2], pixels[x * 4 + 3]};
     };
 
-    // The guest word names a red texture: the draw samples red.
-    {
+    // The address comes from either an application uniform or the driver's
+    // fragment storage descriptor. A different direct slot cannot replace it.
+    for (const int mode : {0, 1, 2}) {
+        const bool driver = mode != 0;
         TestResources resources(device);
         auto* bytes = static_cast<std::uint32_t*>(resources.memory.contents);
         std::memset(bytes, 0, resources.memory.length);
         bytes[0x10 / 4] = static_cast<std::uint32_t>(TestResources::base);
-        bytes[0x20 / 4] = handle_of(41);
+        bytes[0x20 / 4] = mode == 2 ? 0u : handle_of(41);
         auto backend = replay::create_replay_backend(device, queue, resources);
         CHECK(backend != nullptr);
         if (!backend) return;
@@ -7875,19 +14648,30 @@ void test_handle_program_draws(id<MTLDevice> device, id<MTL4CommandQueue> queue)
         id<MTLTexture> red = [device newTextureWithDescriptor:descriptor];
         fill(red, 0xff0000ffu);
         resources.texture_ids[41] = red;
+        id<MTLTexture> blue = [device newTextureWithDescriptor:descriptor];
+        fill(blue, 0xffff0000u);
+        resources.texture_ids[42] = blue;
+        resources.null_handle_texture = [device newTextureWithDescriptor:descriptor];
+        fill(resources.null_handle_texture, 0u);
         auto state = texture_state(96, 4, 4);
         auto target = texture_object(state);
         const NVNtexture* targets[]{&target};
         Recorder recorder;
         NVNprogram program{};
         CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
-        const NVNshaderData shaders[]{{96u, nullptr}, {96u, nullptr}};
+        const NVNshaderData shaders[]{{driver ? 98u : 96u, nullptr}, {driver ? 98u : 96u, nullptr}};
         CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
         load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
         load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
         load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
         load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
                                                          TestResources::base, 0x20);
+        if (driver) {
+            load<Entry::nvnCommandBufferBindStorageBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 3,
+                                                             TestResources::base, 0x80);
+            load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+                                                       combined_handle(42, 0));
+        }
         load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
         const auto commands = recorder.finish();
         const auto fence = backend->submit({&commands, 1});
@@ -7896,7 +14680,7 @@ void test_handle_program_draws(id<MTLDevice> device, id<MTL4CommandQueue> queue)
         CHECK(!backend->last_error());
         CHECK(backend->statistics().draws == 1 && backend->statistics().skipped == 0);
         const auto sample = pixel(resources.textures[96], 0);
-        CHECK(sample[0] == 255 && sample[1] == 0 && sample[2] == 0);
+        CHECK(sample[0] == (mode == 2 ? 0 : 255) && sample[1] == 0 && sample[2] == 0);
         load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, commands);
         load<Entry::nvnProgramFinalize>()(&program);
         load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
@@ -7948,6 +14732,72 @@ void test_handle_program_draws(id<MTLDevice> device, id<MTL4CommandQueue> queue)
         CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
         CHECK(!backend->last_error());
         CHECK(backend->statistics().draws == 2 && backend->statistics().skipped == 0);
+        const auto left = pixel(resources.textures[96], 0);
+        const auto right = pixel(resources.textures[96], 2);
+        CHECK(left[0] == 255 && left[1] == 0 && left[2] == 0);
+        CHECK(right[0] == 0 && right[1] == 255 && right[2] == 0);
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, commands);
+        load<Entry::nvnProgramFinalize>()(&program);
+        load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+    }
+    // Under current handle reads the fragment stage keeps its handles from
+    // draw to draw, but the inline update still makes the second draw read
+    // the new handle; unchanged third and fourth draws reuse the stages.
+    {
+        struct RestorePolicy {
+            ~RestorePolicy() { nvn::set_title_policy({}); }
+        } restore_policy;
+        nvn::TitlePolicy policy;
+        policy.handle_reads = nvn::TitlePolicy::HandleReads::current;
+        nvn::set_title_policy(policy);
+        TestResources resources(device);
+        auto* bytes = static_cast<std::uint32_t*>(resources.memory.contents);
+        std::memset(bytes, 0, resources.memory.length);
+        bytes[0x10 / 4] = static_cast<std::uint32_t>(TestResources::base);
+        bytes[0x14 / 4] = 0;
+        bytes[0x20 / 4] = handle_of(41);
+        const auto updated = handle_of(42);
+        auto backend = replay::create_replay_backend(device, queue, resources);
+        CHECK(backend != nullptr);
+        if (!backend) return;
+        resources.textures[96] = [device newTextureWithDescriptor:descriptor];
+        id<MTLTexture> red = [device newTextureWithDescriptor:descriptor];
+        id<MTLTexture> green = [device newTextureWithDescriptor:descriptor];
+        fill(red, 0xff0000ffu);
+        fill(green, 0xff00ff00u);
+        resources.texture_ids[41] = red;
+        resources.texture_ids[42] = green;
+        auto state = texture_state(96, 4, 4);
+        auto target = texture_object(state);
+        const NVNtexture* targets[]{&target};
+        Recorder recorder;
+        NVNprogram program{};
+        CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+        const NVNshaderData shaders[]{{96u, nullptr}, {96u, nullptr}};
+        CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+                                                         TestResources::base, 0x40);
+        load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 0, 0, 2, 4);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+        load<Entry::nvnCommandBufferUpdateUniformBuffer>()(&recorder.commands, TestResources::base, 0x40,
+                                                           0x20, sizeof updated, &updated);
+        load<Entry::nvnCommandBufferSetScissor>()(&recorder.commands, 2, 0, 2, 4);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+        const auto commands = recorder.finish();
+        const auto fence = backend->submit({&commands, 1});
+        if (!fence) std::fprintf(stderr, "handle program reevaluation (current): %s\n", backend->last_error().detail.c_str());
+        CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+        CHECK(!backend->last_error());
+        CHECK(backend->statistics().draws == 4 && backend->statistics().skipped == 0);
+        // A vertex stage alone can reuse at most three times over four
+        // draws: four reuses prove the fragment stage reused its table too.
+        CHECK(backend->statistics().stage_reuses == 4);
+        CHECK(backend->statistics().stage_binds == 4);
         const auto left = pixel(resources.textures[96], 0);
         const auto right = pixel(resources.textures[96], 2);
         CHECK(left[0] == 255 && left[1] == 0 && left[2] == 0);
@@ -8250,7 +15100,8 @@ void run_descriptor_write_order(id<MTLDevice> device, id<MTL4CommandQueue> queue
     load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
     const auto commands = recorder.finish();
     const auto fence = backend->submit({&commands, 1});
-    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    if (test.fail_drain) CHECK(drain_abandoned(*backend, fence));
+    else CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
     if (test.fail_drain) {
         CHECK(backend->last_error().code == replay::ReplayErrorCode::execution);
         CHECK(backend->statistics().synchronize_gpu_waits > 0);
@@ -8507,7 +15358,7 @@ void test_descriptor_write_order(id<MTLDevice> device, id<MTL4CommandQueue> queu
     }
 }
 
-void test_sampler_registration_order(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+void test_sampler_registration_order(id<MTLDevice> device, id<MTL4CommandQueue> queue, bool late_population = false, bool split_wait = false) {
     TestResources resources(device);
     auto backend = replay::create_replay_backend(device, queue, resources);
     CHECK(backend != nullptr);
@@ -8537,7 +15388,10 @@ void test_sampler_registration_order(id<MTLDevice> device, id<MTL4CommandQueue> 
         return [device newSamplerStateWithDescriptor:sampler_descriptor];
     };
     const auto base = nvn::sampler_registrations.load() + 1;
-    resources.sampler_versions[3] = {{base, clamped(2.0f)}, {base + 1, clamped(0.0f)}, {base + 2, clamped(1.0f)}};
+    resources.sampler_versions[3] = {{base + 2, clamped(1.0f)}, {base + 3, clamped(0.0f)}};
+    if (!late_population) {
+        resources.sampler_versions[3].insert({{base, clamped(2.0f)}, {base + 1, clamped(0.0f)}});
+    }
     auto target_state = texture_state(21, 2, 2);
     auto target_object = texture_object(target_state);
     const NVNtexture* targets[]{&target_object};
@@ -8549,7 +15403,13 @@ void test_sampler_registration_order(id<MTLDevice> device, id<MTL4CommandQueue> 
     CHECK(load<Entry::nvnProgramSetShaders>()(&mip, 2, shaders));
     auto* bytes = static_cast<std::byte*>(resources.memory.contents);
     std::memset(bytes, 0, resources.memory.length);
+    NVNevent gate{};
+    auto& gate_state = *reinterpret_cast<EventState*>(&gate);
+    gate_state.tag = object_tag('E', 'V', 'N', 'T');
+    gate_state.value = reinterpret_cast<volatile std::uint32_t*>(bytes + 0x4000);
     load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    if (!split_wait)
+        load<Entry::nvnCommandBufferWaitEvent>()(&recorder.commands, &gate, NVN_EVENT_WAIT_MODE_EQUAL, 1);
     load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
     load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &mip, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
     nvn::sampler_registrations.store(base);  // sampler 3 registered with level 2
@@ -8558,6 +15418,8 @@ void test_sampler_registration_order(id<MTLDevice> device, id<MTL4CommandQueue> 
     load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
     load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands, &target_object, nullptr, &whole,
         TestResources::base + 0x1000, 0);
+    if (split_wait)
+        load<Entry::nvnCommandBufferWaitEvent>()(&recorder.commands, &gate, NVN_EVENT_WAIT_MODE_EQUAL, 1);
     nvn::sampler_registrations.store(base + 1);  // registered again with level 0
     load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
         combined_handle(22, 3));
@@ -8568,21 +15430,26 @@ void test_sampler_registration_order(id<MTLDevice> device, id<MTL4CommandQueue> 
     nvn::sampler_registrations.store(base + 2);  // and again before the submission
     const auto fence = backend->submit({&handle, 1});
     if (!fence) std::fprintf(stderr, "sampler order replay: %s\n", backend->last_error().detail.c_str());
+    CHECK(fence && backend->completed_fence() < fence);
+    // The held part cannot draw until this CPU signal. Registrations after
+    // submission must not replace the blue mip sampler in either part.
+    nvn::sampler_registrations.store(base + 3);
+    __atomic_store_n(gate_state.value, 1u, __ATOMIC_SEQ_CST);
+    nvn::notify_event_signal_observer(gate_state.value, 1);
     CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
     const auto* output = reinterpret_cast<const std::uint8_t*>(bytes);
     for (unsigned texel = 0; texel < 4; ++texel) {
         const auto* first = output + 0x1000 + texel * 4;
         const auto* second = output + 0x2000 + texel * 4;
-        CHECK(first[0] == 0 && first[1] == 255 && first[2] == 0);    // level 2
-        CHECK(second[0] == 255 && second[1] == 0 && second[2] == 0); // level 0
+        CHECK(first[0] == 0 && first[1] == 0 && first[2] == 255);  // submitted level 1
+        CHECK(second[0] == 0 && second[1] == 0 && second[2] == 255);
     }
     load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
     load<Entry::nvnProgramFinalize>()(&mip);
     load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
 }
 
-// A sampler registered again between the binding and the draw applies to the
-// draw: the draw stamps the registrations made before it.
+// A registration between binding and submission is visible to that submission.
 void test_sampler_draw_order(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
     TestResources resources(device);
     auto backend = replay::create_replay_backend(device, queue, resources);
@@ -8816,6 +15683,1362 @@ void test_resolve_and_partial_clear(id<MTLDevice> device, id<MTL4CommandQueue> q
     load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
 }
 
+id<MTLTexture> pool_rgba(id<MTLDevice> device, std::uint8_t red, std::uint8_t green, std::uint8_t blue,
+                         NSUInteger width = 1, NSUInteger height = 1) {
+    auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:width height:height mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
+    std::vector<std::uint8_t> pixels(width * height * 4);
+    for (NSUInteger texel = 0; texel < width * height; ++texel) {
+        pixels[texel * 4] = red;
+        pixels[texel * 4 + 1] = green;
+        pixels[texel * 4 + 2] = blue;
+        pixels[texel * 4 + 3] = 255;
+    }
+    [texture replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0
+                 withBytes:pixels.data() bytesPerRow:width * 4];
+    return texture;
+}
+
+id<MTLTexture> pool_target(id<MTLDevice> device, NSUInteger width, NSUInteger height = 4) {
+    auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:width height:height mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    return [device newTextureWithDescriptor:descriptor];
+}
+
+void write_pool_ids(TestResources& resources, const std::uint32_t* ids, std::size_t count) {
+    auto* bytes = static_cast<std::uint8_t*>(resources.memory.contents) + 0x200;
+    std::memcpy(bytes, ids, count * sizeof(std::uint32_t));
+}
+
+bool pool_stats_ready(const replay::MetalReplayBackend& backend, std::uint64_t draws, std::uint64_t patches) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto stats = backend.statistics();
+        if (stats.draws >= draws && stats.pool_table_patches >= patches) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return false;
+}
+
+std::uint64_t submit_pool_draw(replay::MetalReplayBackend& backend, Recorder& recorder, NVNprogram& program,
+                               unsigned marker, NVNtexture& color, const NVNtexture* depth, bool depth_write,
+                               std::int32_t image_id, std::uint64_t uniform_address = TestResources::base + 0x200) {
+    const NVNshaderData shaders[]{{marker, nullptr}, {marker, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+    const NVNtexture* targets[]{&color};
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, depth, nullptr);
+    if (depth_write) {
+        NVNdepthStencilState depth_test{};
+        load<Entry::nvnDepthStencilStateSetDefaults>()(&depth_test);
+        load<Entry::nvnDepthStencilStateSetDepthTestEnable>()(&depth_test, 1);
+        load<Entry::nvnDepthStencilStateSetDepthWriteEnable>()(&depth_test, 1);
+        load<Entry::nvnDepthStencilStateSetDepthFunc>()(&depth_test, NVN_DEPTH_FUNC_ALWAYS);
+        load<Entry::nvnCommandBufferBindDepthStencilState>()(&recorder.commands, &depth_test);
+    }
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+                                                     uniform_address, 64);
+    if (image_id >= 0)
+        load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, image_id);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    const auto handle = recorder.finish();
+    const auto fence = backend.submit({&handle, 1});
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    return fence;
+}
+
+void test_texture_pool_ids(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    CHECK(backend != nullptr);
+    if (!backend) return;
+    id<MTLTexture> colors[]{pool_rgba(device, 255, 0, 0), pool_rgba(device, 0, 255, 0), pool_rgba(device, 0, 0, 255)};
+    for (int id = 1; id <= 3; ++id) {
+        TestResources::PoolTexture entry;
+        entry.texture = colors[id - 1];
+        resources.pool_textures[id] = entry;
+    }
+    resources.pool_texture_count = 4;
+    const std::uint32_t ids[]{0, 1, 2, 3, 4, 9, 1, 1};
+    write_pool_ids(resources, ids, 8);
+    resources.textures[80] = pool_target(device, 8);
+    auto color_state = texture_state(80, 8, 4);
+    auto color = texture_object(color_state);
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const auto fence = submit_pool_draw(*backend, recorder, program, 120, color, nullptr, false, -1);
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error());
+    CHECK(backend->statistics().pool_table_builds >= 1);
+    std::array<std::uint8_t, 32> pixels{};
+    [resources.textures[80] getBytes:pixels.data() bytesPerRow:32 fromRegion:MTLRegionMake2D(0, 0, 8, 1) mipmapLevel:0];
+    const std::uint8_t expect[][3]{{0, 0, 0}, {255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {0, 0, 0}, {0, 0, 0}};
+    for (int x = 0; x < 6; ++x)
+        CHECK(pixels[x * 4] == expect[x][0] && pixels[x * 4 + 1] == expect[x][1] && pixels[x * 4 + 2] == expect[x][2]);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+void test_texture_pool_first_read(id<MTLDevice> device, id<MTL4CommandQueue> queue,
+                                  bool coalesced = false, bool missing_note = false, unsigned replacement_kind = 0) {
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    CHECK(backend != nullptr);
+    if (!backend) return;
+    TestResources::PoolTexture entry;
+    entry.texture = pool_rgba(device, 255, 0, 0);
+    entry.made = false;
+    entry.size = 64ull << 20;
+    resources.pool_textures[1] = entry;
+    resources.pool_texture_count = 3;
+    const std::uint32_t ids[]{1, 1, 1, 1};
+    write_pool_ids(resources, ids, 4);
+    resources.textures[81] = pool_target(device, 4);
+    auto color_state = texture_state(81, 4, 4);
+    auto color = texture_object(color_state);
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const auto first = submit_pool_draw(*backend, recorder, program, 120, color, nullptr, false, -1);
+    CHECK(first && backend->wait_fence(first, 10'000'000'000ull));
+    CHECK(!backend->last_error());
+    CHECK(backend->statistics().pool_textures_made == 0);
+    std::array<std::uint8_t, 16> pixels{};
+    [resources.textures[81] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 1) mipmapLevel:0];
+    CHECK(pixels[0] == 0 && pixels[1] == 0 && pixels[2] == 0);
+    std::array<std::uint8_t, 64> cleared{};
+    [resources.textures[81] replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:cleared.data() bytesPerRow:16];
+    const auto second = submit_pool_draw(*backend, recorder, program, 120, color, nullptr, false, -1);
+    CHECK(second && backend->wait_fence(second, 10'000'000'000ull));
+    CHECK(!backend->last_error());
+    CHECK(backend->statistics().pool_textures_made == 1);
+    [resources.textures[81] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 1) mipmapLevel:0];
+    CHECK(pixels[0] == 255 && pixels[1] == 0 && pixels[2] == 0);
+    // The shader read this ID already. A streamed replacement is larger than
+    // the normal walk budget and must be admitted immediately as a read ID.
+    backend->finish_frame(0);
+    resources.pool_textures[1].texture = pool_rgba(device, 0, 255, 0);
+    if (replacement_kind) {
+        const bool array = replacement_kind == 2;
+        const NSUInteger width = array ? 4 : 8, height = array ? 2 : 4;
+        auto* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+            array ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatRGBA16Float width:width height:height mipmapped:NO];
+        desc.storageMode = MTLStorageModeShared;
+        desc.usage = MTLTextureUsageShaderRead;
+        if (array) { desc.textureType = MTLTextureType2DArray; desc.arrayLength = 2; }
+        id<MTLTexture> replacement = [device newTextureWithDescriptor:desc];
+        CHECK(replacement != nil);
+        if (array) {
+            std::vector<std::uint8_t> pixels(width * height * 4, 0);
+            for (NSUInteger pixel = 0; pixel != width * height; ++pixel)
+                pixels[pixel * 4 + 1] = pixels[pixel * 4 + 3] = 255;
+            for (NSUInteger layer = 0; layer != 2; ++layer)
+                [replacement replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 slice:layer
+                    withBytes:pixels.data() bytesPerRow:width * 4 bytesPerImage:width * height * 4];
+        } else {
+            std::vector<std::uint16_t> pixels(width * height * 4, 0);
+            for (NSUInteger pixel = 0; pixel != width * height; ++pixel)
+                pixels[pixel * 4 + 1] = pixels[pixel * 4 + 3] = 0x3c00;
+            [replacement replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0
+                withBytes:pixels.data() bytesPerRow:width * 8];
+        }
+        resources.pool_textures[1].texture = replacement;
+        resources.pool_textures[1].size = array ? 80ull << 20 : 96ull << 20;
+    }
+    resources.pool_textures[1].made = false;
+    resources.pool_textures[1].descriptor_key = 2;
+    resources.note_pool_registration(1, 0);
+    auto* sampler_desc = [MTLSamplerDescriptor new];
+    sampler_desc.supportArgumentBuffers = YES;
+    resources.samplers[7] = [device newSamplerStateWithDescriptor:sampler_desc];
+    resources.pool_sampler_count = 8;
+    resources.note_pool_registration(7, 1);
+    const auto replacement = submit_pool_draw(*backend, recorder, program, replacement_kind == 2 ? 198 : 120,
+        color, nullptr, false, -1);
+    CHECK(replacement && backend->wait_fence(replacement, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+    CHECK(backend->statistics().pool_textures_made == 2);
+    [resources.textures[81] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 1) mipmapLevel:0];
+    CHECK(pixels[0] == 0 && pixels[1] == 255 && pixels[2] == 0);
+
+    // Emptying the ID clears its old read mark. A later cold registration
+    // follows the ordinary first-read path, rather than inheriting admission.
+    backend->finish_frame(0);
+    resources.pool_textures.erase(1);
+    resources.note_pool_registration(1, 0);
+    const auto empty_note = resources.pool_reg_gen;
+    const std::uint32_t other_ids[]{2, 2, 2, 2};
+    write_pool_ids(resources, other_ids, 4);
+    if (!coalesced) {
+        const auto emptied = submit_pool_draw(*backend, recorder, program, 120, color, nullptr, false, -1);
+        CHECK(emptied && backend->wait_fence(emptied, 10'000'000'000ull));
+    }
+    resources.pool_textures[1] = entry;
+    resources.pool_textures[1].texture = pool_rgba(device, 0, 0, 255);
+    resources.pool_textures[1].descriptor_key = 3;
+    resources.note_pool_registration(1, 0);
+    if (missing_note) resources.pool_notes[empty_note].present = false;
+    write_pool_ids(resources, ids, 4);
+    const auto cold = submit_pool_draw(*backend, recorder, program, 120, color, nullptr, false, -1);
+    CHECK(cold && backend->wait_fence(cold, 10'000'000'000ull));
+    [resources.textures[81] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 1) mipmapLevel:0];
+    CHECK(pixels[0] == 0 && pixels[1] == 0 && pixels[2] == 0);
+    const auto read_again = submit_pool_draw(*backend, recorder, program, 120, color, nullptr, false, -1);
+    CHECK(read_again && backend->wait_fence(read_again, 10'000'000'000ull));
+    [resources.textures[81] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 1) mipmapLevel:0];
+    CHECK(pixels[0] == 0 && pixels[1] == 0 && pixels[2] == 255);
+
+    // Replacing the pool clears all ID history, even when the descriptor's
+    // current identity is unchanged.
+    backend->finish_frame(0);
+    resources.pool_textures[1].made = false;
+    ++resources.pool_generation;
+    const auto reset = submit_pool_draw(*backend, recorder, program, 120, color, nullptr, false, -1);
+    CHECK(reset && backend->wait_fence(reset, 10'000'000'000ull));
+    [resources.textures[81] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 1) mipmapLevel:0];
+    CHECK(pixels[0] == 0 && pixels[1] == 0 && pixels[2] == 0);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+// An old GPU reader can finish after the host processes an empty/refill.
+// Its read belongs to the old descriptor lifetime, not to the cold refill.
+void test_pool_empty_with_queued_reader(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    TestResources::PoolTexture entry;
+    entry.texture = pool_rgba(device, 255, 0, 0);
+    entry.size = 64ull << 20;
+    resources.pool_textures[1] = entry;
+    auto late_entry = entry;
+    late_entry.texture = pool_rgba(device, 0, 255, 0);
+    late_entry.made = false;
+    resources.pool_textures[3] = late_entry;
+    resources.pool_texture_count = 4;
+    const std::uint32_t old_ids[]{1, 1, 1, 1}, queued_ids[]{1, 3, 1, 3};
+    const std::uint32_t other_ids[]{2, 2, 2, 2}, late_ids[]{3, 3, 3, 3};
+    write_pool_ids(resources, old_ids, 4);
+    std::memcpy(static_cast<std::byte*>(resources.memory.contents) + 0x300, other_ids, sizeof other_ids);
+    std::memcpy(static_cast<std::byte*>(resources.memory.contents) + 0x400, queued_ids, sizeof queued_ids);
+    std::memcpy(static_cast<std::byte*>(resources.memory.contents) + 0x500, late_ids, sizeof late_ids);
+    std::array<TextureState, 6> states;
+    std::array<NVNtexture, 6> colors;
+    for (unsigned index = 0; index != colors.size(); ++index) {
+        resources.textures[210 + index] = pool_target(device, 4);
+        states[index] = texture_state(210 + index, 4, 4);
+        colors[index] = texture_object(states[index]);
+    }
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    for (unsigned warmup = 0; warmup != 2; ++warmup) {
+        const auto fence = submit_pool_draw(*backend, recorder, program, 120, colors[0], nullptr, false, -1);
+        CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    }
+    backend->finish_frame(0);
+    id<MTLSharedEvent> gate = [device newSharedEvent];
+    [queue waitForEvent:gate value:1];
+    const auto old = submit_pool_draw(*backend, recorder, program, 120, colors[1], nullptr, false, -1,
+        TestResources::base + 0x400);
+    const bool old_ready = old && pool_stats_ready(*backend, 3, 0);
+    CHECK(old_ready);
+    if (!old_ready) {
+        gate.signaledValue = 1;
+        load<Entry::nvnProgramFinalize>()(&program);
+        return;
+    }
+    id<MTLBuffer> old_table = backend->current_texture_pool_buffer();
+    std::vector<std::byte> original(old_table.length);
+    std::memcpy(original.data(), old_table.contents, original.size());
+    resources.pool_textures.erase(1);
+    resources.note_pool_registration(1, 0);
+    entry.texture = pool_rgba(device, 0, 0, 255);
+    entry.made = false;
+    entry.descriptor_key = 2;
+    resources.pool_textures[1] = entry;
+    resources.note_pool_registration(1, 0);
+    const auto other = submit_pool_draw(*backend, recorder, program, 120, colors[2], nullptr, false, -1,
+        TestResources::base + 0x300);
+    const bool other_ready = other && pool_stats_ready(*backend, 4, 0);
+    CHECK(other_ready);
+    CHECK(!resources.pool_textures[1].made);
+    CHECK(!resources.pool_textures[3].made);
+    CHECK(std::memcmp(original.data(), old_table.contents, original.size()) == 0);
+    gate.signaledValue = 1;
+    CHECK(old && backend->wait_fence(old, 10'000'000'000ull));
+    CHECK(other && backend->wait_fence(other, 10'000'000'000ull));
+    std::array<std::uint8_t, 64> pixels{};
+    [resources.textures[211] getBytes:pixels.data() bytesPerRow:16
+        fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+    CHECK(pixels[0] == 255 && pixels[1] == 0 && pixels[2] == 0);
+    CHECK(pixels[4] == 0 && pixels[5] == 0 && pixels[6] == 0);
+    backend->finish_frame(0);
+    const auto cold = submit_pool_draw(*backend, recorder, program, 120, colors[3], nullptr, false, -1);
+    CHECK(cold && backend->wait_fence(cold, 10'000'000'000ull));
+    [resources.textures[213] getBytes:pixels.data() bytesPerRow:16
+        fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+    CHECK(pixels[0] == 0 && pixels[1] == 0 && pixels[2] == 0);
+    CHECK(resources.pool_textures[3].made);
+    const auto late = submit_pool_draw(*backend, recorder, program, 120, colors[5], nullptr, false, -1,
+        TestResources::base + 0x500);
+    CHECK(late && backend->wait_fence(late, 10'000'000'000ull));
+    [resources.textures[215] getBytes:pixels.data() bytesPerRow:16
+        fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+    CHECK(pixels[0] == 0 && pixels[1] == 255 && pixels[2] == 0);
+    backend->finish_frame(0);
+    const auto read_again = submit_pool_draw(*backend, recorder, program, 120, colors[4], nullptr, false, -1);
+    CHECK(read_again && backend->wait_fence(read_again, 10'000'000'000ull));
+    [resources.textures[214] getBytes:pixels.data() bytesPerRow:16
+        fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+    CHECK(pixels[0] == 0 && pixels[1] == 0 && pixels[2] == 255);
+    load<Entry::nvnProgramFinalize>()(&program);
+}
+
+// Replace the registration immediately after a coherent identity is captured.
+// Both captured identities must stay whole, and the replacement must occur.
+void test_pool_read_identity_snapshot(id<MTLDevice> device) {
+    TestResources resources(device);
+    auto* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+        width:4 height:4 mipmapped:NO];
+    desc.storageMode = MTLStorageModePrivate;
+    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+    TestResources::PoolTexture entry;
+    entry.texture = [device newTextureWithDescriptor:desc];
+    entry.depth = true;
+    entry.serial = 101;
+    entry.storage_key = 0x1111;
+    resources.pool_textures[1] = entry;
+    resources.pool_texture_count = 2;
+    replay::PoolTableKey key;
+    key.component = replay::PoolComponent::Depth;
+    replay::PoolTableCache cache(device);
+    auto first = cache.lookup(key, resources, 1, 0, 0);
+    CHECK(first.ok && first.bitmap);
+    if (!first.ok || !first.bitmap) return;
+    auto* bits = static_cast<std::atomic<std::uint32_t>*>(first.bitmap.contents);
+    bits[0].fetch_or(1u << 1, std::memory_order_relaxed);
+    unsigned mutations = 0;
+    const auto mutate = [&] {
+        if (mutations) return;
+        ++mutations;
+        resources.pool_textures[1].serial = 202;
+        resources.pool_textures[1].storage_key = 0x2222;
+        resources.pool_textures[1].descriptor_key = 2;
+        resources.note_pool_registration(1, 0);
+    };
+    resources.on_texture_serial = mutate;
+    resources.on_texture_identity = mutate;
+    CHECK(cache.lookup(key, resources, 2, 1, 0).ok);
+    CHECK(mutations == 1);
+    CHECK(cache.lookup(key, resources, 3, 2, 0).ok);
+    CHECK(std::find(resources.pool_depth_reads.begin(), resources.pool_depth_reads.end(),
+        std::pair<std::uint64_t, std::uint64_t>{101, 0x1111}) != resources.pool_depth_reads.end());
+    CHECK(std::find(resources.pool_depth_reads.begin(), resources.pool_depth_reads.end(),
+        std::pair<std::uint64_t, std::uint64_t>{202, 0x2222}) != resources.pool_depth_reads.end());
+    for (const auto& [serial, storage] : resources.pool_depth_reads)
+        CHECK((serial == 101 && storage == 0x1111) || (serial == 202 && storage == 0x2222));
+
+}
+
+void test_texture_pool_copy_on_write(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    const char* old_thread = std::getenv("ARMIGO_NVN_ENCODE_THREAD");
+    const std::string saved_thread = old_thread ? old_thread : "";
+    setenv("ARMIGO_NVN_ENCODE_THREAD", "0", 1);
+    TestResources resources(device);
+    id<MTLSharedEvent> gate = [device newSharedEvent];
+    std::atomic<bool> gated{false};
+    resources.on_begin_walk = [&] {
+        if (gated.exchange(true)) return;
+        [queue waitForEvent:gate value:1];
+    };
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    if (old_thread) setenv("ARMIGO_NVN_ENCODE_THREAD", saved_thread.c_str(), 1);
+    else unsetenv("ARMIGO_NVN_ENCODE_THREAD");
+    CHECK(backend != nullptr);
+    if (!backend) return;
+    id<MTLTexture> red = pool_rgba(device, 255, 0, 0);
+    id<MTLTexture> green = pool_rgba(device, 0, 255, 0);
+    TestResources::PoolTexture entry;
+    entry.texture = red;
+    entry.descriptor_key = 1;
+    resources.pool_textures[1] = entry;
+    resources.pool_texture_count = 2;
+    const std::uint32_t ids[]{1, 1, 1, 1};
+    write_pool_ids(resources, ids, 4);
+    resources.textures[82] = pool_target(device, 4);
+    resources.textures[83] = pool_target(device, 4);
+    auto first_state = texture_state(82, 4, 4);
+    auto second_state = texture_state(83, 4, 4);
+    auto first_color = texture_object(first_state);
+    auto second_color = texture_object(second_state);
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const auto fence_a = submit_pool_draw(*backend, recorder, program, 120, first_color, nullptr, false, -1);
+    CHECK(fence_a && pool_stats_ready(*backend, 1, 0));
+    id<MTLBuffer> table_a = backend->current_texture_pool_buffer();
+    CHECK(table_a != nil);
+    if (!table_a) return;
+    std::vector<std::uint8_t> before(table_a.length);
+    std::memcpy(before.data(), table_a.contents, table_a.length);
+    resources.pool_textures[1].texture = green;
+    resources.pool_textures[1].descriptor_key = 2;
+    resources.note_pool_registration(1, 0);
+    const auto fence_b = submit_pool_draw(*backend, recorder, program, 120, second_color, nullptr, false, -1);
+    CHECK(fence_b && pool_stats_ready(*backend, 2, 1));
+    std::vector<std::uint8_t> after(table_a.length);
+    std::memcpy(after.data(), table_a.contents, table_a.length);
+    CHECK(before == after);
+    CHECK(backend->current_texture_pool_buffer() != table_a);
+    CHECK(backend->statistics().pool_table_builds == 1);
+    gate.signaledValue = 1;
+    CHECK(backend->wait_fence(fence_a, 10'000'000'000ull));
+    CHECK(backend->wait_fence(fence_b, 10'000'000'000ull));
+    CHECK(!backend->last_error());
+    std::array<std::uint8_t, 16> pixels{};
+    [resources.textures[82] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 1) mipmapLevel:0];
+    CHECK(pixels[0] == 255 && pixels[1] == 0 && pixels[2] == 0);
+    [resources.textures[83] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 1) mipmapLevel:0];
+    CHECK(pixels[0] == 0 && pixels[1] == 255 && pixels[2] == 0);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+void test_texture_pool_patch(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    CHECK(backend != nullptr);
+    if (!backend) return;
+    resources.pool_fallback = pool_rgba(device, 255, 0, 0);
+    resources.pool_texture_count = 4096;
+    id<MTLTexture> replacement = pool_rgba(device, 0, 255, 0);
+    const std::uint32_t ids[]{1, 1, 1, 1};
+    write_pool_ids(resources, ids, 4);
+    resources.textures[84] = pool_target(device, 4);
+    auto color_state = texture_state(84, 4, 4);
+    auto color = texture_object(color_state);
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const auto first = submit_pool_draw(*backend, recorder, program, 120, color, nullptr, false, -1);
+    CHECK(first && backend->wait_fence(first, 10'000'000'000ull));
+    CHECK(!backend->last_error());
+    CHECK(backend->statistics().pool_table_builds == 1);
+    CHECK(backend->statistics().pool_table_patches == 0);
+    TestResources::PoolTexture entry;
+    entry.texture = replacement;
+    entry.descriptor_key = 2;
+    resources.pool_textures[100] = entry;
+    resources.note_pool_registration(100, 0);
+    const auto second = submit_pool_draw(*backend, recorder, program, 120, color, nullptr, false, -1);
+    CHECK(second && backend->wait_fence(second, 10'000'000'000ull));
+    CHECK(!backend->last_error());
+    CHECK(backend->statistics().pool_table_builds == 1);
+    CHECK(backend->statistics().pool_table_patches == 1);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+void test_texture_pool_element_type(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    CHECK(backend != nullptr);
+    if (!backend) return;
+    auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:1 height:1 mipmapped:NO];
+    descriptor.textureType = MTLTextureType2DArray;
+    descriptor.arrayLength = 1;
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> array_texture = [device newTextureWithDescriptor:descriptor];
+    const std::uint8_t red[]{255, 0, 0, 255};
+    [array_texture replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 slice:0 withBytes:red
+                    bytesPerRow:256 bytesPerImage:256];
+    TestResources::PoolTexture entry;
+    entry.texture = array_texture;
+    resources.pool_textures[1] = entry;
+    resources.pool_texture_count = 2;
+    const std::uint32_t ids[]{1, 1, 1, 1};
+    write_pool_ids(resources, ids, 4);
+    resources.textures[85] = pool_target(device, 4);
+    auto color_state = texture_state(85, 4, 4);
+    auto color = texture_object(color_state);
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const auto fence = submit_pool_draw(*backend, recorder, program, 120, color, nullptr, false, -1);
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error());
+    std::array<std::uint8_t, 16> pixels{};
+    [resources.textures[85] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 1) mipmapLevel:0];
+    CHECK(pixels[0] == 0 && pixels[1] == 0 && pixels[2] == 0);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+// Separate texture/sampler tables are independent of combined handles. The
+// first sampler is linear, the second nearest; zero samplers use the default.
+// An exactly zero handle is a typed empty slot, independent of where its
+// handle came from. An unrelated directly bound texture must remain unused.
+void test_zero_sampled_handles(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    for (unsigned kind = 0; kind != 7; ++kind) {
+        TestResources resources(device);
+        std::memset(resources.memory.contents, 0, resources.memory.length);
+        resources.texture_ids[44] = pool_rgba(device, 0, 0, 255);
+        if (kind >= 5) {
+            const std::uint32_t id = kind == 5 ? 0xfffff : 78;
+            std::memcpy(static_cast<std::byte*>(resources.memory.contents) + 0x200, &id, sizeof id);
+            resources.empty_texture_ids.insert(id);
+        }
+        bool poison_lookup = false;
+        resources.on_texture_lookup = [&] { poison_lookup |= resources.last_texture_lookup == 44; };
+        resources.textures[96] = pool_target(device, 4);
+        auto state = texture_state(96, 4, 4); auto target = texture_object(state);
+        const NVNtexture* targets[]{&target};
+        auto backend = replay::create_replay_backend(device, queue, resources);
+        Recorder recorder;
+        NVNprogram program{};
+        CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+        const NVNshaderData shaders[]{{142 + kind, nullptr}, {142 + kind, nullptr}};
+        CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 3, 44);
+        load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, TestResources::base + 0x200, 4);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+        const auto handle = recorder.finish(); auto fence = backend->submit({&handle, 1});
+        CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+        CHECK(!backend->last_error() && backend->statistics().draws == 1 && backend->statistics().skipped == 0 && !poison_lookup);
+        std::array<std::uint8_t, 64> pixels{};
+        [resources.textures[96] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+        for (unsigned pixel = 0; pixel < 16; ++pixel)
+            CHECK(pixels[pixel * 4] == 0 && pixels[pixel * 4 + 1] == 0 && pixels[pixel * 4 + 2] == 0 && pixels[pixel * 4 + 3] == 255);
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+        load<Entry::nvnProgramFinalize>()(&program); load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+    }
+}
+
+void test_separate_resource_handles(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    for (const bool empty : {false, true}) {
+        TestResources resources(device);
+        for (unsigned id = 1; id <= 2; ++id) {
+            auto* sampler = [MTLSamplerDescriptor new];
+            sampler.minFilter = sampler.magFilter = id == 1 ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+            sampler.sAddressMode = sampler.tAddressMode = MTLSamplerAddressModeClampToEdge;
+            sampler.supportArgumentBuffers = YES;
+            resources.samplers[id] = [device newSamplerStateWithDescriptor:sampler];
+        }
+        auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+            width:2 height:2 mipmapped:NO];
+        descriptor.storageMode = MTLStorageModeShared;
+        descriptor.usage = MTLTextureUsageShaderRead;
+        auto image = [device newTextureWithDescriptor:descriptor];
+        const std::uint8_t texels[]{255,0,0,255, 0,255,0,255, 0,0,255,255, 255,255,255,255};
+        [image replaceRegion:MTLRegionMake2D(0, 0, 2, 2) mipmapLevel:0 withBytes:texels bytesPerRow:8];
+        resources.texture_ids[43] = image;
+        resources.texture_ids[44] = pool_rgba(device, 0, 0, 255);
+        resources.textures[96] = pool_target(device, 4);
+        auto target_state = texture_state(96, 4, 4); auto target = texture_object(target_state);
+        const NVNtexture* targets[]{&target};
+        auto backend = replay::create_replay_backend(device, queue, resources);
+        Recorder recorder;
+        NVNprogram program{};
+        CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+        const NVNshaderData shaders[]{{139, nullptr}, {139, nullptr}};
+        CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        load<Entry::nvnCommandBufferBindTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, 44);
+        load<Entry::nvnCommandBufferBindSeparateTexture>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, NVNseparateTextureHandle{43});
+        load<Entry::nvnCommandBufferBindSeparateSampler>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, NVNseparateSamplerHandle{empty ? 0 : combined_handle(0, 1)});
+        load<Entry::nvnCommandBufferBindSeparateSampler>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 1, NVNseparateSamplerHandle{empty ? 0 : combined_handle(0, 2)});
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+        const auto handle = recorder.finish();
+        const auto fence = backend->submit({&handle, 1});
+        CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+        CHECK(!backend->last_error() && backend->statistics().draws == 1 && backend->statistics().skipped == 0);
+        std::array<std::uint8_t, 64> pixels{};
+        [resources.textures[96] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+        if (empty) CHECK(pixels[0] == 255 && pixels[1] == 0 && pixels[2] == 0);
+        else CHECK(pixels[0] < 230 && pixels[1] > 20 && pixels[2] > 20);
+        CHECK(pixels[8] == 255 && pixels[9] == 0 && pixels[10] == 0);
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+        load<Entry::nvnProgramFinalize>()(&program);
+        load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+    }
+}
+
+void test_sampler_pool_filters(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    CHECK(backend != nullptr);
+    if (!backend) return;
+    const auto make_sampler = [&](MTLSamplerMinMagFilter filter) {
+        auto* descriptor = [MTLSamplerDescriptor new];
+        descriptor.minFilter = descriptor.magFilter = filter;
+        descriptor.mipFilter = MTLSamplerMipFilterNotMipmapped;
+        descriptor.sAddressMode = descriptor.tAddressMode = descriptor.rAddressMode = MTLSamplerAddressModeClampToEdge;
+        descriptor.normalizedCoordinates = YES;
+        descriptor.supportArgumentBuffers = YES;
+        return [device newSamplerStateWithDescriptor:descriptor];
+    };
+    resources.samplers[1] = make_sampler(MTLSamplerMinMagFilterLinear);
+    resources.samplers[2] = make_sampler(MTLSamplerMinMagFilterNearest);
+    resources.pool_sampler_count = 3;
+    auto* image_descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:2 height:2 mipmapped:NO];
+    image_descriptor.storageMode = MTLStorageModeShared;
+    image_descriptor.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> image = [device newTextureWithDescriptor:image_descriptor];
+    const std::uint8_t texels[]{255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255};
+    [image replaceRegion:MTLRegionMake2D(0, 0, 2, 2) mipmapLevel:0 withBytes:texels bytesPerRow:8];
+    resources.texture_ids[4] = image;
+    const std::uint32_t ids[]{0, 1, 2, 3};
+    write_pool_ids(resources, ids, 4);
+    resources.textures[86] = pool_target(device, 4);
+    auto color_state = texture_state(86, 4, 4);
+    auto color = texture_object(color_state);
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const auto fence = submit_pool_draw(*backend, recorder, program, 121, color, nullptr, false, 4);
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error());
+    std::array<std::uint8_t, 16> pixels{};
+    [resources.textures[86] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 1) mipmapLevel:0];
+    for (int x : {0, 2, 3})
+        CHECK(pixels[x * 4] == 255 && pixels[x * 4 + 1] == 0 && pixels[x * 4 + 2] == 0);
+    CHECK(pixels[4] < 230 && (pixels[5] > 20 || pixels[6] > 20));
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+// Publishing pool storage changes its own clock without a registration or
+// binding change. Both task and mesh draws must refresh that table before
+// reusing their arguments: red emits column 0, green emits column 3.
+void test_mesh_pool_refresh(id<MTLDevice> device, id<MTL4CommandQueue> queue, bool task) {
+    struct RestorePolicy { ~RestorePolicy() { nvn::set_title_policy({}); } } restore;
+    nvn::TitlePolicy policy;
+    policy.handle_reads = nvn::TitlePolicy::HandleReads::current;
+    nvn::set_title_policy(policy);
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    resources.textures[99] = pool_target(device, 4);
+    id<MTLTexture> red = pool_target(device, 4), green = pool_target(device, 4);
+    std::array<std::uint32_t, 16> texels;
+    texels.fill(0);
+    [resources.textures[99] replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0
+        withBytes:texels.data() bytesPerRow:16];
+    texels.fill(0xff0000ffu);
+    [red replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:texels.data() bytesPerRow:16];
+    texels.fill(0xff00ff00u);
+    [green replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:texels.data() bytesPerRow:16];
+    TestResources::PoolTexture entry;
+    entry.texture = red;
+    entry.shared = true;
+    resources.pool_textures[1] = entry;
+    resources.pool_texture_count = 2;
+    resources.on_texture_write = [&](const TextureState&) {
+        resources.pool_textures[1].texture = green;
+        ++resources.pool_generation;
+    };
+    auto state = texture_state(99, 4, 4);
+    auto target = texture_object(state);
+    const NVNtexture* targets[]{&target};
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const auto marker = task ? 132u : 131u;
+    const NVNshaderData shaders[]{{marker, nullptr}, {marker, nullptr}, {marker, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, task ? 3 : 2, shaders));
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+    bind_mesh_program(&recorder.commands, &program, task);
+    command_draw_mesh_tasks(&recorder.commands, 0, 1);
+    command_draw_mesh_tasks(&recorder.commands, 0, 1);
+    const auto commands = recorder.finish();
+    const auto fence = backend->submit({&commands, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().skipped == 0 && backend->statistics().draws == 2);
+    CHECK(resources.registration == 1 && resources.pool_generation > 1);
+    std::array<std::uint8_t, 64> pixels{};
+    [resources.textures[99] getBytes:pixels.data() bytesPerRow:16
+        fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+    for (unsigned y = 0; y < 4; ++y)
+        for (unsigned x = 0; x < 4; ++x)
+            CHECK(pixels[(y * 4 + x) * 4 + 1] == (x == 0 || x == 3 ? 255 : 0));
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, commands);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+void test_texture_pool_depth_break(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    CHECK(backend != nullptr);
+    if (!backend) return;
+    auto* depth_descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+        width:4 height:4 mipmapped:NO];
+    depth_descriptor.storageMode = MTLStorageModeShared;
+    depth_descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    id<MTLTexture> depth_texture = [device newTextureWithDescriptor:depth_descriptor];
+    resources.textures[87] = depth_texture;
+    TestResources::PoolTexture entry;
+    entry.texture = depth_texture;
+    entry.depth = true;
+    entry.serial = 87;
+    resources.pool_textures[1] = entry;
+    resources.pool_texture_count = 2;
+    const std::uint32_t ids[]{1, 1, 1, 1};
+    write_pool_ids(resources, ids, 4);
+    resources.textures[88] = pool_target(device, 4);
+    resources.textures[89] = pool_target(device, 4);
+    auto warmup_state = texture_state(88, 4, 4);
+    auto color_state = texture_state(89, 4, 4);
+    auto depth_state = texture_state(87, 4, 4);
+    depth_state.description.format = NVN_FORMAT_DEPTH32F;
+    depth_state.memory = static_cast<std::uint8_t*>(resources.memory.contents) + 0x4000;
+    depth_state.size = 64;
+    resources.pool_textures[1].storage_key = replay::pool_storage_key(
+        reinterpret_cast<std::uint64_t>(depth_state.memory), depth_state.size,
+        &depth_state.description, sizeof depth_state.description);
+    const auto old_storage = resources.pool_textures[1].storage_key;
+    auto warmup = texture_object(warmup_state);
+    auto color = texture_object(color_state);
+    auto depth = texture_object(depth_state);
+    Recorder recorder;
+    NVNprogram pool_program{}, plain{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&pool_program, &recorder.device));
+    CHECK(load<Entry::nvnProgramInitialize>()(&plain, &recorder.device));
+    const auto warmup_fence = submit_pool_draw(*backend, recorder, pool_program, 122, warmup, nullptr, false, -1);
+    CHECK(warmup_fence && backend->wait_fence(warmup_fence, 10'000'000'000ull));
+    CHECK(!backend->last_error());
+    // Fold the original depth ID into the read set, then replace it with a
+    // different depth allocation. Its read mark and depth hazard both carry.
+    const auto folded = submit_pool_draw(*backend, recorder, pool_program, 122, warmup, nullptr, false, -1);
+    CHECK(folded && backend->wait_fence(folded, 10'000'000'000ull));
+    resources.textures[187] = [device newTextureWithDescriptor:depth_descriptor];
+    resources.pool_textures[1].texture = resources.textures[187];
+    resources.pool_textures[1].serial = 187;
+    resources.pool_textures[1].descriptor_key = 2;
+    resources.note_pool_registration(1, 0);
+    depth_state.serial = 287;
+    depth_state.memory = static_cast<std::uint8_t*>(resources.memory.contents) + 0x5000;
+    resources.textures[287] = resources.textures[187];
+    resources.pool_textures[1].storage_key = replay::pool_storage_key(
+        reinterpret_cast<std::uint64_t>(depth_state.memory), depth_state.size,
+        &depth_state.description, sizeof depth_state.description);
+    CHECK(old_storage && resources.pool_textures[1].storage_key &&
+          old_storage != resources.pool_textures[1].storage_key);
+    depth = texture_object(depth_state);
+    const NVNshaderData plain_shaders[]{{1u, nullptr}, {1u, nullptr}};
+    const NVNshaderData pool_shaders[]{{122u, nullptr}, {122u, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&plain, 2, plain_shaders));
+    CHECK(load<Entry::nvnProgramSetShaders>()(&pool_program, 2, pool_shaders));
+    const NVNtexture* targets[]{&color};
+    NVNdepthStencilState depth_test{};
+    load<Entry::nvnDepthStencilStateSetDefaults>()(&depth_test);
+    load<Entry::nvnDepthStencilStateSetDepthTestEnable>()(&depth_test, 1);
+    load<Entry::nvnDepthStencilStateSetDepthWriteEnable>()(&depth_test, 1);
+    load<Entry::nvnDepthStencilStateSetDepthFunc>()(&depth_test, NVN_DEPTH_FUNC_ALWAYS);
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, &depth, nullptr);
+    load<Entry::nvnCommandBufferBindDepthStencilState>()(&recorder.commands, &depth_test);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &plain, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    load<Entry::nvnDepthStencilStateSetDepthWriteEnable>()(&depth_test, 0);
+    load<Entry::nvnCommandBufferBindDepthStencilState>()(&recorder.commands, &depth_test);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &pool_program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+                                                     TestResources::base + 0x200, 64);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    const auto handle = recorder.finish();
+    const auto passes_before = backend->statistics().render_passes;
+    const auto breaks_before = backend->statistics().pass_break_depth_sampled;
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error());
+    CHECK(backend->statistics().render_passes == passes_before + 2);
+    CHECK(backend->statistics().pass_break_depth_sampled == breaks_before + 1);
+    std::array<std::uint8_t, 64> pixels{};
+    [resources.textures[89] getBytes:pixels.data() bytesPerRow:16
+        fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+    for (unsigned pixel = 0; pixel != 16; ++pixel)
+        CHECK(pixels[pixel * 4] == 0 && pixels[pixel * 4 + 1] == 0 &&
+              pixels[pixel * 4 + 2] == 0 && pixels[pixel * 4 + 3] == 255);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&pool_program);
+    load<Entry::nvnProgramFinalize>()(&plain);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+void test_texture_pool_allocation_failure(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    CHECK(backend != nullptr);
+    if (!backend) return;
+    TestResources::PoolTexture entry;
+    entry.texture = pool_rgba(device, 255, 0, 0);
+    resources.pool_textures[1] = entry;
+    resources.pool_texture_count = 2;
+    const std::uint32_t ids[]{1, 1, 1, 1};
+    write_pool_ids(resources, ids, 4);
+    resources.textures[90] = pool_target(device, 4);
+    auto color_state = texture_state(90, 4, 4);
+    auto color = texture_object(color_state);
+    backend->set_pool_table_allocation_failure(true);
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const auto fence = submit_pool_draw(*backend, recorder, program, 120, color, nullptr, false, -1);
+    CHECK(drain_abandoned(*backend, fence));
+    const auto error = backend->last_error();
+    CHECK(error.code == replay::ReplayErrorCode::allocation);
+    CHECK(error.detail == "texture pool table is unavailable");
+    CHECK(backend->statistics().draws == 0);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+// One submission draws a pool texture, drains on a report the CPU then copies,
+// and draws it again. The version stays retained, and the command buffer opened
+// by the drain has to take the version's residency set on its own.
+void test_texture_pool_residency_across_segment(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    TestResources resources(device);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    CHECK(backend != nullptr);
+    if (!backend) return;
+    TestResources::PoolTexture entry;
+    entry.texture = pool_rgba(device, 255, 0, 0);
+    entry.made = true;
+    resources.pool_textures[1] = entry;
+    resources.pool_texture_count = 2;
+    const std::uint32_t ids[]{1, 1, 1, 1};
+    write_pool_ids(resources, ids, 4);
+    resources.textures[91] = pool_target(device, 4);
+    resources.textures[92] = pool_target(device, 4);
+    std::array<std::uint8_t, 64> cleared{};
+    for (const std::uint64_t serial : {91ull, 92ull})
+        [resources.textures[serial] replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0
+                                       withBytes:cleared.data() bytesPerRow:16];
+    auto first_state = texture_state(91, 4, 4);
+    auto second_state = texture_state(92, 4, 4);
+    auto first_color = texture_object(first_state);
+    auto second_color = texture_object(second_state);
+    const NVNtexture* first_targets[]{&first_color};
+    const NVNtexture* second_targets[]{&second_color};
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const NVNshaderData shaders[]{{120u, nullptr}, {120u, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, first_targets, nullptr, nullptr, nullptr);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+                                                     TestResources::base + 0x200, 64);
+    load<Entry::nvnCommandBufferResetCounter>()(&recorder.commands, NVN_COUNTER_TYPE_SAMPLES_PASSED);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    load<Entry::nvnCommandBufferReportCounter>()(&recorder.commands, NVN_COUNTER_TYPE_SAMPLES_PASSED,
+                                                 TestResources::base + 0x3000);
+    load<Entry::nvnCommandBufferCopyBufferToBuffer>()(&recorder.commands, TestResources::base + 0x3000,
+                                                     TestResources::base + 0x3100, sizeof(NVNcounterData), 0);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, second_targets, nullptr, nullptr, nullptr);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    const auto handle = recorder.finish();
+    const auto fence = backend->submit({&handle, 1});
+    CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error());
+    CHECK(backend->statistics().synchronize_gpu_waits >= 1);
+    CHECK(backend->statistics().draws >= 2);
+    std::array<std::uint8_t, 16> pixels{};
+    [resources.textures[91] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 1) mipmapLevel:0];
+    CHECK(pixels[0] == 255 && pixels[1] == 0 && pixels[2] == 0);
+    [resources.textures[92] getBytes:pixels.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 1) mipmapLevel:0];
+    CHECK(pixels[0] == 255 && pixels[1] == 0 && pixels[2] == 0);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+struct MappedPages {
+    static constexpr std::size_t size = 64 * 1024;
+    const std::size_t allocation_size;
+    std::uint8_t* bytes = nullptr;
+    explicit MappedPages(std::size_t allocation = size) : allocation_size(allocation) {
+        void* mapped = mmap(nullptr, allocation_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapped != MAP_FAILED) bytes = static_cast<std::uint8_t*>(mapped);
+    }
+    ~MappedPages() {
+        if (bytes) munmap(bytes, allocation_size);
+    }
+    MappedPages(const MappedPages&) = delete;
+    MappedPages& operator=(const MappedPages&) = delete;
+    explicit operator bool() const { return bytes != nullptr; }
+};
+
+MemoryPoolState registered_pool(replay::Resources& resources, MappedPages& pages) {
+    MemoryPoolState pool{};
+    pool.memory = pages.bytes;
+    pool.size = pages.allocation_size;
+    pool.flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+    CHECK(resources.register_pool(pool));
+    return pool;
+}
+
+TextureState placed_texture(replay::Resources& resources, MemoryPoolState& pool, std::uint64_t serial,
+                            std::int32_t flags) {
+    auto state = texture_state(serial, 4, 4);
+    state.description.samples = 1;
+    state.description.flags = flags;
+    const auto layout = resource_layout(state.description);
+    CHECK(layout.has_value());
+    if (!layout) return state;
+    state.size = layout->total_size;
+    state.layer_size = layout->layer_stride;
+    state.memory = pool.memory;
+    state.pool = &pool;
+    state.offset = 0;
+    CHECK(state.size > 0 && state.size <= pool.size);
+    resources.register_texture(state);
+    return state;
+}
+
+void expect_copied_pixel(const std::uint8_t* bytes, std::uint8_t red, std::uint8_t green, std::uint8_t blue,
+                         std::uint8_t alpha) {
+    if (bytes[0] != red || bytes[1] != green || bytes[2] != blue || bytes[3] != alpha)
+        std::fprintf(stderr, "copied pixel %u %u %u %u, expected %u %u %u %u\n", bytes[0], bytes[1], bytes[2],
+                     bytes[3], red, green, blue, alpha);
+    CHECK(bytes[0] == red && bytes[1] == green && bytes[2] == blue && bytes[3] == alpha);
+}
+
+// Real uploads and descriptor lifecycle participate in the same table
+// replacement contract as the admission probes. An old encoded reader keeps
+// its texture while image registration publishes the replacement.
+void test_real_pool_replacement(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    MappedPages descriptor_pages, first_pages, second_pages, old_color_pages, new_color_pages, uniform_pages;
+    CHECK(descriptor_pages && first_pages && second_pages && old_color_pages && new_color_pages && uniform_pages);
+    if (!descriptor_pages || !first_pages || !second_pages || !old_color_pages || !new_color_pages || !uniform_pages) return;
+    replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
+    resources.wait_for_gpu_deswizzle(std::chrono::seconds(10));
+    auto descriptors = registered_pool(resources, descriptor_pages);
+    descriptors.tag = 1;
+    auto first_pool = registered_pool(resources, first_pages);
+    auto second_pool = registered_pool(resources, second_pages);
+    auto old_colors = registered_pool(resources, old_color_pages);
+    auto new_colors = registered_pool(resources, new_color_pages);
+    registered_pool(resources, uniform_pages);
+    DescriptorPoolState descriptor_pool{&descriptors, 0, 300};
+    CHECK(resources.register_texture_pool(descriptor_pool));
+    auto first = placed_texture(resources, first_pool, 9601, 0);
+    auto second = placed_texture(resources, second_pool, 9602, 0);
+    auto old_color = placed_texture(resources, old_colors, 9603, NVN_TEXTURE_FLAGS_COMPRESSIBLE);
+    auto new_color = placed_texture(resources, new_colors, 9604, NVN_TEXTURE_FLAGS_COMPRESSIBLE);
+    if (!first.size || !second.size || !old_color.size || !new_color.size) return;
+    const std::uint8_t red[]{255, 0, 0, 255}, green[]{0, 255, 0, 255};
+    for (std::size_t offset = 0; offset != first.size; offset += 4) std::memcpy(first.memory + offset, red, 4);
+    for (std::size_t offset = 0; offset != second.size; offset += 4) std::memcpy(second.memory + offset, green, 4);
+    resources.register_texture_descriptor(257, first, nullptr);
+    const std::uint32_t ids[]{257, 257, 257, 257};
+    std::memcpy(uniform_pages.bytes, ids, sizeof ids);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    CHECK(backend != nullptr);
+    if (!backend) return;
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const NVNshaderData shaders[]{{120, nullptr}, {120, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+    auto old_target = texture_object(old_color), new_target = texture_object(new_color);
+    const auto draw = [&](NVNtexture& target) {
+        const NVNtexture* targets[]{&target};
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+            reinterpret_cast<std::uint64_t>(uniform_pages.bytes), 64);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+        const auto handle = recorder.finish();
+        const auto fence = backend->submit({&handle, 1});
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+        return fence;
+    };
+    const auto expect = [&](const TextureState& target, const std::uint8_t* rgba) {
+        std::array<std::byte, 64> pixels{};
+        TexelTransfer transfer{};
+        transfer.region = {0, 0, 0, 4, 4, 1};
+        transfer.row_stride = 16;
+        transfer.image_stride = 64;
+        CHECK(resources.read_texels(target, transfer, pixels.data()));
+        for (unsigned pixel = 0; pixel != 16; ++pixel)
+            expect_copied_pixel(reinterpret_cast<const std::uint8_t*>(pixels.data()) + pixel * 4,
+                rgba[0], rgba[1], rgba[2], rgba[3]);
+    };
+    for (unsigned warmup = 0; warmup != 2; ++warmup) {
+        const auto fence = draw(old_target);
+        CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    }
+    expect(old_color, red);
+    id<MTLSharedEvent> gate = [device newSharedEvent];
+    [queue waitForEvent:gate value:1];
+    const auto old_fence = draw(old_target);
+    const bool old_ready = old_fence && pool_stats_ready(*backend, 3, 0);
+    CHECK(old_ready);
+    if (!old_ready) { gate.signaledValue = 1; load<Entry::nvnProgramFinalize>()(&program); return; }
+    id<MTLBuffer> old_table = backend->current_texture_pool_buffer();
+    std::vector<std::byte> old_bytes(old_table.length);
+    std::memcpy(old_bytes.data(), old_table.contents, old_bytes.size());
+    const auto register_image = [&] {
+        std::array<GenericFunction, entry_count> entries;
+        for (std::size_t index = 0; index != entry_count; ++index)
+            entries[index] = implemented_entry(static_cast<Entry>(index));
+        const auto previous = backends();
+        register_resource_entries();
+        set_backends({&resources, backend.get()});
+        NVNtexturePool pool_object{};
+        std::memcpy(&pool_object, &descriptor_pool, sizeof descriptor_pool);
+        second.tag = 1;
+        auto object = texture_object(second);
+        load<Entry::nvnTexturePoolRegisterImage>()(&pool_object, 257, &object, nullptr);
+        set_backends(previous);
+        for (std::size_t index = 0; index != entry_count; ++index)
+            install_entry(static_cast<Entry>(index), entries[index]);
+    };
+    const auto before_upload = resources.upload_counts();
+    register_image();
+    replay::TextureReadIdentity identity;
+    CHECK(resources.texture_read_identity(257, identity) && identity.serial == second.serial);
+    CHECK(resources.texture_for_id(257) != nil);
+    const auto after_upload = resources.upload_counts();
+    CHECK(after_upload.gpu + after_upload.cpu > before_upload.gpu + before_upload.cpu);
+    const auto replacement = draw(new_target);
+    const bool replacement_ready = replacement && pool_stats_ready(*backend, 4, 0);
+    CHECK(replacement_ready);
+    CHECK(std::memcmp(old_bytes.data(), old_table.contents, old_bytes.size()) == 0);
+    gate.signaledValue = 1;
+    CHECK(old_fence && backend->wait_fence(old_fence, 10'000'000'000ull));
+    CHECK(replacement && backend->wait_fence(replacement, 10'000'000'000ull));
+    expect(old_color, red);
+    expect(new_color, green);
+    const auto old_generation = resources.texture_pool_generation();
+    const auto old_empty = resources.texture_empty_generation();
+    resources.release_texture_pool(descriptor_pool);
+    CHECK(resources.texture_pool_generation() != old_generation);
+    CHECK(resources.texture_empty_generation() > old_empty);
+    CHECK(resources.texture_read_identity(257, identity) && identity.descriptor_key == 0);
+    CHECK(resources.register_texture_pool(descriptor_pool));
+    register_image();
+    const auto reset = draw(new_target);
+    CHECK(reset && backend->wait_fence(reset, 10'000'000'000ull));
+    CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+    expect(new_color, green);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+// A real replacement larger than the 32 MiB walk budget stays cold after
+// an empty, even when its note is overwritten or an old GPU reader runs late.
+void test_real_pool_empty_history(id<MTLDevice> device, id<MTL4CommandQueue> queue, unsigned mode) {
+    MappedPages descriptors_pages, first_pages, old_color_pages, cold_color_pages, uniform_pages;
+    MappedPages second_pages(64ull << 20);
+    CHECK(descriptors_pages && first_pages && second_pages && old_color_pages && cold_color_pages && uniform_pages);
+    if (!descriptors_pages || !first_pages || !second_pages || !old_color_pages || !cold_color_pages || !uniform_pages) return;
+    replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
+    resources.wait_for_gpu_deswizzle(std::chrono::seconds(10));
+    auto descriptors = registered_pool(resources, descriptors_pages);
+    descriptors.tag = 1;
+    auto first_pool = registered_pool(resources, first_pages);
+    auto second_pool = registered_pool(resources, second_pages);
+    auto old_colors = registered_pool(resources, old_color_pages);
+    auto cold_colors = registered_pool(resources, cold_color_pages);
+    registered_pool(resources, uniform_pages);
+    DescriptorPoolState descriptor_pool{&descriptors, 0, 300};
+    CHECK(resources.register_texture_pool(descriptor_pool));
+    auto first = placed_texture(resources, first_pool, 9701, 0);
+    auto old_color = placed_texture(resources, old_colors, 9702, NVN_TEXTURE_FLAGS_COMPRESSIBLE);
+    auto cold_color = placed_texture(resources, cold_colors, 9703, NVN_TEXTURE_FLAGS_COMPRESSIBLE);
+    auto second = texture_state(9704, 3072, 3072);
+    second.description.samples = 1;
+    const auto layout = resource_layout(second.description);
+    CHECK(layout && layout->total_size > (32ull << 20) && layout->total_size <= second_pool.size);
+    if (!layout || layout->total_size > second_pool.size) return;
+    second.size = layout->total_size;
+    second.layer_size = layout->layer_stride;
+    second.memory = second_pool.memory;
+    second.pool = &second_pool;
+    resources.register_texture(second);
+    const std::array<std::uint8_t, 4> red{255, 0, 0, 255}, green{0, 255, 0, 255}, black{0, 0, 0, 255};
+    for (std::size_t offset = 0; offset != first.size; offset += 4) std::memcpy(first.memory + offset, red.data(), 4);
+    for (std::size_t offset = 0; offset != second.size; offset += 4) std::memcpy(second.memory + offset, green.data(), 4);
+    resources.register_texture_descriptor(257, first, nullptr);
+    resources.register_texture_descriptor(258, first, nullptr);
+    const std::uint32_t ids[]{257, 257, 257, 257};
+    std::memcpy(uniform_pages.bytes, ids, sizeof ids);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    CHECK(backend != nullptr);
+    if (!backend) return;
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const NVNshaderData shaders[]{{120, nullptr}, {120, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+    auto old_target = texture_object(old_color), cold_target = texture_object(cold_color);
+    const auto draw = [&](NVNtexture& target) {
+        const NVNtexture* targets[]{&target};
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0,
+            reinterpret_cast<std::uint64_t>(uniform_pages.bytes), 64);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+        const auto handle = recorder.finish();
+        const auto fence = backend->submit({&handle, 1});
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+        return fence;
+    };
+    const auto expect = [&](const TextureState& target, const std::array<std::uint8_t, 4>& rgba) {
+        std::array<std::byte, 64> pixels{};
+        TexelTransfer transfer{};
+        transfer.region = {0, 0, 0, 4, 4, 1};
+        transfer.row_stride = 16;
+        transfer.image_stride = 64;
+        CHECK(resources.read_texels(target, transfer, pixels.data()));
+        for (unsigned pixel = 0; pixel != 16; ++pixel)
+            expect_copied_pixel(reinterpret_cast<const std::uint8_t*>(pixels.data()) + pixel * 4,
+                rgba[0], rgba[1], rgba[2], rgba[3]);
+    };
+    const auto register_slot = [&](const TextureState* texture, bool image) {
+        std::array<GenericFunction, entry_count> entries;
+        for (std::size_t index = 0; index != entry_count; ++index)
+            entries[index] = implemented_entry(static_cast<Entry>(index));
+        const auto previous = backends();
+        register_resource_entries();
+        set_backends({&resources, backend.get()});
+        NVNtexturePool pool_object{};
+        std::memcpy(&pool_object, &descriptor_pool, sizeof descriptor_pool);
+        NVNtexture object{};
+        if (texture) {
+            auto tagged = *texture;
+            tagged.tag = 1;
+            object = texture_object(tagged);
+        }
+        if (image) load<Entry::nvnTexturePoolRegisterImage>()(&pool_object, 257, texture ? &object : nullptr, nullptr);
+        else load<Entry::nvnTexturePoolRegisterTexture>()(&pool_object, 257, texture ? &object : nullptr, nullptr);
+        set_backends(previous);
+        for (std::size_t index = 0; index != entry_count; ++index)
+            install_entry(static_cast<Entry>(index), entries[index]);
+    };
+    for (unsigned warmup = 0; warmup != 2; ++warmup) {
+        const auto fence = draw(old_target);
+        CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+    }
+    expect(old_color, red);
+    id<MTLSharedEvent> gate = mode == 2 ? [device newSharedEvent] : nil;
+    std::uint64_t old_fence = 0;
+    id<MTLBuffer> old_table = nil;
+    std::vector<std::byte> old_bytes;
+    if (gate) {
+        [queue waitForEvent:gate value:1];
+        old_fence = draw(old_target);
+        const bool ready = old_fence && pool_stats_ready(*backend, 3, 0);
+        CHECK(ready);
+        if (!ready) { gate.signaledValue = 1; return; }
+        old_table = backend->current_texture_pool_buffer();
+        old_bytes.resize(old_table.length);
+        std::memcpy(old_bytes.data(), old_table.contents, old_bytes.size());
+    }
+    replay::TextureReadIdentity before, empty, refill, other_before, other_after;
+    CHECK(resources.texture_read_identity(257, before));
+    CHECK(resources.texture_read_identity(258, other_before));
+    const auto empty_generation = resources.texture_empty_generation();
+    const auto pool_generation = resources.texture_pool_generation();
+    register_slot(nullptr, mode == 1);
+    CHECK(resources.texture_read_identity(257, empty));
+    CHECK(empty.descriptor_key == 0 && empty.serial == 0 && empty.storage_key == 0);
+    CHECK(empty.empty_epoch > before.empty_epoch && resources.texture_empty_generation() > empty_generation);
+    CHECK(resources.texture_pool_generation() == pool_generation);
+    register_slot(&second, mode != 1);
+    CHECK(resources.texture_read_identity(257, refill));
+    CHECK(refill.serial == second.serial && refill.empty_epoch == empty.empty_epoch);
+    CHECK(resources.texture_read_identity(258, other_after));
+    CHECK(other_after.empty_epoch == other_before.empty_epoch && other_after.serial == first.serial);
+    if (mode == 1) {
+        const auto first_note = resources.registration_log_generation();
+        SamplerParameters sampler{};
+        for (unsigned note = 0; note != 5000; ++note) {
+            sampler.max_anisotropy = 1.0f + float(note & 1);
+            resources.register_sampler_descriptor(299, sampler);
+        }
+        replay::Resources::RegistrationNote note;
+        CHECK(!resources.read_registration_note(first_note, note));
+    }
+    backend->finish_frame(0);
+    const auto cold = draw(cold_target);
+    if (gate) {
+        CHECK(cold && pool_stats_ready(*backend, 4, 0));
+        CHECK(std::memcmp(old_bytes.data(), old_table.contents, old_bytes.size()) == 0);
+        CHECK(!resources.texture_storage_made(257));
+        gate.signaledValue = 1;
+        CHECK(old_fence && backend->wait_fence(old_fence, 10'000'000'000ull));
+    }
+    CHECK(cold && backend->wait_fence(cold, 10'000'000'000ull));
+    CHECK(!resources.texture_storage_made(257));
+    expect(old_color, red);
+    expect(cold_color, black);
+    backend->finish_frame(0);
+    const auto read_again = draw(cold_target);
+    CHECK(read_again && backend->wait_fence(read_again, 10'000'000'000ull));
+    CHECK(resources.texture_storage_made(257));
+    expect(cold_color, green);
+    CHECK(!backend->last_error() && backend->statistics().skipped == 0);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+// Descriptor pool A, storage pool B. The first draw builds the table with the
+// texture. Releasing B, with no new registration, makes the next draw sample
+// the dummy. The encoded table from the first draw is left as it was.
+void test_texture_pool_released_storage(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    MappedPages descriptor_pages, storage_pages, color_pages, uniform_pages;
+    CHECK(descriptor_pages && storage_pages && color_pages && uniform_pages);
+    if (!descriptor_pages || !storage_pages || !color_pages || !uniform_pages) return;
+    replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
+    auto descriptors = registered_pool(resources, descriptor_pages);
+    auto storage = registered_pool(resources, storage_pages);
+    auto colors = registered_pool(resources, color_pages);
+    registered_pool(resources, uniform_pages);
+    DescriptorPoolState descriptor_pool{&descriptors, 0, 64};
+    CHECK(resources.register_texture_pool(descriptor_pool));
+    auto sampled = placed_texture(resources, storage, 9401, 0);
+    if (!sampled.size) return;
+    std::memset(sampled.memory, 0xc0, static_cast<std::size_t>(sampled.size));
+    resources.register_texture_descriptor(1, sampled, nullptr);
+    auto color = placed_texture(resources, colors, 9402, 0);
+    if (!color.size) return;
+    const std::uint32_t ids[]{1, 1, 1, 1};
+    std::memcpy(uniform_pages.bytes, ids, sizeof ids);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    CHECK(backend != nullptr);
+    if (!backend) return;
+    auto color_object = texture_object(color);
+    const NVNtexture* targets[]{&color_object};
+    const auto uniform = reinterpret_cast<std::uint64_t>(uniform_pages.bytes);
+    const NVNcopyRegion whole{0, 0, 0, 4, 4, 1};
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const NVNshaderData shaders[]{{120u, nullptr}, {120u, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+    const auto draw_pool = [&](std::uint64_t copy_at) {
+        const auto draws = backend->statistics().draws;
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, targets, nullptr, nullptr, nullptr);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, uniform, 64);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+        load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands, &color_object, nullptr, &whole, copy_at, 0);
+        const auto handle = recorder.finish();
+        const auto fence = backend->submit({&handle, 1});
+        CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+        CHECK(!backend->last_error());
+        CHECK(backend->statistics().draws == draws + 1);
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    };
+    draw_pool(uniform + 0x1000);
+    expect_copied_pixel(uniform_pages.bytes + 0x1000, 0xc0, 0xc0, 0xc0, 0xc0);
+    resources.release_pool(storage);
+    CHECK(resources.buffer_at(reinterpret_cast<std::uint64_t>(storage.memory), 64).buffer == nil);
+    draw_pool(uniform + 0x2000);
+    // The pool element is R32Float. Sampling the zero dummy fills the missing
+    // channels as (0, 0, 0, 1), which the colour target stores as 0,0,0,255.
+    expect_copied_pixel(uniform_pages.bytes + 0x2000, 0, 0, 0, 255);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
+// Pool-read an unwritten compressible target (dummy), pool-read again so the
+// seen bit is folded while storage is still absent, render into it, then
+// pool-read once more. The storage note from that first allocation is what
+// makes the last read sample the texture.
+void test_texture_pool_storage_after_seen_fold(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+    MappedPages storage_pages, color_pages, uniform_pages, descriptor_pages;
+    CHECK(storage_pages && color_pages && uniform_pages && descriptor_pages);
+    if (!storage_pages || !color_pages || !uniform_pages || !descriptor_pages) return;
+    replay::Resources resources(device, std::make_shared<replay::Metal4SubmissionOwner>(device, queue));
+    auto descriptors = registered_pool(resources, descriptor_pages);
+    auto storage = registered_pool(resources, storage_pages);
+    auto colors = registered_pool(resources, color_pages);
+    registered_pool(resources, uniform_pages);
+    DescriptorPoolState descriptor_pool{&descriptors, 0, 64};
+    CHECK(resources.register_texture_pool(descriptor_pool));
+    auto target = placed_texture(resources, storage, 9501, NVN_TEXTURE_FLAGS_COMPRESSIBLE);
+    auto color = placed_texture(resources, colors, 9502, 0);
+    if (!target.size || !color.size) return;
+    resources.register_texture_descriptor(1, target, nullptr);
+    const std::uint32_t ids[]{1, 1, 1, 1};
+    std::memcpy(uniform_pages.bytes, ids, sizeof ids);
+    auto backend = replay::create_replay_backend(device, queue, resources);
+    CHECK(backend != nullptr);
+    if (!backend) return;
+    auto color_object = texture_object(color);
+    auto target_object = texture_object(target);
+    const NVNtexture* color_targets[]{&color_object};
+    const NVNtexture* rendered[]{&target_object};
+    const auto uniform = reinterpret_cast<std::uint64_t>(uniform_pages.bytes);
+    const NVNcopyRegion whole{0, 0, 0, 4, 4, 1};
+    Recorder recorder;
+    NVNprogram program{};
+    CHECK(load<Entry::nvnProgramInitialize>()(&program, &recorder.device));
+    const auto pool_read = [&](std::uint64_t copy_at) {
+        const NVNshaderData shaders[]{{120u, nullptr}, {120u, nullptr}};
+        CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, shaders));
+        const auto draws = backend->statistics().draws;
+        load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+        load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, color_targets, nullptr, nullptr, nullptr);
+        load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        load<Entry::nvnCommandBufferBindUniformBuffer>()(&recorder.commands, NVN_SHADER_STAGE_FRAGMENT, 0, uniform, 64);
+        load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+        load<Entry::nvnCommandBufferCopyTextureToBuffer>()(&recorder.commands, &color_object, nullptr, &whole, copy_at, 0);
+        const auto handle = recorder.finish();
+        const auto fence = backend->submit({&handle, 1});
+        CHECK(fence && backend->wait_fence(fence, 10'000'000'000ull));
+        CHECK(!backend->last_error());
+        CHECK(backend->statistics().draws == draws + 1);
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, handle);
+    };
+    pool_read(uniform + 0x1000);
+    // Same R32Float dummy sample as the released-storage draw: (0, 0, 0, 1).
+    expect_copied_pixel(uniform_pages.bytes + 0x1000, 0, 0, 0, 255);
+    pool_read(uniform + 0x2000);
+    expect_copied_pixel(uniform_pages.bytes + 0x2000, 0, 0, 0, 255);
+    const NVNshaderData green[]{{1u, nullptr}, {1u, nullptr}};
+    CHECK(load<Entry::nvnProgramSetShaders>()(&program, 2, green));
+    const auto draws = backend->statistics().draws;
+    load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+    load<Entry::nvnCommandBufferSetRenderTargets>()(&recorder.commands, 1, rendered, nullptr, nullptr, nullptr);
+    load<Entry::nvnCommandBufferBindProgram>()(&recorder.commands, &program, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    load<Entry::nvnCommandBufferDrawArrays>()(&recorder.commands, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+    const auto rendered_handle = recorder.finish();
+    const auto rendered_fence = backend->submit({&rendered_handle, 1});
+    CHECK(rendered_fence && backend->wait_fence(rendered_fence, 10'000'000'000ull));
+    CHECK(!backend->last_error());
+    CHECK(backend->statistics().draws == draws + 1);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&recorder.device, rendered_handle);
+    pool_read(uniform + 0x3000);
+    expect_copied_pixel(uniform_pages.bytes + 0x3000, 0, 255, 0, 255);
+    load<Entry::nvnProgramFinalize>()(&program);
+    load<Entry::nvnCommandBufferFinalize>()(&recorder.commands);
+}
+
 } // namespace
 
 int main() {
@@ -8829,7 +17052,31 @@ int main() {
         }
         id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
         CHECK(queue != nil);
-        const auto library = build_library(R"msl(
+        if (std::getenv("ARMIGO_NVN_NATIVE_READBACK_TESTS")) {
+            select_api_version({55, 15});
+            register_command_entries();
+            test_native_readback_followup_progress(device, queue);
+            test_native_readback_followup_progress(device, [device newMTL4CommandQueue], true);
+            test_native_readback_followup_progress(device, [device newMTL4CommandQueue], false, 0, true);
+            for (unsigned failure = 1; failure != 4; ++failure)
+                test_native_readback_followup_progress(device, [device newMTL4CommandQueue], false, failure);
+            std::fprintf(stderr, "Metal native-readback contract failures: %u\n", failures);
+            return failures ? 1 : 0;
+        }
+        if (std::getenv("ARMIGO_NVN_NATIVE_ADMISSION_TESTS")) {
+            select_api_version({55,15}); register_command_entries();
+            test_native_consumer_admission(device,queue);
+            test_native_consumer_admission(device,[device newMTL4CommandQueue],true);
+            test_native_preinflight_failure(device);
+            test_native_capture_autorelease(device);
+            test_native_snapshot_supersession(device,false);
+            test_native_snapshot_supersession(device,true);
+            test_native_producer_result_isolation(device,false);
+            test_native_producer_result_isolation(device,true);
+            return failures?1:0;
+        }
+        const auto library = build_library(std::string("#include <metal_stdlib>\nusing namespace metal;\n") +
+            std::string(shader::pipeline::msl::custom_border_msl) + R"msl(
 #include <metal_stdlib>
 using namespace metal;
 struct RasterOut { float4 position [[position]]; };
@@ -8881,6 +17128,109 @@ fragment MrtFourth mrt_fourth() { return {float4(0, 0, 1, 1), float4(0, 1, 0, 1)
 fragment MrtLast mrt_last() { return {float4(0, 0, 1, 1), float4(0, 1, 0, 1)}; }
 struct MrtBoth { float4 separate [[color(0)]]; float4 first [[color(1)]]; float4 last [[color(2)]]; };
 fragment MrtBoth mrt_both() { return {float4(0, 0, 1, 1), float4(0, 1, 0, 1), float4(1, 0, 1, 1)}; }
+struct AttachmentFeedback { float4 written [[color(0)]]; float4 sampled [[color(1)]]; };
+fragment AttachmentFeedback attachment_feedback_fragment(texture2d<float> image [[texture(0)]]) {
+    constexpr sampler nearest(filter::nearest, address::clamp_to_edge);
+    return {float4(0, 1, 0, 1), image.sample(nearest, float2(0.5f))};
+}
+fragment AttachmentFeedback feedback_chain(texture2d<float, access::read> image [[texture(0)]]) {
+    return {float4(0, 1, 0, 1), float4(image.read(uint2(0), 0).r, image.read(uint2(0), 1).b, 0, 1)};
+}
+fragment AttachmentFeedback feedback_array(texture2d_array<float, access::read> image [[texture(0)]]) {
+    return {float4(0, 1, 0, 1), float4(image.read(uint2(0), 0, 0).r, image.read(uint2(0), 1, 1).b, 0, 1)};
+}
+fragment AttachmentFeedback feedback_cube(texturecube<float> image [[texture(0)]]) {
+    constexpr sampler nearest(filter::nearest, address::clamp_to_edge);
+    return {float4(0, 1, 0, 1), float4(image.sample(nearest, float3(1, 0, 0), level(0)).r,
+        image.sample(nearest, float3(-1, 0, 0), level(1)).b, 0, 1)};
+}
+fragment AttachmentFeedback feedback_cube_array(texturecube_array<float> image [[texture(0)]]) {
+    constexpr sampler nearest(filter::nearest, address::clamp_to_edge);
+    return {float4(0, 1, 0, 1), float4(image.sample(nearest, float3(1, 0, 0), 0, level(0)).r,
+        image.sample(nearest, float3(-1, 0, 0), 1, level(1)).b, 0, 1)};
+}
+fragment AttachmentFeedback attachment_feedback_lod(texture2d<float> image [[texture(0)]], sampler state [[sampler(0)]]) {
+    return {float4(0, 1, 0, 1), image.sample(state, float2(0.5f))};
+}
+fragment AttachmentFeedback attachment_feedback_image(texture2d<float, access::read> image [[texture(0)]]) {
+    return {float4(0, 1, 0, 1), image.read(uint2(2, 2))};
+}
+constant bool border_enabled_ [[function_constant(12)]];
+constant bool border_enabled = is_function_constant_defined(border_enabled_) ? border_enabled_ : true;
+fragment float4 coverage_border_fragment(float4 p [[position]], texture2d<float> image [[texture(0)]],
+                                         sampler state [[sampler(0)]],
+                                         const device ArmigoCustomBorder* support [[buffer(2)]]) {
+    const float u = p.x < 1 ? -2.f : p.x < 2 ? 0.f : p.x < 3 ? 0.5f : 1.f;
+    const float2 uv(u, 0.5f);
+    float4 color = image.sample(state, uv, level(0));
+    if (border_enabled && support[0].enabled)
+        color = armigo_custom_border(color, support[0].coverage.sample(state, uv, level(0)).x, support[0]);
+    return color;
+}
+fragment float4 coverage_border_1025(float4 p [[position]], texture2d<float> image [[texture(0)]],
+                                         sampler state [[sampler(0)]],
+                                         const device ArmigoCustomBorder* support [[buffer(2)]]) {
+    const float u = p.x < 1 ? -2.f : p.x < 2 ? 0.f : p.x < 3 ? 0.5f : 1.f;
+    const float2 uv(u, 0.5f);
+    float4 color = image.sample(state, uv, level(0));
+    if (border_enabled && support[1024].enabled)
+        color = armigo_custom_border(color, support[1024].coverage.sample(state, uv, level(0)).x, support[1024]);
+    return color;
+}
+fragment float4 coverage_border_4096(float4 p [[position]], texture2d<float> image [[texture(0)]],
+                                         sampler state [[sampler(0)]],
+                                         const device ArmigoCustomBorder* support [[buffer(2)]]) {
+    const float u = p.x < 1 ? -2.f : p.x < 2 ? 0.f : p.x < 3 ? 0.5f : 1.f;
+    const float2 uv(u, 0.5f);
+    float4 color = image.sample(state, uv, level(0));
+    if (border_enabled && support[4095].enabled)
+        color = armigo_custom_border(color, support[4095].coverage.sample(state, uv, level(0)).x, support[4095]);
+    return color;
+}
+fragment float4 coverage_border_lod(float4 p [[position]], texture2d<float> image [[texture(0)]],
+    sampler state [[sampler(0)]], const device ArmigoCustomBorder* support [[buffer(2)]]) {
+    const float2 uv(p.x < 1 ? -2.f : p.x < 2 ? 0.125f : p.x < 3 ? 0.5f : 1.f, 0.5f);
+    float4 color = image.sample(state, uv, level(1));
+    if (border_enabled && support[0].enabled)
+        color = armigo_custom_border(color, support[0].coverage.sample(state, uv, level(1)).x, support[0]);
+    return color;
+}
+fragment float4 coverage_border_grad(float4 p [[position]], texture2d<float> image [[texture(0)]],
+    sampler state [[sampler(0)]], const device ArmigoCustomBorder* support [[buffer(2)]]) {
+    const float2 uv(p.x < 1 ? -2.f : p.x < 2 ? 0.125f : p.x < 3 ? 0.5f : 1.f, 0.5f);
+    float4 color = image.sample(state, uv, gradient2d(float2(0.5f, 0), float2(0, 0.5f)));
+    if (border_enabled && support[0].enabled)
+        color = armigo_custom_border(color, support[0].coverage.sample(state, uv, gradient2d(float2(0.5f, 0), float2(0, 0.5f))).x, support[0]);
+    return color;
+}
+fragment float4 coverage_border_bias(float4 p [[position]], texture2d<float> image [[texture(0)]],
+    sampler state [[sampler(0)]], const device ArmigoCustomBorder* support [[buffer(2)]]) {
+    const float2 uv((p.x - 1.5f) * 0.25f + 0.125f, 0.5f);
+    float4 color = image.sample(state, uv, bias(1));
+    if (border_enabled && support[0].enabled)
+        color = armigo_custom_border(color, support[0].coverage.sample(state, uv, bias(1)).x, support[0]);
+    return color;
+}
+fragment float4 border_fragment(texture2d<float> image [[texture(0)]], sampler sample [[sampler(0)]]) {
+    return image.sample(sample, float2(-2.0f));
+}
+fragment float4 image_pixels_fragment(float4 position [[position]], texture2d<float, access::read> image [[texture(0)]]) {
+    return image.read(uint2(position.xy));
+}
+fragment float4 zero_float_fragment(texture2d<float, access::read> image [[texture(0)]]) { return float4(image.read(uint2(0)).rgb, 1); }
+fragment float4 zero_uint_fragment(texture2d<uint, access::read> image [[texture(0)]]) { return float4(float3(image.read(uint2(0)).rgb), 1); }
+fragment float4 zero_sint_fragment(texture2d<int, access::read> image [[texture(0)]]) { return float4(float3(image.read(uint2(0)).rgb), 1); }
+fragment float4 zero_depth_fragment(depth2d<float> image [[texture(0)]]) {
+    constexpr sampler comparison(compare_func::less, filter::nearest);
+    return float4(float3(image.sample_compare(comparison, float2(0.5f), 0.5f)), 1);
+}
+fragment float4 separate_fragment(float4 p [[position]], texture2d<float> image [[texture(0)]],
+                                  sampler first [[sampler(0)]], sampler second [[sampler(1)]],
+                                  constant uint* driver [[buffer(0)]]) {
+    if (driver[0x20 / 4] != 44u || driver[0x168 / 4] != 43u)
+        return float4(0, 0, 1, 1);
+    return p.x < 2.0f ? image.sample(first, float2(0.4f)) : image.sample(second, float2(0.4f));
+}
 fragment float4 sampled_fragment(texture2d<float> image [[texture(0)]], sampler sample [[sampler(0)]]) {
     return image.sample(sample, float2(0.5f));
 }
@@ -8915,9 +17265,25 @@ vertex RasterOut writer_vertex(uint vertex_id [[vertex_id]], device uint* output
     float2 positions[3] = {float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0)};
     return {float4(positions[vertex_id], 0.0, 1.0)};
 }
+struct DefaultPositionOut { float4 position [[position]]; float size [[point_size]]; };
+vertex DefaultPositionOut default_position_vertex(uint vertex_id [[vertex_id]], device atomic_uint* output [[buffer(0)]]) {
+    atomic_fetch_add_explicit(output, 1u, memory_order_relaxed);
+    return {float4(0,0,0,1),1};
+}
+vertex void default_position_vertex_discard(uint vertex_id [[vertex_id]], device atomic_uint* output [[buffer(0)]]) {
+    atomic_fetch_add_explicit(output, 1u, memory_order_relaxed);
+}
+vertex RasterOut attachmentless_vertex(uint vertex_id [[vertex_id]], device uint* output [[buffer(0)]]) {
+    output[vertex_id] = 16u + vertex_id;
+    float2 positions[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};
+    return {float4(positions[vertex_id], 0, 1)};
+}
 fragment float4 writer_fragment(device atomic_uint* output [[buffer(0)]]) {
     atomic_fetch_add_explicit(output, 1u, memory_order_relaxed);
     return float4(1, 0, 0, 1);
+}
+fragment float4 empty_descriptor_fragment(const device uint* input [[buffer(0)]]) {
+    return float4(float(input[0]), float(input[1]), 0.0f, 1.0f);
 }
 fragment float4 reader_fragment(const device uint* input [[buffer(0)]]) {
     return input[0] == 16u ? float4(0, 1, 0, 1) : float4(1, 0, 0, 1);
@@ -8925,7 +17291,58 @@ fragment float4 reader_fragment(const device uint* input [[buffer(0)]]) {
 fragment float4 depth_reader_fragment(depth2d<float, access::read> image [[texture(0)]]) {
     return image.read(uint2(1, 1)) == 0.0f ? float4(0, 1, 0, 1) : float4(1, 0, 0, 1);
 }
+fragment float4 depth_feedback_fragment(float4 position [[position]], depth2d<float, access::read> image [[texture(0)]],
+                                       device float* output [[buffer(0)]]) {
+    uint2 pixel = uint2(position.xy);
+    float value = image.read(pixel);
+    output[pixel.y * 4 + pixel.x] = value;
+    return float4(value, 0, 0, 1);
+}
+fragment float4 depth_kind_feedback_fragment(float4 position [[position]], depth2d<float, access::read> sampled [[texture(0)]],
+                                            depth2d<float, access::read> image [[texture(1)]], device float* output [[buffer(0)]]) {
+    uint2 pixel = uint2(position.xy);
+    float value = sampled.read(pixel) + image.read(pixel);
+    output[pixel.y * 4 + pixel.x] = value;
+    return float4(value, 0, 0, 1);
+}
+fragment float4 stencil_feedback_fragment(float4 position [[position]], texture2d<uint, access::read> stencil [[texture(0)]],
+                                         device uint* output [[buffer(0)]]) {
+    uint2 pixel = uint2(position.xy);
+    uint value = stencil.read(pixel).r;
+    output[pixel.y * 4 + pixel.x] = value;
+    return float4(float(value), 0, 0, 1);
+}
+fragment float4 mixed_depth_feedback_fragment(float4 position [[position]], texture2d<float, access::read> color [[texture(0)]],
+                                             depth2d<float, access::read> depth [[texture(1)]], device float2* output [[buffer(0)]]) {
+    uint2 pixel = uint2(position.xy);
+    output[pixel.y * 4 + pixel.x] = float2(color.read(pixel).r, depth.read(pixel));
+    return float4(0, 1, 0, 1);
+}
+fragment float4 publication_red_fragment() { return float4(1.0, 0.0, 0.0, 1.0); }
 fragment float4 synthetic_fragment() { return float4(0.0, 1.0, 0.0, 1.0); }
+fragment uint4 bc4_unorm_block() { return uint4(255, 0, 0, 0); }
+fragment uint4 bc4_snorm_block() { return uint4(127, 0, 0, 0); }
+constant bool required_y_negate [[function_constant(9)]];
+// An opposite optional default makes a missing specialization observable
+// independently of how the compiler treats an undefined function constant.
+constant bool required_y_value = is_function_constant_defined(required_y_negate) ? required_y_negate : true;
+fragment float4 required_y_direction(float4 position [[position]]) {
+    float y = required_y_value ? 4.0f - position.y : position.y;
+    return y < 2.0f ? float4(1,0,0,1) : float4(0,1,0,1);
+}
+fragment float4 pass_dump_fragment(constant float4& color [[buffer(0)]]) { return color; }
+struct PrefixOut { float4 position [[position]]; float4 color; };
+vertex PrefixOut prefix_vertex(uint id [[vertex_id]], constant uint* words [[buffer(0)]]) {
+    const float2 p[3] = {float2(-1,-1),float2(3,-1),float2(-1,3)};
+    return {float4(p[id],0,1),float4(0,0,float(words[0x560/4]&255u)/255.0f,1)};
+}
+fragment float4 prefix_fragment(PrefixOut in [[stage_in]], constant uint* words [[buffer(0)]]) {
+    return float4(float(words[6]&255u)/255.0f,float(words[7]&255u)/255.0f,
+                  in.color.b,float(words[8]&255u)/255.0f);
+}
+fragment float4 pass_dump_large_fragment(constant float4& tint [[buffer(0)]], const device uint* input [[buffer(1)]]) {
+    return input[2 * 1024 * 1024 / 4] == 0x5a5aa5a5u ? tint : float4(0,0,1,1);
+}
 fragment float4 height_fragment(constant uint* draw [[buffer(6)]]) {
     return float4(float(draw[1]) / 255.0, float(draw[0]) / 255.0, 0.0, 1.0);
 }
@@ -8970,11 +17387,46 @@ struct ColumnPayload { uint column; };
 }
 // Task and mesh stages read their storage tables from driver data (task at
 // 0x670, mesh at 0x770): entry 0 holds the bound buffer's address and size.
-[[mesh]] void table_mesh(ColumnMesh output, constant uint* driver [[buffer(0)]]) {
+[[mesh]] void retained_mesh(ColumnMesh output, constant uint* draw [[buffer(6)]],
+                            device uint* stored [[buffer(1)]], uint group [[threadgroup_position_in_grid]]) {
+    stored[0] = 0x100u + draw[0] + group;
+    emit_column(output, draw[0] + group);
+}
+[[mesh]] void publication_writer_mesh(ColumnMesh output, constant uint* draw [[buffer(6)]],
+                                      device uint* stored [[buffer(1)]]) {
+    stored[0] = 1;
+    emit_column(output, draw[0]);
+}
+[[mesh]] void retained_uniform_mesh(ColumnMesh output, constant uint* values [[buffer(0)]]) {
+    emit_column(output, values[0]);
+}
+vertex RasterOut retained_uniform_vertex(uint vertex_id [[vertex_id]], constant uint* values [[buffer(0)]]) {
+    const uint corners[6]{0, 1, 2, 2, 1, 3};
+    const uint corner = corners[vertex_id];
+    const float left = -1.0f + 0.5f * float(values[0]);
+    return {float4(left + ((corner & 1) ? 0.5f : 0.0f), (corner & 2) ? 1.0f : -1.0f, 0.0f, 1.0f)};
+}
+[[mesh]] void c1_mesh(ColumnMesh output, constant uint* draw [[buffer(6)]],
+                      device uint* stored [[buffer(1)]], constant uint* c1 [[buffer(2)]],
+                      uint group [[threadgroup_position_in_grid]]) {
+    stored[0] = c1[0];
+    emit_column(output, draw[0] + group);
+}
+[[object]] void c1_task(object_data ColumnPayload& payload [[payload]], mesh_grid_properties grid,
+                        constant uint* draw [[buffer(6)]], device uint* stored [[buffer(1)]],
+                        constant uint* c1 [[buffer(2)]], uint group [[threadgroup_position_in_grid]]) {
+    stored[0] = c1[0];
+    payload.column = draw[0] + group;
+    grid.set_threadgroups_per_grid(uint3(1, 1, 1));
+}
+[[mesh]] void table_mesh(ColumnMesh output, constant uint* driver [[buffer(0)]],
+                          device uint* stored [[buffer(1)]]) {
+    stored[0] = 0x11u;
     emit_column(output, driver[(0x770 + 8) / 4] == 64u && driver[0x770 / 4] != ~0u ? 2u : 0u);
 }
 [[object]] void table_task(object_data ColumnPayload& payload [[payload]], mesh_grid_properties grid,
-                           constant uint* driver [[buffer(0)]]) {
+                           constant uint* driver [[buffer(0)]], device uint* stored [[buffer(1)]]) {
+    stored[0] = 0x22u;
     payload.column = driver[(0x670 + 8) / 4] == 32u && driver[0x670 / 4] != ~0u ? 1u : 3u;
     grid.set_threadgroups_per_grid(uint3(1, 1, 1));
 }
@@ -8988,10 +17440,57 @@ kernel void layout_compute(device uint* output [[buffer(0)]], device uint* secon
     output[6] = driver[0x40 / 4];
     second[0] = 0xabcu;
 }
+// Image atomics on a 4x4 texture. The returned channel is the value present
+// before the operation; the other channels of the vector operand stay zero.
+kernel void atomic_or_image(texture2d<uint, access::read_write> image [[texture(0)]],
+                            uint2 id [[thread_position_in_grid]]) {
+    image.atomic_fetch_or(ushort2(id.x, id.y), uint4(0x80000000u, 0, 0, 0));
+}
+kernel void atomic_add_image(texture2d<uint, access::read_write> image [[texture(0)]],
+                             device uint* prior [[buffer(0)]],
+                             uint2 id [[thread_position_in_grid]]) {
+    prior[id.y * 4u + id.x] = image.atomic_fetch_add(ushort2(id.x, id.y), uint4(4u, 0, 0, 0)).x;
+}
+kernel void atomic_min_image(texture2d<int, access::read_write> image [[texture(0)]],
+                             device int* prior [[buffer(0)]],
+                             uint2 id [[thread_position_in_grid]]) {
+    prior[id.y * 4u + id.x] = image.atomic_fetch_min(ushort2(id.x, id.y), int4(-3, 0, 0, 0)).x;
+}
+// Ordinary image store at texel (0, 0) and an atomic or on every other texel.
+// The ordinary slot is texture(0) and is reflected first.
+kernel void mixed_image_atomic(texture2d<float, access::read_write> image [[texture(0)]],
+                               texture2d<uint, access::read_write> atomic_image [[texture(1)]],
+                               uint2 id [[thread_position_in_grid]]) {
+    if (id.x == 0u && id.y == 0u)
+        image.write(float4(0.0, 1.0, 0.0, 1.0), id);
+    else
+        atomic_image.atomic_fetch_or(ushort2(id.x, id.y), uint4(0x80000000u, 0, 0, 0));
+}
+struct AtomicSampleOut { float4 position [[position]]; float4 color; };
+vertex AtomicSampleOut atomic_sample_vertex(uint vertex_id [[vertex_id]],
+                                            texture2d<float> image [[texture(0)]]) {
+    float2 positions[3] = {float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0)};
+    return {float4(positions[vertex_id], 0.0, 1.0), image.read(uint2(0, 0))};
+}
+fragment float4 atomic_sample_fragment(AtomicSampleOut input [[stage_in]],
+                                      texture2d<uint, access::read_write> image [[texture(0)]]) {
+    image.atomic_fetch_or(ushort2(1, 0), uint4(0x80000000u, 0, 0, 0));
+    return input.color;
+}
 // Writes green into the storage image whose handle is the driver data's
 // first image (c0 + 0x10).
 kernel void image_compute(texture2d<float, access::write> image [[texture(0)]], uint2 id [[thread_position_in_grid]]) {
     image.write(float4(0.0, 1.0, 0.0, 1.0), id);
+}
+kernel void image_read_compute(texture2d<float, access::read> image [[texture(0)]], device uint* output [[buffer(0)]]) {
+    output[0] = as_type<uint>(image.read(uint2(0)).x);
+}
+fragment float4 bad_view_fragment(texture2d<uint, access::write> image [[texture(0)]]) {
+    image.write(uint4(0xff00ff00u), uint2(0));
+    return float4(0, 1, 0, 1);
+}
+kernel void bits_image_compute(texture2d<uint, access::write> image [[texture(0)]]) {
+    image.write(uint4(0xff00ff00u), uint2(0));
 }
 kernel void corner_image_compute(texture2d<float, access::write> image [[texture(0)]]) {
     image.write(float4(0.0, 1.0, 0.0, 1.0), uint2(0, 0));
@@ -9020,13 +17519,125 @@ kernel void guest_store_compute(device uint* table [[buffer(7)]], uint id [[thre
     // The write log after the table (byte 262176): entry 1's bit.
     atomic_fetch_or_explicit(reinterpret_cast<device atomic_uint*>(table + 65544), 2u, memory_order_relaxed);
 }
+// Byte 64 of entry 3 (words 32-39). Bit 3 of the write log is entry 3.
+kernel void guest_store_third(device uint* table [[buffer(7)]], uint id [[thread_position_in_grid]]) {
+    if (id != 0) return;
+    const ulong start = ulong(table[32]) | ulong(table[33]) << 32;
+    const ulong delta = ulong(table[36]) | ulong(table[37]) << 32;
+    *reinterpret_cast<device uint*>(start + delta + 64) = 0x77u;
+    atomic_fetch_or_explicit(reinterpret_cast<device atomic_uint*>(table + 65544), 8u, memory_order_relaxed);
+}
 kernel void guest_load_compute(device uint* output [[buffer(0)]], device uint* table [[buffer(7)]],
                                uint id [[thread_position_in_grid]]) {
     if (id == 0) output[0] = *guest_word(table);
 }
+// Looks up the guest address in params and stores 0x77 there, or records a
+// miss the way a raw global store does when the pool is not in the table.
+kernel void guest_store_raw(device uint* params [[buffer(0)]], device uint* table [[buffer(7)]],
+                            uint id [[thread_position_in_grid]]) {
+    if (id != 0u) return;
+    const ulong address = ulong(params[0]) | (ulong(params[1]) << 32);
+    const uint bytes = 4u;
+    if ((address & ulong(bytes - 1u)) == 0ul) {
+        device const uint* entries = table + 8;
+        const uint count = min(max(table[0], 1u), 8192u);
+        uint low = 1u, high = count;
+        while (low < high) {
+            const uint middle = (low + high) / 2u;
+            const ulong start = ulong(entries[middle * 8u]) | (ulong(entries[middle * 8u + 1u]) << 32u);
+            if (start <= address) low = middle + 1u;
+            else high = middle;
+        }
+        const uint found = low - 1u;
+        if (found != 0u && found < count) {
+            device const uint* entry = entries + found * 8u;
+            const ulong start = ulong(entry[0]) | (ulong(entry[1]) << 32u);
+            const ulong end = ulong(entry[2]) | (ulong(entry[3]) << 32u);
+            if (address >= start && address < end && ulong(bytes) <= end - address) {
+                device atomic_uint* log =
+                    reinterpret_cast<device atomic_uint*>(table + 65544u + found / 32u);
+                atomic_fetch_or_explicit(log, 1u << (found & 31u), memory_order_relaxed);
+                const ulong device_address = address + (ulong(entry[4]) | (ulong(entry[5]) << 32u));
+                *reinterpret_cast<device uint*>(device_address) = 0x77u;
+                return;
+            }
+        }
+    }
+    atomic_fetch_add_explicit(reinterpret_cast<device atomic_uint*>(table + 1), 1u, memory_order_relaxed);
+    if (atomic_exchange_explicit(reinterpret_cast<device atomic_uint*>(table + 5), 1u, memory_order_relaxed) == 0u) {
+        table[2] = 0x5706u;
+        table[3] = uint(address);
+        table[4] = uint(address >> 32u);
+    }
+}
 // Stores 1.0 into the green channel of the float4 at byte 0x200 of entry 1.
 kernel void guest_green_compute(device uint* table [[buffer(7)]], uint id [[thread_position_in_grid]]) {
     if (id == 0) guest_word(table)[(0x204 - 64) / 4] = 0x3f800000u;
+}
+struct ArmigoPool {
+    uint n;
+    uint reserved;
+    ulong seen;
+    array<texture2d<float>, 1> e;
+};
+struct ArmigoDepthPool {
+    uint n;
+    uint reserved;
+    ulong seen;
+    array<depth2d<float>, 1> e;
+};
+struct ArmigoArrayPool {
+    uint n;
+    uint reserved;
+    ulong seen;
+    array<texture2d_array<float>, 1> e;
+};
+struct ArmigoSamplerPool {
+    uint n;
+    uint reserved;
+    ulong seen;
+    array<sampler, 1> e;
+};
+uint armigo_pool_read(ulong seen, uint id, uint n) {
+    if (seen != 0 && id < n) {
+        device atomic_uint* word = reinterpret_cast<device atomic_uint*>(seen) + (id >> 5);
+        uint bit = 1u << (id & 31u);
+        if ((atomic_load_explicit(word, memory_order_relaxed) & bit) == 0u)
+            atomic_fetch_or_explicit(word, bit, memory_order_relaxed);
+    }
+    return min(id, n);
+}
+// A pool element controls the emitted column so stale tables change pixels.
+[[mesh]] void pool_mesh(ColumnMesh output, constant ArmigoPool& pool [[buffer(0)]]) {
+    emit_column(output, (&pool.e[0])[1].read(uint2(0)).x > 0.5f ? 0u : 3u);
+}
+[[object]] void pool_task(object_data ColumnPayload& payload [[payload]], mesh_grid_properties grid,
+                          constant ArmigoPool& pool [[buffer(0)]]) {
+    payload.column = (&pool.e[0])[1].read(uint2(0)).x > 0.5f ? 0u : 3u;
+    grid.set_threadgroups_per_grid(uint3(1, 1, 1));
+}
+fragment float4 pool_texture_fragment(constant ArmigoPool& pool [[buffer(0)]], constant uint* ids [[buffer(1)]],
+                                     float4 position [[position]]) {
+    constexpr sampler nearest(filter::nearest, address::clamp_to_edge);
+    const uint index = armigo_pool_read(pool.seen, ids[uint(position.x)], pool.n);
+    return (&pool.e[0])[index].sample(nearest, float2(0.5, 0.5));
+}
+fragment float4 pool_depth_fragment(constant ArmigoDepthPool& pool [[buffer(0)]], constant uint* ids [[buffer(1)]],
+                                   float4 position [[position]]) {
+    constexpr sampler nearest(filter::nearest, address::clamp_to_edge);
+    const uint index = armigo_pool_read(pool.seen, ids[uint(position.x)], pool.n);
+    return float4((&pool.e[0])[index].sample(nearest, float2(0.5, 0.5)), 0.0, 0.0, 1.0);
+}
+fragment float4 pool_array_fragment(constant ArmigoArrayPool& pool [[buffer(0)]], constant uint* ids [[buffer(1)]],
+                                   float4 position [[position]]) {
+    constexpr sampler nearest(filter::nearest, address::clamp_to_edge);
+    const uint index = armigo_pool_read(pool.seen, ids[uint(position.x)], pool.n);
+    return (&pool.e[0])[index].sample(nearest, float2(0.5, 0.5), 0u);
+}
+fragment float4 pool_sampler_fragment(constant ArmigoSamplerPool& pool [[buffer(0)]], constant uint* ids [[buffer(1)]],
+                                     texture2d<float> image [[texture(0)]], float4 position [[position]]) {
+    const uint index = min(ids[uint(position.x)], pool.n);
+    return image.sample((&pool.e[0])[index], float2(0.4, 0.4));
 }
 kernel void synthetic_compute(device uint* output [[buffer(0)]], uint id [[thread_position_in_grid]]) {
     output[id] = 10 + id;
@@ -9054,6 +17665,35 @@ vertex RasterOut fetch_vertex(uint vertex_id [[vertex_id]], uint instance_id [[i
             fragment->metallib = library;
             fragment->stage = shader_input::Stage::Fragment;
             fragment->entry_point = "synthetic_fragment";
+            auto api231_fragment = std::make_shared<platform::CompiledGraphicsStage>(*fragment);
+            api231_fragment->interface.color_output_mask = 0xf;
+            stages.api231_fragment = api231_fragment;
+            auto publication_red_fragment = std::make_shared<platform::CompiledGraphicsStage>(*api231_fragment);
+            publication_red_fragment->entry_point = "publication_red_fragment";
+            stages.publication_red_fragment = publication_red_fragment;
+            auto prefix_vertex = std::make_shared<platform::CompiledGraphicsStage>(*vertex);
+            prefix_vertex->entry_point = "prefix_vertex";
+            prefix_vertex->constant_buffer_windows.push_back({2, 0x564, 0});
+            auto prefix_fragment = std::make_shared<platform::CompiledGraphicsStage>(*fragment);
+            prefix_fragment->entry_point = "prefix_fragment";
+            prefix_fragment->interface.color_output_mask = 0xf;
+            prefix_fragment->constant_buffer_windows.push_back({2, 36, 0});
+            stages.prefix_vertex = prefix_vertex;
+            stages.prefix_fragment = prefix_fragment;
+            auto pass_dump_vertex = std::make_shared<platform::CompiledGraphicsStage>(*vertex);
+            pass_dump_vertex->identity = "pass-dump-vertex";
+            auto pass_dump_fragment = std::make_shared<platform::CompiledGraphicsStage>(*fragment);
+            pass_dump_fragment->entry_point = "pass_dump_fragment";
+            pass_dump_fragment->identity = "pass-dump-fragment";
+            pass_dump_fragment->constant_buffer_windows.push_back({3, 16, 0});
+            pass_dump_fragment->interface.color_output_mask = 0xfu;
+            stages.pass_dump_vertex = pass_dump_vertex;
+            stages.pass_dump_fragment = pass_dump_fragment;
+            auto large_dump = std::make_shared<platform::CompiledGraphicsStage>(*pass_dump_fragment);
+            large_dump->entry_point = "pass_dump_large_fragment";
+            large_dump->identity = "pass-dump-large";
+            large_dump->storage_buffers = {{0, 0x510, 1, platform::CompiledShaderResourceAccess::Read, 4}};
+            stages.pass_dump_large_fragment = large_dump;
             auto compute = std::make_shared<platform::CompiledGraphicsStage>();
             compute->metallib = library;
             compute->stage = shader_input::Stage::Compute;
@@ -9096,12 +17736,98 @@ vertex RasterOut fetch_vertex(uint vertex_id [[vertex_id]], uint instance_id [[i
             corner_image_compute->entry_point = "corner_image_compute";
             corner_image_compute->compute_local_size = {1, 1, 1};
             stages.corner_image_compute = corner_image_compute;
+            auto bits = std::make_shared<platform::CompiledGraphicsStage>(*corner_image_compute);
+            bits->entry_point = "bits_image_compute";
+            bits->resources[0].resource_id = 3;
+            bits->resources[0].texture_descriptor = platform::CompiledShaderTextureDescriptor{};
+            bits->resources[0].texture_descriptor->scalar = platform::CompiledShaderTextureScalar::u32;
+            stages.bits_image_compute = bits;
+            auto bad_compute = std::make_shared<platform::CompiledGraphicsStage>(*bits);
+            bad_compute->resources[0].cbuf_slot = 3;
+            bad_compute->resources[0].handle_byte_offset = 0;
+            stages.bad_view_compute = bad_compute;
+            auto read_compute = std::make_shared<platform::CompiledGraphicsStage>(*bad_compute);
+            read_compute->entry_point = "image_read_compute";
+            read_compute->resources[0].access = platform::CompiledShaderResourceAccess::Read;
+            read_compute->resources[0].texture_descriptor->scalar = platform::CompiledShaderTextureScalar::f32;
+            read_compute->constant_buffers.clear();
+            read_compute->constant_buffer_windows.clear();
+            read_compute->storage_buffers = {{0, 0x310, 0, platform::CompiledShaderResourceAccess::ReadWrite, 4}};
+            stages.image_read_compute = read_compute;
+            auto bad_fragment = std::make_shared<platform::CompiledGraphicsStage>(*fragment);
+            bad_fragment->entry_point = "bad_view_fragment";
+            bad_fragment->identity = "bad-view-fragment";
+            bad_fragment->resources = bad_compute->resources;
+            stages.bad_view_fragment = bad_fragment;
+            auto read_fragment = std::make_shared<platform::CompiledGraphicsStage>(*bad_fragment);
+            read_fragment->entry_point = "image_pixels_fragment";
+            read_fragment->identity = "image-read-fragment";
+            read_fragment->resources = read_compute->resources;
+            stages.image_read_fragment = read_fragment;
             auto image_fragment = std::make_shared<platform::CompiledGraphicsStage>(*fragment);
             image_fragment->entry_point = "image_fragment";
             image_fragment->resources = {image_resource};
             image_fragment->resources.front().cbuf_slot = 2;
             image_fragment->resources.front().handle_byte_offset = 0x20;
             stages.image_fragment = image_fragment;
+            const auto atomic_resource = [](bool is_signed, std::uint32_t handle) {
+                platform::CompiledShaderResource resource;
+                resource.array_length = resource.location.count = 1;
+                resource.cbuf_slot = 0;
+                resource.handle_byte_offset = handle;
+                resource.kind = platform::CompiledShaderResourceKind::StorageImage;
+                resource.access = platform::CompiledShaderResourceAccess::ReadWrite;
+                resource.atomic = true;
+                resource.normalized_coordinates = false;
+                platform::CompiledShaderTextureDescriptor descriptor;
+                descriptor.dimension = platform::CompiledShaderTextureDimension::d2;
+                descriptor.scalar = is_signed ? platform::CompiledShaderTextureScalar::s32
+                                              : platform::CompiledShaderTextureScalar::u32;
+                descriptor.component_format = is_signed
+                    ? platform::TextureComponentFormat::signed_integer
+                    : platform::TextureComponentFormat::unsigned_integer;
+                descriptor.normalized_coordinates = false;
+                resource.texture_descriptor = descriptor;
+                return resource;
+            };
+            auto atomic_or_compute = std::make_shared<platform::CompiledGraphicsStage>(*compute);
+            atomic_or_compute->entry_point = "atomic_or_image";
+            atomic_or_compute->compute_local_size = {4, 4, 1};
+            atomic_or_compute->storage_buffers.clear();
+            atomic_or_compute->resources = {atomic_resource(false, 0x10)};
+            stages.atomic_or_compute = atomic_or_compute;
+            auto atomic_add_compute = std::make_shared<platform::CompiledGraphicsStage>(*atomic_or_compute);
+            atomic_add_compute->entry_point = "atomic_add_image";
+            atomic_add_compute->resources = {atomic_resource(false, 0x20)};
+            atomic_add_compute->storage_buffers = {{0, 0x10, 0, platform::CompiledShaderResourceAccess::ReadWrite, 4}};
+            stages.atomic_add_compute = atomic_add_compute;
+            auto atomic_min_compute = std::make_shared<platform::CompiledGraphicsStage>(*atomic_add_compute);
+            atomic_min_compute->entry_point = "atomic_min_image";
+            atomic_min_compute->resources = {atomic_resource(true, 0x20)};
+            stages.atomic_min_compute = atomic_min_compute;
+            auto mixed_image_atomic = std::make_shared<platform::CompiledGraphicsStage>(*atomic_or_compute);
+            mixed_image_atomic->entry_point = "mixed_image_atomic";
+            auto stored_image = image_resource;
+            stored_image.access = platform::CompiledShaderResourceAccess::ReadWrite;
+            stored_image.resource_id = 0;
+            stored_image.location.first = 0;
+            stored_image.handle_byte_offset = 0x10;
+            auto atomic_slot = atomic_resource(false, 0x18);
+            atomic_slot.resource_id = 1;
+            atomic_slot.location.first = 1;
+            mixed_image_atomic->resources = {stored_image, atomic_slot};
+            stages.mixed_image_atomic_compute = mixed_image_atomic;
+            auto atomic_sample_vertex = std::make_shared<platform::CompiledGraphicsStage>(*vertex);
+            atomic_sample_vertex->entry_point = "atomic_sample_vertex";
+            atomic_sample_vertex->textures.push_back(
+                {0, 0, shader::graphics_msl::TextureBinding::no_sampler});
+            stages.atomic_sample_vertex = atomic_sample_vertex;
+            auto atomic_sample_fragment = std::make_shared<platform::CompiledGraphicsStage>(*fragment);
+            atomic_sample_fragment->entry_point = "atomic_sample_fragment";
+            atomic_sample_fragment->resources = {atomic_resource(false, 0)};
+            atomic_sample_fragment->resources[0].cbuf_slot = 2;
+            atomic_sample_fragment->resources[0].handle_byte_offset = 0x120;
+            stages.atomic_sample_fragment = atomic_sample_fragment;
             for (unsigned index = 0; index < stages.bit_vertices.size(); ++index) {
                 auto bits = std::make_shared<platform::CompiledGraphicsStage>(*vertex);
                 bits->entry_point = index ? "signed_bits_vertex" : "unsigned_bits_vertex";
@@ -9129,6 +17855,56 @@ vertex RasterOut fetch_vertex(uint vertex_id [[vertex_id]], uint instance_id [[i
             push_fragment->entry_point = "uniform_fragment";
             push_fragment->constant_buffer_windows.push_back({16, 16, 0});
             stages.push_fragment = push_fragment;
+            const auto pool_buffer = [](platform::CompiledShaderResourceKind kind,
+                                        std::optional<platform::TextureComponentFormat> component) {
+                platform::CompiledShaderResource resource;
+                resource.array_length = resource.location.count = 1;
+                resource.kind = kind;
+                resource.access = platform::CompiledShaderResourceAccess::Read;
+                resource.location.kind = platform::CompiledShaderResourceLocationKind::Direct;
+                resource.location.resource_namespace = platform::CompiledShaderResourceNamespace::Buffer;
+                resource.location.first = 0;
+                if (component) {
+                    platform::CompiledShaderTextureDescriptor descriptor;
+                    descriptor.dimension = platform::CompiledShaderTextureDimension::d2;
+                    descriptor.component_format = *component;
+                    resource.texture_descriptor = descriptor;
+                }
+                return resource;
+            };
+            auto pool_texture = std::make_shared<platform::CompiledGraphicsStage>(*fragment);
+            pool_texture->entry_point = "pool_texture_fragment";
+            pool_texture->constant_buffer_windows.push_back({3, 64, 1});
+            pool_texture->resources.push_back(pool_buffer(platform::CompiledShaderResourceKind::TexturePool,
+                                                          platform::TextureComponentFormat::floating));
+            stages.pool_texture_fragment = pool_texture;
+            auto pool_array = std::make_shared<platform::CompiledGraphicsStage>(*pool_texture);
+            pool_array->entry_point = "pool_array_fragment";
+            pool_array->resources[0].texture_descriptor->array = true;
+            stages.pool_array_fragment = pool_array;
+            auto pool_depth = std::make_shared<platform::CompiledGraphicsStage>(*pool_texture);
+            pool_depth->entry_point = "pool_depth_fragment";
+            pool_depth->resources = {pool_buffer(platform::CompiledShaderResourceKind::TexturePool,
+                                                 platform::TextureComponentFormat::depth)};
+            stages.pool_depth_fragment = pool_depth;
+            auto pool_sampler = std::make_shared<platform::CompiledGraphicsStage>(*pool_texture);
+            pool_sampler->entry_point = "pool_sampler_fragment";
+            // A keyed image and a sampler pool share one stage. The image is a
+            // direct texture resource; the pool occupies the buffer namespace.
+            platform::CompiledShaderResource sampled;
+            sampled.array_length = sampled.location.count = 1;
+            sampled.cbuf_slot = 2;
+            sampled.handle_byte_offset = 0x20;
+            sampled.kind = platform::CompiledShaderResourceKind::SampledTexture;
+            sampled.access = platform::CompiledShaderResourceAccess::Read;
+            sampled.location.kind = platform::CompiledShaderResourceLocationKind::Direct;
+            sampled.location.resource_namespace = platform::CompiledShaderResourceNamespace::Texture;
+            sampled.location.first = 0;
+            pool_sampler->resources = {
+                pool_buffer(platform::CompiledShaderResourceKind::SamplerPool, std::nullopt),
+                sampled,
+            };
+            stages.pool_sampler_fragment = pool_sampler;
             auto sampled_fragment = std::make_shared<platform::CompiledGraphicsStage>(*fragment);
             sampled_fragment->entry_point = "sampled_fragment";
             sampled_fragment->textures.push_back({0, 0, 0});
@@ -9164,10 +17940,14 @@ vertex RasterOut fetch_vertex(uint vertex_id [[vertex_id]], uint instance_id [[i
             platform::CompiledShaderResource program_resource;
             program_resource.array_length = program_resource.location.count = 1;
             program_resource.cbuf_slot = 31;
+            program_resource.texture_descriptor = platform::CompiledShaderTextureDescriptor{};
             program_resource.handle_byte_offset = 0;
             handle_program_fragment->resources.push_back(program_resource);
             handle_program_fragment->handle_programs = {{1u, 3u, 0x10u, 1u, 3u, 0x14u, 3u, 0x20u}};
             stages.handle_program_fragment = handle_program_fragment;
+            auto driver_handle_fragment = std::make_shared<platform::CompiledGraphicsStage>(*handle_program_fragment);
+            driver_handle_fragment->handle_programs = {{1u, 0u, 0x540u, 1u, 0u, 0x544u, 3u, 0x20u}};
+            stages.driver_handle_program_fragment = driver_handle_fragment;
             auto malformed_handle_fragment = std::make_shared<platform::CompiledGraphicsStage>(*handle_program_fragment);
             malformed_handle_fragment->handle_programs = {{}};
             stages.malformed_handle_fragment = malformed_handle_fragment;
@@ -9175,6 +17955,14 @@ vertex RasterOut fetch_vertex(uint vertex_id [[vertex_id]], uint instance_id [[i
             auto descriptor_fragment = std::make_shared<platform::CompiledGraphicsStage>(*reader_fragment);
             descriptor_fragment->storage_buffers = {{3, 0, 0, platform::CompiledShaderResourceAccess::Read, 4}};
             stages.descriptor_fragment = descriptor_fragment;
+            auto empty_read = std::make_shared<platform::CompiledGraphicsStage>(*descriptor_fragment);
+            empty_read->entry_point = "empty_descriptor_fragment";
+            stages.empty_descriptor_reader = empty_read;
+            auto empty_write = std::make_shared<platform::CompiledGraphicsStage>(*descriptor_fragment);
+            empty_write->entry_point = "writer_fragment";
+            empty_write->storage_buffers[0].access = platform::CompiledShaderResourceAccess::ReadWrite;
+            stages.empty_descriptor_writer = empty_write;
+
             auto tail_descriptor_fragment = std::make_shared<platform::CompiledGraphicsStage>(*descriptor_fragment);
             tail_descriptor_fragment->storage_buffers[0].descriptor_byte_offset = 16;
             stages.tail_descriptor_fragment = tail_descriptor_fragment;
@@ -9185,6 +17973,21 @@ vertex RasterOut fetch_vertex(uint vertex_id [[vertex_id]], uint instance_id [[i
             writer_vertex->storage_buffers.push_back({0, 0x110, 0,
                 platform::CompiledShaderResourceAccess::ReadWrite, 4});
             stages.writer_vertex = writer_vertex;
+            auto attachmentless = std::make_shared<platform::CompiledGraphicsStage>(*writer_vertex);
+            attachmentless->entry_point = "attachmentless_vertex";
+            stages.attachmentless_vertex = attachmentless;
+            auto default_position = std::make_shared<platform::CompiledGraphicsStage>(*writer_vertex);
+            default_position->entry_point = "default_position_vertex";
+            default_position->discard_entry_point = "default_position_vertex_discard";
+            default_position->writes_point_size = default_position->fixed_point_size = true;
+            stages.outputless_vertices[0] = default_position;
+            auto missing_discard = std::make_shared<platform::CompiledGraphicsStage>(*default_position);
+            missing_discard->discard_entry_point = "absent_discard_entry";
+            stages.outputless_vertices[1] = missing_discard;
+            auto legacy_void = std::make_shared<platform::CompiledGraphicsStage>(*writer_vertex);
+            legacy_void->entry_point = "default_position_vertex_discard";
+            legacy_void->requires_rasterizer_discard = true;
+            stages.outputless_vertices[2] = legacy_void;
             auto descriptor_writer_vertex = std::make_shared<platform::CompiledGraphicsStage>(*writer_vertex);
             descriptor_writer_vertex->entry_point = "descriptor_writer_vertex";
             descriptor_writer_vertex->constant_buffer_windows.push_back({3, 16, 1});
@@ -9230,6 +18033,136 @@ vertex RasterOut fetch_vertex(uint vertex_id [[vertex_id]], uint instance_id [[i
             green_mapped->color_outputs = {{0, 2, platform::ColorOutputScalar::f32, 4}};
             stages.green_mapped_fragment = green_mapped;
             stages.sampled_fragment = sampled_fragment;
+            for (unsigned variant = 0; variant != 4; ++variant) {
+                const unsigned slot = variant == 0 ? 0 : variant == 1 ? 10 : variant == 2 ? 128 : 255;
+                auto feedback = std::make_shared<platform::CompiledGraphicsStage>(*fragment);
+                feedback->entry_point = "attachment_feedback_fragment";
+                feedback->identity = "attachment-feedback-" + std::to_string(slot);
+                feedback->interface.color_output_mask = 0xff;
+                feedback->color_outputs = {{0, 15, platform::ColorOutputScalar::f32, 4},
+                                           {1, 15, platform::ColorOutputScalar::f32, 4}};
+                platform::CompiledShaderResource input;
+                input.kind = platform::CompiledShaderResourceKind::SampledTexture;
+                input.array_length = input.location.count = 1;
+                input.resource_id = 8;
+                input.cbuf_slot = 2;
+                input.handle_byte_offset = slot < 128 ? 0x20 + slot * 8 : 0x168 + (slot - 128) * 8;
+                input.location.kind = platform::CompiledShaderResourceLocationKind::Direct;
+                input.location.resource_namespace = platform::CompiledShaderResourceNamespace::Texture;
+                input.texture_descriptor = platform::CompiledShaderTextureDescriptor{};
+                feedback->resources = {input};
+                stages.attachment_feedback[variant] = feedback;
+            }
+            for (unsigned kind = 0; kind != 4; ++kind) {
+                auto feedback = std::make_shared<platform::CompiledGraphicsStage>(*stages.attachment_feedback[0]);
+                const char* functions[]{"feedback_chain", "feedback_array", "feedback_cube", "feedback_cube_array"};
+                feedback->entry_point = functions[kind];
+                feedback->identity = functions[kind];
+                feedback->resources[0].texture_descriptor->dimension = kind >= 2
+                    ? platform::CompiledShaderTextureDimension::cube : platform::CompiledShaderTextureDimension::d2;
+                feedback->resources[0].texture_descriptor->array = kind == 1 || kind == 3;
+                stages.attachment_feedback_views[kind] = feedback;
+            }
+            auto feedback_lod = std::make_shared<platform::CompiledGraphicsStage>(*stages.attachment_feedback[0]);
+            feedback_lod->entry_point = "attachment_feedback_lod";
+            feedback_lod->identity = "attachment-feedback-pinned-lod";
+            auto feedback_sampler = feedback_lod->resources.front();
+            feedback_sampler.kind = platform::CompiledShaderResourceKind::Sampler;
+            feedback_sampler.resource_id = 9;
+            feedback_sampler.location.resource_namespace = platform::CompiledShaderResourceNamespace::Sampler;
+            feedback_sampler.texture_descriptor.reset();
+            feedback_lod->resources.push_back(feedback_sampler);
+            stages.attachment_feedback_lod = feedback_lod;
+            auto feedback_image = std::make_shared<platform::CompiledGraphicsStage>(*stages.attachment_feedback[0]);
+            feedback_image->entry_point = "attachment_feedback_image";
+            feedback_image->identity = "attachment-feedback-image";
+            feedback_image->resources[0].kind = platform::CompiledShaderResourceKind::StorageImage;
+            feedback_image->resources[0].access = platform::CompiledShaderResourceAccess::Read;
+            feedback_image->resources[0].handle_byte_offset = 0x120;
+            stages.attachment_feedback_image = feedback_image;
+            auto border_fragment = std::make_shared<platform::CompiledGraphicsStage>(*sampled_fragment);
+            border_fragment->entry_point = "border_fragment";
+            stages.border_fragment = border_fragment;
+            auto coverage_border = std::make_shared<platform::CompiledGraphicsStage>(*border_fragment);
+            coverage_border->entry_point = "coverage_border_fragment";
+            coverage_border->identity = "coverage-border-fragment";
+            coverage_border->textures.clear();
+            platform::CompiledShaderResource coverage_texture;
+            coverage_texture.kind = platform::CompiledShaderResourceKind::SampledTexture;
+            coverage_texture.array_length = coverage_texture.location.count = 1;
+            coverage_texture.resource_id = 8; coverage_texture.cbuf_slot = 2;
+            coverage_texture.handle_byte_offset = 0x20;
+            coverage_texture.location.kind = platform::CompiledShaderResourceLocationKind::Direct;
+            coverage_texture.location.resource_namespace = platform::CompiledShaderResourceNamespace::Texture;
+            coverage_texture.texture_descriptor = platform::CompiledShaderTextureDescriptor{};
+            auto coverage_sampler = coverage_texture;
+            coverage_sampler.kind = platform::CompiledShaderResourceKind::Sampler;
+            coverage_sampler.resource_id = 9;
+            coverage_sampler.location.resource_namespace = platform::CompiledShaderResourceNamespace::Sampler;
+            coverage_sampler.texture_descriptor.reset();
+            coverage_border->resources = {coverage_texture, coverage_sampler};
+            coverage_border->custom_border = platform::CompiledCustomBorderSupport{2, {{8, 9}}};
+            stages.coverage_border_fragments[0] = coverage_border;
+            for (unsigned mode = 1; mode != 4; ++mode) {
+                auto alternate = std::make_shared<platform::CompiledGraphicsStage>(*coverage_border);
+                const char* names[]{"coverage_border_fragment", "coverage_border_lod", "coverage_border_grad", "coverage_border_bias"};
+                alternate->entry_point = names[mode]; alternate->identity = names[mode];
+                stages.coverage_border_fragments[mode] = alternate;
+            }
+
+
+            // Multiple resources may alias the same physical slots. The shader
+            // reads the last record, proving the entire admitted array is bound.
+            for (unsigned count : {1025u, 4096u}) {
+                auto large = std::make_shared<platform::CompiledGraphicsStage>(*coverage_border);
+                large->entry_point = "coverage_border_" + std::to_string(count);
+                large->identity = large->entry_point;
+                large->resources.clear(); large->custom_border->pairs.clear();
+                for (unsigned i = 0; i != count; ++i) {
+                    auto texture = coverage_texture; auto sampler = coverage_sampler;
+                    texture.resource_id = 2 * i; sampler.resource_id = 2 * i + 1;
+                    large->resources.push_back(texture); large->resources.push_back(sampler);
+                    large->custom_border->pairs.push_back({texture.resource_id, sampler.resource_id});
+                }
+                CHECK(platform::metal::valid_custom_border_pairs(*large));
+                stages.coverage_border_fragments[count == 1025 ? 4 : 5] = large;
+            }
+
+            auto pixels = std::make_shared<platform::CompiledGraphicsStage>(*sampled_fragment);
+            pixels->entry_point = "image_pixels_fragment";
+            pixels->identity = "image-pixels-fragment";
+            pixels->resources.erase(std::remove_if(pixels->resources.begin(), pixels->resources.end(), [](const auto& resource) {
+                return resource.kind == platform::CompiledShaderResourceKind::Sampler;
+            }), pixels->resources.end());
+            stages.image_pixels_fragment = pixels;
+            auto separate = std::make_shared<platform::CompiledGraphicsStage>(*fragment);
+            separate->entry_point = "separate_fragment";
+            separate->identity = "separate-fragment";
+            auto image_key = handle_resource;
+            image_key.cbuf_slot = 2; image_key.handle_byte_offset = 0x168;
+            auto first_sampler = image_key;
+            first_sampler.kind = platform::CompiledShaderResourceKind::Sampler;
+            first_sampler.handle_byte_offset = 0x568;
+            first_sampler.location.resource_namespace = platform::CompiledShaderResourceNamespace::Sampler;
+            auto second_sampler = first_sampler;
+            second_sampler.handle_byte_offset = 0x570; second_sampler.location.first = 1;
+            separate->resources = {image_key, first_sampler, second_sampler};
+            separate->constant_buffer_windows = {{2, 0x574, 0}};
+            stages.separate_fragment = separate;
+            for (unsigned kind = 0; kind != stages.zero_sample_fragments.size(); ++kind) {
+                auto zero = std::make_shared<platform::CompiledGraphicsStage>(*fragment);
+                zero->entry_point = kind < 2 || kind >= 5 ? "zero_float_fragment" : kind == 2 ? "zero_uint_fragment" : kind == 3 ? "zero_sint_fragment" : "zero_depth_fragment";
+                zero->identity = "zero-sampled-" + std::to_string(kind);
+                auto key = handle_resource;
+                key.resource_id = 3; key.cbuf_slot = kind == 0 ? 2 : 3; key.handle_byte_offset = kind == 0 ? 0x20 : 0;
+                key.texture_descriptor = platform::CompiledShaderTextureDescriptor{};
+                key.texture_descriptor->scalar = kind == 2 ? platform::CompiledShaderTextureScalar::u32 : kind == 3 ? platform::CompiledShaderTextureScalar::s32 : platform::CompiledShaderTextureScalar::f32;
+                key.texture_descriptor->comparison = kind == 4;
+                if (kind == 4) key.texture_descriptor->component_format = platform::TextureComponentFormat::depth;
+                zero->resources = {key}; stages.zero_sample_fragments[kind] = zero;
+            }
+
+
             auto mip_fragment = std::make_shared<platform::CompiledGraphicsStage>(*sampled_fragment);
             mip_fragment->entry_point = "mip_fragment";
             stages.mip_fragment = mip_fragment;
@@ -9246,6 +18179,49 @@ vertex RasterOut fetch_vertex(uint vertex_id [[vertex_id]], uint instance_id [[i
             depth_resource.handle_byte_offset = 0x20;
             reflected_depth_reader->resources.push_back(depth_resource);
             stages.depth_reader_fragments[1] = reflected_depth_reader;
+            for (unsigned variant = 0; variant != 2; ++variant) {
+                auto feedback = std::make_shared<platform::CompiledGraphicsStage>(*stages.depth_reader_fragments[variant]);
+                feedback->entry_point = "depth_feedback_fragment";
+                feedback->storage_buffers.push_back({0, 0x510, 0, platform::CompiledShaderResourceAccess::Write, 4});
+                stages.depth_feedback_fragments[variant] = feedback;
+            }
+            for (unsigned order = 0; order != 2; ++order) {
+                auto feedback = std::make_shared<platform::CompiledGraphicsStage>(*stages.depth_feedback_fragments[1]);
+                feedback->entry_point = "depth_kind_feedback_fragment";
+                auto sampled = feedback->resources.front();
+                sampled.kind = platform::CompiledShaderResourceKind::SampledTexture;
+                sampled.access = platform::CompiledShaderResourceAccess::Read;
+                sampled.location.kind = platform::CompiledShaderResourceLocationKind::Direct;
+                sampled.location.resource_namespace = platform::CompiledShaderResourceNamespace::Texture;
+                sampled.location.first = 0;
+                auto image = sampled;
+                image.kind = platform::CompiledShaderResourceKind::StorageImage;
+                image.handle_byte_offset = 0x120;
+                image.location.first = 1;
+                feedback->resources = order ? std::vector{image, sampled} : std::vector{sampled, image};
+                stages.depth_kind_fragments[order] = feedback;
+            }
+            auto stencil_feedback = std::make_shared<platform::CompiledGraphicsStage>(*stages.depth_feedback_fragments[0]);
+            stencil_feedback->entry_point = "stencil_feedback_fragment";
+            stages.stencil_feedback_fragment = stencil_feedback;
+            for (unsigned order = 0; order != 2; ++order) {
+                auto feedback = std::make_shared<platform::CompiledGraphicsStage>(*stages.depth_feedback_fragments[1]);
+                feedback->entry_point = "mixed_depth_feedback_fragment";
+                feedback->interface.color_output_mask = 0xf;
+                feedback->color_outputs = {{0, 15, platform::ColorOutputScalar::f32, 4}};
+                auto color = feedback->resources.front();
+                color.kind = platform::CompiledShaderResourceKind::SampledTexture;
+                color.access = platform::CompiledShaderResourceAccess::Read;
+                color.location.kind = platform::CompiledShaderResourceLocationKind::Direct;
+                color.location.resource_namespace = platform::CompiledShaderResourceNamespace::Texture;
+                color.location.first = 0;
+                auto depth = color;
+                depth.resource_id = 1;
+                depth.handle_byte_offset = 0x28;
+                depth.location.first = 1;
+                feedback->resources = order ? std::vector{depth, color} : std::vector{color, depth};
+                stages.mixed_depth_fragments[order] = feedback;
+            }
             stages.vertex = vertex;
             stages.fragment = fragment;
             stages.compute = compute;
@@ -9283,23 +18259,68 @@ vertex RasterOut fetch_vertex(uint vertex_id [[vertex_id]], uint instance_id [[i
             table_mesh->entry_point = "table_mesh";
             table_mesh->draw_support_buffer_index.reset();
             table_mesh->constant_buffer_windows.push_back({0, 0x780, 0});
+            table_mesh->storage_buffers.push_back({0, 0x770, 1, platform::CompiledShaderResourceAccess::Write, 4});
             stages.table_mesh = table_mesh;
+            auto retained_mesh = std::make_shared<platform::CompiledGraphicsStage>(*column_mesh);
+            retained_mesh->entry_point = "retained_mesh";
+            retained_mesh->storage_buffers.push_back({0, 0x770, 1, platform::CompiledShaderResourceAccess::Write, 4});
+            stages.retained_mesh = retained_mesh;
+            auto publication_writer_mesh = std::make_shared<platform::CompiledGraphicsStage>(*retained_mesh);
+            publication_writer_mesh->entry_point = "publication_writer_mesh";
+            stages.publication_writer_mesh = publication_writer_mesh;
+            auto retained_uniform_mesh = std::make_shared<platform::CompiledGraphicsStage>(*column_mesh);
+            retained_uniform_mesh->entry_point = "retained_uniform_mesh";
+            retained_uniform_mesh->draw_support_buffer_index.reset();
+            retained_uniform_mesh->constant_buffer_windows.push_back({3, 4, 0});
+            stages.retained_uniform_mesh = retained_uniform_mesh;
+            auto retained_uniform_vertex = std::make_shared<platform::CompiledGraphicsStage>(*vertex);
+            retained_uniform_vertex->entry_point = "retained_uniform_vertex";
+            retained_uniform_vertex->constant_buffer_windows.push_back({3, 4, 0});
+            stages.retained_uniform_vertex = retained_uniform_vertex;
+            auto c1_mesh = std::make_shared<platform::CompiledGraphicsStage>(*retained_mesh);
+            c1_mesh->entry_point = "c1_mesh";
+            c1_mesh->constant_buffer_windows.push_back({1, 4, 2});
+            stages.c1_mesh = c1_mesh;
+            auto c1_task = std::make_shared<platform::CompiledGraphicsStage>(*column_task);
+            c1_task->entry_point = "c1_task";
+            c1_task->storage_buffers.push_back({0, 0x670, 1, platform::CompiledShaderResourceAccess::Write, 4});
+            c1_task->constant_buffer_windows.push_back({1, 4, 2});
+            stages.c1_task = c1_task;
             auto table_task = std::make_shared<platform::CompiledGraphicsStage>(*column_task);
             table_task->entry_point = "table_task";
             table_task->draw_support_buffer_index.reset();
             table_task->constant_buffer_windows.push_back({0, 0x680, 0});
+            table_task->storage_buffers.push_back({0, 0x670, 1, platform::CompiledShaderResourceAccess::Write, 4});
             stages.table_task = table_task;
+            auto pool_mesh = std::make_shared<platform::CompiledGraphicsStage>(*column_mesh);
+            pool_mesh->entry_point = "pool_mesh";
+            pool_mesh->draw_support_buffer_index.reset();
+            pool_mesh->resources = stages.pool_texture_fragment->resources;
+            stages.pool_mesh = pool_mesh;
+            auto pool_task = std::make_shared<platform::CompiledGraphicsStage>(*column_task);
+            pool_task->entry_point = "pool_task";
+            pool_task->draw_support_buffer_index.reset();
+            pool_task->resources = stages.pool_texture_fragment->resources;
+            stages.pool_task = pool_task;
             auto guest_store_compute = std::make_shared<platform::CompiledGraphicsStage>(*compute);
             guest_store_compute->entry_point = "guest_store_compute";
             guest_store_compute->compute_local_size = {1, 1, 1};
             guest_store_compute->storage_buffers.clear();
             guest_store_compute->guest_memory = platform::CompiledGuestMemory{7, 0x5701};
             stages.guest_store_compute = guest_store_compute;
+            auto guest_store_third = std::make_shared<platform::CompiledGraphicsStage>(*guest_store_compute);
+            guest_store_third->entry_point = "guest_store_third";
+            guest_store_third->guest_memory = platform::CompiledGuestMemory{7, 0x5705};
+            stages.guest_store_third = guest_store_third;
             auto guest_load_compute = std::make_shared<platform::CompiledGraphicsStage>(*compute);
             guest_load_compute->entry_point = "guest_load_compute";
             guest_load_compute->compute_local_size = {1, 1, 1};
             guest_load_compute->guest_memory = platform::CompiledGuestMemory{7, 0x5702};
             stages.guest_load_compute = guest_load_compute;
+            auto guest_store_raw = std::make_shared<platform::CompiledGraphicsStage>(*guest_load_compute);
+            guest_store_raw->entry_point = "guest_store_raw";
+            guest_store_raw->guest_memory = platform::CompiledGuestMemory{7, 0x5706};
+            stages.guest_store_raw = guest_store_raw;
             auto guest_green_compute = std::make_shared<platform::CompiledGraphicsStage>(*guest_store_compute);
             guest_green_compute->entry_point = "guest_green_compute";
             guest_green_compute->guest_memory = platform::CompiledGuestMemory{7, 0x5703};
@@ -9311,6 +18332,107 @@ vertex RasterOut fetch_vertex(uint vertex_id [[vertex_id]], uint instance_id [[i
             select_api_version({55, 15});
             set_program_resolver(Stages::resolve, &stages);
             register_command_entries();
+            if (std::getenv("ARMIGO_NVN_REAL_EMPTY_TESTS")) {
+                for (unsigned mode = 0; mode != 3; ++mode) test_real_pool_empty_history(device, queue, mode);
+                set_program_resolver(nullptr, nullptr);
+                std::fprintf(stderr, "Metal real pool-empty contract failures: %u\n", failures);
+                return failures ? 1 : 0;
+            }
+            if (std::getenv("ARMIGO_NVN_POOL_EMPTY_TESTS")) {
+                test_texture_pool_first_read(device, queue, true, false);
+                test_texture_pool_first_read(device, queue, true, true);
+                test_pool_empty_with_queued_reader(device, queue);
+                test_texture_pool_first_read(device, queue, false, false, 1);
+                test_texture_pool_first_read(device, queue, false, false, 2);
+                test_real_pool_replacement(device, queue);
+                set_program_resolver(nullptr, nullptr);
+                std::fprintf(stderr, "Metal pool-empty contract failures: %u\n", failures);
+                return failures ? 1 : 0;
+            }
+            if (std::getenv("ARMIGO_NVN_DEPTH_FEEDBACK_REVIEW_TESTS")) {
+                test_depth_attachment_feedback_contracts(device, queue);
+                test_depth_feedback_review_contracts(device, queue);
+                set_program_resolver(nullptr, nullptr);
+                std::fprintf(stderr, "Metal depth-feedback review failures: %u\n", failures);
+                return failures ? 1 : 0;
+            }
+            if (std::getenv("ARMIGO_NVN_RETAINED_MESH_TESTS")) {
+                for (bool to_mesh : {false, true}) test_retained_mesh_uniform_overlap(device,queue,to_mesh);
+                test_program_publication_compute_branch(device,queue);
+                test_graphics_program_publication(device,queue,stages);
+                for (bool pending : {false, true}) test_mesh_publication_writer(device,queue,stages,pending);
+                test_mesh_route_rebind(device,queue);
+                test_retained_standalone_mesh(device,queue);
+                test_retained_mesh_routes(device,queue);
+                for (bool task : {false, true}) test_mesh_constants(device,queue,task);
+                set_program_resolver(nullptr,nullptr);
+                std::fprintf(stderr,"Metal retained mesh contract failures: %u\n",failures);
+                return failures ? 1 : 0;
+            }
+#if ARMIGO_HAS_NATIVE_SHADERS
+            if (std::getenv("ARMIGO_NVN_PROGRAM_CAPTURE_TESTS")) {
+                test_native_mesh_draws(device, queue, stages, false, 0, true);
+                test_native_mesh_draws(device, queue, stages, true, 16, false);
+                set_program_resolver(nullptr, nullptr);
+                std::fprintf(stderr, "Metal program capture contract failures: %u\n", failures);
+                return failures ? 1 : 0;
+            }
+#endif
+            if (std::getenv("ARMIGO_NVN_MESH_DIAGNOSTIC_TESTS")) {
+                test_missing_mesh_diagnostics(device,queue,false);
+                test_missing_mesh_diagnostics(device,queue,true);
+                set_program_resolver(nullptr,nullptr);
+                std::fprintf(stderr,"Metal mesh diagnostic contract failures: %u\n",failures);
+                return failures ? 1 : 0;
+            }
+            if (std::getenv("ARMIGO_NVN_OUTPUTLESS_TESTS")) {
+                for (unsigned mode=0;mode!=3;++mode) test_outputless_vertex_entries(device,queue,mode);
+                set_program_resolver(nullptr,nullptr);
+                std::fprintf(stderr,"Metal output-less entry contract failures: %u\n",failures);
+                return failures ? 1 : 0;
+            }
+            if (std::getenv("ARMIGO_NVN_ATTACHMENTLESS_TESTS")) {
+                for (unsigned mode = 0; mode != 4; ++mode) test_attachmentless_draws(device, queue, mode);
+                set_program_resolver(nullptr, nullptr);
+                std::fprintf(stderr, "Metal attachment-less contract failures: %u\n", failures);
+                return failures ? 1 : 0;
+            }
+            if (std::getenv("ARMIGO_NVN_POOL_REPLACEMENT_TESTS")) {
+                test_texture_pool_first_read(device, queue);
+                test_pool_read_identity_snapshot(device);
+                test_texture_pool_depth_break(device, queue);
+                set_program_resolver(nullptr, nullptr);
+                std::fprintf(stderr, "Metal pool-replacement contract failures: %u\n", failures);
+                return failures ? 1 : 0;
+            }
+            if (std::getenv("ARMIGO_NVN_FEEDBACK_VIEW_TESTS")) {
+                test_attachment_feedback_views(device, queue);
+                set_program_resolver(nullptr, nullptr);
+                std::fprintf(stderr, "Metal attachment feedback view failures: %u\n", failures);
+                return failures ? 1 : 0;
+            }
+            if (std::getenv("ARMIGO_NVN_BORDER_COVERAGE_TESTS")) {
+                test_custom_border_coverage(device, queue);
+                set_program_resolver(nullptr, nullptr);
+                std::fprintf(stderr, "Metal custom border coverage failures: %u\n", failures);
+                return failures ? 1 : 0;
+            }
+            if (std::getenv("ARMIGO_NVN_COLOUR_STORAGE_TESTS")) {
+                test_bc4_colour_alias(device, queue, stages);
+                test_attachment_feedback(device, queue);
+                test_attachment_feedback_views(device, queue);
+                test_depth_attachment_feedback_contracts(device, queue);
+                test_pass_dump_numeric(device, queue);
+                set_program_resolver(nullptr, nullptr);
+                std::fprintf(stderr, "Metal colour-storage contract failures: %u\n", failures);
+                return failures ? 1 : 0;
+            }
+            if (std::getenv("ARMIGO_NVN_DEPTH_FEEDBACK_TESTS")) {
+                test_depth_attachment_feedback_contracts(device, queue);
+                set_program_resolver(nullptr, nullptr);
+                std::fprintf(stderr, "Metal depth-feedback contract failures: %u\n", failures);
+                return failures ? 1 : 0;
+            }
             if (std::getenv("ARMIGO_NVN_UNUSED_COLOR_CONTRACT_TESTS")) {
                 test_unused_color_contract(device, queue);
                 set_program_resolver(nullptr, nullptr);
@@ -9343,6 +18465,15 @@ vertex RasterOut fetch_vertex(uint vertex_id [[vertex_id]], uint instance_id [[i
                 set_program_resolver(nullptr, nullptr);
                 return failures ? 1 : 0;
             }
+            if (std::getenv("ARMIGO_NVN_SAMPLER_SUBMISSION_TESTS")) {
+                test_sampler_registration_order(device, queue);
+                test_sampler_registration_order(device, queue, true);
+                test_sampler_registration_order(device, queue, true, true);
+                test_sampler_draw_order(device, queue);
+                set_program_resolver(nullptr, nullptr);
+                std::fprintf(stderr, "Metal sampler submission failures: %u\n", failures);
+                return failures ? 1 : 0;
+            }
             if (std::getenv("ARMIGO_NVN_DESCRIPTOR_ORDER_TESTS")) {
                 test_descriptor_write_order(device, queue);
                 set_program_resolver(nullptr, nullptr);
@@ -9357,6 +18488,27 @@ vertex RasterOut fetch_vertex(uint vertex_id [[vertex_id]], uint instance_id [[i
                 std::fprintf(stderr, "Metal batched query contract failures: %u\n", failures);
                 return failures ? 1 : 0;
             }
+            if (std::getenv("ARMIGO_NVN_EVENT_PREDECESSOR_TESTS")) {
+                for (const bool split : {false, true})
+                    for (const bool replay_reports : {false, true})
+                        for (const bool evaluated : {false, true})
+                            test_event_wait_after_publication(device, queue, split, replay_reports, evaluated);
+                for (const bool add : {false, true})
+                    for (const bool replay_reports : {false, true})
+                        for (const auto order : {EventWriterOrder::after_wait, EventWriterOrder::before_wait,
+                                                 EventWriterOrder::second_wait, EventWriterOrder::reversed_single, EventWriterOrder::reversed_second})
+                            test_event_wait_predecessor(device, queue, add, replay_reports, order);
+                set_program_resolver(nullptr, nullptr);
+                return failures ? 1 : 0;
+            }
+            if (std::getenv("ARMIGO_NVN_EVENT_RETIREMENT_TESTS")) {
+                for (const bool add : {false, true})
+                    for (const bool replay_reports : {false, true})
+                        for (const bool pulse : {false, true})
+                            test_event_retirement_publication(device, queue, add, replay_reports, pulse);
+                set_program_resolver(nullptr, nullptr);
+                return failures ? 1 : 0;
+            }
             if (std::getenv("ARMIGO_NVN_CONDITIONAL_CONTRACT_TESTS")) {
                 for (const auto which : {ConditionalContract::ordinary, ConditionalContract::occluded,
                         ConditionalContract::report_in_block, ConditionalContract::report_after_block,
@@ -9369,6 +18521,7 @@ vertex RasterOut fetch_vertex(uint vertex_id [[vertex_id]], uint instance_id [[i
                 // Also cover equality, reused addresses, cross-submission
                 // predicates, and the GPU ordering stress below.
             }
+            test_replay_conditional_render(device, queue);
             test_segmented_uniforms_and_effects(device, queue);
             test_stencil_clear_without_stencil(device, queue);
             test_depth_bounds_draw(device, queue);
@@ -9411,6 +18564,27 @@ vertex RasterOut fetch_vertex(uint vertex_id [[vertex_id]], uint instance_id [[i
             test_depth_barrier_continuation(device, queue, true, true);
             test_depth_barrier_continuation(device, queue, false, false, true);
             test_depth_barrier_continuation(device, queue, false, false, false, true);
+            test_texture_pool_ids(device, queue);
+            test_texture_pool_first_read(device, queue);
+            test_texture_pool_first_read(device, queue, true, false);
+            test_texture_pool_first_read(device, queue, true, true);
+            test_pool_empty_with_queued_reader(device, queue);
+            test_texture_pool_first_read(device, queue, false, false, 1);
+            test_texture_pool_first_read(device, queue, false, false, 2);
+            test_pool_read_identity_snapshot(device);
+            test_texture_pool_copy_on_write(device, queue);
+            test_texture_pool_patch(device, queue);
+            test_texture_pool_element_type(device, queue);
+            test_sampler_pool_filters(device, queue);
+            test_separate_resource_handles(device, queue);
+            test_zero_sampled_handles(device, queue);
+            test_texture_pool_depth_break(device, queue);
+            test_texture_pool_allocation_failure(device, queue);
+            test_texture_pool_residency_across_segment(device, queue);
+            test_texture_pool_released_storage(device, queue);
+            test_real_pool_replacement(device, queue);
+            for (unsigned mode = 0; mode != 3; ++mode) test_real_pool_empty_history(device, queue, mode);
+            test_texture_pool_storage_after_seen_fold(device, queue);
             test_binding_generations(device, queue);
             test_draw_write_order_and_submission_bindings(device, queue);
             test_submission_slot_reuse(device, queue);
@@ -9445,13 +18619,38 @@ vertex RasterOut fetch_vertex(uint vertex_id [[vertex_id]], uint instance_id [[i
             test_overlapping_uniform_update_order(device, queue);
             test_uniform_prefix_growth(device, queue);
             test_constant_window_bound(device, queue);
+            test_constant_window_zero_pad(device, queue, stages, false);
+            test_constant_window_zero_pad(device, queue, stages, true);
+            test_small_padded_window(device, queue, stages);
+#if ARMIGO_HAS_NATIVE_SHADERS
+            test_generated_proven_window(device, queue, stages);
+#endif
             test_conditional_clear_after_timestamp_report(device, queue);
             test_push_constant_block(device, queue);
+            test_fragment_y_specialization(device, queue, stages);
+            for (bool to_mesh : {false, true}) test_retained_mesh_uniform_overlap(device,queue,to_mesh);
+            test_program_publication_compute_branch(device,queue);
+            test_graphics_program_publication(device,queue,stages);
+            for (bool pending : {false, true}) test_mesh_publication_writer(device,queue,stages,pending);
+            test_mesh_route_rebind(device,queue);
+            test_retained_standalone_mesh(device,queue);
+            test_retained_mesh_routes(device,queue);
+            for (bool task : {false, true}) test_mesh_constants(device,queue,task);
             test_mesh_draw_skipped(device, queue);
             test_mesh_draws(device, queue);
+            test_mesh_record_batch(device, queue);
+            for (const bool texture_storage : {false, true})
+                test_mesh_record_exclusions(device, queue, texture_storage);
+            test_texture_prefix_api231(device, queue);
             test_mesh_storage_tables(device, queue);
+            test_mesh_storage_tables(device, queue, true);
+            for (const bool task : {false, true}) test_mesh_pool_refresh(device, queue, task);
 #if ARMIGO_HAS_NATIVE_SHADERS
-            for (const bool near_is_zero : {false, true}) test_native_mesh_draws(device, queue, stages, near_is_zero);
+            // The fragment reads a 16-byte vector through the pool pointer:
+            // a size-zero or four-byte descriptor does not truncate its pool.
+            for (const bool near_is_zero : {false, true}) for (const std::uint32_t bytes : {0u, 4u, 16u})
+                test_native_mesh_draws(device, queue, stages, near_is_zero, bytes, !near_is_zero && bytes == 0);
+            test_native_mesh_archive(device, queue, stages);
 #endif
             test_compute_driver_layout(device, queue);
             test_segment_timestamps(device, queue, false);
@@ -9460,13 +18659,64 @@ vertex RasterOut fetch_vertex(uint vertex_id [[vertex_id]], uint instance_id [[i
             test_relaxed_barrier_hazards(device, queue);
             test_segment_timestamp_order(device, queue);
             test_compute_driver_layout_limit(device, queue);
+            test_custom_border_pool_diagnostic(device);
+            test_custom_border_diagnostic(device, queue);
+            test_custom_border_coverage(device, queue);
+            test_native_consumer_admission(device, queue);
+            test_native_readback_followup_progress(device, [device newMTL4CommandQueue]);
+            test_native_readback_followup_progress(device, [device newMTL4CommandQueue], true);
+            test_native_readback_followup_progress(device, [device newMTL4CommandQueue], false, 0, true);
+            for (unsigned failure = 1; failure != 4; ++failure)
+                test_native_readback_followup_progress(device, [device newMTL4CommandQueue], false, failure);
+            test_native_consumer_admission(device,[device newMTL4CommandQueue],true);
+            test_native_preinflight_failure(device);
+            test_native_capture_autorelease(device);
+            test_native_snapshot_supersession(device,false);
+            test_native_snapshot_supersession(device,true);
+            test_native_producer_result_isolation(device,false);
+            test_native_producer_result_isolation(device,true);
+            test_native_capture_submission_order(device, queue);
+            for (const bool shutdown : {false, true})
+                test_native_capture_upload_wrap_shutdown(device, queue, shutdown);
+            test_real_upload_feedback_failure(device, queue);
+            test_bc4_colour_alias(device, queue, stages);
+            test_attachment_feedback(device, queue);
+            test_attachment_feedback_views(device, queue);
+            test_missing_mesh_diagnostics(device,queue,false);
+            test_missing_mesh_diagnostics(device,queue,true);
+            for (unsigned mode=0;mode!=3;++mode) test_outputless_vertex_entries(device,queue,mode);
+            for (unsigned mode = 0; mode != 4; ++mode) test_attachmentless_draws(device, queue, mode);
+            test_depth_attachment_feedback_contracts(device, queue);
+            test_depth_feedback_review_contracts(device, queue);
+            test_feedback_refresh_after_nondraw_write(device, queue);
+            test_image_atomics(device, queue);
             test_compute_storage_image(device, queue);
+            for (const int mode : {0, 1, 2, 3}) test_storage_image_format_view(device, queue, mode);
             test_storage_image_upgrade(device, queue);
+            test_image_resolution_errors(device, queue);
+            test_storage_descriptor_resolution_errors(device, queue);
+            for (int mode = 0; mode != 4; ++mode) test_storage_image_without_texture(device, queue, mode);
             test_storage_image_upgrade_after_sample(device, queue);
             test_cross_queue_event_waits(device, queue);
             test_held_queue_does_not_block_reads(device, queue);
             test_cpu_signal_value_is_latched(device, queue);
             test_event_waits_inside_submissions(device, queue);
+            test_event_wait_paths(device, queue);
+            for (const bool add : {false, true})
+                for (const bool replay_reports : {false, true})
+                    for (const bool pulse : {false, true})
+                        test_event_retirement_publication(device, queue, add, replay_reports, pulse);
+            for (const bool add : {false, true})
+                for (const bool replay_reports : {false, true})
+                    for (const auto order : {EventWriterOrder::after_wait, EventWriterOrder::before_wait,
+                                             EventWriterOrder::second_wait, EventWriterOrder::reversed_single, EventWriterOrder::reversed_second})
+                        test_event_wait_predecessor(device, queue, add, replay_reports, order);
+            for (const bool split : {false, true})
+                for (const bool replay_reports : {false, true})
+                    for (const bool evaluated : {false, true})
+                        test_event_wait_after_publication(device, queue, split, replay_reports, evaluated);
+            test_event_hold_release_at_encode(device, queue);
+            for (const unsigned kind : {0u, 1u, 2u}) test_gpu_profile(device, queue, kind);
             test_finalized_queue_state(device, queue);
             test_held_parts_beyond_slots(device, queue);
             test_sustained_hold(device, queue);
@@ -9489,9 +18739,11 @@ vertex RasterOut fetch_vertex(uint vertex_id [[vertex_id]], uint instance_id [[i
             test_guest_memory_table(device, queue);
             test_vertex_stream_beside_guest_table(device, queue);
             test_guest_memory_writers(device, queue);
+            test_unaddressed_guest_pool(device, queue);
             test_guest_memory_uniform_versions(device, queue);
             test_guest_write_log(device, queue);
             test_guest_write_consumers(device, queue);
+            test_learned_guest_writes(device, queue);
             test_graphics_base_instance(device, queue);
             test_vertex_fetch_misaligned(device, queue);
             test_vertex_input_bits(device, queue, false);
@@ -9501,12 +18753,20 @@ vertex RasterOut fetch_vertex(uint vertex_id [[vertex_id]], uint instance_id [[i
             test_handle_program_draws(device, queue);
             test_descriptor_write_order(device, queue);
             test_sampler_registration_order(device, queue);
+            test_sampler_registration_order(device, queue, true);
+            test_sampler_registration_order(device, queue, true, true);
             test_sampler_draw_order(device, queue);
             for (const bool level_one : {false, true}) {
                 test_mip_alias_reopened_pass(device, queue, level_one);
                 test_mip_alias_shared_subresource(device, queue, level_one);
             }
             test_resolve_and_partial_clear(device, queue);
+            test_pass_dump_numeric(device, queue);
+            test_pass_dump_clear(device, queue, false);
+            test_pass_dump_clear(device, queue, true);
+            test_pass_dump_metadata(device);
+            test_pass_dump_clear(device, queue, false, true);
+            test_pass_dump_clear(device, queue, true, false, true);
             set_program_resolver(nullptr, nullptr);
         }
     }

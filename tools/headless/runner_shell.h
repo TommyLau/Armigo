@@ -110,6 +110,12 @@ struct RunnerArguments {
     bool refresh_hz_explicit = false; // --refresh-hz always wins over player policy
 };
 
+// Applies explicit development-pack environment overrides. Relative paths are
+// resolved against the launch's original save directory. Production packs reject
+// these options; validation completes before any argument is changed.
+[[nodiscard]] runtime::LaunchStatus apply_development_run_options(
+    RunnerArguments& arguments, bool development_pack);
+
 struct ParsedRunArguments {
     bool ok = false;
     bool help = false;
@@ -162,6 +168,14 @@ void retain_runtime_until_process_exit(std::shared_ptr<runtime::ProcessRuntime> 
 // destroy those statics under them aborts the process. Call it once the report
 // is written; it returns normally when nothing was retained.
 void exit_process_if_runtime_retained(int exit_code);
+
+// The folder the shell extracts a --container input into when no cache
+// directory is given: it is the shell's own and is removed when the run ends,
+// just before a process with a retained runtime exits, at exit, and by a
+// detached watcher once the process is gone, so a killed run leaves nothing.
+// Empty when this process made none. A --cache directory is never removed.
+[[nodiscard]] std::filesystem::path owned_container_directory();
+void remove_owned_container_directory();
 
 struct ShellReport {
     runtime::RunResult result;

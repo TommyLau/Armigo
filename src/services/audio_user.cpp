@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/audio_user.h>
 #include <armigo/services/audio_out.h>
 
@@ -17,18 +18,8 @@ namespace armigo::services::audio_user {
 namespace {
 using namespace horizon;
 
-constexpr std::uint32_t sfco = 0x4f434653;
+using namespace horizon::cmif;
 
-std::uint32_t read(const IpcMessage& message, std::size_t offset) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i < 4; ++i)
-        value |= std::uint32_t(std::to_integer<unsigned char>(message[offset + i])) << (8 * i);
-    return value;
-}
-
-void write(IpcMessage& message, std::size_t offset, std::uint32_t value) {
-    for (unsigned i = 0; i < 4; ++i) message[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
-}
 } // namespace
 
 UserClientSession::UserClientSession(std::uint64_t process_id, audren::OutputFactory output_factory)

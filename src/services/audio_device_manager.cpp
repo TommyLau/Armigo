@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/audio_device_manager.h>
 
 #include <algorithm>
@@ -19,23 +20,14 @@ namespace armigo::services::auddmg {
 namespace {
 using namespace horizon;
 
-constexpr std::uint32_t sfco = 0x4f434653;
+using namespace horizon::cmif;
 constexpr std::string_view device_name = "AudioVirtualOutput0";
 constexpr std::string_view physical_device_name = "AudioTvOutput";
 // Sample types of a stream: 16-bit integer and 32-bit float PCM.
 constexpr std::uint32_t sample_pcm_int16 = 2;
 constexpr std::uint32_t sample_pcm_float = 5;
 
-std::uint32_t read(const IpcMessage& message, std::size_t offset) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i < 4; ++i)
-        value |= std::uint32_t(std::to_integer<unsigned char>(message[offset + i])) << (8 * i);
-    return value;
-}
 
-void write(IpcMessage& message, std::size_t offset, std::uint32_t value) {
-    for (unsigned i = 0; i < 4; ++i) message[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
-}
 
 void put(std::span<std::byte> block, std::size_t offset, std::uint64_t value, unsigned width) {
     for (unsigned i = 0; i < width; ++i) block[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);

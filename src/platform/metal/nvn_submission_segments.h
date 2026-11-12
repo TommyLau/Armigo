@@ -17,7 +17,7 @@ namespace armigo::platform::metal::nvn_driver {
 // A submission is committed in segments at render-pass boundaries once `draws`
 // draws were encoded since the last cut, while fewer than `inflight` segments
 // are on the GPU. Cutting after every pass that drew keeps the GPU fed while
-// the rest of the submission encodes; for title 01007EF00011E000 it ran 27%
+// the rest of the submission encodes; for the first acceptance workload it ran 27%
 // faster uncapped than 16-draw segments.
 struct SegmentPolicy {
     std::uint64_t draws = 1;

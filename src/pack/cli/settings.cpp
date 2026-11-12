@@ -10,6 +10,7 @@
 
 #include "settings.h"
 
+#include <algorithm>
 #include <charconv>
 #include <cstdio>
 #include <cstdlib>
@@ -68,9 +69,11 @@ std::variant<std::string, std::array<std::byte, 32>> read_nso_build_id(
     return build_id;
 }
 
-std::variant<std::string, TitleMatch> match_title_build(
-    std::uint64_t title_id, const std::array<std::byte, 32>& build_id,
-    const std::filesystem::path& executable) {
+namespace {
+
+// titles/<TitleID>/ under the title root, or why there is none.
+std::variant<std::string, std::filesystem::path> title_folder(std::uint64_t title_id,
+                                                             const std::filesystem::path& executable) {
     char identity_text[17];
     std::snprintf(identity_text, sizeof identity_text, "%016llX",
                   static_cast<unsigned long long>(title_id));
@@ -78,7 +81,7 @@ std::variant<std::string, TitleMatch> match_title_build(
     std::filesystem::path root;
     if (const char* override_root = std::getenv("ARMIGO_TITLES"); override_root && *override_root) {
         if (std::string_view(override_root) == "off") {
-            return "Title settings are turned off.";
+            return std::string("Title settings are turned off.");
         }
         root = override_root;
     } else {
@@ -87,8 +90,36 @@ std::variant<std::string, TitleMatch> match_title_build(
     const auto folder = root / identity;
     std::error_code error;
     if (!std::filesystem::is_directory(folder, error)) {
-        return "No title settings for " + identity + ".";
+        return std::string("No title settings for " + identity + ".");
     }
+    return folder;
+}
+
+} // namespace
+
+std::string check_title_platform(std::uint64_t title_id, const std::string& platform,
+                                 const std::filesystem::path& executable) {
+    const auto found = title_folder(title_id, executable);
+    if (std::holds_alternative<std::string>(found)) return {};
+    const auto& folder = std::get<std::filesystem::path>(found);
+    auto read = compat::read_title_settings(folder, title_id);
+    if (std::holds_alternative<std::string>(read)) return {};
+    std::string listed;
+    for (const auto& patch : std::get<compat::TitleSettings>(read).patches) {
+        if (std::find(patch.platforms.begin(), patch.platforms.end(), platform) != patch.platforms.end()) return {};
+        for (const auto& name : patch.platforms)
+            if (listed.find(name) == std::string::npos) listed += (listed.empty() ? "" : ", ") + name;
+    }
+    return "Title " + folder.filename().string() + " does not support packing for " + platform +
+        "; its title settings (" + (folder / "profile.json").string() + ") list " + listed + ".";
+}
+
+std::variant<std::string, TitleMatch> match_title_build(
+    std::uint64_t title_id, const std::array<std::byte, 32>& build_id,
+    const std::filesystem::path& executable) {
+    const auto found = title_folder(title_id, executable);
+    if (const auto* failure = std::get_if<std::string>(&found)) return *failure;
+    const auto& folder = std::get<std::filesystem::path>(found);
     auto read = compat::read_title_settings(folder, title_id);
     if (auto* failure = std::get_if<std::string>(&read)) {
         return std::move(*failure);

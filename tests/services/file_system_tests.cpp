@@ -12,7 +12,13 @@
 #include <armigo/services/addon_content_catalog.h>
 #include <armigo/services/file_system.h>
 
+#include <mach/mach.h>
+#include <sys/clonefile.h>
+#include <dlfcn.h>
+
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <unistd.h>
@@ -23,6 +29,24 @@
 #include <memory>
 #include <span>
 #include <vector>
+
+namespace {
+std::atomic<int> forced_clone_error{0};
+std::atomic<unsigned> clone_attempts{0};
+}
+
+// Exercise real host clones and specific OS failure returns through the service.
+extern "C" int clonefile(const char* source, const char* destination, std::uint32_t flags) {
+    clone_attempts.fetch_add(1);
+    if (const auto error = forced_clone_error.load()) {
+        errno = error;
+        return -1;
+    }
+    using Function = int (*)(const char*, const char*, std::uint32_t);
+    static const auto original = reinterpret_cast<Function>(dlsym(RTLD_NEXT, "clonefile"));
+    if (!original) { errno = ENOSYS; return -1; }
+    return original(source, destination, flags);
+}
 
 namespace {
 using namespace armigo::horizon;
@@ -616,6 +640,202 @@ void test_save_data(bool loaded = false) {
     CHECK(send() == IpcDisposition::unsupported);
 }
 
+// Direct buffered requests exercise file behavior independently of descriptor packing.
+struct SaveClient {
+    FileSystemServiceSession session{71, 0};
+    IpcMessage message{};
+    std::array<std::byte, 2048> memory{};
+    GuestBuffers buffers;
+    std::uint32_t mount = 0;
+    SaveClient() : buffers(
+        [](void* raw, std::uint64_t at, std::span<std::byte> out) noexcept {
+            auto& bytes = static_cast<SaveClient*>(raw)->memory;
+            if (at > bytes.size() || out.size() > bytes.size() - at) return false;
+            std::memcpy(out.data(), bytes.data() + at, out.size()); return true;
+        },
+        [](void* raw, std::uint64_t at, std::span<const std::byte> in) noexcept {
+            auto& bytes = static_cast<SaveClient*>(raw)->memory;
+            if (at > bytes.size() || in.size() > bytes.size() - at) return false;
+            std::memcpy(bytes.data() + at, in.data(), in.size()); return true;
+        }, this) {
+        buffers.add({0, 1024, true, true});
+        buffers.add({512, 512, true, true});
+        CHECK(session.request(control(0), 71).disposition == IpcDisposition::handled);
+        prepare(1, 51);
+        auto reply = session.request(message, 71);
+        CHECK(reply.disposition == IpcDisposition::handled);
+        mount = static_cast<std::uint32_t>(get(reply.bytes, 48));
+        CHECK(mount >= 2);
+    }
+    void prepare(std::uint32_t object, std::uint32_t command) {
+        message.fill(std::byte{});
+        put(message, 0, 6); put(message, 4, 30);
+        put(message, 16, 0x00580001); put(message, 20, object);
+        put(message, 32, 0x49434653); put(message, 36, 1); put(message, 40, command);
+    }
+    void paths(const char* first, const char* second = "") {
+        memory.fill(std::byte{});
+        std::memcpy(memory.data(), first, std::strlen(first));
+        std::memcpy(memory.data() + 512, second, std::strlen(second));
+    }
+    IpcReply send() { return session.request_with_buffers(message, 71, buffers); }
+    std::uint32_t open(const char* path) {
+        paths(path); prepare(mount, 8); auto reply = send();
+        CHECK(reply.disposition == IpcDisposition::handled);
+        return static_cast<std::uint32_t>(get(reply.bytes, 48));
+    }
+    std::uint64_t size(std::uint32_t file) {
+        prepare(file, 4); auto reply = send(); CHECK(reply.disposition == IpcDisposition::handled);
+        return get(reply.bytes, 48, 8);
+    }
+    void read(std::uint32_t file, std::uint64_t offset, std::uint64_t count) {
+        memory.fill(std::byte{}); prepare(file, 0);
+        put(message, 56, offset, 8); put(message, 64, count, 8);
+        CHECK(send().disposition == IpcDisposition::handled);
+    }
+    void commit() { prepare(mount, 10); CHECK(send().disposition == IpcDisposition::handled); }
+};
+
+std::uint64_t physical_footprint() {
+    task_vm_info_data_t info{};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    CHECK(task_info(mach_task_self(), TASK_VM_INFO,
+                   reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS);
+    return info.phys_footprint;
+}
+
+// A multi-GiB sparse tree must mount without reading any unrelated payload.
+// This test never commits or opens those files, so disk use stays bounded.
+void test_save_mount_is_metadata_only() {
+    const auto root = std::filesystem::temp_directory_path() /
+        ("armigo-save-lazy-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root / "nested");
+    for (unsigned index = 0; index < 96; ++index) {
+        std::ofstream file(root / "nested" / std::to_string(index), std::ios::binary);
+        file.seekp((32u << 20) - 1); file.put('Z');
+    }
+    armigo::services::fs::set_host_save_directory(root);
+    const auto before = physical_footprint();
+    {
+        SaveClient client;
+        const auto after = physical_footprint();
+        CHECK(after <= before + (32u << 20));
+    }
+    armigo::services::fs::set_host_save_directory({});
+    std::filesystem::remove_all(root);
+}
+
+// Untouched payloads survive commit, rename and a second commit; opened
+// aliases retain their contents after rename/delete and tree replacement.
+void test_lazy_save_roundtrip() {
+    const auto root = std::filesystem::temp_directory_path() /
+        ("armigo-save-roundtrip-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root / "nested");
+    std::ofstream(root / "opened", std::ios::binary) << "ABCDEFGH";
+    std::ofstream(root / "nested/unopened", std::ios::binary) << "retained payload";
+    std::ofstream(root / "untouched", std::ios::binary) << "second commit";
+    armigo::services::fs::set_host_save_directory(root);
+    {
+        SaveClient client;
+        client.paths("nested"); client.prepare(client.mount, 9);
+        const auto directory_reply = client.send();
+        CHECK(directory_reply.disposition == IpcDisposition::handled);
+        const auto directory = static_cast<std::uint32_t>(get(directory_reply.bytes, 48));
+        client.prepare(directory, 0);
+        CHECK(client.send().disposition == IpcDisposition::handled);
+        std::uint64_t listed_size = 0;
+        for (unsigned byte = 0; byte < 8; ++byte)
+            listed_size |= std::uint64_t(std::to_integer<unsigned>(client.memory[0x308 + byte])) << (byte * 8);
+        CHECK(listed_size == 16);
+        const auto file = client.open("opened");
+        CHECK(client.size(file) == 8);
+        client.read(file, 2, 3);
+        CHECK(std::memcmp(client.memory.data(), "CDE", 3) == 0);
+        client.paths("opened", "renamed"); client.prepare(client.mount, 5);
+        CHECK(client.send().disposition == IpcDisposition::handled);
+        client.read(file, 0, 8);
+        CHECK(std::memcmp(client.memory.data(), "ABCDEFGH", 8) == 0);
+        client.memory[0] = std::byte{'X'}; client.prepare(file, 1);
+        put(client.message, 56, 3, 8); put(client.message, 64, 1, 8);
+        CHECK(client.send().disposition == IpcDisposition::handled);
+        client.paths("nested", "moved"); client.prepare(client.mount, 6);
+        CHECK(client.send().disposition == IpcDisposition::handled);
+        client.commit();
+        client.commit();
+        const auto untouched = client.open("moved/unopened");
+        CHECK(client.size(untouched) == 16);
+        client.read(untouched, 9, 7);
+        CHECK(std::memcmp(client.memory.data(), "payload", 7) == 0);
+        client.prepare(file, 3); put(client.message, 48, 5, 8);
+        CHECK(client.send().disposition == IpcDisposition::handled);
+        client.commit();
+        client.paths("renamed"); client.prepare(client.mount, 1);
+        CHECK(client.send().disposition == IpcDisposition::handled);
+        client.commit();
+        client.read(file, 0, 5);
+        CHECK(std::memcmp(client.memory.data(), "ABCXE", 5) == 0);
+        CHECK(!std::filesystem::exists(root / "renamed"));
+    }
+    {
+        SaveClient client;
+        const auto file = client.open("untouched");
+        client.read(file, 0, 13);
+        CHECK(std::memcmp(client.memory.data(), "second commit", 13) == 0);
+    }
+    // Missing host backing is an explicit failure, never an empty opened file.
+    {
+        SaveClient client;
+        std::filesystem::remove(root / "untouched");
+        client.paths("untouched"); client.prepare(client.mount, 8);
+        CHECK(client.send().disposition == IpcDisposition::unsupported);
+        CHECK(std::string(client.session.diagnostic()).find("backing") != std::string::npos);
+        client.prepare(client.mount, 10);
+        CHECK(client.send().disposition == IpcDisposition::unsupported);
+        CHECK(std::filesystem::is_regular_file(root / "moved/unopened"));
+    }
+    armigo::services::fs::set_host_save_directory({});
+    std::filesystem::remove_all(root);
+    std::filesystem::remove_all(std::filesystem::path(root).concat(".commit"));
+}
+
+// Actual permission, I/O, space and collision failures must not turn into
+// payload copies; only unavailable or cross-filesystem clones allow copying.
+void test_unopened_save_clone_failures() {
+    const auto root = std::filesystem::temp_directory_path() /
+        ("armigo-save-clone-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    std::ofstream(root / "untouched", std::ios::binary) << "original payload";
+    armigo::services::fs::set_host_save_directory(root);
+    {
+        SaveClient client;
+        for (const auto error : {EACCES, EIO, ENOSPC, EEXIST}) {
+            forced_clone_error.store(error);
+            client.prepare(client.mount, 10);
+            CHECK(client.send().disposition == IpcDisposition::unsupported);
+            std::ifstream source(root / "untouched", std::ios::binary);
+            CHECK(std::string(std::istreambuf_iterator<char>(source), {}) == "original payload");
+            CHECK(!std::filesystem::exists(std::filesystem::path(root).concat(".previous")));
+        }
+        for (const auto error : {ENOTSUP, EXDEV, ENOSYS}) {
+            forced_clone_error.store(error);
+            client.commit();
+        }
+        forced_clone_error.store(0);
+        const auto before = clone_attempts.load();
+        client.commit();
+        CHECK(clone_attempts.load() > before);
+        const auto file = client.open("untouched");
+        client.read(file, 0, 16);
+        CHECK(std::memcmp(client.memory.data(), "original payload", 16) == 0);
+    }
+    forced_clone_error.store(0);
+    armigo::services::fs::set_host_save_directory({});
+    std::filesystem::remove_all(root);
+}
+
 // With a host save directory a commit writes the tree to disk and a later
 // mount reads it back.
 void test_save_data_persists() {
@@ -902,6 +1122,9 @@ int main() {
     test_cloned_session_storage_read();
     test_save_data();
     test_save_data_persists();
+    test_save_mount_is_metadata_only();
+    test_lazy_save_roundtrip();
+    test_unopened_save_clone_failures();
     test_save_directory_trailing_separator();
     test_save_recovery_after_interrupted_commit();
     test_large_storage_read();

@@ -9,6 +9,7 @@
 // ============================================================================
 
 #include "bundle.h"
+#include <armigo/pack/dependency_notices.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -122,9 +123,13 @@ std::string strings_escape(std::string_view text) {
 } // namespace
 
 std::string info_plist(const BundleSpec& spec) {
-    const auto display = xml_escape(spec.display_name);
-    const auto name = xml_escape(spec.bundle_name);
+    // Finder only localizes an app whose raw display name matches its file stem.
+    const auto display = xml_escape(spec.platform == "ios" ? spec.display_name : spec.file_name);
+    const auto name = xml_escape(spec.display_name);
+    const auto localizations = app_localizations(spec);
+    const auto region = localizations.empty() ? std::string{} : xml_escape(localizations.front().first);
     const auto identifier = xml_escape(spec.bundle_identifier);
+    const auto executable = xml_escape(spec.executable_name);
     std::string supported_rates = "<key>SupportedRates</key><array>";
     for (const auto rate : spec.supported_frame_rates)
         supported_rates += "<integer>" + std::to_string(rate) + "</integer>";
@@ -142,12 +147,16 @@ std::string info_plist(const BundleSpec& spec) {
             "</integer><key>DisplayRefresh</key><integer>" +
             std::to_string(spec.display_refresh_rate) + "</integer>" + supported_rates + experimental_rates + "</dict>\n"
         : std::string{};
+    const std::string development = spec.development || spec.development_metal_hud
+        ? "<key>ArmigoDevelopmentPack</key><true/>\n" : "";
     if (spec.platform == "ios") {
+        const std::string metal_hud = spec.development_metal_hud
+            ? "<key>ArmigoDevelopmentMetalHud</key><true/>\n" : "";
         return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
                "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
                "<plist version=\"1.0\"><dict>\n"
-               "<key>CFBundleDevelopmentRegion</key><string>en</string>\n" + bundle_localizations(spec) +
-               "<key>CFBundleExecutable</key><string>ArmigoPlayer</string>\n"
+               "<key>CFBundleDevelopmentRegion</key><string>" + region + "</string>\n" + bundle_localizations(spec) +
+               "<key>CFBundleExecutable</key><string>" + executable + "</string>\n" +
                "<key>CFBundleIdentifier</key><string>" + identifier + "</string>\n"
                "<key>CFBundleName</key><string>" + name + "</string>\n"
                "<key>CFBundleDisplayName</key><string>" + display + "</string>\n"
@@ -171,7 +180,7 @@ std::string info_plist(const BundleSpec& spec) {
                "<key>GCSupportedGameControllers</key><array><dict><key>ProfileName</key><string>ExtendedGamepad</string></dict></array>\n"
                "<key>CFBundleIconName</key><string>AppIcon</string>\n"
                "<key>CFBundleIconFiles</key><array><string>AppIcon</string></array>\n"
-               "<key>UIFileSharingEnabled</key><true/>\n"
+               "<key>UIFileSharingEnabled</key><true/>\n" + development + metal_hud +
                "</dict></plist>\n";
     }
     return std::string(
@@ -181,13 +190,13 @@ std::string info_plist(const BundleSpec& spec) {
                "<plist version=\"1.0\">\n"
                "<dict>\n"
                "    <key>CFBundleDevelopmentRegion</key>\n"
-               "    <string>en</string>\n"
+               "    <string>") + region + "</string>\n" + std::string(
                "    <key>CFBundleExecutable</key>\n"
-               "    <string>Armigo</string>\n"
+               "    <string>") + executable + "</string>\n" + std::string(
                "    <key>CFBundleIdentifier</key>\n"
                "    <string>") +
            identifier +
-           "</string>\n" + bundle_localizations(spec) + frame_rate +
+           "</string>\n" + bundle_localizations(spec) + frame_rate + development +
            "    <key>CFBundleInfoDictionaryVersion</key>\n"
            "    <string>6.0</string>\n"
            "    <key>CFBundleName</key>\n"
@@ -226,7 +235,11 @@ std::string info_plist(const BundleSpec& spec) {
            "</plist>\n";
 }
 
-std::string settings_bundle(const BundleSpec&) {
+std::string settings_bundle(const BundleSpec& spec) {
+    const std::string development = spec.development_metal_hud
+        ? "<dict><key>Type</key><string>PSToggleSwitchSpecifier</string><key>Title</key>"
+          "<string>Metal Performance HUD</string><key>Key</key><string>development_metal_hud</string>"
+          "<key>DefaultValue</key><true/></dict>\n" : "";
     return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
         "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
         "<plist version=\"1.0\"><dict>\n"
@@ -251,7 +264,7 @@ std::string settings_bundle(const BundleSpec&) {
         "<key>FooterText</key><string>Game language follows this app's language in system Settings. "
         "Changes take effect the next time the game starts.</string></dict>\n"
         "<dict><key>Type</key><string>PSToggleSwitchSpecifier</string><key>Title</key><string>Performance Overlay</string>"
-        "<key>Key</key><string>performance_overlay</string><key>DefaultValue</key><false/></dict>\n"
+        "<key>Key</key><string>performance_overlay</string><key>DefaultValue</key><false/></dict>\n" + development +
         "</array></dict></plist>\n";
 }
 
@@ -315,6 +328,10 @@ bool write_localized_names(const BundleSpec& spec, const std::filesystem::path& 
 
 std::variant<std::string, std::filesystem::path> assemble_application(const BundleSpec& spec) {
     std::error_code error;
+    if (spec.executable_name.empty() || spec.executable_name.find_first_not_of(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-") != std::string::npos) {
+        return std::string("The packed executable name must contain only ASCII letters, digits or hyphens.");
+    }
     if (spec.icon.empty()) {
         return std::string("The title has no icon.");
     }
@@ -338,6 +355,8 @@ std::variant<std::string, std::filesystem::path> assemble_application(const Bund
     if (error) {
         return "Cannot create " + title.string() + ".";
     }
+    std::filesystem::create_directories(armigo / "licenses", error);
+    if (error) return std::string("Cannot create the dependency license directory.");
     if (ios) {
         std::filesystem::create_directories(resources / "Settings.bundle", error);
         if (error) return std::string("Cannot create the iOS Settings bundle.");
@@ -346,6 +365,8 @@ std::variant<std::string, std::filesystem::path> assemble_application(const Bund
     if (!write_file(contents / "Info.plist", info_plist(spec), write_error) ||
         !write_file(armigo / "pack.json", pack_json(spec), write_error) ||
         !write_file(armigo / "languages.txt", language_manifest(spec), write_error) ||
+        !write_file(armigo / "licenses" / "Opus.txt", opus_notice, write_error) ||
+        !write_file(armigo / "licenses" / "Zstandard.txt", zstd_notice, write_error) ||
         (ios && !write_file(resources / "Settings.bundle" / "Root.plist", settings_bundle(spec), write_error)) ||
         !write_localized_names(spec, resources, write_error) ||
         !write_file(resources / (ios ? "AppIcon.png" : "AppIcon.icns"),
@@ -363,7 +384,7 @@ std::variant<std::string, std::filesystem::path> assemble_application(const Bund
         "</dict></plist>\n", write_error)) {
         return write_error;
     }
-    const auto executable = executable_directory / (ios ? "ArmigoPlayer" : "Armigo");
+    const auto executable = executable_directory / spec.executable_name;
     std::filesystem::copy_file(spec.player, executable, std::filesystem::copy_options::overwrite_existing,
                                error);
     if (error) {

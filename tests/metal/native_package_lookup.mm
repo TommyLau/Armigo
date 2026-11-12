@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <random>
 #include <vector>
+#include <tuple>
 
 namespace {
 namespace sn = armigo::shader_native;
@@ -118,6 +119,57 @@ int main() {
         const auto& artifact = std::get<pl::MslArtifact>(translated);
         const auto reflection = armigo::platform::metal::native_stage_reflection(artifact, emission, pl::Stage::fragment, program.image);
         const std::vector<std::byte> library = bytes_of("packaged-metal-library");
+
+        // A direct driver storage binding needs no GPU constant-buffer
+        // window. Its validated host-binding fact remains in the package.
+        {
+            auto pair = sn::test::raw(0xb82);
+            for (auto [at, width, value] : {std::tuple{16u, 8u, 8u}, {24u, 8u, 255u}, {54u, 5u, 0u},
+                                          {38u, 16u, 0x510u}, {73u, 3u, 5u}}) sn::test::field(pair, at, width, value);
+            auto load = sn::test::raw(0x381);
+            for (auto [at, width, value] : {std::tuple{16u, 8u, 0u}, {24u, 8u, 8u}, {72u, 1u, 1u},
+                                          {73u, 3u, 6u}, {77u, 4u, 5u}, {81u, 3u, 7u}}) sn::test::field(load, at, width, value);
+            Fixture direct_fixture({pair, load, sn::test::exit_instruction()}); put(direct_fixture.code, 0x48, 0xf);
+            const auto direct_program = direct_fixture.program();
+            auto direct_translation = sn::translate_native(direct_program, options);
+            CHECK(std::holds_alternative<pl::MslArtifact>(direct_translation));
+            if (!std::holds_alternative<pl::MslArtifact>(direct_translation)) return 1;
+            const auto& direct = std::get<pl::MslArtifact>(direct_translation);
+            CHECK(direct.source.find("armigo_guest_address") == std::string::npos);
+            CHECK(direct.reflection.resources.size() == 1 &&
+                  std::holds_alternative<pl::StorageBufferSource>(std::get<pl::BufferUse>(direct.reflection.resources[0].use).source));
+            const auto metadata = armigo::platform::metal::native_stage_reflection(
+                direct, emission, pl::Stage::fragment, direct_program.image);
+            sn::NativeStageWrite direct_stage;
+            direct_stage.stage_identity = direct_program.stage_identity; direct_stage.stage = sn::NativeStageKind::fragment;
+            direct_stage.program.assign(direct_program.image.begin(), direct_program.image.end());
+            sn::NativeVariantWrite direct_variant;
+            direct_variant.depth = sn::NativeDepth::stage; direct_variant.source = direct.source;
+            direct_variant.reflection = bytes_of(metadata); direct_variant.library = library;
+            direct_stage.variants.push_back(std::move(direct_variant));
+            TemporaryDirectory direct_directory;
+            auto direct_writer = sn::NativeSectionWriter::create(direct_directory.path);
+            CHECK(std::holds_alternative<sn::NativeSectionWriter>(direct_writer));
+            if (!std::holds_alternative<sn::NativeSectionWriter>(direct_writer)) return 1;
+            const auto accepted = std::get<sn::NativeSectionWriter>(direct_writer).add(direct_stage);
+            if (const auto* failure = std::get_if<std::string>(&accepted)) std::fprintf(stderr, "direct storage add: %s\n", failure->c_str());
+            CHECK(std::holds_alternative<std::monostate>(accepted));
+            const auto parsed = armigo::platform::make_source_stage(armigo::shader_input::Stage::Fragment,
+                direct_program.image, bytes_of(metadata), direct.source);
+            if (const auto* error = std::get_if<armigo::platform::MetalShaderPackageError>(&parsed))
+                std::fprintf(stderr, "direct storage reflection: %s\n", error->detail.c_str());
+            CHECK(std::holds_alternative<std::shared_ptr<const armigo::platform::CompiledGraphicsStage>>(parsed));
+            if (const auto* stage = std::get_if<std::shared_ptr<const armigo::platform::CompiledGraphicsStage>>(&parsed)) {
+                CHECK((*stage)->storage_buffers.size() == 1);
+                if (!(*stage)->storage_buffers.empty()) CHECK((*stage)->storage_buffers[0].pool_pointer);
+            }
+            auto invalid = metadata;
+            const auto fact = invalid.find("bound_storage_descriptor");
+            CHECK(fact != std::string::npos);
+            if (fact != std::string::npos) invalid.replace(fact, std::string_view("bound_storage_descriptor").size(), "negate_y");
+            CHECK(std::holds_alternative<armigo::platform::MetalShaderPackageError>(armigo::platform::make_source_stage(
+                armigo::shader_input::Stage::Fragment, direct_program.image, bytes_of(invalid), direct.source)));
+        }
 
         // The same mesh program, translated as the run-time path translates it
         // and stored for both depth conventions.

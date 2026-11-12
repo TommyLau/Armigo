@@ -332,6 +332,7 @@ struct Allocation : std::enable_shared_from_this<Allocation> {
         extent.slices = mip.depth;
         extent.gob_block_height_log2 = mip.gob_block_height_log2;
         extent.gob_block_depth_log2 = mip.gob_block_depth_log2;
+        extent.gob_order = layout.gob_order;
         const std::size_t block_height = std::size_t{1} << mip.gob_block_height_log2;
         const std::size_t block_depth = std::size_t{1} << mip.gob_block_depth_log2;
         const std::size_t robs_y =

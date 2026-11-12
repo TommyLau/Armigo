@@ -17,6 +17,9 @@
 #include "../translation/stage_fixture.h"
 
 #include <array>
+#include <cerrno>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -30,6 +33,8 @@
 #include <unistd.h>
 #include <variant>
 #include <vector>
+
+extern char** environ;
 
 namespace {
 
@@ -214,6 +219,20 @@ void test_identity_and_cache(Fixture& fixture) {
     if (const auto* report = std::get_if<package::IosBuildReport>(&built)) CHECK(report->converted_stages == 2);
     const std::string macos_manifest = read(fixture.macos / "manifest.json");
     const std::string ios_manifest = read(options.output / "manifest.json");
+    // The player and packer use one synthetic translator, SDK and tool set.
+    // Compare their real canonical profiles and generated admission header.
+    std::array<std::string, 4> parity_arguments{ARMIGO_TEST_PYTHON, ARMIGO_IOS_CHAIN_PARITY_SCRIPT,
+        (fixture.bin / "translate").string(), (options.output / "manifest.json").string()};
+    std::array<char*, 5> parity_argv{parity_arguments[0].data(), parity_arguments[1].data(),
+        parity_arguments[2].data(), parity_arguments[3].data(), nullptr};
+    pid_t child = 0;
+    const int spawned = ::posix_spawn(&child, parity_argv[0], nullptr, nullptr, parity_argv.data(), environ);
+    CHECK(spawned == 0);
+    if (spawned == 0) {
+        int status = 0; pid_t observed;
+        do { observed = ::waitpid(child, &status, 0); } while (observed == -1 && errno == EINTR);
+        CHECK(observed == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
     CHECK(manifest_value(macos_manifest, "platform") == "macos-metal4");
     CHECK(manifest_value(ios_manifest, "platform") == "ios-metal4");
     CHECK(manifest_value(macos_manifest, "chain_id") != manifest_value(ios_manifest, "chain_id"));
@@ -228,7 +247,7 @@ void test_identity_and_cache(Fixture& fixture) {
     CHECK(read(input_stage / "reflection.json") == read(output_stage / "reflection.json"));
     CHECK(!fs::exists(output_stage / "source.metal"));
     CHECK(read(output_stage / "shader.metallib").starts_with("LIBAIR"));
-    CHECK(read(fixture.log).find("-std=metal4.0 -mios-version-min=26.0 -Werror") != std::string::npos);
+    CHECK(read(fixture.log).find("-std=metal4.0 -mios-version-min=26.0 -fwrapv -Werror") != std::string::npos);
     std::size_t cache_entries = 0;
     for (const auto& entry : fs::directory_iterator(fixture.cache)) {
         if (entry.path().extension() == ".metallib") ++cache_entries;

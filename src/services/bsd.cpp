@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/bsd.h>
 
 #include <armigo/horizon/startup_queries.h>
@@ -21,19 +22,7 @@
 namespace armigo::services::bsd {
 namespace {
 using namespace horizon;
-std::uint32_t read(const IpcMessage& bytes, std::size_t offset) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i != 4; ++i)
-        value |= std::uint32_t(std::to_integer<unsigned char>(bytes[offset + i])) << (8 * i);
-    return value;
-}
-std::uint64_t read64(const IpcMessage& bytes, std::size_t offset) {
-    return read(bytes, offset) | std::uint64_t{read(bytes, offset + 4)} << 32;
-}
-void write(IpcMessage& bytes, std::size_t offset, std::uint32_t value) {
-    for (unsigned i = 0; i != 4; ++i)
-        bytes[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
-}
+using namespace horizon::cmif;
 // A reply with `output_bytes` after the CMIF header, domain or not.
 IpcReply reply_with(bool domain, unsigned output_bytes) {
     IpcReply reply{IpcDisposition::handled};

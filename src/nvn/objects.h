@@ -57,6 +57,7 @@ struct DeviceState {
     std::uint32_t tag, flags, window_origin, depth_mode;
     void* debug_callback;
     void* debug_data;
+    std::uint64_t gob_order = 0;
 };
 ARMIGO_NVN_FITS(DeviceState, NVNdevice);
 
@@ -164,6 +165,8 @@ struct TextureState {
     // Immutable snapshot of this serial that command records point at, so a
     // later rewrite of the game's object never changes recorded commands.
     const void* snapshot;
+    // The selected graphics ABI's GOB interleave, retained by the snapshot.
+    std::uint64_t gob_order = 0;
 };
 ARMIGO_NVN_FITS(TextureState, NVNtexture);
 static_assert(sizeof(TextureState) <= 0x80, "Texture storage is 128 bytes");
@@ -212,18 +215,10 @@ struct SamplerState {
 ARMIGO_NVN_FITS(SamplerState, NVNsampler);
 static_assert(offsetof(SamplerState, parameters) == 4 && sizeof(SamplerState) <= 64);
 
-// Every sampler registration takes the next number. A recorded texture or
-// sampler binding keeps the number current when it was recorded, so the replay
-// resolves its sampler as registered at that point of the guest's commands:
-// a game may register one sampler ID again between the draws of one command
-// buffer.
-// Draws and dispatches stamp the number (binding records too), and handles read
-// from guest memory resolve the same way as bound ones.
-// Known difference from resolving at GPU execution: a command buffer recorded
-// once and submitted again after its sampler was registered anew keeps the
-// version it was recorded with (until 64 newer versions push it out, after
-// which the newest is used and reported). Title 01007EF00011E000 meets none:
-// its pre-recorded command buffers never use a sampler registered again.
+// Distinct sampler parameters take a monotonic publication number. A queued
+// command submission captures that boundary once, so descriptor IDs resolve
+// their submit-visible parameters even when host encoding runs later. Legacy
+// record stamps remain in command streams; they do not capture descriptor data.
 inline std::atomic<std::uint64_t> sampler_registrations{0};
 
 // ---------------------------------------------------------------- descriptor handles

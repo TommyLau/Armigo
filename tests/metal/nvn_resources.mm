@@ -16,6 +16,7 @@
 #include <armigo/nvn/driver.h>
 
 #include "nvn/resource_layout.h"
+#include "nvn/commands.h"
 #include "platform/metal/nvn_resources.h"
 
 #include <algorithm>
@@ -28,6 +29,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <string>
 #include <vector>
 
 #include <sys/mman.h>
@@ -121,6 +124,9 @@ void check_buffer_pool(id<MTLDevice> device, metal::Resources &resources,
                     [](std::uint8_t value) { return value == 0x5a; }));
   resources.release_pool(pool);
   const auto address = reinterpret_cast<std::uint64_t>(pool.memory);
+  // The second miss is answered from the thread's miss cache; registering
+  // the pool again changes the pool generation, which ends it.
+  CHECK(resources.buffer_at(address, 64).buffer == nil);
   CHECK(resources.buffer_at(address, 64).buffer == nil);
   CHECK(resources.register_pool(pool));
   const auto replacement = resources.buffer_at(address, 64);
@@ -232,6 +238,9 @@ void check_guest_memory_claims(metal::Resources &resources) {
   CHECK(resources.register_pool(visible));
   CHECK(resources.register_pool(hidden));
   const auto visible_begin = reinterpret_cast<std::uint64_t>(visible.memory);
+  // A handed-out address admits the pool. The GPU-inaccessible pool is not
+  // "never addressed": it is ineligible until an address over it is handed out.
+  resources.note_addressed(visible_begin, visible.size);
   const auto listed = [&](const std::vector<metal::Resources::GuestMemoryPool> &pools, std::uint64_t begin) {
     return std::ranges::any_of(pools, [&](const auto &pool) { return pool.begin == begin; });
   };
@@ -242,6 +251,15 @@ void check_guest_memory_claims(metal::Resources &resources) {
   std::vector<metal::Resources::GuestMemoryPool> unchanged(1);
   CHECK(resources.claim_guest_memory_pools(generation, unchanged) == generation && unchanged.size() == 1 &&
         unchanged.front().begin == 0);
+  // A virtual pool mapping the GPU-inaccessible physical pool hands out its
+  // range: the shader reaches it through that address, so the table lists it.
+  const auto hidden_begin = reinterpret_cast<std::uint64_t>(hidden.memory);
+  resources.note_addressed(hidden_begin, hidden.size);
+  std::vector<metal::Resources::GuestMemoryPool> mapped;
+  const auto mapped_generation = resources.claim_guest_memory_pools(generation, mapped);
+  CHECK(mapped_generation != generation && mapped.size() == 2 && listed(mapped, hidden_begin));
+  CHECK(!resources.address_in_unaddressed_pool(hidden_begin + 32));
+  resources.complete_gpu_writes(resources.gpu_write_generation());
 
   // While the release waits, a new lease leaves the pool out; retiring both
   // ends the wait.
@@ -292,6 +310,8 @@ void check_guest_lease_waits(id<MTLDevice> device) {
   CHECK(resources.register_pool(second));
   const auto first_begin = reinterpret_cast<std::uint64_t>(first.memory);
   const auto second_begin = reinterpret_cast<std::uint64_t>(second.memory);
+  resources.note_addressed(first_begin, first.size);
+  resources.note_addressed(second_begin, second.size);
   std::vector<metal::Resources::GuestMemoryPool> pools;
   // Completes every write noted so far after a delay, from another thread,
   // as the replay's retirement does.
@@ -320,6 +340,113 @@ void check_guest_lease_waits(id<MTLDevice> device) {
   CHECK(!resources.register_pool(second));
   resources.complete_gpu_writes(resources.gpu_write_generation());
   resources.set_completion_hook({});
+}
+
+// Three pools. A whole-pool address admits A, a texture range admits B, and
+// C stays out until the filter is switched off. A range that adds no coverage
+// leaves the generation where it is. The switch is read when the resources
+// are created.
+void check_addressed_pool_admission(id<MTLDevice> device) {
+  const char *previous = std::getenv("ARMIGO_NVN_ADDRESSED_POOLS");
+  const std::string saved = previous ? previous : "";
+  const bool had = previous != nullptr;
+  struct RestoreEnv {
+    std::string saved;
+    bool had;
+    ~RestoreEnv() {
+      if (had) setenv("ARMIGO_NVN_ADDRESSED_POOLS", saved.c_str(), 1);
+      else unsetenv("ARMIGO_NVN_ADDRESSED_POOLS");
+    }
+  } restore{saved, had};
+  unsetenv("ARMIGO_NVN_ADDRESSED_POOLS");
+
+  Pages a_pages(1), b_pages(1), c_pages(1);
+  CHECK(a_pages.bytes() && b_pages.bytes() && c_pages.bytes());
+  if (!a_pages.bytes() || !b_pages.bytes() || !c_pages.bytes()) return;
+  const auto make = [](Pages &pages) {
+    nvn::MemoryPoolState pool{};
+    pool.memory = reinterpret_cast<std::uint8_t *>(pages.bytes());
+    pool.size = pages.size();
+    return pool;
+  };
+  auto pool_a = make(a_pages), pool_b = make(b_pages), pool_c = make(c_pages);
+  const auto begin_of = [](const nvn::MemoryPoolState &pool) {
+    return reinterpret_cast<std::uint64_t>(pool.memory);
+  };
+  const auto listed = [](const std::vector<metal::Resources::GuestMemoryPool> &pools, std::uint64_t begin) {
+    return std::ranges::any_of(pools, [&](const auto &pool) { return pool.begin == begin; });
+  };
+
+  metal::Resources resources(device);
+  CHECK(resources.register_pool(pool_a));
+  CHECK(resources.register_pool(pool_b));
+  CHECK(resources.register_pool(pool_c));
+  const auto before = resources.pool_generation();
+  resources.note_addressed(begin_of(pool_a), pool_a.size);
+  const auto after_a = resources.pool_generation();
+  CHECK(after_a != before);
+  std::vector<metal::Resources::GuestMemoryPool> pools;
+  CHECK(resources.claim_guest_memory_pools(0, pools) == after_a);
+  CHECK(pools.size() == 1 && listed(pools, begin_of(pool_a)));
+  CHECK(!listed(pools, begin_of(pool_b)) && !listed(pools, begin_of(pool_c)));
+  const auto admission_a = resources.guest_memory_admission();
+  CHECK(admission_a.omitted_pools == 2);
+  CHECK(admission_a.omitted_bytes == pool_b.size + pool_c.size);
+  CHECK(!resources.address_in_unaddressed_pool(begin_of(pool_a)));
+  CHECK(resources.address_in_unaddressed_pool(begin_of(pool_c) + 32));
+  CHECK(!resources.address_in_unaddressed_pool(1));
+
+  resources.note_addressed(begin_of(pool_b) + 64, 128);
+  const auto after_b = resources.pool_generation();
+  CHECK(after_b != after_a);
+  pools.clear();
+  CHECK(resources.claim_guest_memory_pools(0, pools) == after_b);
+  CHECK(pools.size() == 2 && listed(pools, begin_of(pool_a)) && listed(pools, begin_of(pool_b)));
+  CHECK(!listed(pools, begin_of(pool_c)));
+  const auto admission_b = resources.guest_memory_admission();
+  CHECK(admission_b.omitted_pools == 1 && admission_b.omitted_bytes == pool_c.size);
+  CHECK(!resources.address_in_unaddressed_pool(begin_of(pool_b) + 64));
+
+  const auto settled = resources.pool_generation();
+  resources.note_addressed(begin_of(pool_b) + 64, 32);
+  resources.note_addressed(begin_of(pool_a), pool_a.size);
+  CHECK(resources.pool_generation() == settled);
+  resources.complete_gpu_writes(resources.gpu_write_generation());
+
+  // A pool registered again on released pages is listed only once an
+  // address is handed out from it; B's marks stay with B.
+  resources.release_pool(pool_a);
+  CHECK(resources.register_pool(pool_a));
+  pools.clear();
+  resources.claim_guest_memory_pools(0, pools);
+  CHECK(!listed(pools, begin_of(pool_a)) && listed(pools, begin_of(pool_b)));
+  CHECK(resources.address_in_unaddressed_pool(begin_of(pool_a) + 32));
+  resources.note_addressed(begin_of(pool_a) + 32, 16);
+  pools.clear();
+  resources.claim_guest_memory_pools(0, pools);
+  CHECK(listed(pools, begin_of(pool_a)) && listed(pools, begin_of(pool_b)));
+  resources.complete_gpu_writes(resources.gpu_write_generation());
+  resources.release_pool(pool_a);
+  resources.release_pool(pool_b);
+  resources.release_pool(pool_c);
+
+  setenv("ARMIGO_NVN_ADDRESSED_POOLS", "0", 1);
+  Pages open_a(1), open_b(1), open_c(1);
+  CHECK(open_a.bytes() && open_b.bytes() && open_c.bytes());
+  if (!open_a.bytes() || !open_b.bytes() || !open_c.bytes()) return;
+  auto switch_a = make(open_a), switch_b = make(open_b), switch_c = make(open_c);
+  metal::Resources open(device);
+  CHECK(open.register_pool(switch_a));
+  CHECK(open.register_pool(switch_b));
+  CHECK(open.register_pool(switch_c));
+  pools.clear();
+  CHECK(open.claim_guest_memory_pools(0, pools) != 0 && pools.size() == 3);
+  CHECK(listed(pools, begin_of(switch_a)) && listed(pools, begin_of(switch_b)) &&
+        listed(pools, begin_of(switch_c)));
+  const auto admission_open = open.guest_memory_admission();
+  CHECK(admission_open.omitted_pools == 0 && admission_open.omitted_bytes == 0);
+  CHECK(!open.address_in_unaddressed_pool(begin_of(switch_c)));
+  open.complete_gpu_writes(open.gpu_write_generation());
 }
 
 // A GPU write found once it completed (the guest-memory write log) reaches a
@@ -422,6 +549,7 @@ void check_texture_usage(metal::Resources &resources) {
   resources.register_texture(single);
   id<MTLTexture> plain = storage_of(resources.texture(single, nullptr));
   CHECK(plain != nil);
+  CHECK(plain.storageMode == MTLStorageModePrivate && !plain.allowGPUOptimizedContents);
   CHECK((plain.usage & MTLTextureUsageRenderTarget) &&
         !(plain.usage & (MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView)));
   // Its first storage image write gives it writable storage in place of the
@@ -431,6 +559,7 @@ void check_texture_usage(metal::Resources &resources) {
   CHECK(writable && previous == plain && writable != plain &&
         (writable.usage & MTLTextureUsageShaderWrite) && writable.width == plain.width &&
         writable.pixelFormat == plain.pixelFormat && writable.mipmapLevelCount == plain.mipmapLevelCount);
+  CHECK(writable && !writable.allowGPUOptimizedContents);
   CHECK(storage_of(resources.texture(single, nullptr)) == writable);
   CHECK(resources.upgrade_for_image_write(single.serial, previous) == writable && previous == nil);
   CHECK(resources.upgrade_for_image_write(single.serial + 1000, previous) == nil);
@@ -446,6 +575,7 @@ void check_texture_usage(metal::Resources &resources) {
     resources.register_texture(chain);
     id<MTLTexture> mips = storage_of(resources.texture(chain, nullptr));
     CHECK(mips != nil && mips.mipmapLevelCount == 3);
+    CHECK(!mips.allowGPUOptimizedContents);
     CHECK((mips.usage & MTLTextureUsagePixelFormatView) != 0);
   }
   resources.release_pool(pool);
@@ -683,6 +813,91 @@ void check_sampler_stamps(metal::Resources &resources) {
   CHECK(resources.sampler_for_id(60) == renewed);
   CHECK(resources.sampler_for_id(61, after_binding) == sampler_61);
 
+  // Mip selection uses the parameters captured for the binding's registration.
+  auto pinned = nearest;
+  pinned.min_filter = NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR;
+  pinned.min_lod = pinned.max_lod = 2;
+  resources.register_sampler_descriptor(63, pinned);
+  const auto pinned_binding = nvn::sampler_registrations.load();
+  CHECK(resources.sampler_pinned_level(63) == 2);
+  pinned.min_lod = pinned.max_lod = 3;
+  resources.register_sampler_descriptor(63, pinned);
+  CHECK(resources.sampler_pinned_level(63, pinned_binding) == 2);
+  CHECK(resources.sampler_pinned_level(63) == 3);
+  pinned.min_lod = pinned.max_lod = 2.5f;
+  resources.register_sampler_descriptor(63, pinned);
+  CHECK(!resources.sampler_pinned_level(63));
+  CHECK(!resources.sampler_pinned_level(61));
+  CHECK(!resources.sampler_pinned_level(999));
+
+  // Coverage sampling must retain the exact registered custom color without
+  // making a plain lookup silently accept a substituted border.
+  auto custom = nearest;
+  custom.wrap_s = custom.wrap_t = NVN_WRAP_MODE_CLAMP_TO_BORDER;
+  custom.border[0] = 0.25f; custom.border[1] = 0.75f;
+  custom.border[2] = 0.5f; custom.border[3] = 0.125f;
+  resources.register_sampler_descriptor(64, custom);
+  const auto custom_binding = nvn::sampler_registrations.load();
+  const auto first_custom = resources.coverage_sampler_for_id(64, custom_binding);
+  CHECK(first_custom.sampler && first_custom.custom);
+  CHECK((first_custom.color == std::array<float, 4>{0.25f, 0.75f, 0.5f, 0.125f}));
+  CHECK(resources.sampler_for_id(64, custom_binding) == nil);
+  CHECK(resources.coverage_sampler_for_id(64, custom_binding).sampler == first_custom.sampler);
+  custom.border[0] = 0.875f;
+  resources.register_sampler_descriptor(64, custom);
+  const auto latest_custom = resources.coverage_sampler_for_id(64, UINT64_MAX);
+  CHECK(latest_custom.sampler && latest_custom.custom && latest_custom.color[0] == 0.875f);
+  CHECK(resources.coverage_sampler_for_id(64, custom_binding).color[0] == 0.25f);
+  CHECK(resources.coverage_sampler_for_id(64, custom_binding).sampler == first_custom.sampler);
+  CHECK(resources.sampler_for_id(64) == nil);
+
+  // A descriptor may first be populated after command recording. Capture
+  // its submit-visible version, then overwrite before the worker resolves it.
+  resources.register_sampler_descriptor(65, custom);
+  nvn::CommandWalkStatus submission_status{};
+  const auto submitted = nvn::prepare_commands({}, submission_status);
+  CHECK(submitted && submission_status == nvn::CommandWalkStatus::complete);
+  const auto submitted_color = custom.border[0];
+  custom.border[0] = 0.625f;
+  resources.register_sampler_descriptor(65, custom);
+  const auto submitted_again = nvn::prepare_commands({}, submission_status);
+  resources.register_sampler_descriptor(65, nearest);
+  if (submitted && submitted_again) {
+    const auto before = resources.coverage_sampler_for_id(65, nvn::submission_sampler_registrations(*submitted));
+    const auto after = resources.coverage_sampler_for_id(65, nvn::submission_sampler_registrations(*submitted_again));
+    CHECK(before.sampler && before.custom && before.color[0] == submitted_color);
+    CHECK(after.sampler && after.custom && after.color[0] == 0.625f);
+    CHECK(resources.sampler_for_id(65, nvn::submission_sampler_registrations(*submitted)) == nil);
+    CHECK(resources.sampler_for_id(65) != nil);
+  }
+  CHECK(resources.coverage_sampler_for_id(66, UINT64_MAX).sampler == nil);
+  CHECK(!resources.take_sampler_failure().empty());
+
+  auto submitted_pinned = nearest;
+  submitted_pinned.min_filter = NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR;
+  submitted_pinned.min_lod = submitted_pinned.max_lod = 2;
+  resources.register_sampler_descriptor(68, submitted_pinned);
+  const auto mip_submission = nvn::prepare_commands({}, submission_status);
+  submitted_pinned.min_lod = submitted_pinned.max_lod = 3;
+  resources.register_sampler_descriptor(68, submitted_pinned);
+  if (mip_submission)
+    CHECK(resources.sampler_pinned_level(68, nvn::submission_sampler_registrations(*mip_submission)) == 2);
+  CHECK(resources.sampler_pinned_level(68) == 3);
+
+  // Dropped history is a missing version, never an instruction to sample
+  // a newer ordinary state. Neither API may silently choose that state.
+  resources.register_sampler_descriptor(67, nearest);
+  const auto retired = nvn::sampler_registrations.load();
+  for (unsigned i = 1; i <= 66; ++i) {
+    auto changed = nearest;
+    changed.lod_bias = static_cast<float>(i) / 128;
+    resources.register_sampler_descriptor(67, changed);
+  }
+  CHECK(resources.sampler_for_id(67, retired) == nil);
+  CHECK(!resources.take_sampler_failure().empty());
+  CHECK(resources.coverage_sampler_for_id(67, retired).sampler == nil);
+  CHECK(!resources.take_sampler_failure().empty());
+
   // A replaced sampler pool drops every ID, cached or not.
   resources.release_sampler_pool(first_pool);
   CHECK(resources.sampler_for_id(60, after_binding) == nil);
@@ -830,6 +1045,90 @@ void check_upload_certificates_follow_cpu_mapping(id<MTLDevice> device) {
   armigo::graphics::texflush::forget(7101);
 }
 
+void check_empty_texture_ids(id<MTLDevice> device) {
+  metal::Resources resources(device);
+  Pages descriptor_pages(1), data_pages(1);
+  CHECK(descriptor_pages.bytes() && data_pages.bytes());
+  if (!descriptor_pages.bytes() || !data_pages.bytes()) return;
+  nvn::MemoryPoolState descriptors{}, data{};
+  descriptors.memory = reinterpret_cast<std::uint8_t*>(descriptor_pages.bytes()); descriptors.size = descriptor_pages.size();
+  data.memory = reinterpret_cast<std::uint8_t*>(data_pages.bytes()); data.size = data_pages.size();
+  descriptors.flags = data.flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+  CHECK(resources.register_pool(descriptors) && resources.register_pool(data));
+  nvn::DescriptorPoolState pool{}; pool.pool = &descriptors; pool.count = 64;
+  CHECK(resources.register_texture_pool(pool));
+  auto texture = make_texture(data, 9901);
+  resources.register_texture_descriptor(43, texture, nullptr);
+  CHECK(!resources.texture_id_empty(43));
+  CHECK(!resources.texture_id_empty(47));
+  CHECK(resources.texture_id_empty(64) && resources.texture_id_empty(0xfffff));
+  resources.release_pool(data);
+  CHECK(resources.texture_id_empty(43));
+  resources.release_pool(descriptors);
+}
+
+// Empty bindings preserve the shader's declared type and scalar class. Read
+// the real allocations on the GPU, including depth and multisample storage.
+void check_typed_empty_textures(id<MTLDevice> device, metal::Resources& resources,
+                                id<MTLCommandQueue> queue) {
+  const std::array types{MTLTextureType1D, MTLTextureType1DArray, MTLTextureType2D,
+      MTLTextureType2DArray, MTLTextureTypeCube, MTLTextureTypeCubeArray,
+      MTLTextureType3D, MTLTextureTypeTextureBuffer, MTLTextureType2DMultisample,
+      MTLTextureType2DMultisampleArray};
+  for (const auto type : types) {
+    auto texture = resources.fitted_texture(0, nil, type, true);
+    CHECK(texture && texture.textureType == type);
+    if (!texture) continue;
+    const bool buffer = type == MTLTextureTypeTextureBuffer;
+    const bool multisample = type == MTLTextureType2DMultisample || type == MTLTextureType2DMultisampleArray;
+    CHECK(texture.pixelFormat == (buffer ? MTLPixelFormatRGBA32Float : MTLPixelFormatRGBA8Unorm));
+    if (buffer) {
+      CHECK(texture.buffer && texture.width == 4096);
+      if (texture.buffer.contents) {
+        auto* bytes = static_cast<const std::uint8_t*>(texture.buffer.contents);
+        CHECK(std::all_of(bytes, bytes + texture.buffer.length, [](auto value) { return value == 0; }));
+      }
+    } else if (multisample) {
+      CHECK(texture.sampleCount == 4);
+      CHECK(texture.storageMode == MTLStorageModePrivate && !texture.allowGPUOptimizedContents);
+      const std::string source = std::string("#include <metal_stdlib>\nusing namespace metal;\nkernel void read_empty(") +
+          (type == MTLTextureType2DMultisampleArray ? "texture2d_ms_array<float>" : "texture2d_ms<float>") +
+          " image [[texture(0)]], device float4* output [[buffer(0)]]) { output[0] = image.read(uint2(0), " +
+          (type == MTLTextureType2DMultisampleArray ? "0, 0); }" : "0); }");
+      NSError* error = nil;
+      auto library = [device newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()] options:nil error:&error];
+      auto pipeline = library ? [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"read_empty"] error:&error] : nil;
+      CHECK(pipeline != nil);
+      if (!pipeline) continue;
+      auto result = [device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+      std::memset(result.contents, 0xff, 16);
+      auto commands = [queue commandBuffer]; auto compute = [commands computeCommandEncoder];
+      [compute setComputePipelineState:pipeline]; [compute setTexture:texture atIndex:0]; [compute setBuffer:result offset:0 atIndex:0];
+      [compute dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+      [compute endEncoding]; [commands commit]; [commands waitUntilCompleted];
+      CHECK(commands.status == MTLCommandBufferStatusCompleted);
+      auto* values = static_cast<const float*>(result.contents);
+      CHECK(values[0] == 0 && values[1] == 0 && values[2] == 0 && values[3] == 0);
+    }
+  }
+  for (const auto format : {MTLPixelFormatRGBA8Unorm, MTLPixelFormatRGBA32Uint,
+                           MTLPixelFormatRGBA32Sint, MTLPixelFormatDepth32Float}) {
+    auto texture = resources.fitted_texture(0, nil, MTLTextureType2D, true, format);
+    CHECK(texture && texture.pixelFormat == format);
+    if (!texture || texture.pixelFormat != format) continue;
+    auto bytes = [device newBufferWithLength:256 options:MTLResourceStorageModeShared];
+    std::memset(bytes.contents, 0xff, bytes.length);
+    auto commands = [queue commandBuffer]; auto blit = [commands blitCommandEncoder];
+    [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+        sourceSize:MTLSizeMake(1,1,1) toBuffer:bytes destinationOffset:0 destinationBytesPerRow:256 destinationBytesPerImage:256];
+    [blit endEncoding]; [commands commit]; [commands waitUntilCompleted];
+    CHECK(commands.status == MTLCommandBufferStatusCompleted);
+    const auto count = format == MTLPixelFormatRGBA32Uint || format == MTLPixelFormatRGBA32Sint ? 16 : 4;
+    const auto* values = static_cast<const std::uint8_t*>(bytes.contents);
+    CHECK(std::all_of(values, values + count, [](auto value) { return value == 0; }));
+  }
+}
+
 void check_texture_resources(id<MTLDevice> device, metal::Resources &resources,
                              id<MTLCommandQueue> queue) {
   Pages pages(4);
@@ -870,7 +1169,8 @@ void check_texture_resources(id<MTLDevice> device, metal::Resources &resources,
     uncached_pattern[i] = std::byte((i * 29 + 3) & 0xff);
   CHECK(nvn::transfer_pool_texels(state, transfer, uncached_pattern.data(),
                                   true));
-  CHECK(resources.texture(state, nullptr) == texture);
+  texture = resources.texture(state, nullptr);
+  CHECK(texture != nil);
   CHECK(read_native_rgba(resources, device, queue, texture) == uncached_pattern);
   pattern = uncached_pattern;
 
@@ -881,16 +1181,19 @@ void check_texture_resources(id<MTLDevice> device, metal::Resources &resources,
   });
   pattern[0] ^= std::byte{0x7f};
   CHECK(nvn::transfer_pool_texels(state, transfer, pattern.data(), true));
-  CHECK(resources.texture(state, nullptr) == texture);
+  texture = resources.texture(state, nullptr);
+  CHECK(texture != nil);
   CHECK(read_native_rgba(resources, device, queue, texture) == pattern);
   pattern[1] ^= std::byte{0x3f};
   CHECK(nvn::transfer_pool_texels(state, transfer, pattern.data(), true));
-  CHECK(resources.texture(state, nullptr) == texture);
+  texture = resources.texture(state, nullptr);
+  CHECK(texture != nil);
   CHECK(read_native_rgba(resources, device, queue, texture) == pattern);
   armigo::memory::WriteTracker::set_protect_hook(nullptr);
 
   std::reverse(pattern.begin(), pattern.end());
   CHECK(resources.write_texels(state, transfer, pattern.data()));
+  texture = resources.texture(state, nullptr);
   CHECK(read_native_rgba(resources, device, queue, texture) == pattern);
 
   resources.register_texture_descriptor(7, state, nullptr);
@@ -903,7 +1206,8 @@ void check_texture_resources(id<MTLDevice> device, metal::Resources &resources,
   std::vector<std::byte> encoded_gpu(state.size);
   std::memcpy(encoded_gpu.data(), state.memory, encoded_gpu.size());
   CHECK(nvn::transfer_pool_texels(state, transfer, pattern.data(), true));
-  CHECK(resources.texture(state, nullptr) == texture);
+  texture = resources.texture(state, nullptr);
+  CHECK(texture != nil);
   CHECK(read_native_rgba(resources, device, queue, texture) == pattern);
 
   metal::BufferSpan backing = resources.buffer_at(
@@ -929,7 +1233,9 @@ void check_texture_resources(id<MTLDevice> device, metal::Resources &resources,
   });
   resources.note_gpu_write(reinterpret_cast<std::uint64_t>(state.memory),
                            state.size);
-  CHECK(resources.texture_for_id(7).parentTexture == texture);
+  id<MTLTexture> refreshed_view = resources.texture_for_id(7);
+  texture = resources.texture(state, nullptr);
+  CHECK(refreshed_view.parentTexture == texture);
   CHECK(backing_completion_calls == 1);
   CHECK(read_native_rgba(resources, device, queue, texture) == gpu_pattern);
 
@@ -979,6 +1285,34 @@ void check_texture_resources(id<MTLDevice> device, metal::Resources &resources,
   volume_descriptor.width = volume_descriptor.height = volume_descriptor.depth = 4;
   id<MTLTexture> volume = [device newTextureWithDescriptor:volume_descriptor];
   CHECK(resources.fitted_texture(7, volume, MTLTextureType2D) == nil);
+  // A floating-point handle-table element with an incompatible source type
+  // reads a typed zero, including when the host resolved that element.
+  id<MTLTexture> zero_2d = resources.fitted_texture(7, volume, MTLTextureType2D, true);
+  CHECK(resources.fitted_texture(0, nil, MTLTextureType2D, true) == zero_2d);
+  CHECK(zero_2d && zero_2d.textureType == MTLTextureType2D && zero_2d.width == 1);
+  id<MTLTexture> zero_array = resources.fitted_texture(7, volume, MTLTextureType2DArray, true);
+  CHECK(zero_array && zero_array.textureType == MTLTextureType2DArray && zero_array.arrayLength == 1);
+  std::uint32_t zero_2d_texel = 0xffffffffu, zero_array_texel = 0xffffffffu;
+  [zero_2d getBytes:&zero_2d_texel bytesPerRow:4 fromRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0];
+  [zero_array getBytes:&zero_array_texel bytesPerRow:4 bytesPerImage:4
+            fromRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:0];
+  CHECK(zero_2d_texel == 0 && zero_array_texel == 0);
+  // A 2D texture in a cube or 3D slot reads a zero texture of the declared
+  // type; a view of a view is made from the texture under both.
+  MTLTextureDescriptor *flat_descriptor =
+      [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:8 height:8 mipmapped:NO];
+  id<MTLTexture> flat = [device newTextureWithDescriptor:flat_descriptor];
+  id<MTLTexture> zero_cube = resources.fitted_texture(8, flat, MTLTextureTypeCube);
+  CHECK(zero_cube && zero_cube.textureType == MTLTextureTypeCube && zero_cube.width == 1);
+  CHECK(resources.fitted_texture(9, flat, MTLTextureTypeCube) == zero_cube);
+  id<MTLTexture> zero_volume = resources.fitted_texture(8, flat, MTLTextureType3D);
+  CHECK(zero_volume && zero_volume.textureType == MTLTextureType3D && zero_volume.depth == 1);
+  std::uint32_t texel = 0xffffffffu;
+  [zero_volume getBytes:&texel bytesPerRow:4 bytesPerImage:4 fromRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1)
+            mipmapLevel:0 slice:0];
+  CHECK(texel == 0);
+  id<MTLTexture> face_of_face = resources.fitted_texture(10, face, MTLTextureType2DArray);
+  CHECK(face_of_face && face_of_face.parentTexture == cube);
 
   nvn::TextureState rgbx = make_texture(pool, 42);
   rgbx.description.format = NVN_FORMAT_RGBX8;
@@ -1056,6 +1390,7 @@ void check_texture_resources(id<MTLDevice> device, metal::Resources &resources,
   CHECK(nvn::transfer_pool_texels(
       state, one_pixel, const_cast<std::byte *>(cpu_pixel.data()), true));
   resources.flush_pool(pool, 0, cpu_pixel.size());
+  texture = resources.texture(state, nullptr);
   const auto partial_result = read_native_rgba(resources, device, queue, texture);
   CHECK(std::equal(cpu_pixel.begin(), cpu_pixel.end(), partial_result.begin()));
   for (std::size_t pixel = 1; pixel < 16; ++pixel) {
@@ -1158,6 +1493,7 @@ void check_cached_pool_flush(id<MTLDevice> device, metal::Resources &resources,
   CHECK(resources.texture(state, nullptr) == texture);
   CHECK(read_native_rgba(resources, device, queue, texture) == before);
   resources.flush_pool(pool, 0, state.size);
+  texture = resources.texture(state, nullptr);
   CHECK(read_native_rgba(resources, device, queue, texture) == after);
 
   id<MTLCommandBuffer> source_clear = [queue commandBuffer];
@@ -1183,7 +1519,9 @@ void check_cached_pool_flush(id<MTLDevice> device, metal::Resources &resources,
   std::vector<std::byte> coherent_cpu(64);
   CHECK(resources.read_texels(state, transfer, coherent_cpu.data()));
   CHECK(std::equal(red.begin(), red.end(), coherent_cpu.begin()));
-  CHECK(resources.texture(state, nullptr) == texture);
+  texture = resources.texture(state, nullptr);
+  CHECK(texture != nil);
+  aliased_texture = texture;
   const auto preserved_source = read_native_rgba(resources, device, queue, texture);
   CHECK(std::equal(red.begin(), red.end(), preserved_source.begin()));
   CHECK(preserved_source[4] == std::byte{0} &&
@@ -1213,7 +1551,8 @@ void check_cached_pool_flush(id<MTLDevice> device, metal::Resources &resources,
     CHECK(pixels[pixel * 4 + 3] == std::byte{255});
   }
   CHECK(resources.write_texels(alias, transfer, before.data()));
-  CHECK(resources.texture(state, nullptr) == texture);
+  texture = resources.texture(state, nullptr);
+  CHECK(texture != nil);
   CHECK(read_native_rgba(resources, device, queue, texture) == before);
   CHECK(resources.sampler_for_id(5) != nil);
   resources.release_texture_pool(first_pool);
@@ -1611,6 +1950,7 @@ struct DeswizzleCase {
   nvn::TextureDescription description{};
   std::size_t offset = 0;
   std::vector<std::byte> expected;
+  std::uint64_t gob_order = 0;
 };
 
 nvn::TextureDescription deswizzle_description(std::int32_t target, std::int32_t format,
@@ -1645,7 +1985,8 @@ upload_cases(id<MTLDevice> device, id<MTLCommandQueue> queue,
   for (const auto &entry : cases) {
     nvn::TextureState state{};
     state.description = entry.description;
-    const auto layout = nvn::resource_layout(entry.description);
+    state.gob_order = entry.gob_order;
+    const auto layout = nvn::resource_layout(state);
     CHECK(layout.has_value());
     if (!layout) return results;
     state.size = layout->total_size;
@@ -1695,6 +2036,10 @@ void check_gpu_deswizzle_uploads(id<MTLDevice> device, id<MTLCommandQueue> queue
   add(deswizzle_description(NVN_TEXTURE_TARGET_1D_ARRAY, NVN_FORMAT_R8, 70, 3, 1, 1));
   add(deswizzle_description(NVN_TEXTURE_TARGET_3D, NVN_FORMAT_R8, 8, 8, 11, 4));
   add(deswizzle_description(NVN_TEXTURE_TARGET_3D, NVN_FORMAT_RGBA8, 33, 17, 9, 3));
+  add(deswizzle_description(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_R8, 64, 8, 1, 1));
+  cases.back().gob_order = 1;
+  add(deswizzle_description(NVN_TEXTURE_TARGET_3D, NVN_FORMAT_RGBA8, 16, 8, 3, 1));
+  cases.back().gob_order = 1;
   add(deswizzle_description(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA_ASTC_6x5, 50, 23, 1, 2));
   // Depth alone keeps its bytes, so it takes the GPU path too.
   add(deswizzle_description(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_DEPTH16, 45, 21, 1, 1));
@@ -1734,9 +2079,24 @@ void check_gpu_deswizzle_uploads(id<MTLDevice> device, id<MTLCommandQueue> queue
     const auto layout = nvn::resource_layout(entry.description);
     nvn::TextureState state{};
     state.description = entry.description;
+    state.gob_order = entry.gob_order;
     state.size = layout->total_size;
     state.memory = pool.memory + entry.offset;
     const bool is_3d = entry.description.target == NVN_TEXTURE_TARGET_3D;
+    if (entry.gob_order == 1) {
+      // Independent one-GOB row/column positions, repeated over volume slices.
+      const std::array<std::size_t, 8> rows{0, 16, 32, 48, 128, 144, 160, 176};
+      const std::array<std::size_t, 4> columns{0, 64, 256, 320};
+      const auto slices = is_3d ? entry.description.depth : 1u;
+      for (std::uint32_t z = 0; z < slices; ++z)
+        for (std::size_t y = 0; y < 8; ++y)
+          for (std::size_t x = 0; x < 64; ++x) {
+            const auto value = std::uint8_t((x * 17 + y * 31 + z * 53) & 255);
+            pool.memory[entry.offset + z * 512 + rows[y] + columns[x / 16] + x % 16] = value;
+            entry.expected.push_back(std::byte(value));
+          }
+      continue;
+    }
     for (std::uint32_t layer = 0; layer < layout->layers; ++layer) {
       for (std::uint32_t level = 0; level < layout->levels; ++level) {
         const auto &mip = layout->mips[level];
@@ -1770,6 +2130,62 @@ void check_gpu_deswizzle_uploads(id<MTLDevice> device, id<MTLCommandQueue> queue
     CHECK(gpu[index] == cases[index].expected);
     CHECK(cpu[index] == gpu[index]);
   }
+}
+
+void check_experimental_initial_zero(id<MTLDevice> device, id<MTLCommandQueue> queue) {
+  struct Case { bool enabled, cpu_access, compressible, packaged, depth, zero; };
+  const Case cases[]{{false, false, true, false, false, false},
+                     {true, false, true, false, false, true},
+                     {true, true, true, false, false, false},
+                     {true, false, false, false, false, false},
+                     {true, false, true, true, false, false},
+                     {true, false, false, false, true, true}};
+  for (const auto& test : cases) {
+    CHECK(setenv("ARMIGO_NVN_ZERO_GPU_TEXTURES", test.enabled ? "1" : "0", 1) == 0);
+    Pages pages(4);
+    nvn::MemoryPoolState pool{};
+    pool.memory = reinterpret_cast<std::uint8_t*>(pages.bytes());
+    pool.size = pages.size();
+    pool.flags = NVN_MEMORY_POOL_FLAGS_GPU_CACHED |
+        (test.cpu_access ? NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED : NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS);
+    metal::Resources resources(device);
+    CHECK(resources.register_pool(pool));
+    auto state = make_texture(pool, 900);
+    state.description.flags = test.compressible ? NVN_TEXTURE_FLAGS_COMPRESSIBLE : 0;
+    state.has_packaged_layout = test.packaged;
+    if (test.depth) state.description.format = NVN_FORMAT_DEPTH32F;
+    const auto layout = nvn::resource_layout(state);
+    CHECK(layout.has_value());
+    if (!layout) continue;
+    state.size = layout->total_size;
+    state.layer_size = layout->layer_stride;
+    std::vector<std::byte> poison(state.size, std::byte{0x6b});
+    if (test.depth) {
+      const float depth = 0.75f;
+      for (std::size_t at = 0; at + 4 <= poison.size(); at += 4)
+        std::memcpy(poison.data() + at, &depth, 4);
+    }
+    std::memcpy(pool.memory, poison.data(), poison.size());
+    resources.register_texture(state);
+    id<MTLTexture> texture = resources.texture(state, nullptr);
+    CHECK(texture != nil);
+    if (!texture) continue;
+    const auto pixels = read_native_rgba(resources, device, queue, texture);
+    CHECK(pixels.size() == 64);
+    if (test.zero) {
+      CHECK(std::all_of(pixels.begin(), pixels.end(), [](std::byte b) { return b == std::byte{}; }));
+      CHECK(resources.upload_counts().gpu == 0 && resources.upload_counts().cpu == 0);
+      CHECK(std::memcmp(pool.memory, poison.data(), poison.size()) == 0);
+      std::vector<std::byte> readback(64);
+      CHECK(resources.read_texels(state, whole_rgba_transfer(), readback.data()));
+      CHECK(std::all_of(readback.begin(), readback.end(), [](std::byte b) { return b == std::byte{}; }));
+    } else {
+      CHECK(std::all_of(pixels.begin(), pixels.end(), [](std::byte b) { return b == std::byte{0x6b}; }));
+    }
+    resources.release_texture(state);
+    resources.release_pool(pool);
+  }
+  CHECK(unsetenv("ARMIGO_NVN_ZERO_GPU_TEXTURES") == 0);
 }
 
 // Storage the upload converts keeps the CPU path: packed depth/stencil, in
@@ -1860,9 +2276,74 @@ void check_cpu_upload_paths(id<MTLDevice> device, id<MTLCommandQueue> queue) {
   resources.release_pool(pool);
 }
 
-// One texture uploaded twice in one batch keeps the second upload, on both
-// paths: the batch orders the two copies into the same texture.
-void check_repeated_upload_in_batch(id<MTLDevice> device, id<MTLCommandQueue> queue) {
+struct PendingTextureDraw {
+  id<MTLCommandBuffer> commands = nil;
+  id<MTLSharedEvent> gate = nil;
+  id<MTLTexture> target = nil;
+  std::shared_ptr<std::atomic<std::uint64_t>> generation =
+      std::make_shared<std::atomic<std::uint64_t>>(0);
+  dispatch_semaphore_t retired = dispatch_semaphore_create(0);
+};
+
+PendingTextureDraw pending_texture_draw(id<MTLDevice> device, id<MTLCommandQueue> queue,
+                                        id<MTLRenderPipelineState> pipeline,
+                                        metal::Resources& resources, id<MTLTexture> texture) {
+  PendingTextureDraw draw;
+  draw.gate = [device newSharedEvent];
+  auto *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                     width:4 height:4 mipmapped:NO];
+  descriptor.storageMode = MTLStorageModePrivate;
+  descriptor.usage = MTLTextureUsageRenderTarget;
+  draw.target = [device newTextureWithDescriptor:descriptor];
+  draw.commands = [queue commandBuffer];
+  [draw.commands encodeWaitForEvent:draw.gate value:1];
+  auto *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+  pass.colorAttachments[0].texture = draw.target;
+  pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+  pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+  id<MTLRenderCommandEncoder> encoder = [draw.commands renderCommandEncoderWithDescriptor:pass];
+  [encoder setRenderPipelineState:pipeline];
+  [encoder setFragmentTexture:texture atIndex:0];
+  [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+  [encoder endEncoding];
+  const auto generation = draw.generation;
+  const auto retired = draw.retired;
+  auto *owner = &resources;
+  [draw.commands addCompletedHandler:^(id<MTLCommandBuffer> done) {
+    if (done.status == MTLCommandBufferStatusCompleted)
+      owner->complete_gpu_writes(generation->load());
+    dispatch_semaphore_signal(retired);
+  }];
+  [draw.commands commit];
+  return draw;
+}
+
+void finish_texture_draw(PendingTextureDraw& draw) {
+  draw.gate.signaledValue = 1;
+  CHECK(complete(draw.commands));
+  if (draw.commands.error)
+    std::fprintf(stderr, "Pending texture draw failed: %s\n", draw.commands.error.localizedDescription.UTF8String);
+  CHECK(dispatch_semaphore_wait(draw.retired, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) == 0);
+}
+
+// A streamed upload publishes another texture while pending draws keep the
+// previous content. Aliases resolve the published storage, and a spare is
+// reusable only after the submission that last named it has retired.
+void check_streamed_texture_rotation(id<MTLDevice> device, id<MTLCommandQueue> queue) {
+  NSError *error = nil;
+  id<MTLLibrary> library = [device newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+      "vertex float4 v(uint id [[vertex_id]]) { const float2 p[3] = {float2(-1,-1), float2(3,-1), float2(-1,3)}; return float4(p[id],0,1); }\n"
+      "fragment float4 f(texture2d<float> t [[texture(0)]]) { return t.read(uint2(0)); }\n"
+                                                    options:nil error:&error];
+  CHECK(library != nil);
+  auto *descriptor = [MTLRenderPipelineDescriptor new];
+  descriptor.vertexFunction = [library newFunctionWithName:@"v"];
+  descriptor.fragmentFunction = [library newFunctionWithName:@"f"];
+  descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+  id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+  CHECK(pipeline != nil);
+  if (!pipeline) return;
+  id<MTLCommandQueue> readers = [device newCommandQueue];
   for (const bool cpu_only : {false, true}) {
     Pages pages(4);
     CHECK(pages.bytes() != nullptr);
@@ -1877,22 +2358,161 @@ void check_repeated_upload_in_batch(id<MTLDevice> device, id<MTLCommandQueue> qu
     pool.flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
     CHECK(resources.register_pool(pool));
     auto state = make_texture(pool, 500);
-    std::vector<std::byte> first(64), second(64);
-    for (std::size_t i = 0; i < 64; ++i) {
-      first[i] = std::byte((i * 7 + 1) & 0xff);
-      second[i] = std::byte((i * 11 + 200) & 0xff);
-    }
+    auto alias = state;
+    alias.serial = 501;
+    std::vector<std::byte> first(64, std::byte{0x11}), second(64, std::byte{0x33}),
+        third(64, std::byte{0x55}), fourth(64, std::byte{0x77});
     CHECK(nvn::transfer_pool_texels(state, whole_rgba_transfer(), first.data(), true));
     resources.register_texture(state);
-    id<MTLTexture> texture = resources.texture(state, nullptr);
-    CHECK(texture != nil);
+    resources.register_texture(alias);
+    resources.register_texture_descriptor(77, state, nullptr);
+    resources.register_texture_descriptor(78, alias, nullptr);
+    metal::Resources::DescriptorStamp stamp;
+    id<MTLTexture> old = resources.texture(state, nullptr);
+    CHECK(old != nil && !old.allowGPUOptimizedContents);
+    CHECK(resources.texture_for_id(77, stamp).parentTexture == old);
+    CHECK(resources.texture_for_id(78).parentTexture == old);
+    if (old) CHECK(read_native_rgba(resources, device, queue, old) == first);
+    auto first_draw = pending_texture_draw(device, readers, pipeline, resources, old);
     CHECK(nvn::transfer_pool_texels(state, whole_rgba_transfer(), second.data(), true));
-    CHECK(resources.texture(state, nullptr) == texture);
+    id<MTLTexture> current = resources.texture(state, nullptr);
+    CHECK(current != nil && current != old && !current.allowGPUOptimizedContents);
+    CHECK(!resources.texture_stamp_current(77, stamp));
+    CHECK(resources.texture_for_id(78).parentTexture == current);
+    if (current) CHECK(read_native_rgba(resources, device, queue, current) == second);
+    if (old) CHECK(read_native_rgba(resources, device, queue, old) == first);
+    // The upload has finished while the old draw is still gated on the GPU.
+    CHECK(first_draw.commands.status != MTLCommandBufferStatusCompleted);
+    first_draw.generation->store(resources.gpu_write_generation());
+    finish_texture_draw(first_draw);
+    CHECK(read_native_rgba(resources, device, queue, first_draw.target) == first);
+    auto second_draw = pending_texture_draw(device, readers, pipeline, resources, current);
+    CHECK(nvn::transfer_pool_texels(state, whole_rgba_transfer(), third.data(), true));
+    id<MTLTexture> reused = resources.texture(state, nullptr);
+    CHECK(reused == old && !reused.allowGPUOptimizedContents);
+    second_draw.generation->store(resources.gpu_write_generation());
+    CHECK(resources.texture_for_id(78).parentTexture == reused);
+    if (reused) CHECK(read_native_rgba(resources, device, queue, reused) == third);
+    if (current) CHECK(read_native_rgba(resources, device, queue, current) == second);
+    // The second storage is still named by a pending submission.
+    CHECK(nvn::transfer_pool_texels(state, whole_rgba_transfer(), fourth.data(), true));
+    id<MTLTexture> fresh = resources.texture(state, nullptr);
+    CHECK(fresh != nil && fresh != current && fresh != reused && !fresh.allowGPUOptimizedContents);
+    if (fresh) CHECK(read_native_rgba(resources, device, queue, fresh) == fourth);
+    if (current) CHECK(read_native_rgba(resources, device, queue, current) == second);
+    if (reused) CHECK(read_native_rgba(resources, device, queue, reused) == third);
+    CHECK(second_draw.commands.status != MTLCommandBufferStatusCompleted);
+    finish_texture_draw(second_draw);
+    CHECK(read_native_rgba(resources, device, queue, second_draw.target) == second);
     const auto counts = resources.upload_counts();
-    CHECK((cpu_only ? counts.cpu : counts.gpu) == 2);
-    if (texture) CHECK(read_native_rgba(resources, device, queue, texture) == second);
+    CHECK((cpu_only ? counts.cpu : counts.gpu) == 4);
+    resources.release_texture(alias);
     resources.release_texture(state);
     resources.release_pool(pool);
+  }
+}
+
+// A retained native snapshot pins its physical content, not merely its Metal
+// object. Even an advanced replay retirement cannot recycle that allocation.
+void check_native_snapshot_pin(id<MTLDevice> device, id<MTLCommandQueue> queue) {
+  Pages pages(4);
+  metal::Resources resources(device);
+  CHECK(resources.wait_for_gpu_deswizzle(std::chrono::seconds(10)));
+  nvn::MemoryPoolState pool{};
+  pool.memory = reinterpret_cast<std::uint8_t*>(pages.bytes());
+  pool.size = pages.size();
+  pool.flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+  CHECK(resources.register_pool(pool));
+  auto state = make_texture(pool, 5900);
+  std::vector<std::byte> first(64, std::byte{0x11}), second(64, std::byte{0x33}), third(64, std::byte{0x55});
+  CHECK(nvn::transfer_pool_texels(state, whole_rgba_transfer(), first.data(), true));
+  resources.register_texture(state);
+  auto snapshot = resources.capture_native(state);
+  CHECK(snapshot.texture && snapshot.allocation && snapshot.release_read);
+  CHECK(resources.flush_uploads());
+  CHECK(snapshot.producer_error().empty());
+  CHECK(nvn::transfer_pool_texels(state, whole_rgba_transfer(), second.data(), true));
+  id<MTLTexture> current = resources.texture(state, nullptr);
+  CHECK(current && current != snapshot.texture);
+  CHECK(resources.flush_uploads());
+  resources.complete_gpu_writes(resources.gpu_write_generation());
+  CHECK(nvn::transfer_pool_texels(state, whole_rgba_transfer(), third.data(), true));
+  id<MTLTexture> fresh = resources.texture(state, nullptr);
+  CHECK(fresh && fresh != current && fresh != snapshot.texture);
+  CHECK(resources.flush_uploads());
+  CHECK(read_native_rgba(resources, device, queue, snapshot.texture) == first);
+  CHECK(read_native_rgba(resources, device, queue, fresh) == third);
+  snapshot.release_read();
+  snapshot = {};
+  resources.release_pool(pool);
+}
+
+// A buffer-backed native source leases its pool until the frame finishes or
+// is canceled. Pool release waits outside the resource mutex.
+void check_native_pool_lease(id<MTLDevice> device) {
+  Pages pages(4);
+  metal::Resources resources(device);
+  nvn::MemoryPoolState pool{};
+  pool.memory = reinterpret_cast<std::uint8_t*>(pages.bytes());
+  pool.size = pages.size();
+  pool.flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+  CHECK(resources.register_pool(pool));
+  auto state = make_texture(pool, 5901);
+  state.description.flags = NVN_TEXTURE_FLAGS_LINEAR;
+  state.description.stride = 256;
+  const auto layout = nvn::resource_layout(state.description);
+  CHECK(layout.has_value());
+  if (!layout) return;
+  state.size = layout->total_size; state.layer_size = layout->layer_stride;
+  resources.register_texture(state);
+  auto snapshot = resources.capture_native(state);
+  CHECK(snapshot.texture && resources.texture_is_in_place(state));
+  if (!snapshot.texture) return;
+  auto owner = resources.submission_owner();
+  auto native = std::make_shared<metal::Metal4NativeSubmission>(owner, owner->reserve(),
+      snapshot.producer_error, snapshot.allocation, snapshot.release_read);
+  const auto generation = resources.pool_generation();
+  std::atomic<bool> released{false};
+  std::thread release([&] { resources.release_pool(pool); released.store(true); });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (resources.pool_generation() == generation && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  CHECK(resources.pool_generation() != generation && !released.load());
+  native->cancel();
+  release.join();
+  CHECK(released.load());
+  CHECK(resources.buffer_at(reinterpret_cast<std::uint64_t>(pool.memory), 16).buffer == nil);
+}
+
+// Releasing a pool drops both uploaded versions even when texture entries
+// stay registered and no subsequent registration sweeps them.
+void check_pool_release_drops_upload_spares(id<MTLDevice> device) {
+  Pages pages(3);
+  CHECK(pages.bytes() != nullptr);
+  if (!pages.bytes()) return;
+  metal::Resources resources(device);
+  for (unsigned index = 0; index != 3; ++index) {
+    __weak id<MTLTexture> old, current;
+    @autoreleasepool {
+      nvn::MemoryPoolState pool{};
+      pool.memory = reinterpret_cast<std::uint8_t*>(pages.bytes() + index * getpagesize());
+      pool.size = getpagesize();
+      pool.flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+      CHECK(resources.register_pool(pool));
+      auto state = make_texture(pool, 3600 + index);
+      resources.register_texture(state);
+      std::vector<std::byte> bytes(64, std::byte{0x12});
+      CHECK(resources.write_texels(state, whole_rgba_transfer(), bytes.data()));
+      old = resources.texture(state, nullptr);
+      CHECK(resources.flush_uploads());
+      std::fill(bytes.begin(), bytes.end(), std::byte{0x34});
+      CHECK(resources.write_texels(state, whole_rgba_transfer(), bytes.data()));
+      current = resources.texture(state, nullptr);
+      CHECK(resources.flush_uploads());
+      CHECK(old && current && old != current);
+      resources.release_pool(pool);
+    }
+    CHECK(old == nil && current == nil);
   }
 }
 
@@ -1912,8 +2532,10 @@ void check_upload_fences(id<MTLDevice> device) {
   CHECK(resources.register_pool(pool));
   std::vector<std::byte> bytes(64, std::byte{0x5a});
 
-  // The first fence with uploads in flight orders them on the CPU, once per
-  // Resources; spend it here so the fences below take the event path.
+  // The first batch is asynchronous too: a gated GPU cannot prevent its
+  // CPU publication, and no event priming drains the upload on this thread.
+  id<MTLSharedEvent> gate = [device newSharedEvent];
+  [resources.submission_owner()->queue() waitForEvent:gate value:1];
   auto primer = make_texture(pool, 599);
   primer.memory = pool.memory + 8192;
   primer.offset = 8192;
@@ -1922,6 +2544,10 @@ void check_upload_fences(id<MTLDevice> device) {
   CHECK(resources.texture(primer, nullptr) != nil);
   metal::UploadFence primed;
   resources.commit_uploads(primed);
+  CHECK(primed.floor == 0 && primed.value > 0);
+  CHECK(resources.unsettled_uploads() == 1);
+  gate.signaledValue = 1;
+  CHECK(resources.flush_uploads());
   CHECK(resources.unsettled_uploads() == 0);
 
   // An upload from a thread that has not begun a walk is external.
@@ -1939,7 +2565,7 @@ void check_upload_fences(id<MTLDevice> device) {
   // The next fence starts where the last ended, also with nothing to wait for.
   metal::UploadFence two;
   resources.commit_uploads(two);
-  CHECK(two.floor == one.value && two.value == one.value && two.event == nil);
+  CHECK(two.floor == one.value && two.value == one.value);
 
   // An upload from the walking thread is waited for through its fence's range.
   resources.begin_walk();
@@ -1960,12 +2586,9 @@ void check_upload_fences(id<MTLDevice> device) {
   resources.release_pool(pool);
 }
 
-// The first segment that would wait for the upload event is ordered after its
-// batch on the CPU: a batch still running on the transfer queue when the replay
-// queue commits its first event wait stalls on the GPU for 4 s. That fence
-// carries no event and leaves nothing unsettled, and the uploaded content is
-// already in the texture; later batches use the event as usual.
-void check_first_event_wait_follows_completion(id<MTLDevice> device,
+// The first Metal 4 batch obeys the same asynchronous contract as every later
+// batch. An explicit CPU reader waits for completion; replay publication does not.
+void check_first_upload_publication(id<MTLDevice> device,
                                                id<MTLCommandQueue> queue) {
   Pages pages(4);
   CHECK(pages.bytes() != nullptr);
@@ -1990,12 +2613,11 @@ void check_first_event_wait_follows_completion(id<MTLDevice> device,
   metal::UploadFence fence;
   resources.commit_uploads(fence);
   CHECK(fence.value >= 1 && fence.floor == 0);
-  CHECK(fence.event == nil);
-  CHECK(resources.unsettled_uploads() == 0);
   CHECK(!resources.uploads_failed(fence));
+  CHECK(resources.unsettled_uploads() == 0);
   if (texture) CHECK(read_native_rgba(resources, device, queue, texture) == bytes);
 
-  // The next batch is ordered through the event.
+  // The next batch extends the logical completion/error range.
   auto second = make_texture(pool, 701);
   second.memory = pool.memory + 4096;
   second.offset = 4096;
@@ -2089,6 +2711,490 @@ void check_gpu_upload_batches(id<MTLDevice> device, id<MTLCommandQueue> queue) {
   }
 }
 
+bool covers_whole_page(const void *memory, std::uint64_t size) {
+  const auto page = static_cast<std::uintptr_t>(getpagesize());
+  const auto lo = reinterpret_cast<std::uintptr_t>(memory);
+  if (!memory || !size || !page ||
+      size > std::numeric_limits<std::uintptr_t>::max() - lo)
+    return false;
+  const auto hi = lo + static_cast<std::uintptr_t>(size);
+  return ((lo + page - 1) & ~(page - 1)) < (hi & ~(page - 1));
+}
+
+// Stores one byte of every whole page inside the range, putting each byte
+// back as it was. A protected page faults and is recorded as written.
+void fault_whole_pages(std::uint8_t *memory, std::uint64_t size) {
+  const auto page = static_cast<std::uintptr_t>(getpagesize());
+  const auto lo = reinterpret_cast<std::uintptr_t>(memory);
+  const auto hi = lo + static_cast<std::uintptr_t>(size);
+  const auto begin = (lo + page - 1) & ~(page - 1);
+  const auto end = hi & ~(page - 1);
+  for (auto address = begin; address < end; address += page) {
+    auto *byte = reinterpret_cast<volatile std::uint8_t *>(address);
+    const auto value = *byte;
+    *byte = value;
+  }
+}
+
+bool clear_color(id<MTLCommandQueue> queue, id<MTLTexture> texture, double red,
+                 double green, double blue) {
+  auto commands = [queue commandBuffer];
+  auto *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+  pass.colorAttachments[0].texture = texture;
+  pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+  pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+  pass.colorAttachments[0].clearColor = MTLClearColorMake(red, green, blue, 1);
+  auto encoder = [commands renderCommandEncoderWithDescriptor:pass];
+  if (!encoder)
+    return false;
+  [encoder endEncoding];
+  [commands commit];
+  return complete(commands);
+}
+
+bool fill_rgba(const nvn::TextureState &state, std::uint8_t red, std::uint8_t green,
+               std::uint8_t blue, std::uint8_t alpha) {
+  const auto pixels =
+      std::size_t{state.description.width} * state.description.height;
+  std::vector<std::byte> image(pixels * 4);
+  for (std::size_t pixel = 0; pixel < pixels; ++pixel) {
+    image[pixel * 4] = std::byte{red};
+    image[pixel * 4 + 1] = std::byte{green};
+    image[pixel * 4 + 2] = std::byte{blue};
+    image[pixel * 4 + 3] = std::byte{alpha};
+  }
+  nvn::TexelTransfer transfer;
+  transfer.region = {0, 0, 0, static_cast<std::int32_t>(state.description.width),
+                     static_cast<std::int32_t>(state.description.height), 1};
+  transfer.row_stride = std::size_t{state.description.width} * 4;
+  transfer.image_stride = transfer.row_stride * state.description.height;
+  return nvn::transfer_pool_texels(state, transfer, image.data(), true);
+}
+
+bool rgba_is(const std::vector<std::byte> &bytes, unsigned red, unsigned green,
+             unsigned blue, unsigned alpha) {
+  if (bytes.size() < 4 || bytes.size() % 4 != 0)
+    return false;
+  for (std::size_t index = 0; index < bytes.size(); index += 4) {
+    const unsigned channels[] = {
+        std::to_integer<unsigned>(bytes[index]),
+        std::to_integer<unsigned>(bytes[index + 1]),
+        std::to_integer<unsigned>(bytes[index + 2]),
+        std::to_integer<unsigned>(bytes[index + 3])};
+    if (channels[0] != red || channels[1] != green || channels[2] != blue ||
+        channels[3] != alpha) {
+      std::fprintf(stderr, "pixel %zu is %u %u %u %u, expected %u %u %u %u\n",
+                   index / 4, channels[0], channels[1], channels[2], channels[3],
+                   red, green, blue, alpha);
+      return false;
+    }
+  }
+  return true;
+}
+
+// The draw binding resolves the descriptor again, so a cached view cannot
+// hide whether guest memory replaced the GPU's texture.
+id<MTLTexture> draw_texture(metal::Resources &resources, const nvn::TextureState &state,
+                            std::int32_t descriptor) {
+  resources.register_texture_descriptor(descriptor, state, nullptr);
+  return resources.texture_for_id(descriptor);
+}
+
+// A colour texture large enough that at least one host page lies wholly
+// inside its storage. offset places it within the allocation.
+bool place_texture(Pages &pages, std::size_t offset, std::int32_t format,
+                   std::int32_t target, std::uint32_t depth, std::uint64_t serial,
+                   nvn::MemoryPoolState &pool, nvn::TextureState &state,
+                   armigo::graphics::TextureLayoutDescription &layout) {
+  for (const std::uint32_t side : {64u, 128u, 256u}) {
+    nvn::TextureDescription description{};
+    description.target = target;
+    description.format = format;
+    description.samples = 1;
+    description.width = side;
+    description.height = target == NVN_TEXTURE_TARGET_1D ? 1u : side;
+    description.depth = depth;
+    description.levels = 1;
+    const auto computed = nvn::resource_layout(description);
+    if (!computed || offset > pages.size() ||
+        computed->total_size > pages.size() - offset)
+      continue;
+    auto *memory = pages.bytes() + offset;
+    if (!covers_whole_page(memory, computed->total_size))
+      continue;
+    pool = {};
+    pool.memory = reinterpret_cast<std::uint8_t *>(memory);
+    pool.size = computed->total_size;
+    pool.flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+    state = {};
+    state.description = description;
+    state.size = computed->total_size;
+    state.layer_size = computed->layer_stride;
+    state.memory = pool.memory;
+    state.pool = &pool;
+    state.serial = serial;
+    layout = *computed;
+    return true;
+  }
+  return false;
+}
+
+// GPU-written texture storage stays the GPU's until the CPU rewrites a whole
+// page of an uncompressed 2D texture, or any stored byte of a block-compressed
+// texture. Depth and pools the CPU cannot write do not change hands.
+void check_cpu_rewrite_after_gpu_write(id<MTLDevice> device, id<MTLCommandQueue> queue) {
+  metal::Resources resources(device);
+  resources.wait_for_gpu_deswizzle(std::chrono::seconds(10));
+  const auto page = static_cast<std::size_t>(getpagesize());
+  Pages color_pages(128);
+  CHECK(color_pages.bytes() != nullptr);
+  if (!color_pages.bytes())
+    return;
+
+  nvn::MemoryPoolState pool{};
+  nvn::TextureState state{};
+  armigo::graphics::TextureLayoutDescription layout{};
+  CHECK(place_texture(color_pages, 0, NVN_FORMAT_RGBA8, NVN_TEXTURE_TARGET_2D, 1,
+                      88001, pool, state, layout));
+  if (!state.memory)
+    return;
+  CHECK(resources.register_pool(pool));
+  resources.register_texture(state);
+  CHECK(fill_rgba(state, 0, 0, 0, 255));
+  id<MTLTexture> texture = draw_texture(resources, state, 4100);
+  CHECK(texture != nil);
+  if (!texture)
+    return;
+  CHECK(resources.flush_uploads());
+  CHECK(clear_color(queue, texture, 1, 0, 0));
+  resources.note_gpu_write(state);
+  const auto rewrites_at_clear = resources.cpu_rewrites_after_gpu();
+  // A store made after the GPU write was recorded but before it completed is
+  // older than the GPU's contents: it does not take the texture back.
+  CHECK(fill_rgba(state, 255, 0, 255, 255));
+  fault_whole_pages(state.memory, state.size);
+  resources.complete_gpu_writes(resources.gpu_write_generation());
+  texture = draw_texture(resources, state, 4100);
+  CHECK(texture != nil);
+  if (texture)
+    CHECK(rgba_is(read_texture_bytes(resources, device, queue, texture, layout, false),
+                  255, 0, 0, 255));
+  CHECK(resources.cpu_rewrites_after_gpu() == rewrites_at_clear);
+
+  CHECK(fill_rgba(state, 0, 255, 0, 255));
+  fault_whole_pages(state.memory, state.size);
+  texture = draw_texture(resources, state, 4100);
+  CHECK(texture != nil);
+  if (texture)
+    CHECK(rgba_is(read_texture_bytes(resources, device, queue, texture, layout, false),
+                  0, 255, 0, 255));
+  CHECK(resources.cpu_rewrites_after_gpu() == rewrites_at_clear + 1);
+
+  CHECK(resources.flush_uploads());
+  CHECK(clear_color(queue, texture, 1, 1, 1));
+  resources.note_gpu_write(state);
+  resources.complete_gpu_writes(resources.gpu_write_generation());
+  texture = draw_texture(resources, state, 4100);
+  CHECK(texture != nil);
+  if (texture)
+    CHECK(rgba_is(read_texture_bytes(resources, device, queue, texture, layout, false),
+                  255, 255, 255, 255));
+  CHECK(resources.cpu_rewrites_after_gpu() == rewrites_at_clear + 1);
+  CHECK(fill_rgba(state, 0, 0, 255, 255));
+  fault_whole_pages(state.memory, state.size);
+  texture = draw_texture(resources, state, 4100);
+  CHECK(texture != nil);
+  if (texture)
+    CHECK(rgba_is(read_texture_bytes(resources, device, queue, texture, layout, false),
+                  0, 0, 255, 255));
+  CHECK(resources.cpu_rewrites_after_gpu() == rewrites_at_clear + 2);
+  resources.release_texture(state);
+  resources.release_pool(pool);
+
+  // A store in the shared page at the start of the texture does not cover a
+  // whole page, so the GPU's clear remains what the next draw samples.
+  Pages edge_pages(128);
+  CHECK(edge_pages.bytes() != nullptr);
+  if (!edge_pages.bytes())
+    return;
+  CHECK(place_texture(edge_pages, page / 2, NVN_FORMAT_RGBA8, NVN_TEXTURE_TARGET_2D, 1,
+                      88002, pool, state, layout));
+  CHECK((reinterpret_cast<std::uintptr_t>(state.memory) & (page - 1)) != 0);
+  CHECK(resources.register_pool(pool));
+  resources.register_texture(state);
+  CHECK(fill_rgba(state, 0, 0, 0, 255));
+  texture = draw_texture(resources, state, 4101);
+  CHECK(texture != nil);
+  if (!texture)
+    return;
+  CHECK(resources.flush_uploads());
+  CHECK(clear_color(queue, texture, 1, 0, 0));
+  resources.note_gpu_write(state);
+  auto *edge = reinterpret_cast<volatile std::uint8_t *>(state.memory);
+  *edge = static_cast<std::uint8_t>(*edge ^ 0x5a);
+  const auto rewrites_at_edge = resources.cpu_rewrites_after_gpu();
+  texture = draw_texture(resources, state, 4101);
+  CHECK(texture != nil);
+  if (texture)
+    CHECK(rgba_is(read_texture_bytes(resources, device, queue, texture, layout, false),
+                  255, 0, 0, 255));
+  CHECK(resources.cpu_rewrites_after_gpu() == rewrites_at_edge);
+  resources.release_texture(state);
+  resources.release_pool(pool);
+
+  // A block-compressed texture cannot be a render target. A GPU copy into it
+  // leaves that copy in place until the CPU stores new blocks, which are
+  // uploaded.
+  nvn::TextureDescription compressed_description{};
+  compressed_description.target = NVN_TEXTURE_TARGET_2D;
+  compressed_description.format = NVN_FORMAT_RGBA_DXT1;
+  compressed_description.samples = 1;
+  compressed_description.width = 32;
+  compressed_description.height = 32;
+  compressed_description.depth = 1;
+  compressed_description.levels = 1;
+  const auto compressed_layout = nvn::resource_layout(compressed_description);
+  CHECK(compressed_layout.has_value());
+  if (compressed_layout) {
+    Pages compressed_pages(8);
+    CHECK(compressed_pages.bytes() != nullptr);
+    CHECK(compressed_pages.bytes() &&
+          compressed_layout->total_size <= compressed_pages.size());
+    if (compressed_pages.bytes() &&
+        compressed_layout->total_size <= compressed_pages.size()) {
+      pool = {};
+      pool.memory = reinterpret_cast<std::uint8_t *>(compressed_pages.bytes());
+      pool.size = compressed_layout->total_size;
+      pool.flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+      state = {};
+      state.description = compressed_description;
+      state.size = compressed_layout->total_size;
+      state.layer_size = compressed_layout->layer_stride;
+      state.memory = pool.memory;
+      state.pool = &pool;
+      state.serial = 88003;
+      const auto &mip = compressed_layout->mips.front();
+      std::vector<std::byte> first(mip.block_rows * mip.linear_row_bytes, std::byte{0x11});
+      std::vector<std::byte> copied(first.size(), std::byte{0x22});
+      std::vector<std::byte> rewritten(first.size(), std::byte{0x33});
+      auto write_blocks = [&](const std::vector<std::byte> &blocks) {
+        nvn::TexelTransfer transfer;
+        transfer.region = {0, 0, 0, 32, 32, 1};
+        transfer.row_stride = mip.linear_row_bytes;
+        transfer.image_stride = blocks.size();
+        return nvn::transfer_pool_texels(state, transfer,
+                                         const_cast<std::byte *>(blocks.data()), true);
+      };
+      CHECK(resources.register_pool(pool));
+      resources.register_texture(state);
+      CHECK(write_blocks(first));
+      texture = draw_texture(resources, state, 4102);
+      CHECK(texture != nil);
+      if (texture) {
+        CHECK(read_texture_bytes(resources, device, queue, texture, *compressed_layout,
+                                 false) == first);
+        const auto row = (mip.linear_row_bytes + 255) & ~std::size_t{255};
+        id<MTLBuffer> blocks = [device newBufferWithLength:row * mip.block_rows
+                                                   options:MTLResourceStorageModeShared];
+        auto *block_bytes = static_cast<std::byte *>(blocks.contents);
+        for (std::uint32_t row_index = 0; row_index < mip.block_rows; ++row_index)
+          std::memcpy(block_bytes + row_index * row,
+                      copied.data() + row_index * mip.linear_row_bytes,
+                      mip.linear_row_bytes);
+        auto copy = [queue commandBuffer];
+        auto blit = [copy blitCommandEncoder];
+        [blit copyFromBuffer:blocks
+                       sourceOffset:0
+                  sourceBytesPerRow:row
+                sourceBytesPerImage:row * mip.block_rows
+                         sourceSize:MTLSizeMake(32, 32, 1)
+                          toTexture:texture
+                   destinationSlice:0
+                   destinationLevel:0
+                  destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+        [copy commit];
+        CHECK(complete(copy));
+        const auto rewrites_before_copy = resources.cpu_rewrites_after_gpu();
+        resources.note_gpu_write(state);
+        texture = draw_texture(resources, state, 4102);
+        CHECK(texture != nil);
+        if (texture)
+          CHECK(read_texture_bytes(resources, device, queue, texture, *compressed_layout,
+                                   false) == copied);
+        CHECK(resources.cpu_rewrites_after_gpu() == rewrites_before_copy);
+        CHECK(write_blocks(rewritten));
+        texture = draw_texture(resources, state, 4102);
+        CHECK(texture != nil);
+        if (texture)
+          CHECK(read_texture_bytes(resources, device, queue, texture, *compressed_layout,
+                                   false) == copied);
+        // A block-compressed texture the GPU wrote stays the GPU's: its guest
+        // bytes do not hold the copy, so uploading them would lose it.
+        CHECK(resources.cpu_rewrites_after_gpu() == rewrites_before_copy);
+      }
+      resources.release_texture(state);
+      resources.release_pool(pool);
+    }
+  }
+
+  // A depth texture keeps the GPU clear when the CPU rewrites its pages.
+  Pages depth_pages(128);
+  CHECK(depth_pages.bytes() != nullptr);
+  const bool depth_placed =
+      depth_pages.bytes() &&
+      place_texture(depth_pages, 0, NVN_FORMAT_DEPTH32F, NVN_TEXTURE_TARGET_2D, 1,
+                    88004, pool, state, layout);
+  CHECK(depth_placed);
+  if (depth_placed) {
+    CHECK(resources.register_pool(pool));
+    resources.register_texture(state);
+    texture = resources.texture(state, nullptr);
+    CHECK(texture != nil && texture.pixelFormat == MTLPixelFormatDepth32Float);
+    if (texture) {
+      CHECK(resources.flush_uploads());
+      auto clear = [queue commandBuffer];
+      auto *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+      pass.depthAttachment.texture = texture;
+      pass.depthAttachment.loadAction = MTLLoadActionClear;
+      pass.depthAttachment.storeAction = MTLStoreActionStore;
+      pass.depthAttachment.clearDepth = 0.25;
+      auto encoder = [clear renderCommandEncoderWithDescriptor:pass];
+      CHECK(encoder != nil);
+      [encoder endEncoding];
+      [clear commit];
+      CHECK(complete(clear));
+      const auto rewrites_before_depth = resources.cpu_rewrites_after_gpu();
+      resources.note_gpu_write(state);
+      std::memset(state.memory, 0xff, static_cast<std::size_t>(state.size));
+      fault_whole_pages(state.memory, state.size);
+      texture = resources.texture(state, nullptr);
+      CHECK(texture != nil);
+      CHECK(resources.cpu_rewrites_after_gpu() == rewrites_before_depth);
+      if (texture) {
+        CHECK(resources.flush_uploads());
+        const auto row = (std::size_t{texture.width} * 4 + 255) & ~std::size_t{255};
+        id<MTLBuffer> depth = [device newBufferWithLength:row
+                                                  options:MTLResourceStorageModeShared];
+        auto read = [queue commandBuffer];
+        auto blit = [read blitCommandEncoder];
+        [blit copyFromTexture:texture
+                         sourceSlice:0
+                         sourceLevel:0
+                        sourceOrigin:MTLOriginMake(0, 0, 0)
+                          sourceSize:MTLSizeMake(1, 1, 1)
+                            toBuffer:depth
+                   destinationOffset:0
+              destinationBytesPerRow:row
+            destinationBytesPerImage:row];
+        [blit endEncoding];
+        [read commit];
+        CHECK(complete(read));
+        float sample = 0;
+        std::memcpy(&sample, depth.contents, sizeof sample);
+        CHECK(sample == 0.25f);
+      }
+    }
+    resources.release_texture(state);
+    resources.release_pool(pool);
+  }
+
+  // A pool the CPU cannot write is not stamped and its pages are not
+  // protected again for the GPU write. The clear stays in place.
+  Pages hidden_pages(128);
+  CHECK(hidden_pages.bytes() != nullptr);
+  const bool hidden_placed =
+      hidden_pages.bytes() &&
+      place_texture(hidden_pages, 0, NVN_FORMAT_RGBA8, NVN_TEXTURE_TARGET_2D, 1,
+                    88005, pool, state, layout);
+  CHECK(hidden_placed);
+  if (hidden_placed) {
+    pool.flags = NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_GPU_CACHED |
+                 NVN_MEMORY_POOL_FLAGS_COMPRESSIBLE;
+    CHECK(resources.register_pool(pool));
+    resources.register_texture(state);
+    CHECK(fill_rgba(state, 0, 0, 0, 255));
+    texture = draw_texture(resources, state, 4103);
+    CHECK(texture != nil);
+    if (texture) {
+      CHECK(resources.flush_uploads());
+      const auto page_size = static_cast<std::uintptr_t>(getpagesize());
+      const auto lo = reinterpret_cast<std::uintptr_t>(state.memory);
+      const auto whole = (lo + page_size - 1) & ~(page_size - 1);
+      auto *writable = reinterpret_cast<volatile std::uint8_t *>(whole);
+      const auto kept = *writable;
+      *writable = kept;
+      CHECK(clear_color(queue, texture, 1, 0, 0));
+      const auto protects = armigo::memory::WriteTracker::stats().protect_calls;
+      const auto rewrites_before_hidden = resources.cpu_rewrites_after_gpu();
+      resources.note_gpu_write(state);
+      CHECK(armigo::memory::WriteTracker::stats().protect_calls == protects);
+      CHECK(fill_rgba(state, 0, 255, 0, 255));
+      fault_whole_pages(state.memory, state.size);
+      texture = draw_texture(resources, state, 4103);
+      CHECK(texture != nil);
+      if (texture)
+        CHECK(rgba_is(read_texture_bytes(resources, device, queue, texture, layout, false),
+                      255, 0, 0, 255));
+      CHECK(resources.cpu_rewrites_after_gpu() == rewrites_before_hidden);
+    }
+    resources.release_texture(state);
+    resources.release_pool(pool);
+  }
+}
+
+void check_texture_read_identity(id<MTLDevice> device) {
+  Pages pages(2);
+  CHECK(pages.bytes());
+  if (!pages.bytes()) return;
+  nvn::MemoryPoolState pool{};
+  pool.memory = reinterpret_cast<std::uint8_t*>(pages.bytes());
+  pool.size = pages.size();
+  metal::Resources resources(device);
+  CHECK(resources.register_pool(pool));
+  std::array<nvn::TextureState, 3> states{
+      make_texture(pool, 97001), make_texture(pool, 97002), make_texture(pool, 97003)};
+  states[0].description.format = states[1].description.format = NVN_FORMAT_DEPTH32F;
+  states[1].memory += pages.size() / 2;
+  states[1].offset = pages.size() / 2;
+  states[2].memory += 512;
+  states[2].offset = 512;
+  std::array<metal::TextureReadIdentity, 3> allowed;
+  for (unsigned index = 0; index != states.size(); ++index) {
+    resources.register_texture_descriptor(19, states[index], nullptr);
+    CHECK(resources.texture_read_identity(19, allowed[index]));
+    CHECK(allowed[index].serial == states[index].serial);
+    CHECK(allowed[index].descriptor_key == resources.texture_descriptor_key(19));
+    CHECK(allowed[index].storage_key == resources.texture_storage_key(19));
+    CHECK(allowed[index].depth == (index != 2));
+  }
+  std::atomic<bool> start{false}, ready{false}, stop{false};
+  std::uint64_t writes = 0;
+  std::thread writer([&] {
+    while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+    while (!stop.load(std::memory_order_acquire)) {
+      resources.register_texture_descriptor(19, states[writes % states.size()], nullptr);
+      ++writes;
+      ready.store(true, std::memory_order_release);
+    }
+  });
+  start.store(true, std::memory_order_release);
+  while (!ready.load(std::memory_order_acquire)) std::this_thread::yield();
+  for (unsigned read = 0; read != 50'000; ++read) {
+    metal::TextureReadIdentity identity;
+    CHECK(resources.texture_read_identity(19, identity));
+    CHECK(std::any_of(allowed.begin(), allowed.end(), [&](const auto& expected) {
+      return identity.serial == expected.serial && identity.storage_key == expected.storage_key &&
+          identity.depth == expected.depth && identity.descriptor_key == expected.descriptor_key &&
+          identity.empty_epoch == expected.empty_epoch;
+    }));
+  }
+  stop.store(true, std::memory_order_release);
+  writer.join();
+  CHECK(writes != 0);
+  resources.release_pool(pool);
+}
+
 } // namespace
 
 int main() {
@@ -2106,11 +3212,15 @@ int main() {
     check_buffer_pool(device, resources, queue);
     check_guest_memory_claims(resources);
     check_guest_lease_waits(device);
+    check_addressed_pool_admission(device);
     check_completed_gpu_write(device, resources, queue);
     check_texture_resources(device, resources, queue);
+    check_typed_empty_textures(device, resources, queue);
+    check_empty_texture_ids(device);
     check_texture_usage(resources);
     check_texture_slot_revalidation(resources);
     check_descriptor_stamps(resources);
+    check_texture_read_identity(device);
     check_sampler_stamps(resources);
     check_recreated_texture_generation(device, queue);
     check_sampled_view_over_inherited_storage(device, queue);
@@ -2124,11 +3234,16 @@ int main() {
     check_in_place_write_completion(device, resources, queue, false);
     check_in_place_write_completion(device, resources, queue, true);
     check_gpu_deswizzle_uploads(device, queue);
+    check_experimental_initial_zero(device, queue);
     check_cpu_upload_paths(device, queue);
-    check_repeated_upload_in_batch(device, queue);
+    check_streamed_texture_rotation(device, queue);
+    check_native_snapshot_pin(device, queue);
+    check_native_pool_lease(device);
+    check_pool_release_drops_upload_spares(device);
     check_gpu_upload_batches(device, queue);
     check_upload_fences(device);
-    check_first_event_wait_follows_completion(device, queue);
+    check_first_upload_publication(device, queue);
+    check_cpu_rewrite_after_gpu_write(device, queue);
     if (failures) {
       std::fprintf(stderr, "%u NVN resource checks failed\n", failures);
       return 1;

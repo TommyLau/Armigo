@@ -4,6 +4,7 @@
     {
       "title_id": "0x0400486024DEC000",
       "main_build_id": "e0f3ccfaf50065ae4ea01eb5aeb13b1a45da3348000000000000000000000000",
+      "platforms": ["macos"],
       "module": "frame-rate",
       "calls": [
         {
@@ -19,11 +20,20 @@
         "variant": "ratio-division"
       },
       "nvn_driver": true,
+      "pipelines": "pipelines.tsv",
       "startup_user": true,
+      "shader_inputs": {
+        "containers": "native",
+        "dictionary_member": "Pack/ZsDic.pack.zs"
+      },
       "nvn_policy": {
         "cpu_cached_texture_writes": true,
         "timestamps": "segment",
-        "barriers": "game"
+        "barriers": "game",
+        "conditional_render": "replay",
+        "handle_reads": "current",
+        "guest_store_textures": "retired",
+        "replay": "core"
       },
       "note": "Switch 2 bring-up: NVN 231.40 driver; user preselected; cached-pool CPU writes reach textures; segment timestamps and game pass barriers are provisional until gameplay renders. No support claim."
     }

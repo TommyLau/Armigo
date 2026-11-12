@@ -24,8 +24,10 @@ namespace armigo::pack {
 struct PackedNames {
     // CFBundleDisplayName: the control-data title, unchanged.
     std::string display_name;
-    // CFBundleName and the app file name, from the control-data naming library.
+    // The sanitized title and title id, unique even when two titles share a name.
     std::string file_name;
+    // An ASCII title slug and title id, or just the id when no ASCII slug exists.
+    std::string executable_name;
     // com.tommylau.armigo.<TitleID>, with the title id in sixteen uppercase hex digits.
     std::string bundle_identifier;
     // Language of display_name. Icon selection uses this.
@@ -41,7 +43,7 @@ struct PackedNames {
 };
 
 // Reads the packed app's names from control data. Display name, file name and
-// icon language come from the control-data naming library. Returns the
+// icon language use the first supported NACP language. Returns the
 // library's detail string when the control data or the title cannot be used.
 [[nodiscard]] std::variant<std::string, PackedNames> names_from_control(
     std::uint64_t title_id, std::span<const std::byte> nacp);

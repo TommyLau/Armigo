@@ -56,6 +56,24 @@ struct StorageTarget {
     ResourceId resource;
     StorageAddress address;
 };
+// Stage-buffer instructions address header-sized task/mesh regions. Dynamic
+// accesses outside their declared region are undefined by this contract.
+enum class StageBufferPolicy : std::uint8_t { header_direct_v1 = 1 };
+struct StageBufferAccess {
+    StageBufferPolicy policy{StageBufferPolicy::header_direct_v1};
+    std::uint32_t region_base{}, region_bytes{}, allocation_bytes{};
+    [[nodiscard]] constexpr bool valid_for(std::uint32_t allocation) const noexcept {
+        return policy == StageBufferPolicy::header_direct_v1 && allocation_bytes == allocation &&
+            region_bytes && !(region_base & 3u) && !(region_bytes & 3u) &&
+            region_base <= allocation && region_bytes <= allocation - region_base;
+    }
+};
+// Native non-RMW LDG orders 5/7 use ordinary aligned scalar/vector loads.
+// The decoded scope remains metadata; stores and atomic operations are separate.
+enum class NativeLoadPolicy : std::uint8_t { aligned_v1 = 1 };
+// Native word atomics address the actual workgroup allocation directly.
+// Defined accesses stay within that allocation; no zero/drop substitute exists.
+enum class NativeSharedAtomicPolicy : std::uint8_t { word_address_v1 = 1 };
 struct MemoryInfo {
     AddressSpace space{AddressSpace::constant_buffer};
     Access access{Access::read};
@@ -85,9 +103,16 @@ struct MemoryInfo {
     // serves the access from the first descriptor whose range contains the
     // guest address; none reads zero or drops the store.
     std::vector<StorageTarget> storage_alternatives;
+    // Translation proved an ordinary load's descriptor-relative byte offset.
+    // This path follows the host storage binding without guest-pool lookup.
+    std::optional<TextureKey> direct_storage;
     // Storage: legalization proved the descriptor-relative address word
     // aligned, so each 4-byte element is one host word.
     bool storage_word_aligned{};
+    // Set only by stage-buffer instruction lowering, never ordinary LDS/STS.
+    std::optional<StageBufferAccess> stage_buffer;
+    std::optional<NativeLoadPolicy> native_load_policy;
+    std::optional<NativeSharedAtomicPolicy> native_shared_atomic_policy;
 };
 struct DynamicHandle { InputIndex input; };
 using HandleSource = std::variant<TextureKey, DynamicHandle>;
@@ -157,6 +182,18 @@ struct Operation {
     std::vector<Operand> inputs, outputs;
     OperationInfo info;
 };
+inline bool valid_native_shared_atomic(const Operation& op, const MemoryInfo& m, Stage stage) {
+    return m.native_shared_atomic_policy == NativeSharedAtomicPolicy::word_address_v1 &&
+        stage == Stage::compute && op.opcode == Opcode::atomic &&
+        op.numeric == NumericMode{Domain::unsigned_integer, ScalarType::u32} &&
+        m.space == AddressSpace::shared && m.access == Access::read_write &&
+        m.atomic == AtomicKind::add && m.element_bytes == 4 && m.elements == 1 && m.alignment == 4 &&
+        m.data.size() == 1 && !m.is_volatile && m.order == MemoryOrder::relaxed &&
+        m.scope == MemoryScope::workgroup && !m.resource && !m.constant_buffer_slot && !m.array_index &&
+        !m.global_address_high && !m.storage_address && m.storage_alternatives.empty() &&
+        !m.direct_storage && !m.storage_word_aligned && !m.stage_buffer && !m.native_load_policy &&
+        !m.dynamic_byte_offset_upper_bound && (!m.dynamic_byte_offset || m.byte_offset == 0);
+}
 struct PhiInput { BlockId predecessor; ValueId value; };
 struct Phi {
     SourceLocation source;
@@ -196,6 +233,8 @@ struct Program {
     std::vector<Operation> operations;
     std::vector<Value> values;
     std::vector<Dependency> dependencies;
+    // API-mandated fragment test ordering is observable for shader side effects.
+    bool api_mandated_early_fragment_tests{};
 };
 struct RegisterProgram { Program ir; };
 struct SsaProgram { Program ir; };

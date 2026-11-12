@@ -243,7 +243,7 @@ struct FragmentBuilder {
         BufferUse use;
         use.source = ConstantBufferSource{0};
         use.access = Access::read;
-        use.size = {SizeKind::constant_buffer_window, 64, 4, ConstantBufferPolicy::runtime_zero_words_v1};
+        use.size = {SizeKind::constant_buffer_window, 64, 4, ConstantBufferPolicy::padded_zero_words_v2};
         buffer = ResourceId{static_cast<std::uint32_t>(p.requirements.uses.size())};
         p.requirements.uses.push_back(use);
         plan.resources.push_back({buffer, use, MetalRange{MetalNamespace::buffer, 0, 1}});
@@ -1281,7 +1281,7 @@ int run_one(id<MTLDevice> device, id<MTL4Compiler> compiler, id<MTL4CommandQueue
         return 1;
     }
     std::vector<std::uint32_t> constants = item.constants;
-    while (constants.size() < 4) constants.push_back(0);
+    while (constants.size() < 20) constants.push_back(0);
     id<MTLBuffer> constant_buffer = [device newBufferWithBytes:constants.data()
         length:constants.size() * sizeof(std::uint32_t) options:MTLResourceStorageModeShared];
     std::array<std::uint32_t, 18> sizes{};

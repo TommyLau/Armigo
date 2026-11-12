@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <functional>
 #include <initializer_list>
+#include <regex>
 #include <string>
 #include <tuple>
 
@@ -144,12 +145,15 @@ std::vector<Case> cases() {
     // Narrow loads: U8, S8, U16, S16 at every byte and half of a word.
     std::vector<Words> bytes;
     for (unsigned i = 0; i < 8; ++i) bytes.push_back(address(base + 4 * (3 + i)));
-    c.push_back({"narrow loads", {uniform_load(4, 0), uniform_load(5, 1),
-        uniform_ldg(0, 255, true, 4, 1, 0), uniform_ldg(1, 255, true, 4, 3, 1), uniform_ldg(2, 255, true, 4, 2, 2), uniform_ldg(3, 255, true, 4, 2, 3)}, bytes,
-        [](const Words& in, Words m) {
-            const auto w = m[index_of(in[0] | std::uint64_t(in[1]) << 32)];
-            return std::pair{Pixel{(w >> 8) & 0xff, std::uint32_t(sign8(w, 3)), w >> 16, std::uint32_t(sign16(w, 1))}, m};
-        }});
+    for (const unsigned order : {0u, 4u, 5u, 7u}) {
+        c.push_back({"narrow loads, order " + std::to_string(order), {uniform_load(4, 0), uniform_load(5, 1),
+            uniform_ldg(0, 255, true, 4, 1, 0, order), uniform_ldg(1, 255, true, 4, 3, 1, order),
+            uniform_ldg(2, 255, true, 4, 2, 2, order), uniform_ldg(3, 255, true, 4, 2, 3, order)}, bytes,
+            [](const Words& in, Words m) {
+                const auto w = m[index_of(in[0] | std::uint64_t(in[1]) << 32)];
+                return std::pair{Pixel{(w >> 8) & 0xff, std::uint32_t(sign8(w, 3)), w >> 16, std::uint32_t(sign16(w, 1))}, m};
+            }});
+    }
     // STG.E.64 (uniform form) and STG.E.32 (register form), then a load back.
     std::vector<Words> stores;
     for (unsigned i = 0; i + 2 <= window_words; i += 10) stores.push_back(address(base + 4 * i, {0x11111111u * (i + 1), 0xcafe0000u + i}));
@@ -177,6 +181,19 @@ std::vector<Case> cases() {
                 return std::pair{Pixel{loaded, 0, 0, 0}, m};
             }});
     }
+    // Each admitted native order reads a complete aligned vector.
+    std::vector<Words> pairs, aligned_quads;
+    for (unsigned i = 0; i + 2 <= window_words; i += 6) pairs.push_back(address(base + 4 * i));
+    for (unsigned i = 0; i + 4 <= window_words; i += 12) aligned_quads.push_back(address(base + 4 * i));
+    for (const unsigned type : {5u, 6u})
+        for (const unsigned order : {0u, 4u, 5u, 7u})
+            c.push_back({"wide load, type " + std::to_string(type) + " order " + std::to_string(order),
+                {memory_op(0x381, type, order, {{16, 8, 0}, {24, 8, 8}, {40, 24, 0}, {72, 1, 1}, {81, 3, 7}})},
+                type == 5 ? pairs : aligned_quads,
+                [type](const Words& in, Words m) {
+                    const auto at = index_of(in[0] | std::uint64_t(in[1]) << 32);
+                    return std::pair{type == 5 ? Pixel{m[at], m[at + 1], 0, 0} : Pixel{m[at], m[at + 1], m[at + 2], m[at + 3]}, m};
+                }});
     // Atomics: ADD (register form), ADD (uniform form, Ra.64 bit 70), RED MAX,
     // RED MIN signed, and compare-exchange.
     std::vector<Words> atomics;
@@ -308,6 +325,194 @@ std::vector<Case> cases() {
 }
 int main() { @autoreleasepool { try {
     MetalHarness gpu;
+    // Proven driver descriptors use ordinary storage reads at translation
+    // time, including packed vectors whose pointer has word alignment.
+    for (unsigned order : {0u, 4u, 5u, 7u}) for (unsigned type : {4u, 5u, 6u})
+        for (int displacement : {0, 4, 16}) {
+        const unsigned width = type == 4 ? 1 : type == 5 ? 2 : 4;
+        auto pair = op(0xb82, {{16, 8, 8}, {24, 8, 255}, {54, 5, 0}, {38, 16, 0x510}, {73, 3, 5}});
+        Fixture fixture({move(0, 0), move(1, 0), move(2, 0), move(3, 0), pair,
+            memory_op(0x381, type, order, {{16, 8, 0}, {24, 8, 8}, {40, 24, std::uint32_t(displacement) & 0xffffffu},
+                                        {72, 1, 1}, {81, 3, 7}}), exit_instruction()});
+        put(fixture.code, 0x48, 0xf);
+        auto compiled = gpu.compile(fixture);
+        const auto storages = std::count_if(compiled.artifact.reflection.resources.begin(),
+            compiled.artifact.reflection.resources.end(), [](const auto& resource) {
+                const auto* buffer = std::get_if<ir::BufferUse>(&resource.use);
+                return buffer && std::holds_alternative<ir::StorageBufferSource>(buffer->source);
+            });
+        check(storages == 1, "driver-derived LDG has one direct storage binding");
+        check(compiled.artifact.source.find("armigo_guest_address") == std::string::npos,
+            "proven driver loads contain no pool lookup or runtime fallback");
+        if (order == 5 && type == 6 && displacement == 0) {
+            const std::regex declaration(R"(\b(?:uint|ulong|bool) (value[0-9]+) = \{\};)");
+            const auto& source = compiled.artifact.source;
+            for (auto it = std::sregex_iterator(source.begin(), source.end(), declaration); it != std::sregex_iterator(); ++it) {
+                const std::regex name("\\b" + (*it)[1].str() + "\\b");
+                check(std::distance(std::sregex_iterator(source.begin(), source.end(), name), std::sregex_iterator()) > 1,
+                    "direct storage emission omits orphan SSA temporary declarations");
+            }
+        }
+        if (width > 1) check(compiled.artifact.source.find("packed_uint" + std::to_string(width)) != std::string::npos,
+            "driver-derived wide LDG has one packed vector read");
+        for (unsigned bytes : {32u, 64u}) {
+            Words input(0x520 / 4, 0);
+            constexpr std::uint64_t guest_base = 0x1234fffffff0ull;
+            input[0x510 / 4] = std::uint32_t(guest_base);
+            input[0x514 / 4] = std::uint32_t(guest_base >> 32);
+            input[0x518 / 4] = bytes;
+            MetalHarness::GuestMemory guest{guest_base,
+                {0x10203040u, 0x50607080u, 0x90a0b0c0u, 0xd0e0f001u, 0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
+                 0x55555555u, 0x66666666u, 0x77777777u, 0x88888888u, 0x99999999u, 0xaaaaaaaau, 0xbbbbbbbbu, 0xccccccccu}};
+            const auto got = gpu.run(compiled, input, &guest);
+            for (unsigned lane = 0; lane < 4; ++lane)
+                check(got[lane] == (lane < width ? guest.words[unsigned(displacement) / 4 + lane] : 0u),
+                    "direct descriptor-relative LDG preserves all words");
+            check(guest.table[1] == 0 && guest.table[5] == 0, "direct loads do not use guest miss instrumentation");
+        }
+    }
+    // The high word may add the carry from the same low-word sum. This
+    // crosses 4 GiB and must still become one direct vector load.
+    {
+        auto pair = op(0xb82, {{16, 8, 8}, {24, 8, 255}, {54, 5, 0}, {38, 16, 0x510}, {73, 3, 5}});
+        auto low = op(0x210, {{16, 8, 12}, {24, 8, 8}, {32, 8, 10}, {64, 8, 255},
+                              {77, 4, 15}, {81, 3, 0}, {84, 3, 7}, {87, 4, 15}});
+        auto high = op(0x210, {{16, 8, 13}, {24, 8, 9}, {32, 8, 255}, {64, 8, 255},
+                               {74, 1, 1}, {77, 4, 15}, {81, 3, 7}, {84, 3, 7}, {87, 4, 0}});
+        Fixture fixture({pair, move(10, 16), low, high,
+            memory_op(0x381, 6, 5, {{16, 8, 0}, {24, 8, 12}, {72, 1, 1}, {81, 3, 7}}), exit_instruction()});
+        put(fixture.code, 0x48, 0xf);
+        const auto compiled = gpu.compile(fixture);
+        check(compiled.artifact.source.find("armigo_guest_address") == std::string::npos,
+            "correlated low-word carry admits direct storage");
+        constexpr std::uint64_t address = 0x1234fffffff0ull;
+        Words input(0x520 / 4, 0); input[0x510 / 4] = std::uint32_t(address);
+        input[0x514 / 4] = std::uint32_t(address >> 32); input[0x518 / 4] = 32;
+        MetalHarness::GuestMemory guest{address, {0, 0, 0, 0, 0x11u, 0x22u, 0x33u, 0x44u}};
+        check(gpu.run(compiled, input, &guest) == Pixel{0x11u, 0x22u, 0x33u, 0x44u},
+            "correlated carry reaches the right words across 4 GiB");
+    }
+    // Correlated carries still describe full 64-bit addresses when the
+    // relative displacement leaves the descriptor's 32-bit offset range.
+    // Each rejected case points at a different valid guest pool.
+    for (unsigned scenario = 0; scenario < 6; ++scenario) {
+        auto pair = op(0xb82, {{16, 8, 8}, {24, 8, 255}, {54, 5, 0}, {38, 16, 0x510}, {73, 3, 5}});
+        const auto low = [](unsigned opcode, unsigned d, unsigned a, unsigned b) {
+            return op(opcode, {{16, 8, d}, {24, 8, a}, {32, opcode == 0x810 ? 32u : 8u, b}, {64, 8, 255},
+                {77, 4, 15}, {81, 3, 0}, {84, 3, 7}, {87, 4, 15}});
+        };
+        const auto high = [](unsigned d, unsigned a) {
+            return op(0x210, {{16, 8, d}, {24, 8, a}, {32, 8, 255}, {64, 8, 255},
+                {74, 1, 1}, {77, 4, 15}, {81, 3, 7}, {84, 3, 7}, {87, 4, 0}});
+        };
+        std::vector<sn::Instruction> code{move(0, 0), move(1, 0), move(2, 0), move(3, 0), pair, load(10, 0)};
+        if (scenario == 4) code.push_back(op(0x812, {{16, 8, 10}, {24, 8, 10}, {32, 32, 0x3c}, {64, 8, 255},
+            {72, 8, 0xc0}, {81, 3, 7}, {87, 4, 15}}));
+        if (scenario < 2 || scenario == 4) { code.push_back(low(0x210, 12, 8, 10)); code.push_back(high(13, 9)); }
+        if (scenario == 3) { code.push_back(low(0x810, 12, 8, 16)); code.push_back(high(13, 9)); }
+        if (scenario == 5) {
+            code.push_back(move(12, 16));
+            code.push_back(op(0x824, {{16, 8, 10}, {24, 8, 10}, {32, 32, 96}, {64, 8, 12}, {81, 3, 7}, {87, 4, 15}}));
+            code.push_back(low(0x210, 14, 8, 10)); code.push_back(high(15, 9));
+        }
+        if (scenario == 0) { code.push_back(low(0x810, 14, 12, 32)); code.push_back(high(15, 13)); }
+        code.push_back(ldg(0, scenario == 0 || scenario == 5 ? 14 : scenario == 2 ? 8 : 12,
+            scenario == 0 || scenario >= 4 ? 0 : scenario == 1 ? 32 : -4, scenario == 5 ? 6 : 4));
+        code.push_back(exit_instruction());
+        Fixture fixture(code); put(fixture.code, 0x48, 0xf);
+        const auto compiled = gpu.compile(fixture);
+        Words input(0x520 / 4, 0); input[0] = scenario == 5 ? 0u : 0xfffffff0u;
+        input[0x510 / 4] = 0; input[0x514 / 4] = 1; input[0x518 / 4] = 64;
+        MetalHarness::GuestMemory guest{0x100000000ull, Words(24, 0)};
+        guest.words[4] = 0xaaaaaaaau; guest.words[20] = 0xbbbbbbbbu; guest.words[11] = 0xccccccccu;
+        guest.words[3] = 0xddddddddu; guest.words[12] = 0xeeeeeeeeu;
+        guest.build_table = [](std::uint64_t device) {
+            Words table(ir::guest_memory_bytes / 4, 0); table[0] = 4;
+            const std::array<std::array<std::uint64_t, 3>, 3> pools{{
+                {0xfffffff0ull, 0x100000000ull, device + 32},
+                {0x100000000ull, 0x100000040ull, device},
+                {0x200000000ull, 0x200000020ull, device + 64}}};
+            for (unsigned i = 0; i < pools.size(); ++i) {
+                const auto row = ir::guest_memory_header_words + (i + 1) * ir::guest_memory_entry_words;
+                const std::array<std::uint64_t, 3> fields{pools[i][0], pools[i][1], pools[i][2] - pools[i][0]};
+                for (unsigned j = 0; j < fields.size(); ++j) { table[row + j*2] = std::uint32_t(fields[j]); table[row+j*2+1] = std::uint32_t(fields[j] >> 32); }
+            }
+            return table;
+        };
+        const auto expected = scenario < 2 ? 0xbbbbbbbbu : scenario == 2 ? 0xccccccccu : scenario == 3 ? 0xddddddddu : scenario == 4 ? 0xeeeeeeeeu : 0xaaaaaaaau;
+        check(gpu.run(compiled, input, &guest)[0] == expected,
+            "A full relative carry or negative displacement reaches its valid pool");
+        check((compiled.artifact.source.find("armigo_guest_address") != std::string::npos) == (scenario < 3),
+            "Only proven nonnegative bounded relative displacements use direct storage");
+        check(guest.table[1] == 0, "Offset proof regressions access valid guest pools");
+    }
+    // Independent arithmetic on the high word selects a different valid
+    // pool. Merely finding the descriptor high word in that expression is
+    // insufficient to turn the access into a descriptor-relative load.
+    for (bool dynamic : {false, true}) for (std::uint32_t delta : {1u, 0xffffffffu}) {
+        auto pair = op(0xb82, {{16, 8, 8}, {24, 8, 255}, {54, 5, 0}, {38, 16, 0x510}, {73, 3, 5}});
+        auto high_add = op(dynamic ? 0x210 : 0x810,
+            {{16, 8, 9}, {24, 8, 9}, {32, dynamic ? 8u : 32u, dynamic ? 10u : delta}, {64, 8, 255},
+             {77, 4, 15}, {81, 3, 7}, {84, 3, 7}, {87, 4, 15}});
+        Fixture fixture({pair, load(10, 0), high_add, ldg(0, 8, 0, 5), exit_instruction()});
+        const auto compiled = gpu.compile(fixture);
+        check(compiled.artifact.source.find("armigo_guest_address") != std::string::npos,
+            "independent high-word arithmetic retains the raw address");
+        Words input(0x520 / 4, 0); input[0] = delta;
+        input[0x510 / 4] = 0; input[0x514 / 4] = 2; input[0x518 / 4] = 16;
+        MetalHarness::GuestMemory guest{0x200000000ull,
+            {0x11111111u, 0, 0, 0, 0x22222222u, 0, 0, 0, 0x33333333u, 0, 0, 0}};
+        guest.build_table = [](std::uint64_t device) {
+            Words table(ir::guest_memory_bytes / 4, 0); table[0] = 4;
+            for (unsigned entry : {1u, 2u, 3u}) {
+                const auto start = std::uint64_t(entry) << 32;
+                const auto difference = device + 16u * (entry - 1) - start;
+                const auto row = ir::guest_memory_header_words + entry * ir::guest_memory_entry_words;
+                for (auto [at, value] : {std::pair{0u, start}, {2u, start + 16}, {4u, difference}}) {
+                    table[row + at] = std::uint32_t(value); table[row + at + 1] = std::uint32_t(value >> 32);
+                }
+            }
+            return table;
+        };
+        check(gpu.run(compiled, input, &guest)[0] == (delta == 1 ? 0x33333333u : 0x11111111u),
+            "independent high-word arithmetic reaches the correct valid pool");
+        check(guest.table[1] == 0, "high-word arithmetic addresses are valid guest accesses");
+    }
+    // A low word can come from a driver descriptor while the high word
+    // selects another valid pool with the same low address. That is a raw
+    // pointer choice, not a proven access to the bound storage buffer.
+    {
+        auto pair = op(0xb82, {{16, 8, 8}, {24, 8, 255}, {54, 5, 0}, {38, 16, 0x510}, {73, 3, 5}});
+        auto predicate = op(0x20c, {{24, 8, 10}, {32, 8, 255}, {68, 4, 7}, {76, 3, 2},
+                                   {81, 3, 0}, {84, 3, 7}, {87, 4, 7}});
+        auto skip = op(0x947, {{12, 4, 8}, {32, 50, 16}, {87, 4, 7}});
+        Fixture fixture({pair, load(10, 0), predicate, skip, move(9, 0), ldg(0, 8, 0, 5), exit_instruction()});
+        const auto compiled = gpu.compile(fixture);
+        check(compiled.artifact.source.find("armigo_guest_address") != std::string::npos,
+            "mixed high-word origins retain full guest addressing");
+        constexpr std::uint64_t primary = 0x1234fffffff0ull, other = 0xfffffff0ull;
+        for (unsigned select : {0u, 1u}) {
+            Words input(0x520 / 4, 0); input[0] = select;
+            input[0x510 / 4] = std::uint32_t(primary); input[0x514 / 4] = std::uint32_t(primary >> 32);
+            input[0x518 / 4] = 16;
+            MetalHarness::GuestMemory guest{primary, {0x12121212u, 0, 0, 0, 0x34343434u, 0, 0, 0}};
+            guest.build_table = [](std::uint64_t device) {
+                Words table(ir::guest_memory_bytes / 4, 0); table[0] = 3;
+                for (unsigned entry : {1u, 2u}) {
+                    const auto start = entry == 1 ? other : primary;
+                    const auto delta = device + (entry == 1 ? 16 : 0) - start;
+                    const auto row = ir::guest_memory_header_words + entry * ir::guest_memory_entry_words;
+                    for (auto [at, value] : {std::pair{0u, start}, {2u, start + 16}, {4u, delta}}) {
+                        table[row + at] = std::uint32_t(value); table[row + at + 1] = std::uint32_t(value >> 32);
+                    }
+                }
+                return table;
+            };
+            check(gpu.run(compiled, input, &guest)[0] == (select ? 0x12121212u : 0x34343434u),
+                "high-word selection reaches the selected valid pool");
+            check(guest.table[1] == 0, "both selected addresses are valid guest accesses");
+        }
+    }
     unsigned checked = 0;
     for (const auto& test : cases()) {
         auto compiled = gpu.compile(program(test));
@@ -337,15 +542,35 @@ int main() { @autoreleasepool { try {
             ++checked;
         }
     }
-    // Strong orders become relaxed device atomics in the Metal source; weak
-    // and constant accesses stay plain pointer accesses.
+    // Native LDG uses ordinary loads for each admitted order. Strong STG
+    // still uses relaxed device atomic stores.
     for (const auto& test : cases()) {
         if (test.name.rfind("word load and store, order ", 0)) continue;
         const auto source = gpu.compile(program(test)).artifact.source;
         const bool strong = test.name.back() == '5' || test.name.back() == '7';
-        check((source.find("atomic_load_explicit(reinterpret_cast<device atomic_uint*>(guest_device") != std::string::npos) == strong &&
+        check(source.find("atomic_load_explicit(reinterpret_cast<device atomic_uint*>(guest_device") == std::string::npos &&
               (source.find("atomic_store_explicit(reinterpret_cast<device atomic_uint*>(guest_device") != std::string::npos) == strong,
-              "strong guest loads and stores are relaxed device atomics, weak and constant ones plain");
+              "native LDG stays plain while strong STG stays atomic");
+        check((source.find("native_ldg_aligned_v1") != std::string::npos) == strong,
+              "orders 5/7 carry the versioned native aligned-load policy");
+    }
+    // A native wide load is exactly one vector read, without word or atomic reads.
+    const auto occurrences = [](const std::string& text, std::string_view needle) {
+        std::size_t count = 0;
+        for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + needle.size())) ++count;
+        return count;
+    };
+    for (const auto& test : cases()) {
+        if (test.name.rfind("wide load, type ", 0)) continue;
+        const auto source = gpu.compile(program(test)).artifact.source;
+        const bool quad = test.name.find("type 6") != std::string::npos;
+        const auto vectors = occurrences(source, quad ? "*reinterpret_cast<device const uint4*>" : "*reinterpret_cast<device const uint2*>");
+        const auto words = occurrences(source, "*reinterpret_cast<device const uint*>");
+        const auto atomics = occurrences(source, "atomic_load_explicit(reinterpret_cast<device atomic_uint*>(guest_device");
+        if (vectors != 1 || words != 0 || atomics != 0) {
+            std::fprintf(stderr, "%s: %zu vector, %zu word and %zu atomic reads\n", test.name.c_str(), vectors, words, atomics);
+            throw std::runtime_error("wide guest load source shape");
+        }
     }
     // The reflection names the stages that write guest memory.
     for (const auto& test : cases()) {
@@ -391,17 +616,44 @@ int main() { @autoreleasepool { try {
             ++checked;
         }
     }
-    // A vertex stage with no outputs (an empty program, as titles bind for
-    // draws that discard their primitives) returns void and builds a
-    // rasterization-disabled pipeline.
+    // Known-depth output-less vertices retain normal point rasterization and
+    // execute the same memory writes and early exits under explicit discard.
     {
-        Fixture empty({exit_instruction()}, sn::Stage::vertex);
-        empty.code[0x35] = std::byte{};
-        sn::FrontendOptions options; options.vertex_depth = ir::DepthConvention::negative_one_to_one;
-        const auto artifact = gpu.discard_pipeline(empty, options);
-        check(artifact.reflection.requires_rasterizer_discard && artifact.source.find("vertex void ") != std::string::npos,
-              "an output-less vertex stage requires rasterizer discard");
-        ++checked;
+        const auto store = [&](unsigned displacement, unsigned value) {
+            return memory_op(0x386, 4, 5, {{24,8,8},{32,8,value},{40,24,displacement},{72,1,1}});
+        };
+        auto predicate = op(0x20c, {{24,8,10},{32,8,255},{68,4,7},{76,3,2},
+                                  {81,3,0},{84,3,7},{87,4,7}});
+        auto early = exit_instruction(); field(early,12,4,0);
+        Fixture fixture({load(8,0),load(9,1),load(10,2),move(11,0x12345678),store(0,11),
+                         predicate,early,move(11,0xabcdef01),store(4,11),exit_instruction()}, sn::Stage::vertex);
+        fixture.code[0x35] = std::byte{};
+        for (const auto depth : {ir::DepthConvention::zero_to_one, ir::DepthConvention::negative_one_to_one}) {
+            sn::FrontendOptions options; options.vertex_depth = depth;
+            const auto translated = sn::translate_native(fixture.program(), options);
+            if (auto error = std::get_if<ir::Diagnostic>(&translated)) throw std::runtime_error(error->message);
+            const auto& artifact = std::get<ir::MslArtifact>(translated);
+            check(!artifact.reflection.requires_rasterizer_discard && artifact.reflection.fixed_point_size &&
+                  !artifact.reflection.discard_entry_point.empty(), "known-depth vertex has both static entries");
+            for (bool discard : {false,true}) for (bool triangles : {false,true}) for (unsigned condition : {0u,1u}) {
+                MetalHarness::GuestMemory guest{base,{0,0}};
+                const auto pixels = gpu.outputless_vertex(artifact,discard,triangles,
+                    {std::uint32_t(base),std::uint32_t(base>>32),condition},guest);
+                check(guest.words[0]==0x12345678 && guest.words[1]==(condition ? 0xabcdef01u : 0u),
+                      "both vertex entries preserve guest writes and conditional early exit");
+                check(guest.table[1]==0, "output-less vertex guest accesses stay in range");
+                unsigned drawn=0;
+                for (const auto& pixel : pixels) {
+                    if (pixel[0]==-1) { check(pixel==std::array<float,4>{-1,-1,-1,-1}, "untouched output-less target pixel"); continue; }
+                    ++drawn;
+                    check(pixel==std::array<float,4>{depth==ir::DepthConvention::zero_to_one ? 0.0f : 0.5f,1,2,3},
+                          "default vertex position follows selected clip depth");
+                }
+                check(drawn==(discard || triangles ? 0u : 1u), "only the normal point rasterizes");
+                ++checked;
+            }
+            gpu.discard_pipeline(fixture,options);
+        }
     }
     std::printf("Native global memory and fragment position Metal execution passed (%u vectors, miss record)\n", checked + 1);
     return 0;

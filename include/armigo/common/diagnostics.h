@@ -30,16 +30,19 @@ enum class Level : int {
 namespace detail {
 inline std::atomic<int> minimum_level{static_cast<int>(Level::info)};
 inline std::atomic<int> frame_stats{1};
+inline std::atomic<bool> player_quiet{false};
 } // namespace detail
 
 // One relaxed load. A disabled call still evaluates its arguments, so callers
 // that build strings check enabled() or frame_stats_enabled() first.
 [[nodiscard]] inline bool enabled(Level level) noexcept {
-    return static_cast<int>(level) <= detail::minimum_level.load(std::memory_order_relaxed);
+    return (level == Level::error || !detail::player_quiet.load(std::memory_order_relaxed)) &&
+           static_cast<int>(level) <= detail::minimum_level.load(std::memory_order_relaxed);
 }
 
 [[nodiscard]] inline bool frame_stats_enabled() noexcept {
-    return detail::frame_stats.load(std::memory_order_relaxed) != 0;
+    return !detail::player_quiet.load(std::memory_order_relaxed) &&
+           detail::frame_stats.load(std::memory_order_relaxed) != 0;
 }
 
 [[nodiscard]] inline Level minimum_level() noexcept {
@@ -71,9 +74,9 @@ void newline() noexcept;
 // environment says otherwise. This is the process default.
 void use_development_defaults() noexcept;
 
-// The player (windowed, packed, and iOS): warnings and errors, frame stats
-// off, unless ARMIGO_LOG or ARMIGO_FRAME_STATS is set.
-void use_player_defaults() noexcept;
+// Ordinary players emit errors only and never create diagnostic files.
+// Explicit development tooling may opt into environment-controlled diagnostics.
+void use_player_defaults(bool development_diagnostics = false) noexcept;
 
 // Truncates `path` on the first open of a launch and appends warnings and
 // errors until 1 MiB. A second open of the same path in this process keeps

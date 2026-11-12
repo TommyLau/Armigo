@@ -41,6 +41,12 @@ struct GraphicsPresentation {
     // the frame's fence has completed. A windowed presenter on the same device
     // draws it without the CPU copy.
     std::shared_ptr<const void> native_texture;
+    // Opaque submission context retains the captured allocation and its GPU order.
+    std::shared_ptr<void> native_submission;
+    // Ordered native consumers validate this after GPU/ordered CPU completion,
+    // before visible presentation or successful frame observation. It owns its
+    // captures and caches the producer result across consumer/VI checks.
+    std::function<bool()> native_producer_ready;
     bool native_vsync_paced = false;
     std::uint32_t slot = 0;
     std::uint64_t frame_number = 0;

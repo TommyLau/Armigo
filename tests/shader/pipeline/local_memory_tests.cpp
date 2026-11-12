@@ -288,6 +288,184 @@ void legalize_split_tests() {
         "Runtime-checked access with a zero allocation is rejected");
 }
 
+// The stage-buffer contract is a distinct header-sized policy, not an
+// invented bound for ordinary shared-memory instructions.
+void stage_buffer_policy_tests() {
+  Facts facts;
+  facts.set(FactQuery<FactKind::compute_local_size>{}, ComputeLocalSize{{1, 1, 1}});
+  facts.set(FactQuery<FactKind::compute_shared_memory_bytes>{}, std::uint32_t{64});
+  const auto make = [](StageBufferAccess region, Operand address = ValueId{0}) {
+    auto p = empty(Stage::compute);
+    p.values.push_back({ValueType::word32});
+    p.functions[0].parameters.push_back(ValueId{0});
+    auto load = local_access(false, 0, 4, 1, narrow(false, ScalarType::u32));
+    auto &memory = std::get<MemoryInfo>(load.info);
+    memory.space = AddressSpace::shared;
+    memory.dynamic_byte_offset = InputIndex{0};
+    memory.stage_buffer = region;
+    load.inputs = {address};
+    const auto loaded = add(p, std::move(load));
+    p.functions[0].results = {ValueType::word32};
+    p.blocks[0].terminator = Return{{loaded}};
+    return p;
+  };
+  const StageBufferAccess region{StageBufferPolicy::header_direct_v1, 16, 32, 64};
+  auto legal = run(make(region), facts);
+  check(std::holds_alternative<LegalProgram>(legal),
+        "Dynamic stage-buffer indexing accepts the declared region contract");
+  if (const auto *accepted = std::get_if<LegalProgram>(&legal)) {
+    const auto &memory = std::get<MemoryInfo>(accepted->ir.operations.back().info);
+    check(memory.stage_buffer && !memory.dynamic_byte_offset_upper_bound,
+          "Stage-buffer contract records no invented dynamic bound");
+  }
+  for (const auto address : {12u, 48u, 0xfffffffcu}) {
+    const auto result = run(make(region, word(address)), facts);
+    const auto *error = std::get_if<Diagnostic>(&result);
+    check(error && error->code == DiagnosticCode::unsupported_capability,
+          "Constant stage-buffer access cannot cross either region boundary");
+  }
+  check(std::holds_alternative<LegalProgram>(run(make(region, word(44)), facts)),
+        "Last complete region word is admitted");
+  for (const auto invalid : {
+           StageBufferAccess{StageBufferPolicy::header_direct_v1, 16, 32, 68},
+           StageBufferAccess{StageBufferPolicy::header_direct_v1, 16, 52, 64},
+           StageBufferAccess{StageBufferPolicy::header_direct_v1, 17, 32, 64},
+           StageBufferAccess{static_cast<StageBufferPolicy>(2), 16, 32, 64}}) {
+    check(std::holds_alternative<Diagnostic>(run(make(invalid), facts)),
+          "Invalid allocation, extent, alignment or version is rejected");
+  }
+  auto local = make(region);
+  std::get<MemoryInfo>(local.operations.back().info).space = AddressSpace::local;
+  check(std::holds_alternative<Diagnostic>(run(std::move(local), facts)),
+        "Stage-buffer policy cannot bypass local-memory checks");
+  auto vector = make(region);
+  std::get<MemoryInfo>(vector.operations.back().info).elements = 2;
+  check(std::holds_alternative<Diagnostic>(run(std::move(vector), facts)),
+        "Stage-buffer policy cannot admit a vector memory operation");
+}
+
+void native_shared_atomic_policy_tests() {
+  Facts facts;
+  facts.set(FactQuery<FactKind::compute_local_size>{},
+            ComputeLocalSize{{32, 1, 1}});
+  facts.set(FactQuery<FactKind::compute_shared_memory_bytes>{},
+            std::uint32_t{64});
+  const auto make = [](bool native, std::optional<std::uint32_t> literal = {}) {
+    auto p = empty(Stage::compute);
+    p.values.push_back({ValueType::word32});
+    p.functions[0].parameters.push_back(ValueId{0});
+    const auto address = add(p, {{8, {}},
+                                 Opcode::bit_and,
+                                 Effects::none,
+                                 {Domain::bits, ScalarType::u32},
+                                 {ValueId{0}, word(0xfffffffcu)},
+                                 {},
+                                 {}});
+    MemoryInfo memory;
+    memory.space = AddressSpace::shared;
+    memory.access = Access::read_write;
+    memory.scope = MemoryScope::workgroup;
+    memory.atomic = AtomicKind::add;
+    memory.alignment = 4;
+    memory.dynamic_byte_offset = InputIndex{0};
+    memory.data = {InputIndex{1}};
+    if (native)
+      memory.native_shared_atomic_policy =
+          NativeSharedAtomicPolicy::word_address_v1;
+    Operation operation{
+        {16, {}},
+        Opcode::atomic,
+        Effects::none,
+        {Domain::unsigned_integer, ScalarType::u32},
+        {literal ? Operand{word(*literal)} : Operand{address}, word(1)},
+        {},
+        memory};
+    operation.effects = required_effects(operation);
+    const auto old = add(p, std::move(operation));
+    p.functions[0].results = {ValueType::word32};
+    p.blocks[0].terminator = Return{{old}};
+    return p;
+  };
+  check(std::holds_alternative<Diagnostic>(run(make(false), facts)),
+        "Legacy shared atomics retain static address bounds");
+  check(std::holds_alternative<LegalProgram>(run(make(false, 60), facts)),
+        "Legacy bounded atomics are unchanged");
+  const auto legal = run(make(true), facts);
+  check(std::holds_alternative<LegalProgram>(legal),
+        "Native word atomic accepts a runtime aligned index");
+  if (const auto *accepted = std::get_if<LegalProgram>(&legal)) {
+    const auto &info =
+        std::get<MemoryInfo>(accepted->ir.operations.back().info);
+    check(info.native_shared_atomic_policy &&
+              !info.dynamic_byte_offset_upper_bound,
+          "Native word addressing carries no invented upper bound");
+    auto structured = structure(*accepted, accepted->ir.limits);
+    check(std::holds_alternative<StructuredProgram>(structured),
+          "Native atomic policy structures successfully");
+    if (const auto *source = std::get_if<StructuredProgram>(&structured)) {
+      check(std::holds_alternative<ResourcePlan>(
+                plan_resources(*source, profile())),
+            "Planning independently accepts native policy");
+      for (unsigned mutation = 0; mutation < 10; ++mutation) {
+        auto changed = *source;
+        auto &operation = changed.ir.operations.back();
+        auto &m = std::get<MemoryInfo>(operation.info);
+        switch (mutation) {
+        case 0:
+          m.native_shared_atomic_policy =
+              static_cast<NativeSharedAtomicPolicy>(2);
+          break;
+        case 1:
+          m.space = AddressSpace::local;
+          break;
+        case 2:
+          m.atomic = AtomicKind::minimum;
+          break;
+        case 3:
+          m.alignment = 1;
+          break;
+        case 4:
+          m.order = MemoryOrder::acquire_release;
+          break;
+        case 5:
+          m.scope = MemoryScope::device;
+          break;
+        case 6:
+          m.dynamic_byte_offset_upper_bound = 60;
+          break;
+        case 7:
+          m.byte_offset = 4;
+          break;
+        case 8:
+          operation.numeric = {Domain::signed_integer, ScalarType::s32};
+          break;
+        case 9:
+          changed.ir.operations.front().inputs[1] = word(0xffffffffu);
+          break;
+        }
+        check(std::holds_alternative<Diagnostic>(
+                  plan_resources(changed, profile())),
+              "Independent planning rejects malformed native policy or lost "
+              "alignment");
+      }
+      auto constant = *source;
+      constant.ir.operations.back().inputs[0] = word(64);
+      check(std::holds_alternative<Diagnostic>(
+                plan_resources(constant, profile())),
+            "Planning rejects a constant beyond the workgroup allocation");
+    }
+  }
+  for (const auto address : {64u, 65u, 0xfffffffcu})
+    check(std::holds_alternative<Diagnostic>(run(make(true, address), facts)),
+          "Native policy refuses invalid constant addresses");
+  check(std::holds_alternative<LegalProgram>(run(make(true, 60), facts)),
+        "Native policy accepts the final complete word");
+  auto unaligned = make(true);
+  unaligned.operations.front().inputs[1] = word(0xffffffffu);
+  check(std::holds_alternative<Diagnostic>(run(std::move(unaligned), facts)),
+        "Native policy requires a real word-alignment proof");
+}
+
 // --- MSL text emission ------------------------------------------------------
 
 struct Fixture {
@@ -611,6 +789,8 @@ int main(int argc, char **argv) {
     }
   }
   legalize_split_tests();
+  stage_buffer_policy_tests();
+  native_shared_atomic_policy_tests();
   emission_tests();
   if (failures)
     std::cerr << failures << " local memory tests failed\n";

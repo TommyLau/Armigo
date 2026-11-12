@@ -9,6 +9,7 @@
 // ============================================================================
 
 #include "service_registry.h"
+#include "../../src/nvn/backend.h"
 
 #include <armigo/horizon/startup_queries.h>
 #include <armigo/runtime/presentation_clock.h>
@@ -1194,6 +1195,35 @@ void test_supported_service_inventory_and_real_handles() {
     CHECK(stats.service_connections == names.size() + presentation_connections);
 }
 
+void test_nvn_failure_without_presentation() {
+    class FailedReplay final : public nvn::ReplayBackend {
+    public:
+        std::string error;
+        std::uint64_t submit(std::span<const nvn::api::NVNcommandHandle>) override { return 0; }
+        void flush() override {}
+        std::uint64_t completed_fence() const override { return 0; }
+        bool wait_fence(std::uint64_t, std::uint64_t) override { return false; }
+        std::string fatal_error_detail() const override { return error; }
+    } replay;
+    Fixture fixture;
+    auto dependencies = fixture.dependencies(profile());
+    dependencies.nvn_driver = true;
+    auto made = create_service_registry(std::move(dependencies));
+    CHECK(std::holds_alternative<std::shared_ptr<ServiceRegistry>>(made));
+    if (auto* registry = std::get_if<std::shared_ptr<ServiceRegistry>>(&made)) {
+        const auto saved = nvn::backends();
+        nvn::set_backends({nullptr, &replay});
+        CHECK(!(*registry)->failure());
+        replay.error = "NVN replay abandoned submission 7: synthetic unsupported attachment view";
+        const auto failure = (*registry)->failure();
+        CHECK(failure && failure->stage == LaunchStage::graphics);
+        CHECK(failure && failure->operation == "service_registry.nvn_replay");
+        CHECK(failure && failure->detail == replay.error);
+        CHECK((*registry)->statistics().completed_frames == 0);
+        nvn::set_backends(saved);
+    }
+}
+
 void test_unknown_authorized_service_latches_failure() {
     Fixture fixture;
     auto registry = fixture.create();
@@ -1414,6 +1444,7 @@ int main(int argc, char** argv) {
     test_shader_package_failure_is_structured();
     test_background_shader_package_failure_is_structured();
     test_supported_service_inventory_and_real_handles();
+    test_nvn_failure_without_presentation();
     test_unknown_authorized_service_latches_failure();
     test_stop_drains_and_refuses_new_work();
     if (failures != 0) return 1;

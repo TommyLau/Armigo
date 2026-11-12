@@ -267,8 +267,12 @@ NVNboolean nvnSamplerPoolInitialize(NVNsamplerPool* p, const NVNmemoryPool* m, p
     return 1;
 }
 void nvnTexturePoolRegisterTexture(const NVNtexturePool* p, int id, const NVNtexture* t, const NVNtextureView* v) {
-    if (!p || !t || !state<TextureState>(t).tag) { invalid("texture descriptor"); return; }
+    if (!p || (t && !state<TextureState>(t).tag)) { invalid("texture descriptor"); return; }
     if (!valid_slot(state<DescriptorPoolState>(p), id)) return;
+    if (!t) {
+        backends().resources->clear_texture_descriptor(id);
+        return;
+    }
     backends().resources->register_texture_descriptor(id, state<TextureState>(t),
         v ? &state<TextureViewState>(v) : nullptr);
 }

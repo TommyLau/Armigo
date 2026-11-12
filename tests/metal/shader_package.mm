@@ -1102,6 +1102,66 @@ void test_v3_resource_reflections(const fs::path& base) {
     }
 }
 
+std::string atomic_storage_image(const char* scalar, const char* component, const char* atomic) {
+    std::string json =
+        "[{\"cbuf_slot\":2,\"handle_byte_offset\":0,\"kind\":\"texture\","
+        "\"dimension\":\"d2\",\"array\":false,\"multisample\":false,\"scalar\":\"";
+    json += scalar;
+    json += "\",\"component_format\":\"";
+    json += component;
+    json += "\",\"normalized_coordinates\":false,\"comparison\":false,\"resource_id\":0,"
+            "\"array_length\":1,\"location\":{\"kind\":\"direct\",\"namespace\":\"texture\","
+            "\"first\":0,\"count\":1},\"resource_kind\":\"storage_image\",\"access\":\"read_write\"";
+    if (atomic) {
+        json += ",\"atomic\":";
+        json += atomic;
+    }
+    json += "}]";
+    return json;
+}
+
+void expect_atomic_resource(const fs::path& base, const char* name, const std::string& textures,
+                            bool present) {
+    auto fixture = package(base / name, true, textures, "", "[]", "", true);
+    auto opened = platform::MetalShaderPackage::open(fixture.root, {fixture.chain, true});
+    if (const auto* error = std::get_if<platform::MetalShaderPackageError>(&opened))
+        std::fprintf(stderr, "atomic reflection %s: %s\n", name, error->detail.c_str());
+    CHECK(std::holds_alternative<std::shared_ptr<platform::MetalShaderPackage>>(opened));
+    if (const auto* package_ptr = std::get_if<std::shared_ptr<platform::MetalShaderPackage>>(&opened)) {
+        Backing backing;
+        auto address_space = memory(backing);
+        const auto selected = (*package_ptr)->lookup(snapshot(fixture, backing), address_space);
+        const auto* pair = std::get_if<platform::CompiledGraphicsPair>(&selected);
+        CHECK(pair && pair->fragment->resources.size() == 1);
+        if (pair && !pair->fragment->resources.empty())
+            CHECK(pair->fragment->resources.front().atomic == present);
+    }
+}
+
+void expect_atomic_refusal(const fs::path& base, const char* name, const std::string& textures) {
+    auto fixture = package(base / name, true, textures, "", "[]", "", true);
+    auto opened = platform::MetalShaderPackage::open(fixture.root, {fixture.chain, true});
+    const auto* error = std::get_if<platform::MetalShaderPackageError>(&opened);
+    if (!error || error->detail.find("Texture atomic flag is invalid") == std::string::npos)
+        std::fprintf(stderr, "atomic refusal %s: %s\n", name, error ? error->detail.c_str() : "opened");
+    CHECK(error && error->detail.find("Texture atomic flag is invalid") != std::string::npos);
+}
+
+void test_atomic_image_reflections(const fs::path& base) {
+    expect_atomic_resource(base, "atomic-u32",
+                           atomic_storage_image("u32", "unsigned_integer", "true"), true);
+    expect_atomic_resource(base, "atomic-s32",
+                           atomic_storage_image("s32", "signed_integer", "true"), true);
+    expect_atomic_resource(base, "atomic-absent",
+                           atomic_storage_image("u32", "unsigned_integer", nullptr), false);
+    auto sampled = v3_texture_resources(1, false);
+    replace(sampled, "\"access\":\"read\"}", "\"access\":\"read\",\"atomic\":true}");
+    expect_atomic_refusal(base, "atomic-sampled", sampled);
+    expect_atomic_refusal(base, "atomic-float", atomic_storage_image("f32", "floating", "true"));
+    expect_atomic_refusal(base, "atomic-false",
+                          atomic_storage_image("u32", "unsigned_integer", "false"));
+}
+
 void test_v3_draw_support_reflections(const fs::path& base) {
     const std::string support =
         "{\"schema\":\"armigo-draw-parameters\",\"version\":1,"
@@ -1400,7 +1460,11 @@ void test_ported_v2_constant_buffers(const fs::path& base) {
     // The entire Metal namespace is available when actual stream indices do
     // not collide. Window size is independent of the live binding's size.
     for (const unsigned extent : {4u, 65536u}) {
-        auto valid = package(base / ("cb-boundary-" + std::to_string(extent)), true);
+      for (const std::string policy : {"runtime_zero_words_v1", "padded_zero_words_v2", "proven_zero_words_v2"}) {
+        const bool padded = policy == "padded_zero_words_v2";
+        auto valid = package(base / ("cb-boundary-" + std::to_string(extent) + "-" + policy), true);
+        if (policy != "runtime_zero_words_v1") mutate_reflection(valid, valid.vertex_variant,
+            "runtime_zero_words_v1", policy);
         mutate_reflection(valid, valid.vertex_variant, "\"window_bytes\":64",
                           "\"window_bytes\":" + std::to_string(extent));
         mutate_reflection(valid, valid.vertex_variant, "\"metal_buffer_index\":0",
@@ -1420,8 +1484,10 @@ void test_ported_v2_constant_buffers(const fs::path& base) {
                 CHECK(pair->vertex->constant_buffer_windows[0].window_bytes == extent);
                 CHECK(pair->vertex->constant_buffer_windows[0].metal_buffer_index == 30);
                 CHECK(pair->vertex->constant_buffer_support_index == 29);
+                CHECK(pair->vertex->constant_buffer_windows[0].zero_padding_bytes == (padded ? 16 : 0));
             }
         }
+      }
     }
 }
 
@@ -2608,6 +2674,7 @@ int main() {
         test_manifest_and_artifact_rejection(root);
         test_ported_v2_reflections(root);
         test_v3_resource_reflections(root);
+        test_atomic_image_reflections(root);
         test_v3_storage_buffer_reflections(root);
         test_v3_draw_support_reflections(root);
         test_ported_v2_class_inputs(root);

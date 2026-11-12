@@ -177,7 +177,8 @@ PipelineArchiveResult build_pipeline_archive(const PipelineArchiveBuild& build) 
         std::filesystem::remove_all(staging, error);
         return failure("no Metal 4 command queue");
     }
-    auto resources = std::make_unique<Resources>(device);
+    auto submission = std::make_shared<Metal4SubmissionOwner>(device, queue);
+    auto resources = std::make_unique<Resources>(device, submission);
     auto replay = create_replay_backend(device, queue, *resources);
     if (!replay) {
         std::filesystem::remove_all(staging, error);
@@ -210,9 +211,15 @@ PipelineArchiveResult build_pipeline_archive(const PipelineArchiveBuild& build) 
     }
     if (build.warm_only) {
         std::filesystem::remove_all(staging, error);
-        if (report.archive_misses || report.failed) {
+        // A pipeline the archive build compiled but could not archive misses
+        // here by design; any other miss means the archive lacks a pipeline.
+        result.expected_misses = std::min<std::uint64_t>(report.archive_misses,
+            explained_archive_misses(report.warmup_missed, read_unarchived_pipelines(build.cache_root)));
+        const auto unexplained = report.archive_misses - result.expected_misses;
+        if (unexplained || report.failed) {
             result.error = "the existing archive did not satisfy every warm-up row (" +
-                           std::to_string(report.archive_misses) + " archive misses, " +
+                           std::to_string(unexplained) + " archive misses, " +
+                           std::to_string(result.expected_misses) + " expected misses of unarchivable pipelines, " +
                            std::to_string(report.failed) + " failed rows)";
             return result;
         }
@@ -225,6 +232,10 @@ PipelineArchiveResult build_pipeline_archive(const PipelineArchiveBuild& build) 
     {
         std::ofstream out(directory / "identity.txt", std::ios::binary);
         out << identity;
+    }
+    if (!write_unarchived_pipelines(directory, report.unarchived)) {
+        std::filesystem::remove_all(staging, error);
+        return failure("cannot record the pipelines the archive could not hold");
     }
     const auto target = build.cache_root / directory.filename();
     const auto previous =

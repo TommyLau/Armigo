@@ -320,6 +320,7 @@ void validate_stage_resources(const CompiledGraphicsStage& stage,
         require(binding.guest_binding < 18 && binding.metal_buffer_index < 31 &&
                     binding.window_bytes >= 4 && binding.window_bytes <= 65536 &&
                     !(binding.window_bytes & 3u) &&
+                    (binding.zero_padding_bytes == 0 || binding.zero_padding_bytes == 16) &&
                     guest.insert(binding.guest_binding).second &&
                     buffers.insert(binding.metal_buffer_index).second,
                 "constant-buffer window reflection is invalid");
@@ -333,6 +334,9 @@ void validate_stage_resources(const CompiledGraphicsStage& stage,
     require(stage.storage_buffers.size() <= 31,
             "storage-buffer reflection exceeds the Metal buffer namespace");
     for (const auto& binding : stage.storage_buffers) {
+        require(!binding.pool_pointer,
+                "whole-pool storage pointers require NVN memory-pool bindings",
+                CommandStatus::Unsupported);
         const auto window = std::ranges::find_if(stage.constant_buffer_windows,
             [&](const auto& candidate) { return candidate.guest_binding == binding.cbuf_slot; });
         require(binding.cbuf_slot < 18 && binding.descriptor_byte_offset <= 65524 &&
@@ -377,14 +381,38 @@ void validate_stage_resources(const CompiledGraphicsStage& stage,
         std::set<std::uint32_t> ids;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> members;
         for (const auto& resource : stage.resources) {
+            const bool pool = resource.kind == CompiledShaderResourceKind::TexturePool ||
+                              resource.kind == CompiledShaderResourceKind::SamplerPool;
             require(ids.insert(resource.resource_id).second && resource.array_length &&
-                        (resource.cbuf_slot < 18 ||
-                         resource.cbuf_slot == armigo::shader::pipeline::handle_program_slot) &&
+                        (pool ? resource.cbuf_slot == 0 ||
+                                resource.cbuf_slot == armigo::shader::pipeline::texture_pool_slot
+                              : resource.cbuf_slot < 18 ||
+                                resource.cbuf_slot == armigo::shader::pipeline::handle_program_slot) &&
                         !(resource.handle_byte_offset & 3u) &&
                         std::uint64_t(resource.handle_byte_offset) +
                             std::uint64_t(resource.array_length) * 4 <= 65536 &&
                         resource.location.count == resource.array_length,
                     "resource reflection provenance or array length is invalid");
+            if (pool) {
+                require(resource.access == CompiledShaderResourceAccess::Read,
+                        "texture pool resources must be read-only");
+                const bool sampler_pool = resource.kind == CompiledShaderResourceKind::SamplerPool;
+                if (sampler_pool)
+                    require(!resource.texture_descriptor, "sampler pool carries a texture descriptor");
+                else
+                    require(resource.texture_descriptor.has_value(),
+                            "texture pool is missing its texture descriptor");
+                const auto& location = resource.location;
+                const auto end = std::uint64_t(location.first) + location.count;
+                require(location.kind == CompiledShaderResourceLocationKind::Direct &&
+                            location.resource_namespace == CompiledShaderResourceNamespace::Buffer &&
+                            end <= 31,
+                        "texture pool buffer location is invalid");
+                for (std::uint64_t index = location.first; index < end; ++index)
+                    require(buffers.insert(static_cast<unsigned>(index)).second,
+                            "texture pool buffer aliases another buffer");
+                continue;
+            }
             require(resource.access == CompiledShaderResourceAccess::Read &&
                         (resource.kind == CompiledShaderResourceKind::SampledTexture ||
                          resource.kind == CompiledShaderResourceKind::Sampler),
@@ -1439,7 +1467,7 @@ private:
         }
         for (const auto& binding : stage.constant_buffer_windows) {
             const auto& guest = stop.constant_buffers[stage_index][binding.guest_binding];
-            std::vector<std::byte> bytes(binding.window_bytes);
+            std::vector<std::byte> bytes(binding.backing_bytes());
             // Whole words below the bound size; the rest of the window reads
             // zero (a word only partly inside the bound reads zero).
             const auto copied = guest.enabled
@@ -1472,12 +1500,12 @@ private:
                         })) {
                         requests.push_back({guest.address, std::move(*range), BufferUse::Uniform, 4,
                             std::nullopt, std::pair{shader_stage, std::uint32_t(binding.metal_buffer_index)},
-                            ResourceAccess::Read, binding.window_bytes});
+                            ResourceAccess::Read, binding.backing_bytes()});
                         continue;
                     } else if (intervals && registry) {
                         if (window_records_) {
                             window_records_->push_back({std::uint32_t(binding.metal_buffer_index),
-                                std::uint8_t(binding.guest_binding), guest.address, copied, binding.window_bytes,
+                                std::uint8_t(binding.guest_binding), guest.address, copied, binding.backing_bytes(),
                                 *range});
                             // The record tracks the window: a store into it
                             // takes the window again instead of rebuilding
@@ -1488,7 +1516,7 @@ private:
                         }
                         const auto& bytes = range->bytes;
                         window = WindowKey{bytes.backing.owner, bytes.backing.allocation,
-                            bytes.backing.generation, bytes.offset, bytes.size, binding.window_bytes};
+                            bytes.backing.generation, bytes.offset, bytes.size, binding.backing_bytes()};
                         for (const auto& interval : *intervals)
                             window_state.push_back({interval.bytes.offset, interval.bytes.size, interval.version});
                         const auto found = windows_.find(*window);
@@ -2568,6 +2596,10 @@ private:
                     fact ? std::optional(*fact) : std::nullopt, std::nullopt, std::nullopt});
             }
         } else for (const auto& resource : stage.resources) {
+            if (resource.kind == CompiledShaderResourceKind::TexturePool ||
+                resource.kind == CompiledShaderResourceKind::SamplerPool)
+                reject(CommandStatus::Unsupported,
+                       "texture pool tables have no command-stream binding path");
             for (std::uint32_t element = 0; element != resource.array_length; ++element) {
                 const auto offset = resource.handle_byte_offset + element * 4;
                 const auto& location = resource.location;

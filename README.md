@@ -2,7 +2,7 @@
 
 Armigo turns your own Nintendo Switch game files into a standalone player app
 for macOS and iOS. It is a native compatibility
-runtime: a thin Horizon (firmware 20.5.0) layer that runs the game's own code
+runtime: a thin Horizon (firmware 23.0.1) layer that runs the game's own code
 and SDK unchanged, with graphics on Metal 4.
 
 You give Armigo a game you own, its updates and add-on content, your console's

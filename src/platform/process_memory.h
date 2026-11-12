@@ -11,6 +11,7 @@
 #pragma once
 
 #include <armigo/memory/guest_memory_model.h>
+#include "host_limits.h"
 
 #include <cstdint>
 #include <string>
@@ -42,9 +43,6 @@ struct ProcessMemoryStatus {
 
     constexpr bool ok() const noexcept { return error == ProcessMemoryError::none; }
 };
-
-// Returns the native virtual-memory page size, or zero when it is unavailable.
-std::uint64_t native_page_size() noexcept;
 
 // Current native protection at an owned mapped address, for exact rollback.
 // Optionally returns the remaining bytes in this native protection run.
@@ -83,17 +81,18 @@ public:
 
     // Creates a separately owned, shared alias of an existing native mapping.
     // It does not copy or freeze bytes. The source owner must retain a valid
-    // mapping for the duration of this call.
+    // mapping for the duration of this call. The optional status retains native errors.
     static ProcessMemoryResult alias_copy(
         std::uint64_t source_address, std::uint64_t size,
-        memory::Permission permission) noexcept;
+        memory::Permission permission, ProcessMemoryStatus* status = nullptr) noexcept;
 
     // Creates a host-private writable view of the same physical pages. Unlike
     // guest aliases, its address is above the guest query limit so it cannot
     // occupy an address that guest memory metadata reports as available.
     // This owner must be destroyed before the source backing is replaced.
     static ProcessMemoryResult writable_host_alias(
-        std::uint64_t source_address, std::uint64_t size) noexcept;
+        std::uint64_t source_address, std::uint64_t size,
+        ProcessMemoryStatus* status = nullptr) noexcept;
 
     ProcessMemoryRegion(const ProcessMemoryRegion&) = delete;
     ProcessMemoryRegion& operator=(const ProcessMemoryRegion&) = delete;
@@ -124,7 +123,7 @@ public:
 
 private:
     static ProcessMemoryResult shared_alias(std::uint64_t source_address,
-        std::uint64_t size, memory::Permission permission, bool guest_address) noexcept;
+        std::uint64_t size, memory::Permission permission, bool guest_address, ProcessMemoryStatus* status) noexcept;
     ProcessMemoryRegion(std::uint64_t address, std::uint64_t size) noexcept
         : address_(address), size_(size) {}
     void reset() noexcept;

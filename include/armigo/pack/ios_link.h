@@ -27,6 +27,7 @@ struct IosLinkOptions {
     // Private generated sources, outside the repository. Must remain present
     // until linking finishes; image files are referenced by assembly incbin.
     std::filesystem::path work_directory;
+    // The title-specific executable path; independent of the generic build target name.
     std::filesystem::path output_executable;
 };
 

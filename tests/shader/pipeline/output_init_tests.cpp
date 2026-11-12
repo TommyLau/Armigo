@@ -203,6 +203,24 @@ void structured_tests() {
             "Vertex stage without outputs is a void vertex that requires rasterizer discard");
     }
 
+    // A known clip convention permits normal rasterization of the hardware
+    // default position, while a separate void entry preserves explicit discard.
+    Fixture default_position(Stage::vertex);
+    default_position.plan.io.clear();
+    default_position.p.requirements.io.clear();
+    const auto default_result = default_position.emit();
+    if (const auto* d = std::get_if<Diagnostic>(&default_result)) {
+        check(false, std::string("default_position: ") + d->message);
+    } else {
+        const auto& artifact = std::get<MslArtifact>(default_result);
+        check(!artifact.reflection.requires_rasterizer_discard && artifact.reflection.fixed_point_size &&
+              artifact.source.find("vertex ArmigoOutput armigo_vertex_main(") != std::string::npos,
+              "Known-depth output-less vertex keeps normal position and point rasterization");
+        check(artifact.source.find("vertex void armigo_vertex_main_discard(") != std::string::npos,
+              "Known-depth output-less vertex has a static void discard entry");
+        compile_with_metal("default_position", artifact.source);
+    }
+
     // The policy covers writes on live paths only: a store under a literal
     // false guard writes nothing, so the completeness check still rejects.
     Fixture infeasible(Stage::vertex);

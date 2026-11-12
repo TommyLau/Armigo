@@ -51,7 +51,7 @@ FACT_KINDS = {"local_memory_bytes", "constant_buffer_bound_mask",
               "fragment_output_type", "input_interpolation", "topology",
               "depth_convention", "origin_convention", "negate_y", "alpha_test",
               "early_z", "alpha_to_coverage", "dual_source_blend", "draw_parameters",
-              "compute_local_size", "compute_shared_memory_bytes"}
+              "compute_local_size", "compute_shared_memory_bytes", "bound_storage_descriptor"}
 FACT_ORIGINS = {"validated_header", "captured_state", "explicit_option", "derived"}
 TEXTURE_DIMENSIONS = {"d1", "d2", "d3", "cube", "buffer"}
 COMPONENT_FORMATS = {"unorm", "snorm", "unsigned_integer", "signed_integer",
@@ -306,7 +306,7 @@ def validate_constant_buffers_v2(items):
                 extent % 4 == 0 and is_uint(metal, 30) and guest not in guests and
                 metal not in metals and item["size_kind"] == "constant_buffer_window" and
                 is_uint(item["alignment"], 4) and item["alignment"] == 4 and
-                item["policy"] == "runtime_zero_words_v1",
+                item["policy"] in ("runtime_zero_words_v1", "padded_zero_words_v2", "proven_zero_words_v2"),
                 "constant-buffer reflection is invalid")
         guests.add(guest)
         metals.add(metal)
@@ -328,9 +328,11 @@ def validate_support_buffers_v2(items, constant_buffer_indices):
                 "support-buffer reflection is invalid")
 
 
-def validate_storage_buffers_v3(items, constant_buffers):
+def validate_storage_buffers_v3(items, constant_buffers, dependencies):
     require(isinstance(items, list) and len(items) <= 31,
             "storage_buffers must be an array of at most 31 entries")
+    require(isinstance(dependencies, list) and len(dependencies) <= 1024,
+            "storage binding dependencies are invalid")
     windows = {item["guest_binding"]: item["window_bytes"]
                for item in constant_buffers}
     descriptors, metals = set(), set()
@@ -342,9 +344,12 @@ def validate_storage_buffers_v3(items, constant_buffers):
         offset = item["descriptor_byte_offset"]
         metal = item["metal_buffer_index"]
         descriptor = (slot, offset)
+        bound = any(isinstance(item, dict) and item.get("kind") == "bound_storage_descriptor" and
+                    item.get("index") == slot and item.get("byte_offset") == offset and
+                    item.get("component") == 0 and item.get("value") is True
+                    for item in dependencies)
         require(is_uint(slot, 17) and is_uint(offset, 65524) and
-                offset % 8 == 0 and slot in windows and
-                offset + 12 <= windows[slot] and
+                offset % 8 == 0 and (bound or (slot in windows and offset + 12 <= windows[slot])) and
                 is_uint(metal, 30) and metal not in metals and
                 descriptor not in descriptors and
                 item["access"] in ("read", "write", "read_write") and
@@ -359,6 +364,8 @@ def validate_storage_buffers_v3(items, constant_buffers):
 # through 30 stay outside the constant-buffer range. The stage loader admits
 # the same optional root field and the same index rule.
 HANDLE_PROGRAM_SLOT = 31
+# Pool tables name this slot themselves. admits_texture_slot does not admit it.
+TEXTURE_POOL_SLOT = 30
 HANDLE_PROGRAM_LIMIT = 4096
 
 
@@ -456,48 +463,101 @@ def validate_textures_v3(items, argument_buffer, programs):
     require(all(is_uint(resource_id, 0xffffffff) for resource_id in resource_ids) and
             len(set(resource_ids)) == len(resource_ids),
             "resource IDs must be unique uint32 values")
-    direct_ranges = {"texture": [], "sampler": []}
+    direct_ranges = {"texture": [], "sampler": [], "buffer": []}
     member_ranges = []
+    sampler_pools = 0
     for item in items:
         require(isinstance(item, dict) and "kind" in item, "texture entry is invalid")
         kind = item["kind"]
-        require(kind in ("texture", "sampler"), "texture kind is unsupported")
-        common = ("cbuf_slot", "handle_byte_offset", "kind", "resource_id",
-                  "array_length", "location")
-        if kind == "texture":
+        require(kind in ("texture", "sampler", "texture_pool", "sampler_pool"),
+                "texture kind is unsupported")
+        pool = kind in ("texture_pool", "sampler_pool")
+        if pool:
+            require("cbuf_slot" not in item and "handle_byte_offset" not in item,
+                    "pool records do not carry constant-buffer keys")
+        if kind == "sampler_pool":
+            require("comparison" not in item and "normalized_coordinates" not in item,
+                    "sampler pool records do not carry sampler state")
+            sampler_pools += 1
+            require(sampler_pools <= 1, "a stage admits one sampler pool")
+        common = ("kind", "resource_id", "array_length", "location")
+        if kind == "texture_pool":
             require_keys(item, common + ("dimension", "array", "multisample", "scalar",
-                         "component_format", "normalized_coordinates", "comparison",
-                         "resource_kind", "access"), "texture")
+                         "component_format", "comparison", "resource_kind", "access"),
+                         "texture pool")
+        elif kind == "sampler_pool":
+            require_keys(item, common, "sampler pool")
+        elif kind == "texture":
+            texture_keys = ("cbuf_slot", "handle_byte_offset") + common + (
+                "dimension", "array", "multisample", "scalar",
+                "component_format", "normalized_coordinates", "comparison",
+                "resource_kind", "access")
+            if "atomic" in item:
+                texture_keys += ("atomic",)
+            require_keys(item, texture_keys, "texture")
         else:
-            require_keys(item, common + ("comparison", "normalized_coordinates"), "sampler")
+            require_keys(item, ("cbuf_slot", "handle_byte_offset") + common + (
+                         "comparison", "normalized_coordinates"), "sampler")
         length = item["array_length"]
-        offset = item["handle_byte_offset"]
-        require(is_uint(offset, 65532) and offset % 4 == 0 and
-                is_uint(length, 0xffffffff) and length > 0 and
-                offset + length * 4 <= 65536 and
-                admits_texture_slot(item["cbuf_slot"], offset, length, programs),
+        require(is_uint(length, 0xffffffff) and length > 0,
                 "texture provenance reflection is invalid")
-        require(isinstance(item["comparison"], bool) and
-                isinstance(item["normalized_coordinates"], bool),
-                f"{kind} reflection is invalid")
-        if kind == "texture":
+        if pool:
+            require(length <= 16384, "texture provenance reflection is invalid")
+        else:
+            offset = item["handle_byte_offset"]
+            require(is_uint(offset, 65532) and offset % 4 == 0 and
+                    offset + length * 4 <= 65536 and
+                    admits_texture_slot(item["cbuf_slot"], offset, length, programs),
+                    "texture provenance reflection is invalid")
+        if kind == "texture_pool":
+            require(isinstance(item["comparison"], bool), "texture pool reflection is invalid")
+        elif kind != "sampler_pool":
+            require(isinstance(item["comparison"], bool) and
+                    isinstance(item["normalized_coordinates"], bool),
+                    f"{kind} reflection is invalid")
+        if kind in ("texture", "texture_pool"):
             require(item["dimension"] in TEXTURE_DIMENSIONS and
                     item["scalar"] in SCALARS and
                     item["component_format"] in COMPONENT_FORMATS and
                     isinstance(item["array"], bool) and
-                    isinstance(item["multisample"], bool) and
-                    item["resource_kind"] in ("sampled", "storage_image") and
-                    item["access"] in ("read", "write", "read_write") and
-                    (item["resource_kind"] != "sampled" or item["access"] == "read"),
+                    isinstance(item["multisample"], bool),
                     "texture reflection is invalid")
-            texture_descriptor_value({name: item[name] for name in
-                                      ("dimension", "array", "multisample", "scalar",
-                                       "component_format", "normalized_coordinates",
-                                       "comparison")}, "texture")
+            if kind == "texture_pool":
+                require(item["resource_kind"] == "sampled" and item["access"] == "read",
+                        "texture reflection is invalid")
+            else:
+                require(item["resource_kind"] in ("sampled", "storage_image") and
+                        item["access"] in ("read", "write", "read_write") and
+                        (item["resource_kind"] != "sampled" or item["access"] == "read"),
+                        "texture reflection is invalid")
+            descriptor = {name: item[name] for name in
+                          ("dimension", "array", "multisample", "scalar",
+                           "component_format", "comparison")}
+            descriptor["normalized_coordinates"] = (
+                False if kind == "texture_pool" else item["normalized_coordinates"])
+            texture_descriptor_value(descriptor, "texture")
+            if kind == "texture" and "atomic" in item:
+                require(item["atomic"] is True and
+                        item["resource_kind"] == "storage_image" and
+                        item["scalar"] in ("u32", "s32") and
+                        item["dimension"] == "d2" and item["array"] is False,
+                        "texture atomic flag is invalid")
         location = item["location"]
         require(isinstance(location, dict) and "kind" in location,
                 "resource location is invalid")
-        if argument_buffer is None:
+        if pool:
+            require_keys(location, ("kind", "namespace", "first", "count"),
+                         "resource location")
+            first, count = location["first"], location["count"]
+            require(location["kind"] == "direct" and location["namespace"] == "buffer" and
+                    is_uint(first, 30) and is_uint(count, 31) and count == length and
+                    first + count <= 31,
+                    "direct resource location is invalid")
+            ranges = direct_ranges["buffer"]
+            require(all(first + count <= start or first >= end for start, end in ranges),
+                    "direct resource locations overlap")
+            ranges.append((first, first + count))
+        elif argument_buffer is None:
             require_keys(location, ("kind", "namespace", "first", "count"),
                          "resource location")
             namespace = "texture" if kind == "texture" else "sampler"
@@ -571,6 +631,11 @@ def validate_dependencies(items, programs):
                     admits_texture_slot(item["index"], item["byte_offset"], 1, programs),
                     "texture descriptor dependency key is invalid")
             texture_descriptor_value(item["value"], "texture descriptor dependency")
+        if item["kind"] == "bound_storage_descriptor":
+            require(item["index"] < 18 and item["byte_offset"] <= 65536 - 12 and
+                    item["byte_offset"] % 8 == 0 and item["component"] == 0 and
+                    type(item["value"]) is bool,
+                    "bound storage descriptor dependency is invalid")
         identity = (item["kind"], item["index"], item["byte_offset"], item["component"])
         require(identity not in keys, "dependencies must be deduplicated")
         keys.add(identity)
@@ -598,6 +663,8 @@ def validate_texture_descriptor_dependencies(items, textures):
 def validate_resource_dependencies_v3(dependencies, resources):
     by_key = {}
     for resource in resources:
+        if "cbuf_slot" not in resource or "handle_byte_offset" not in resource:
+            continue
         by_key.setdefault((resource["cbuf_slot"], resource["handle_byte_offset"]), []).append(resource)
     descriptor_fields = ("dimension", "array", "multisample", "scalar",
                          "component_format", "normalized_coordinates", "comparison")
@@ -611,7 +678,7 @@ def validate_resource_dependencies_v3(dependencies, resources):
         value = dependency["value"]
         if kind == "texture_descriptor":
             for entry in entries:
-                fields = descriptor_fields if entry["kind"] == "texture" else (
+                fields = descriptor_fields if entry["kind"] in ("texture", "texture_pool") else (
                     "comparison", "normalized_coordinates")
                 require(all(value[name] == entry[name] for name in fields),
                         "resource descriptor dependency disagrees with its provenance")
@@ -823,7 +890,7 @@ def validate_reflection_v2(metadata, program, source):
     constant_buffer_indices = validate_constant_buffers_v2(metadata["constant_buffers"])
     validate_support_buffers_v2(metadata["support_buffers"], constant_buffer_indices)
     storage_buffer_indices = (validate_storage_buffers_v3(
-        metadata.get("storage_buffers", []), metadata["constant_buffers"])
+        metadata.get("storage_buffers", []), metadata["constant_buffers"], metadata["dependencies"])
         if v3 else set())
     argument_buffer_index = (validate_argument_buffer_v3(metadata["argument_buffer"])
                              if v3 else None)
@@ -841,6 +908,16 @@ def validate_reflection_v2(metadata, program, source):
                               for item in metadata["support_buffers"]}
     reserved_buffer_indices = (constant_buffer_indices | support_buffer_indices |
                                storage_buffer_indices | vertex_buffer_indices)
+    if v3:
+        for item in metadata["textures"]:
+            if item.get("kind") not in ("texture_pool", "sampler_pool"):
+                continue
+            location = item["location"]
+            first = location["first"]
+            for index in range(first, first + location["count"]):
+                require(index not in reserved_buffer_indices,
+                        "texture pool overlaps a reflected buffer")
+                reserved_buffer_indices.add(index)
     if "draw_support" in metadata:
         support = metadata["draw_support"]
         require(isinstance(support, dict) and set(support) == {
@@ -1198,9 +1275,11 @@ def run_tool(arguments):
 # The translator predeclares SSA temporaries and proves every read defined,
 # including reads correlated with the guarding predicate of their definition;
 # Clang's path-insensitive uninitialized-use heuristic cannot see that
-# correlation, so it is not a gate here.
-METAL_COMPILE_FLAGS = ("-std=metal4.0", "-mmacosx-version-min=26.0", "-Werror",
-                       "-Wno-unused-variable", "-Wno-sometimes-uninitialized")
+# correlation, so it is not a gate here. -fbracket-depth raises the front
+# end's nested-bracket limit.
+METAL_COMPILE_FLAGS = ("-std=metal4.0", "-mmacosx-version-min=26.0", "-fwrapv", "-Werror",
+                       "-Wno-unused-variable", "-Wno-sometimes-uninitialized",
+                       "-fbracket-depth=1024")
 _compiler_identity = None
 _compiler_identity_lock = threading.Lock()
 

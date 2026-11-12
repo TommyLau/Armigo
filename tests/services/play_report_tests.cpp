@@ -107,6 +107,22 @@ IpcMessage report_request(std::uint32_t command, bool user, bool domain = false)
     return message;
 }
 
+// RequestImmediateTransmission (10200): no buffers, no PID, no arguments.
+IpcMessage transmission_request(bool domain) {
+    IpcMessage message{};
+    put(message, 0, 4);
+    put(message, 4, (16 + (domain ? 16 : 0) + 16) / 4);
+    const auto cmif = domain ? 32u : 16u;
+    if (domain) {
+        put(message, 16, (16u << 16) | 1);
+        put(message, 20, 1);
+    }
+    put(message, cmif, 0x49434653);
+    put(message, cmif + 4, 1);
+    put(message, cmif + 8, 10200);
+    return message;
+}
+
 struct Fixture {
     Memory memory;
     HandleTable handles{4};
@@ -175,6 +191,21 @@ void test_session_controls_and_lifetime() {
     CHECK(!lifetime.expired());
     CHECK(fixture.handles.close(fixture.handle));
     CHECK(lifetime.expired());
+}
+
+void test_immediate_transmission() {
+    for (const auto domain : {false, true}) {
+        Fixture fixture;
+        if (domain) {
+            fixture.message = control(0);
+            CHECK(fixture.send() == IpcDisposition::handled);
+        }
+        for (unsigned repetition = 0; repetition < 2; ++repetition) {
+            fixture.message = transmission_request(domain);
+            fixture.result(0, domain);
+        }
+        CHECK(fixture.handles.size() == 1);
+    }
 }
 
 void test_save_and_malformed_buffers() {
@@ -278,7 +309,7 @@ void test_save_and_malformed_buffers() {
                 put(fixture.message, 52, 2);
                 fixture.reject();
             }
-            for (const auto command : {10100u, 10104u, 10200u, 10400u, 99999u}) {
+            for (const auto command : {10100u, 10104u, 10300u, 10400u, 99999u}) {
                 fixture.message = report_request(command, true, domain);
                 fixture.reject();
             }
@@ -308,38 +339,49 @@ void check_report(Bytes report, bool valid) {
 }
 
 void test_report_contract() {
+    // The 23.0.1 check: values are integers, unsigned integers, 64-bit floats,
+    // UTF-8 strings or an extension of type 0 with eight data bytes.
     for (const auto& value : {
-        bytes({0}), bytes({0xff}), bytes({0xc2}), bytes({0xc3}),
-        bytes({0xcc, 0xff}), bytes({0xd3, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}),
-        bytes({0xa0}), bytes({0xa3, 0xe2, 0x82, 0xac}), bytes({0xa1, 0}),
-        bytes({0xc4, 2, 0xff, 0}), bytes({0xca, 0x3f, 0x80, 0, 0}),
+        bytes({0}), bytes({0x7f}), bytes({0xff}), bytes({0xe0}),
+        bytes({0xcc, 0xff}), bytes({0xcd, 1, 2}), bytes({0xce, 1, 2, 3, 4}),
+        bytes({0xcf, 1, 2, 3, 4, 5, 6, 7, 8}),
+        bytes({0xd0, 0x80}), bytes({0xd3, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}),
         bytes({0xcb, 0x3f, 0xf0, 0, 0, 0, 0, 0, 0}),
-        bytes({0xd7, 0, 0, 0, 0, 0, 0, 0, 0, 0}),
-        bytes({0xd4, 65, 1}), bytes({0xc7, 10, 66, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}),
-        bytes({0x90}), bytes({0x92, 1, 0xff}),
-        bytes({0x92, 0xca, 0, 0, 0, 0, 0xcb, 0, 0, 0, 0, 0, 0, 0, 0}),
-        bytes({0x80}), bytes({0x81, 0xa1, 'a', 1}),
-        bytes({0x92, 0x81, 0xa1, 'a', 1, 0x81, 0xa1, 'a', 0xff})})
+        bytes({0xcb, 0x7f, 0xf8, 0, 0, 0, 0, 0, 0}),   // Any 64-bit pattern, NaN included.
+        bytes({0xa0}), bytes({0xa3, 0xe2, 0x82, 0xac}), bytes({0xa1, 0}),
+        bytes({0xd9, 2, 'o', 'k'}),
+        bytes({0xd7, 0, 1, 2, 3, 4, 5, 6, 7, 8}),
+        bytes({0xc7, 8, 0, 1, 2, 3, 4, 5, 6, 7, 8})})
         check_report(root_value(value), true);
 
     for (const auto& value : {
-        bytes({0xc0}), bytes({0xc1}), bytes({0xa1}), bytes({0xa2, 0xc0, 0x80}),
+        bytes({0xc0}), bytes({0xc1}), bytes({0xc2}), bytes({0xc3}),
+        bytes({0xc4, 2, 0xff, 0}), bytes({0xca, 0x3f, 0x80, 0, 0}),
+        bytes({0xd7, 1, 0, 0, 0, 0, 0, 0, 0, 0}),        // Extension type other than 0.
+        bytes({0xd6, 0, 0, 0, 0, 0}),                   // Type 0 with four bytes.
+        bytes({0xd4, 65, 1}), bytes({0xc7, 10, 66, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}),
+        bytes({0x90}), bytes({0x92, 1, 2}), bytes({0x80}), bytes({0x81, 0xa1, 'a', 1}),
+        bytes({0xa1}), bytes({0xa2, 0xc0, 0x80}),
         bytes({0xa3, 0xed, 0xa0, 0x80}), bytes({0xa4, 0xf4, 0x90, 0x80, 0x80}),
-        bytes({0xca, 0x7f, 0x80, 0, 0}), bytes({0xcb, 0x7f, 0xf8, 0, 0, 0, 0, 0, 0}),
-        bytes({0xd4, 0, 1}), bytes({0xd4, 1, 0}),
-        bytes({0x91, 0x90}), bytes({0x92, 0xc2, 0}), bytes({0x91, 0xc0}),
-        bytes({0x91, 0xc4, 0}), bytes({0x91, 0xd4, 65, 0}),
-        bytes({0x81, 0xa1, 'a', 0xc4, 0}), bytes({0x81, 0xa1, 'a', 0xd4, 65, 0}),
-        bytes({0x92, 0x81, 0xa1, 'a', 1, 0x81, 0xa1, 'b', 1}),
-        bytes({0x82, 0xa1, 'a', 1, 0xa1, 'A', 2}),
         bytes({0xdd, 0xff, 0xff, 0xff, 0xff})})
         check_report(root_value(value), false);
 
+    // Keys are 1-63 bytes of [0-9A-Za-z_:], with no rule for the first byte.
+    check_report(bytes({0x81, 0xa1, '1', 1}), true);
+    check_report(bytes({0x81, 0xa3, 'a', ':', 'b', 1}), true);
+    check_report(bytes({0x81, 0xa2, '_', 'Z', 1}), true);
+    check_report(bytes({0x81, 0xa1, '-', 1}), false);
+    check_report(bytes({0x81, 0xa1, ' ', 1}), false);
+    check_report(bytes({0x81, 0xa0, 1}), false);
+    check_report(bytes({0x81, 0x01, 1}), false);         // A non-string key.
+    // Keys are unique ignoring ASCII case.
+    check_report(bytes({0x82, 0xa1, 'a', 1, 0xa1, 'A', 2}), false);
+    check_report(bytes({0x82, 0xa1, 'a', 1, 0xa1, 'b', 2}), true);
+    check_report(bytes({0x82, 0xa2, 'a', 'b', 1, 0xa1, 'a', 2}), true);
+    // One map at the root with 1-100 pairs and nothing after it.
     check_report(bytes({0x80}), false);
     check_report(bytes({0x90}), false);
-    check_report(bytes({0x81, 0xa1, '1', 1}), false);
-    check_report(bytes({0x81, 0xa0, 1}), false);
-    check_report(bytes({0x82, 0xa1, 'a', 1, 0xa1, 'A', 2}), false);
+    check_report(bytes({0x01}), false);
     check_report(bytes({0x81, 0xa1, 'a', 1, 0}), false);
 
     for (const auto length : {63u, 64u}) {
@@ -358,35 +400,23 @@ void test_report_contract() {
         }
         check_report(report, count == 100);
     }
-    auto nested = bytes({0x80});
-    for (unsigned depth = 1; depth <= 4; ++depth) {
-        check_report(root_value(nested), depth <= 3);
-        nested = root_value(nested);
-    }
-    auto maximum = root_value(bytes({0xc6, 0, 0, 0xff, 0xf8}));
-    maximum.resize(65536);
+    auto maximum = root_value(bytes({0xdb, 0, 0, 0xff, 0xf8}));
+    maximum.resize(65536, std::byte{'s'});
     check_report(maximum, true);
     maximum.push_back(std::byte{0});
     check_report(maximum, false);
 
     // Every proper prefix of a complete one-value report must fail, including
-    // prefixes inside multi-byte lengths, extension bodies and container data.
+    // prefixes inside multi-byte lengths and extension bodies.
     for (const auto& value : {
         bytes({0xdb, 0, 0, 0, 3, 'a', 'b', 'c'}),
-        bytes({0xc5, 0, 3, 1, 2, 3}),
         bytes({0xc8, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0}),
-        bytes({0xdf, 0, 0, 0, 1, 0xa1, 'a', 0xdc, 0, 2, 1, 2})}) {
+        bytes({0xcf, 1, 2, 3, 4, 5, 6, 7, 8})}) {
         const auto complete = root_value(value);
         check_report(complete, true);
         for (std::size_t length = 0; length < complete.size(); ++length)
             check_report(Bytes(complete.begin(), complete.begin() + length), false);
     }
-    check_report(root_value(bytes({0x92,
-        0x81, 0xa1, 'a', 0x91, 1,
-        0x81, 0xa1, 'a', 0x92, 1, 2})), false); // Nested array counts form part of the schema.
-    check_report(root_value(bytes({0x92,
-        0x81, 0xa1, 'a', 1,
-        0x81, 0xa1, 'A', 1})), false); // Schema key matching is case-sensitive.
 }
 
 } // namespace
@@ -531,6 +561,7 @@ void test_send_report_with_user() {
 
 int main() {
     test_session_controls_and_lifetime();
+    test_immediate_transmission();
     test_save_and_malformed_buffers();
     test_save_with_opt_in_flag();
     test_report_contract();

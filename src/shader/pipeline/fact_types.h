@@ -92,7 +92,9 @@ enum class FactKind : std::uint8_t {
     vertex_attribute_format, fragment_output_type, input_interpolation,
     topology, depth_convention, origin_convention, negate_y, alpha_test,
     early_z, alpha_to_coverage, dual_source_blend, draw_parameters,
-    compute_local_size, compute_shared_memory_bytes, count
+    compute_local_size, compute_shared_memory_bytes,
+    // The host binds this driver descriptor as an ordinary storage buffer.
+    bound_storage_descriptor, count
 };
 struct FactKey {
     FactKind kind{};
@@ -108,6 +110,8 @@ struct FactKey {
     // A texture keyed at handle_program_slot takes its handle from a program.
     case FactKind::texture_descriptor: return (key.index < 18 || key.index == handle_program_slot) && key.byte_offset % 4 == 0;
     case FactKind::constant_buffer_size: return key.index < 18 && key.byte_offset == 0;
+    case FactKind::bound_storage_descriptor:
+        return key.index < 18 && key.byte_offset % 8 == 0 && key.byte_offset <= 65536 - 12;
     case FactKind::vertex_attribute_format: case FactKind::fragment_output_type:
     case FactKind::input_interpolation: return key.index <= 65535 && key.byte_offset == 0;
     case FactKind::local_memory_bytes: case FactKind::constant_buffer_bound_mask:
@@ -154,6 +158,7 @@ ARMIGO_FACT_TYPE(early_z, bool);
 ARMIGO_FACT_TYPE(alpha_to_coverage, bool);
 ARMIGO_FACT_TYPE(dual_source_blend, bool);
 ARMIGO_FACT_TYPE(draw_parameters, bool);
+ARMIGO_FACT_TYPE(bound_storage_descriptor, bool);
 #undef ARMIGO_FACT_TYPE
 
 template <FactKind K> struct FactQuery {

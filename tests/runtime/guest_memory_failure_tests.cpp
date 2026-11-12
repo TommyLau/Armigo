@@ -10,6 +10,8 @@
 
 #include <armigo/horizon/read_only_shared_memory.h>
 #include <armigo/runtime/guest_memory.h>
+#include <armigo/memory/write_tracker.h>
+#include "process_memory.h"
 
 #include <algorithm>
 #include <array>
@@ -21,6 +23,8 @@
 #include <memory>
 #include <new>
 #include <span>
+#include <string>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -40,6 +44,11 @@ Operation operation = Operation::none;
 std::uint64_t begin = 0, end = 0;
 unsigned remaining = 0, failures_left = 0, failures_seen = 0;
 bool triggered = false;
+std::uint64_t address_limit = 0;
+unsigned limit_queries = 0;
+unsigned high_alias_attempts = 0;
+void (*before_failure)(void*) = nullptr;
+void* before_failure_context = nullptr;
 void arm(Operation requested, std::uint64_t address, std::uint64_t size, unsigned after, unsigned count = 1) {
     operation = requested; begin = address; end = address + size; remaining = after;
     failures_left = count; failures_seen = 0; triggered = false;
@@ -48,7 +57,9 @@ bool fail(Operation requested, std::uint64_t address) {
     if (operation != requested || address < begin || address >= end) return false;
     if (remaining) { --remaining; return false; }
     if (--failures_left == 0) operation = Operation::none;
-    ++failures_seen; triggered = true; return true;
+    ++failures_seen; triggered = true;
+    if (const auto callback = std::exchange(before_failure, nullptr)) callback(before_failure_context);
+    return true;
 }
 }
 namespace remote_reservation {
@@ -58,6 +69,17 @@ unsigned acquired = 0;
 }
 // Executable-local symbol overrides inject native failures without adding a
 // production fault hook. RTLD_NEXT retains the actual platform implementation.
+extern "C" kern_return_t task_info(task_name_t task, task_flavor_t flavor,
+    task_info_t info, mach_msg_type_number_t* count) {
+    static const auto real = reinterpret_cast<decltype(&task_info)>(dlsym(RTLD_NEXT, "task_info"));
+    const auto result = real(task, flavor, info, count);
+    if (native_fault::address_limit && result == KERN_SUCCESS && flavor == TASK_VM_INFO &&
+        *count >= TASK_VM_INFO_REV2_COUNT) {
+        reinterpret_cast<task_vm_info_t>(info)->max_address = native_fault::address_limit;
+        ++native_fault::limit_queries;
+    }
+    return result;
+}
 extern "C" kern_return_t mach_vm_protect(vm_map_t task, mach_vm_address_t address,
     mach_vm_size_t size, boolean_t maximum, vm_prot_t protection) {
     static const auto real = reinterpret_cast<decltype(&mach_vm_protect)>(dlsym(RTLD_NEXT, "mach_vm_protect"));
@@ -76,6 +98,10 @@ extern "C" kern_return_t mach_vm_remap(vm_map_t task, mach_vm_address_t* address
     mach_vm_address_t source, boolean_t copy, vm_prot_t* current, vm_prot_t* maximum,
     vm_inherit_t inheritance) {
     static const auto real = reinterpret_cast<decltype(&mach_vm_remap)>(dlsym(RTLD_NEXT, "mach_vm_remap"));
+    if (native_fault::address_limit && (flags & VM_FLAGS_ANYWHERE) && *address >= native_fault::address_limit) {
+        ++native_fault::high_alias_attempts;
+        return KERN_NO_SPACE;
+    }
     if ((flags & VM_FLAGS_OVERWRITE) && native_fault::fail(native_fault::Operation::remap, *address))
         return KERN_NO_SPACE;
     return real(task, address, size, mask, flags, source_task, source, copy, current, maximum, inheritance);
@@ -670,7 +696,14 @@ void partial_native_failures() {
         const auto saved_attempt = attempt;
         native_fault::arm(operation, destination.address - 4096, 4 * page,
             operation == native_fault::Operation::remap ? 1 : 0);
-        CHECK(host_failure(copied.memory->dispatch(4, attempt)) && native_fault::triggered);
+        const auto rejected = copied.memory->dispatch(4, attempt);
+        CHECK(host_failure(rejected) && native_fault::triggered);
+        if (const auto* error = std::get_if<LaunchFailure>(&rejected)) {
+            CHECK(error->detail.find("ProcessMemoryError=") != std::string::npos);
+            CHECK(error->detail.find("native_code=" + std::to_string(
+                operation == native_fault::Operation::remap ? KERN_NO_SPACE : KERN_PROTECTION_FAILURE)) !=
+                std::string::npos);
+        }
         CHECK(attempt == saved_attempt && unchanged(*copied.memory, unmapped));
         for (unsigned i = 0; i < 4; ++i)
             CHECK(native_protection(destination.address - 4096 + i * page) == VM_PROT_NONE);
@@ -694,6 +727,134 @@ void partial_native_failures() {
     CHECK(source_bytes[0] == std::byte{0x34} && source_bytes[source.size - 1] == std::byte{0x34});
     CHECK(handled(copied.memory->dispatch(5, unmap)) && unmap[0] == 0);
     CHECK((sample(*copied.memory, source) == std::array<std::byte, 2>{std::byte{0x79}, std::byte{0x79}}));
+#endif
+}
+
+// Temporary rollback views must fit hosts whose VA limit is below 512 GiB.
+// Native-page neighbors keep their bytes and permissions after a failed map.
+// Rollback aliases are shared views, not frozen snapshots. A neighboring
+// writer and a retained physical alias must keep the same bytes and identity.
+void copied_stack_concurrent_neighbor_rollback() {
+#if defined(__APPLE__)
+    const auto page = native_page_size();
+    if (page <= horizon::guest_page_size) return;
+    for (const bool bounded : {false, true}) for (const bool tracked : {false, true}) {
+        Fixture fixture;
+        horizon::QueryRegisters grow{}; grow[1] = 2 * mib;
+        CHECK(handled(fixture.memory->dispatch(1, grow)) && grow[0] == 0);
+        const auto base = free_stack_address(*fixture.memory, 4 * page);
+        const horizon::AddressRange prefix{base, 4096};
+        const horizon::AddressRange source{grow[1] + page + 4096, page};
+        const horizon::AddressRange destination{base + 4096, page};
+        auto bytes = pin(*fixture.memory, {grow[1], 4096}, memory::Permission::read | memory::Permission::write);
+        std::fill(bytes->writable_bytes().begin(), bytes->writable_bytes().end(), std::byte{0x27});
+        bytes.reset();
+        horizon::QueryRegisters neighbor{}; neighbor[0] = prefix.address; neighbor[1] = grow[1]; neighbor[2] = prefix.size;
+        CHECK(handled(fixture.memory->dispatch(4, neighbor)) && neighbor[0] == 0);
+        const auto before = snapshot(*fixture.memory);
+        auto reserved = platform::ProcessMemoryRegion::reserve(page);
+        auto* physical = std::get_if<platform::ProcessMemoryRegion>(&reserved);
+        CHECK(physical != nullptr);
+        if (!physical) return;
+        CHECK(physical->alias(0, page, base, memory::Permission::read | memory::Permission::write).ok());
+        if (tracked) {
+            memory::WriteTracker::add_range(reinterpret_cast<void*>(base), page);
+            CHECK(memory::WriteTracker::protect_checked(reinterpret_cast<void*>(base), page));
+        }
+        const auto stamp = memory::WriteTracker::now();
+        struct NeighborWrite { std::uint64_t address; bool ran = false; } writer{prefix.address};
+        native_fault::address_limit = bounded ? 64ull << 30 : 0;
+        native_fault::arm(native_fault::Operation::protect, base, 2 * page, 0);
+        native_fault::before_failure_context = &writer;
+        native_fault::before_failure = [](void* context) {
+            auto& write = *static_cast<NeighborWrite*>(context);
+            std::thread thread([&] {
+                auto* value = reinterpret_cast<volatile std::uint8_t*>(write.address);
+                value[0] = 0x5a;
+                value[4095] = 0x6b;
+                write.ran = true;
+            });
+            thread.join();
+        };
+        auto request = seeded_registers();
+        request[0] = destination.address; request[1] = source.address; request[2] = source.size;
+        CHECK(host_failure(fixture.memory->dispatch(4, request)) && native_fault::triggered && writer.ran);
+        native_fault::operation = native_fault::Operation::none;
+        native_fault::before_failure = nullptr;
+        native_fault::address_limit = 0;
+        CHECK(unchanged(*fixture.memory, before));
+        const auto* guest = reinterpret_cast<const volatile std::uint8_t*>(prefix.address);
+        const auto* retained = reinterpret_cast<const volatile std::uint8_t*>(physical->address());
+        CHECK(guest[0] == 0x5a && guest[4095] == 0x6b);
+        CHECK(retained[0] == 0x5a && retained[4095] == 0x6b);
+        if (tracked) {
+            CHECK(memory::WriteTracker::written_since(reinterpret_cast<void*>(base), page, stamp));
+            memory::WriteTracker::remove_range(reinterpret_cast<void*>(base));
+        }
+    }
+#endif
+}
+
+void copied_stack_in_bounded_address_space() {
+#if defined(__APPLE__)
+    const auto page = native_page_size();
+    if (page <= horizon::guest_page_size) return;
+    Fixture fixture;
+    horizon::QueryRegisters grow{}; grow[1] = 2 * mib;
+    CHECK(handled(fixture.memory->dispatch(1, grow)) && grow[0] == 0);
+    const auto base = free_stack_address(*fixture.memory, 4 * page);
+    const horizon::AddressRange prefix{base, 4096};
+    const horizon::AddressRange source{grow[1] + page + 4096, page};
+    const horizon::AddressRange destination{base + 4096, page};
+    auto bytes = pin(*fixture.memory, {grow[1], 4096}, memory::Permission::read | memory::Permission::write);
+    std::fill(bytes->writable_bytes().begin(), bytes->writable_bytes().end(), std::byte{0x27});
+    bytes.reset();
+    bytes = pin(*fixture.memory, source, memory::Permission::read | memory::Permission::write);
+    std::fill(bytes->writable_bytes().begin(), bytes->writable_bytes().end(), std::byte{0x65});
+    bytes.reset();
+    horizon::QueryRegisters neighbor{}; neighbor[0] = prefix.address; neighbor[1] = grow[1]; neighbor[2] = prefix.size;
+    CHECK(handled(fixture.memory->dispatch(4, neighbor)) && neighbor[0] == 0);
+    const auto before = snapshot(*fixture.memory);
+    const std::array protections{native_protection(base), native_protection(base + page)};
+    native_fault::high_alias_attempts = 0;
+    native_fault::limit_queries = 0;
+    native_fault::address_limit = (private_mode ? 64ull : 128ull) << 30;
+    const auto outside = platform::ProcessMemoryRegion::reserve(page, native_fault::address_limit);
+    CHECK(std::get_if<platform::ProcessMemoryError>(&outside) &&
+          std::get<platform::ProcessMemoryError>(outside) == platform::ProcessMemoryError::out_of_range);
+    platform::ProcessMemoryStatus unavailable;
+    const auto private_alias = platform::ProcessMemoryRegion::writable_host_alias(base, page, &unavailable);
+    CHECK(std::holds_alternative<platform::ProcessMemoryError>(private_alias) &&
+          unavailable.error == platform::ProcessMemoryError::unsupported);
+    for (const auto operation : {native_fault::Operation::remap, native_fault::Operation::protect}) {
+        auto request = seeded_registers();
+        request[0] = destination.address; request[1] = source.address; request[2] = source.size;
+        const auto original = request;
+        native_fault::arm(operation, base, 2 * page, 0);
+        CHECK(host_failure(fixture.memory->dispatch(4, request)) && native_fault::triggered);
+        native_fault::operation = native_fault::Operation::none;
+        CHECK(request == original && unchanged(*fixture.memory, before));
+        CHECK(native_protection(base) == protections[0] && native_protection(base + page) == protections[1]);
+        CHECK((sample(*fixture.memory, prefix) == std::array<std::byte, 2>{std::byte{0x27}, std::byte{0x27}}));
+        CHECK((sample(*fixture.memory, source) == std::array<std::byte, 2>{std::byte{0x65}, std::byte{0x65}}));
+    }
+    horizon::QueryRegisters map{};
+    map[0] = destination.address; map[1] = source.address; map[2] = source.size;
+    const auto mapped = fixture.memory->dispatch(4, map);
+    CHECK(handled(mapped) && map[0] == 0);
+    if (handled(mapped) && map[0] == 0) {
+        bytes = pin(*fixture.memory, destination, memory::Permission::read | memory::Permission::write);
+        std::fill(bytes->writable_bytes().begin(), bytes->writable_bytes().end(), std::byte{0x79});
+        bytes.reset();
+        horizon::QueryRegisters unmap{};
+        unmap[0] = destination.address; unmap[1] = source.address; unmap[2] = source.size;
+        CHECK(handled(fixture.memory->dispatch(5, unmap)) && unmap[0] == 0);
+        CHECK((sample(*fixture.memory, source) == std::array<std::byte, 2>{std::byte{0x79}, std::byte{0x79}}));
+    }
+    CHECK((sample(*fixture.memory, prefix) == std::array<std::byte, 2>{std::byte{0x27}, std::byte{0x27}}));
+    native_fault::address_limit = 0;
+    CHECK(native_fault::limit_queries != 0);
+    CHECK(native_fault::high_alias_attempts == 0);
 #endif
 }
 
@@ -861,6 +1022,8 @@ int main() {
     for (bool mode : {false, true}) {
         private_mode = mode;
         partial_native_failures();
+        copied_stack_in_bounded_address_space();
+        copied_stack_concurrent_neighbor_rollback();
         copied_shared_native_failures();
         failed_rollback_poisons_owner();
         CHECK(sweep_bootstrap_allocate());

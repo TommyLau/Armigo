@@ -16,6 +16,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <iostream>
+#include <optional>
 #include <random>
 #include <stdexcept>
 
@@ -288,7 +289,107 @@ void task_and_mesh_stages() {
     wrong.vertex_depth_zero_to_one = true;
     check(std::holds_alternative<sn::NativeStageFiles>(narrow.find(identity('e'), wrong)), "admitted mesh depth");
 }
+
+// The lookup a recorded row uses: program digest and stage kind, then the
+// depth suffix. The warm-up keeps the stage only when the built identity text
+// matches; that comparison needs a reflection the stage loader accepts.
+std::optional<sn::NativeStageFiles> resolve_runtime_stage(const sn::NativePackage& package, std::string_view identity) {
+    const auto parsed = sn::parse_runtime_stage_identity(identity);
+    if (!parsed) return std::nullopt;
+    const auto stage_identity = package.identity_for_program(parsed->program_digest, parsed->stage);
+    if (!stage_identity) return std::nullopt;
+    sn::NativeLookup lookup;
+    lookup.stage = parsed->stage;
+    lookup.pixel_rate_disabled = true;
+    lookup.vertex_fetch = false;
+    lookup.fragment_position_matches = true;
+    lookup.vertex_depth_zero_to_one = parsed->vertex_depth_zero_to_one;
+    auto found = package.find(*stage_identity, lookup);
+    if (const auto* files = std::get_if<sn::NativeStageFiles>(&found)) return *files;
+    return std::nullopt;
+}
+
+std::vector<std::string> row_fields(std::string_view row) {
+    std::vector<std::string> fields;
+    if (row.size() < 3 || row[1] != '\t') return fields;
+    row.remove_prefix(2);
+    while (!row.empty()) {
+        const auto tab = row.find('\t');
+        fields.emplace_back(row.substr(0, tab));
+        if (tab == std::string_view::npos) break;
+        row.remove_prefix(tab + 1);
+    }
+    return fields;
+}
+
+void runtime_identity_row() {
+    TemporaryDirectory directory;
+    const sn::NativePackage package = publish(directory.path);
+    const std::string vertex_digest = sha256_hex("vertex-program-bytes");
+    const std::string fragment_digest = sha256_hex("fragment-program-bytes");
+    const auto vertex_id = package.identity_for_program(vertex_digest, sn::NativeStageKind::vertex);
+    const auto fragment_id = package.identity_for_program(fragment_digest, sn::NativeStageKind::fragment);
+    check(vertex_id && *vertex_id == identity('b'), "vertex program identity");
+    check(fragment_id && *fragment_id == identity('a'), "fragment program identity");
+    check(!package.identity_for_program(vertex_digest, sn::NativeStageKind::fragment), "digest is per stage kind");
+    check(!package.identity_for_program(std::string(64, '0'), sn::NativeStageKind::vertex), "unknown program");
+    check(package.identity_for_program(vertex_digest, sn::NativeStageKind::vertex) == vertex_id, "program index stays");
+
+    const std::string vertex_identity = "0." + vertex_digest + ".1";
+    const std::string fragment_identity = "1." + fragment_digest + ".0";
+    const std::string row = "R\t" + vertex_identity + "\t" + fragment_identity + "\tv1:00";
+    const auto fields = row_fields(row);
+    check(fields.size() == 3 && fields[0] == vertex_identity && fields[1] == fragment_identity, "render row");
+    const auto vertex = resolve_runtime_stage(package, fields[0]);
+    const auto fragment = resolve_runtime_stage(package, fields[1]);
+    check(vertex && vertex->library == bytes("zero-library"), "zero depth resolves");
+    check(fragment && fragment->library == bytes("fragment-library"), "fragment resolves");
+    const auto minus = resolve_runtime_stage(package, "0." + vertex_digest + ".2");
+    check(minus && minus->library == bytes("minus-library"), "minus depth resolves");
+    check(!resolve_runtime_stage(package, "0." + vertex_digest + ".0"), "wrong depth suffix");
+    check(!resolve_runtime_stage(package, "0." + std::string(64, '0') + ".1"), "unknown digest");
+
+    check(!sn::parse_runtime_stage_identity(identity('a')), "packaged identity is not run-time text");
+    check(!sn::parse_runtime_stage_identity("0." + std::string(64, 'F') + ".1"), "uppercase digest");
+    check(!sn::parse_runtime_stage_identity("2." + vertex_digest + ".0"), "geometry stage");
+    check(!sn::parse_runtime_stage_identity("6." + vertex_digest + ".0"), "task stage number");
+    check(!sn::parse_runtime_stage_identity("7." + vertex_digest + ".0"), "mesh stage number");
+    check(!sn::parse_runtime_stage_identity("4." + vertex_digest + ".0"), "mesh wrong depth suffix");
+    const auto mesh = sn::parse_runtime_stage_identity("4." + vertex_digest + ".2");
+    check(mesh && mesh->stage == sn::NativeStageKind::mesh && !mesh->vertex_depth_zero_to_one, "mesh minus suffix");
+    const auto task = sn::parse_runtime_stage_identity("3." + vertex_digest + ".0");
+    check(task && task->stage == sn::NativeStageKind::task, "task stage");
+    const auto compute = sn::parse_runtime_stage_identity("5." + vertex_digest + ".4x8x1s128");
+    check(compute && compute->stage == sn::NativeStageKind::compute && compute->program_digest == vertex_digest,
+          "compute suffix");
+}
 } // namespace
+
+// A source larger than the source.metal policy is refused when it would be
+// written and recorded by digest and size when it is not.
+void large_unstored_source() {
+    auto stage = fragment_stage();
+    stage.variants.front().source.assign(sn::maximum_native_source_bytes + 1, 'x');
+    {
+        TemporaryDirectory directory;
+        auto created = sn::NativeSectionWriter::create(directory.path, true);
+        auto& writer = std::get<sn::NativeSectionWriter>(created);
+        check(std::holds_alternative<std::string>(writer.add(stage)), "large stored source refused");
+    }
+    TemporaryDirectory directory;
+    auto created = sn::NativeSectionWriter::create(directory.path, false);
+    auto& writer = std::get<sn::NativeSectionWriter>(created);
+    check(std::holds_alternative<std::monostate>(writer.add(stage)), "large unstored source added");
+    check(std::holds_alternative<sn::NativeSection>(writer.finish(counts(), {})), "large unstored finish");
+    auto opened = sn::NativePackage::open(directory.path);
+    check(std::holds_alternative<sn::NativePackage>(opened), "large unstored open");
+    const auto& package = std::get<sn::NativePackage>(opened);
+    check(package.section().entries.front().variants.front().source_size == sn::maximum_native_source_bytes + 1,
+          "large unstored size");
+    sn::NativeLookup fragment;
+    fragment.stage = sn::NativeStageKind::fragment;
+    check(std::holds_alternative<sn::NativeStageFiles>(package.find(identity('a'), fragment)), "large unstored hit");
+}
 
 int main() {
     try {
@@ -388,8 +489,10 @@ int main() {
         auto missing_section = sn::NativePackage::open(directory.path / "absent");
         check(std::holds_alternative<std::string>(missing_section), "missing section");
         omitted_source();
+        large_unstored_source();
         legacy_manifest_loads();
         task_and_mesh_stages();
+        runtime_identity_row();
         std::cout << "Native shader package tests passed\n";
         return 0;
     } catch (const std::exception& error) {

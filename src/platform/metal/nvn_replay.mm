@@ -12,8 +12,12 @@
 #include <armigo/execution/guest_timeline.h>
 #include <TargetConditionals.h>
 #include "nvn_replay.h"
+#include "../../nvn/program_capture.h"
+#include "nvn_image_formats.h"
+#include "nvn_pool_tables.h"
 #include "nvn_draw_state.h"
 #include "nvn_color_aliases.h"
+#include "nvn_pass_dump.h"
 #include "nvn_submission_segments.h"
 #include "nvn_primitive_expansion.h"
 #include "nvn_gpu_frame_work.h"
@@ -28,6 +32,7 @@
 #include <objc/runtime.h>
 
 #include "../../nvn/commands.h"
+#include "../../nvn/conditional_reports.h"
 #include "../../nvn/programs.h"
 #ifdef ARMIGO_HAS_NATIVE_SHADERS
 #include "nvn_native_stages.h"
@@ -69,9 +74,13 @@
 #include <memory>
 #include <thread>
 #include <cmath>
+#include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
+#include <optional>
+#include <vector>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <map>
@@ -82,6 +91,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -121,7 +131,67 @@ id<MTLLibrary> load_stage_library(id<MTLDevice> device, const platform::Compiled
         options.preserveInvariance = YES;
         NSString* source = [[NSString alloc] initWithBytes:code.data() length:code.size()
                                                   encoding:NSUTF8StringEncoding];
-        if (source) library = [device newLibraryWithSource:source options:options error:&error];
+        if (source) {
+            // A source compile can take Metal's compiler arbitrarily long (some
+            // stages never finish), and the replay thread must not wait for it
+            // without bound: the guest waits on this submission's fence. The
+            // compile runs asynchronously and is waited for up to a deadline;
+            // past it the stage is unavailable for now (its draws are skipped)
+            // and the library is taken once the compile finishes.
+            struct Compile {
+                std::mutex mutex;
+                std::condition_variable done_signal;
+                bool done = false;
+                id<MTLLibrary> library = nil;
+                NSError* error = nil;
+            };
+            static std::mutex compiles_mutex;
+            static std::unordered_map<std::string, std::shared_ptr<Compile>> compiles;
+            std::shared_ptr<Compile> compile;
+            bool start = false;
+            {
+                const std::lock_guard lock(compiles_mutex);
+                auto& entry = compiles[code];
+                if (!entry) {
+                    entry = std::make_shared<Compile>();
+                    start = true;
+                }
+                compile = entry;
+            }
+            if (start)
+                [device newLibraryWithSource:source options:options
+                           completionHandler:^(id<MTLLibrary> result, NSError* failure) {
+                    const std::lock_guard lock(compile->mutex);
+                    compile->library = result;
+                    compile->error = failure;
+                    compile->done = true;
+                    compile->done_signal.notify_all();
+                }];
+            static const auto deadline = [] {
+                const char* value = std::getenv("ARMIGO_NVN_SOURCE_COMPILE_TIMEOUT_MS");
+                const auto milliseconds = value ? std::strtoull(value, nullptr, 10) : 5000ull;
+                return std::chrono::milliseconds(milliseconds ? milliseconds : 5000ull);
+            }();
+            std::unique_lock lock(compile->mutex);
+            if (!compile->done_signal.wait_for(lock, start ? deadline : std::chrono::milliseconds(0),
+                                               [&] { return compile->done; })) {
+                detail = "the Metal source compile has not finished after " +
+                         std::to_string(deadline.count()) + " ms; the stage is unavailable until it does";
+                return nil;
+            }
+            library = compile->library;
+            error = compile->error;
+            if (library) {
+                lock.unlock();
+                const std::lock_guard forget(compiles_mutex);
+                compiles.erase(code);
+            }
+        }
+    }
+    if (library && !stage.discard_entry_point.empty() &&
+        ![library.functionNames containsObject:[NSString stringWithUTF8String:stage.discard_entry_point.c_str()]]) {
+        detail = "shader library is missing its declared rasterizer-discard entry";
+        return nil;
     }
     if (!library)
         detail = std::string("shader library load failed: ") +
@@ -198,13 +268,26 @@ void note_push_bank_reads(std::size_t stage, bool pushed, bool bound) {
                         "Armigo NVN 231.40: stage %zu reads constant buffer 16 with %s\n", stage, cases[which]);
 }
 constexpr std::size_t texture_slots = 128;
+constexpr std::size_t bound_texture_slots = 256;
+constexpr std::size_t separate_texture_slot_base = 128;
 // Graphics driver data: the word GLSLC adds to the hardware instance ID.
 constexpr std::size_t graphics_base_instance_offset = 0x644;
 constexpr std::size_t sampler_slots = 128;
 constexpr std::size_t image_slots = 32;
 // Several queue submissions can belong to one frame. Keep room for the next
-// frame to encode while earlier submissions still own their GPU storage.
-constexpr std::size_t submission_slots = 6;
+// frame to encode while earlier submissions still own their GPU storage: six
+// slots, the title's nvn_policy.submission_slots, or ARMIGO_NVN_SUBMISSION_SLOTS
+// (1 to 16) for measurement. Read when a replay encodes its first submission.
+constexpr std::size_t max_submission_slots = 16;
+std::size_t submission_slot_count() {
+    if (const char* text = std::getenv("ARMIGO_NVN_SUBMISSION_SLOTS")) {
+        const auto parsed = std::strtoull(text, nullptr, 10);
+        if (parsed >= 1 && parsed <= max_submission_slots) return static_cast<std::size_t>(parsed);
+    }
+    if (const auto slots = nvn::title_policy().submission_slots; slots >= 1 && slots <= max_submission_slots)
+        return slots;
+    return 6;
+}
 // Pipelines a capturing session writes to one archive file before it starts
 // another (see ReplayImpl::capture).
 constexpr std::uint64_t archive_chunk_pipelines = 4096;
@@ -612,19 +695,157 @@ struct BoundBuffer {
     std::uint64_t size = 0;
 };
 
-struct ReplayState {
+// Logical bindings survive changes to the executing geometry pipeline.
+// The six Metal slots below are projections, not the public binding namespace.
+struct ReplayPrograms {
+    struct Cached {
+        std::shared_ptr<const ResolvedProgram> program;
+        bool failed = false;
+    };
+    std::array<Cached, stage_count> ordinary;
+    Cached task, task_mesh, standalone_mesh, auxiliary_mesh;
+    std::array<std::shared_ptr<const ResolvedProgram>, stage_count> stage_programs;
+    std::uint32_t failed_stages = 0, write_stages = 0;
+    std::int32_t geometry_mode = 0;
+
+    static bool stage_writes(const ResolvedProgram* program, std::size_t stage) {
+        const auto* shader = program ? program->stages[stage].get() : nullptr;
+        return shader && ((shader->guest_memory && shader->guest_memory->writes) ||
+            std::ranges::any_of(shader->storage_buffers, [](const auto& resource) {
+                return resource.access != platform::CompiledShaderResourceAccess::Read;
+            }));
+    }
+    void update_write_stage(std::size_t stage) {
+        const auto bit = 1u << stage;
+        write_stages = stage_writes(stage_programs[stage].get(), stage)
+            ? write_stages | bit : write_stages & ~bit;
+    }
+    bool select() {
+        bool changed = false;
+        std::uint32_t failures = 0;
+        for (std::size_t stage = 0; stage != stage_count; ++stage) {
+            const Cached* selected = &ordinary[stage];
+            if (geometry_mode && stage != NVN_SHADER_STAGE_FRAGMENT && stage != NVN_SHADER_STAGE_COMPUTE) {
+                selected = nullptr;
+                if (stage == NVN_SHADER_STAGE_TESS_CONTROL && geometry_mode == 1) selected = &task;
+                if (stage == NVN_SHADER_STAGE_TESS_EVALUATION)
+                    selected = geometry_mode == 1 ? &task_mesh : &standalone_mesh;
+            }
+            const auto* next = selected && !selected->failed ? selected->program.get() : nullptr;
+            if (stage_programs[stage].get() != next) {
+                stage_programs[stage] = next ? selected->program : nullptr;
+                update_write_stage(stage);
+                changed = true;
+            }
+            if (selected && selected->failed) failures |= 1u << stage;
+        }
+        changed |= failed_stages != failures;
+        failed_stages = failures;
+        return changed;
+    }
+    static void update(Cached& cache, const std::shared_ptr<const ResolvedProgram>& program,
+                       bool present, bool failed) {
+        const auto* next = present ? program.get() : nullptr;
+        if (cache.program.get() != next) cache.program = present ? program : nullptr;
+        cache.failed = failed;
+    }
+    bool bind(const BindProgram& command, const std::shared_ptr<const ResolvedProgram>& program) {
+        const auto mask = static_cast<std::uint32_t>(command.stages);
+        if (!mask) return false;
+        const auto present = program ? program->logical_stages : 0u;
+        constexpr auto compute_bit = 1u << NVN_SHADER_STAGE_COMPUTE;
+        const bool compute = (present & mask & compute_bit) != 0;
+        constexpr auto graphics_bits = ((1u << logical_binding_stage_count) - 1) & ~compute_bit;
+        const auto published = compute ? compute_bit : graphics_bits;
+        // Publish the complete graphics list, including its opposite-route
+        // clear, before applying the requested mask's missing-stage clears.
+        const bool has_task = (present & (1u << 6)) != 0;
+        const bool has_mesh = (present & (1u << 7)) != 0;
+        if (!compute && has_mesh) {
+            auto& selected = program->mesh_uses_task ? task_mesh : standalone_mesh;
+            auto& opposite = program->mesh_uses_task ? standalone_mesh : task_mesh;
+            opposite = {};
+            update(selected, program, true,
+                (program->failed_stages & (1u << NVN_SHADER_STAGE_TESS_EVALUATION)) != 0);
+            update(auxiliary_mesh, program, program->mesh_primitive_header,
+                program->mesh_primitive_header && selected.failed);
+        }
+        if (!compute && has_task)
+            update(task, program, true,
+                (program->failed_stages & (1u << NVN_SHADER_STAGE_TESS_CONTROL)) != 0);
+        for (std::size_t stage = 0; stage != stage_count; ++stage) {
+            const auto bit = 1u << stage;
+            if (!(present & published & bit)) continue;
+            update(ordinary[stage], program, true, (program->failed_stages & bit) != 0);
+        }
+        const auto missing = mask & ~present;
+        for (std::size_t stage = 0; stage != stage_count; ++stage)
+            if (missing & (1u << stage)) ordinary[stage] = {};
+        if (missing & (1u << 6)) task = {};
+        if (missing & (1u << 7)) task_mesh = standalone_mesh = auxiliary_mesh = {};
+        return select();
+    }
+    std::array<program_capture::Cache, 10> capture_caches() const {
+        std::array<program_capture::Cache, 10> result;
+        const auto copy = [&](std::size_t index, const Cached& entry, std::size_t physical) {
+            auto& out = result[index]; out.failed = entry.failed;
+            if (!entry.program) return;
+            out.generation = entry.program->state.serial; out.capture_call = entry.program->capture_call;
+            const auto& shader = entry.program->stages[physical];
+            if (!shader) return;
+            if (!shader->native_stage_identity.empty()) {
+                out.stage_identity = shader->native_stage_identity; out.identity_domain = "native-control-payload";
+            } else { out.stage_identity = shader->identity; out.identity_domain = "compiled-stage"; }
+            if (index == 9) out.identity_domain += ":auxiliary-metadata";
+        };
+        for (std::size_t i = 0; i != ordinary.size(); ++i) copy(i, ordinary[i], i);
+        copy(6, task, 3); copy(7, task_mesh, 4); copy(8, standalone_mesh, 4); copy(9, auxiliary_mesh, 4);
+        return result;
+    }
+    std::size_t resource_stage(std::size_t physical) const {
+        if (geometry_mode && physical == NVN_SHADER_STAGE_TESS_CONTROL) return 6;
+        if (geometry_mode && physical == NVN_SHADER_STAGE_TESS_EVALUATION) return 7;
+        return physical;
+    }
+    std::optional<std::size_t> execution_stage(std::size_t logical) const {
+        if (!geometry_mode) return logical < stage_count ? std::optional{logical} : std::nullopt;
+        if (logical == 6 && geometry_mode == 1) return NVN_SHADER_STAGE_TESS_CONTROL;
+        if (logical == 7) return NVN_SHADER_STAGE_TESS_EVALUATION;
+        if (logical == NVN_SHADER_STAGE_FRAGMENT || logical == NVN_SHADER_STAGE_COMPUTE) return logical;
+        return std::nullopt;
+    }
+};
+
+struct ReplayState : ReplayPrograms {
     SetRenderTargets targets{};
     std::array<std::shared_ptr<const TextureState>, 8> target_owners;
     std::shared_ptr<const TextureState> depth_owner;
-    std::array<std::array<BoundBuffer, buffer_slots>, stage_count> uniform{};
-    std::array<std::array<BoundBuffer, buffer_slots>, stage_count> storage{};
-    std::array<std::array<std::uint64_t, texture_slots>, stage_count> textures{};
-    std::array<std::array<std::uint64_t, sampler_slots>, stage_count> samplers{};
-    std::array<std::array<std::uint64_t, image_slots>, stage_count> images{};
+    std::array<std::array<BoundBuffer, buffer_slots>, logical_binding_stage_count> uniform{};
+    std::array<std::array<BoundBuffer, buffer_slots>, logical_binding_stage_count> storage{};
+    std::array<std::array<std::uint64_t, bound_texture_slots>, logical_binding_stage_count> textures{};
+    std::array<std::uint64_t, logical_binding_stage_count> texture_prefix{};
+    std::array<std::array<std::uint64_t, sampler_slots>, logical_binding_stage_count> samplers{};
+    std::array<std::array<std::uint64_t, image_slots>, logical_binding_stage_count> images{};
     // Each graphics stage's push-constant block and the hardware constant
     // buffer its shaders read it as (0 before any push).
-    std::array<std::array<std::byte, push_constant_bytes>, stage_count> push_constants{};
-    std::array<std::uint32_t, stage_count> push_bank{};
+    std::array<std::array<std::byte, push_constant_bytes>, logical_binding_stage_count> push_constants{};
+    std::array<std::uint32_t, logical_binding_stage_count> push_bank{};
+    auto& uniform_at(std::size_t physical) { return uniform[resource_stage(physical)]; }
+    const auto& uniform_at(std::size_t physical) const { return uniform[resource_stage(physical)]; }
+    auto& storage_at(std::size_t physical) { return storage[resource_stage(physical)]; }
+    const auto& storage_at(std::size_t physical) const { return storage[resource_stage(physical)]; }
+    auto& textures_at(std::size_t physical) { return textures[resource_stage(physical)]; }
+    const auto& textures_at(std::size_t physical) const { return textures[resource_stage(physical)]; }
+    auto& prefix_at(std::size_t physical) { return texture_prefix[resource_stage(physical)]; }
+    const auto& prefix_at(std::size_t physical) const { return texture_prefix[resource_stage(physical)]; }
+    auto& samplers_at(std::size_t physical) { return samplers[resource_stage(physical)]; }
+    const auto& samplers_at(std::size_t physical) const { return samplers[resource_stage(physical)]; }
+    auto& images_at(std::size_t physical) { return images[resource_stage(physical)]; }
+    const auto& images_at(std::size_t physical) const { return images[resource_stage(physical)]; }
+    auto& push_at(std::size_t physical) { return push_constants[resource_stage(physical)]; }
+    const auto& push_at(std::size_t physical) const { return push_constants[resource_stage(physical)]; }
+    auto& push_bank_at(std::size_t physical) { return push_bank[resource_stage(physical)]; }
+    const auto& push_bank_at(std::size_t physical) const { return push_bank[resource_stage(physical)]; }
     // Sampler registrations made before the current draw was recorded, from
     // the latest stamp or binding record (0 before any).
     std::uint64_t sampler_registrations = 0;
@@ -638,26 +859,6 @@ struct ReplayState {
     MultisampleStateBits multisample{};
     PolygonStateBits polygon{};
     DepthStencilStateBits depth_stencil{};
-    std::array<std::shared_ptr<const ResolvedProgram>, stage_count> stage_programs;
-    // Immutable shader reflection changes only when a stage's program changes.
-    std::uint32_t write_stages = 0;
-    void update_write_stage(std::size_t stage) {
-        const auto& program = stage_programs[stage];
-        const auto* shader = program ? program->stages[stage].get() : nullptr;
-        // A stage that stores through the guest-memory table may store
-        // anywhere in its pools.
-        const bool writes = shader && ((shader->guest_memory && shader->guest_memory->writes) ||
-            std::ranges::any_of(shader->storage_buffers, [](const auto& resource) {
-                return resource.access != platform::CompiledShaderResourceAccess::Read;
-            }));
-        const auto bit = 1u << stage;
-        write_stages = writes ? write_stages | bit : write_stages & ~bit;
-    }
-
-    // Bit s: the program bound to stage s has that stage, but it failed to
-    // translate (stage_programs[s] is then empty). Draws and dispatches that
-    // would use it are refused rather than run without it.
-    std::uint32_t failed_stages = 0;
     std::array<MTLViewport, 16> viewports = [] {
         std::array<MTLViewport, 16> values{};
         for (auto& value : values) value.zfar = 1.0;
@@ -752,13 +953,63 @@ vertex void armigo_nvn_render_predicate_vertex(device const PredicateJob& job [[
 enum class PassBreak : std::uint8_t {
     render_targets, transfer, clear, dispatch, barrier, wait_sync, fence_sync, counter, depth_needed,
     storage_after_depth_barrier, color_alias, depth_sampled, sample_locations, downsample, discard, skip,
-    cpu_drain, finish, predicate, buffer_writes, relaxed_hazard, count
+    cpu_drain, finish, predicate, buffer_writes, relaxed_hazard, wait_event, draw_dump, attachment_feedback, count
 };
 constexpr const char* pass_break_names[] = {
     "render_targets", "transfer", "clear", "dispatch", "barrier", "wait_sync", "fence_sync", "counter",
     "depth_needed", "storage_after_depth_barrier", "color_alias", "depth_sampled", "sample_locations",
-    "downsample", "discard", "skip", "cpu_drain", "finish", "predicate", "buffer_writes", "relaxed_hazard"};
+    "downsample", "discard", "skip", "cpu_drain", "finish", "predicate", "buffer_writes", "relaxed_hazard",
+    "wait_event", "draw_dump", "attachment_feedback"};
 static_assert(std::size(pass_break_names) == std::size_t(PassBreak::count));
+
+// What opened a transfer (compute) encoder. With ARMIGO_NVN_PASS_REASONS=1 the
+// replay counts each new transfer encoder by the operation that asked for it,
+// and how many of them ended an open render pass ("transfers: site=opened/split").
+enum class TransferSite : std::uint8_t {
+    other, update_uniforms, uniform_window, graphics_writes, uniform_access, storage_bind, dispatch, copy, upload,
+    clear_buffer, clear_texture, report, mesh_indirect, predicate, counter, synchronize, cpu_read, finish, count
+};
+constexpr const char* transfer_site_names[] = {
+    "other", "update_uniforms", "uniform_window", "graphics_writes", "uniform_access", "storage_bind", "dispatch",
+    "copy", "upload", "clear_buffer", "clear_texture", "report", "mesh_indirect", "predicate", "counter", "synchronize",
+    "cpu_read", "finish"};
+static_assert(std::size(transfer_site_names) == std::size_t(TransferSite::count));
+
+// ARMIGO_NVN_EVENT_WAIT_DRAIN switches the event-wait shortcuts off, for
+// A/B runs of picture faults: "1" or "all" drains the GPU at every event wait
+// and releases a held wait only when its writer retires; otherwise a
+// comma-separated list of "leading" (a released leading wait drains),
+// "own" (a wait this submission's own write meets drains instead of taking a
+// barrier), "pending" (every later wait drains, whether or not a writer is
+// pending) and "release" (a held wait goes on when its writer retires, not
+// when an encoded write meets it).
+struct EventWaitDrains {
+    bool leading = false, own = false, pending = false, release = false;
+};
+
+const EventWaitDrains& event_wait_drains() {
+    static const EventWaitDrains drains = [] {
+        EventWaitDrains result;
+        const char* value = std::getenv("ARMIGO_NVN_EVENT_WAIT_DRAIN");
+        if (!value || !*value) return result;
+        const std::string_view list{value};
+        if (list == "1" || list == "all") return EventWaitDrains{true, true, true, true};
+        for (std::size_t begin = 0; begin <= list.size();) {
+            const auto end = std::min(list.find(',', begin), list.size());
+            const auto name = list.substr(begin, end - begin);
+            if (name == "leading") result.leading = true;
+            else if (name == "own") result.own = true;
+            else if (name == "pending") result.pending = true;
+            else if (name == "release") result.release = true;
+            else if (!name.empty())
+                armigo::diag::write(armigo::diag::Level::warning,
+                                    "Armigo NVN: ARMIGO_NVN_EVENT_WAIT_DRAIN names an unknown shortcut\n");
+            begin = end + 1;
+        }
+        return result;
+    }();
+    return drains;
+}
 
 bool pass_reasons_enabled() {
     static const bool enabled = [] {
@@ -808,6 +1059,10 @@ struct PassBreakCounts {
     // counter reports by kind.
     std::atomic<std::uint64_t> conditional_gpu{0}, conditional_cpu{0}, if_equal{0}, if_not_equal{0};
     std::atomic<std::uint64_t> report_samples{0}, report_other{0};
+    std::array<std::atomic<std::uint64_t>, std::size_t(TransferSite::count)> transfers{}, transfer_splits{};
+    // Clears drawn in a render encoder of their own, and clears taken as a
+    // pass's load action.
+    std::atomic<std::uint64_t> clears_own{0}, clears_load{0};
 };
 
 PassBreakCounts& pass_break_counts() {
@@ -818,6 +1073,18 @@ PassBreakCounts& pass_break_counts() {
 void note_pass_break(PassBreak why) {
     if (pass_reasons_enabled())
         pass_break_counts().reasons[std::size_t(why)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void note_clear(bool own) {
+    if (pass_reasons_enabled()) (own ? pass_break_counts().clears_own : pass_break_counts().clears_load)
+        .fetch_add(1, std::memory_order_relaxed);
+}
+
+void note_transfer_open(TransferSite site, bool split) {
+    if (!pass_reasons_enabled()) return;
+    auto& counts = pass_break_counts();
+    counts.transfers[std::size_t(site)].fetch_add(1, std::memory_order_relaxed);
+    if (split) counts.transfer_splits[std::size_t(site)].fetch_add(1, std::memory_order_relaxed);
 }
 
 void note_conditional(bool gpu, bool if_equal) {
@@ -870,6 +1137,12 @@ void report_pass_breaks(std::uint64_t fence) {
     line += " conditionals: gpu=" + take(counts.conditional_gpu) + " cpu=" + take(counts.conditional_cpu) +
         " if_equal=" + take(counts.if_equal) + " if_not_equal=" + take(counts.if_not_equal) +
         " reports: samples=" + take(counts.report_samples) + " other=" + take(counts.report_other);
+    line += " clears: own=" + take(counts.clears_own) + " load=" + take(counts.clears_load);
+    line += " transfers:";
+    for (std::size_t index = 0; index != counts.transfers.size(); ++index)
+        if (const auto opened = counts.transfers[index].exchange(0, std::memory_order_relaxed))
+            line += std::string(" ") + transfer_site_names[index] + "=" + std::to_string(opened) + "/" +
+                std::to_string(counts.transfer_splits[index].exchange(0, std::memory_order_relaxed));
     armigo::diag::opt_in( "%s\n", line.c_str());
 }
 
@@ -932,6 +1205,10 @@ struct NativePipeline {
     std::int32_t zero_attribute_slot = -1;
     std::shared_ptr<const platform::CompiledGraphicsStage> vertex_stage;
     std::shared_ptr<const platform::CompiledGraphicsStage> fragment_stage;
+    // Keep the source stages that the mesh cache key names alive, including
+    // when the mesh library is a variant tailored to its fragment inputs.
+    std::shared_ptr<const platform::CompiledGraphicsStage> mesh_source_stage, task_stage;
+    id<MTLLibrary> task_library = nil;
     id<MTLLibrary> vertex_library = nil;
     id<MTLLibrary> fragment_library = nil;
     // Set once when the pipeline is created and never reassigned: records
@@ -1064,15 +1341,338 @@ UniformUpdate uniform_slice(const UniformUpdate& source, std::uint64_t offset, s
 
 class EncodeThread;
 
+// One residency set for every submission. An allocation joins it at its first
+// use in a submission, and the set is committed only when it changed, before
+// the next segment commit; every command buffer uses it. An allocation leaves
+// it once every submission that used it retired and no submission used it for
+// `window` submissions. A set per submission was made, filled, committed at
+// every segment and released again about 26 times a frame.
+class SharedResidency {
+public:
+    static constexpr std::uint64_t window = 256;
+
+    bool ready() const { return set_ != nil; }
+
+    bool create(id<MTLDevice> device) {
+        auto* descriptor = [MTLResidencySetDescriptor new];
+        descriptor.initialCapacity = 4096;
+        NSError* error = nil;
+        set_ = [device newResidencySetWithDescriptor:descriptor error:&error];
+        return set_ != nil;
+    }
+
+    id<MTLResidencySet> set() const { return set_; }
+
+    // Changes whenever a sweep removes an allocation: a carried resident
+    // table from before is no longer proof of residency.
+    std::uint64_t removals() const { return removals_.load(std::memory_order_acquire); }
+
+    // `sequence` is the encoding submission's, which is in flight. A
+    // submission's allocations arrive in one batch per segment commit, so
+    // the lock is taken once for all of them.
+    void add(std::span<const __unsafe_unretained id<MTLAllocation>> allocations, std::uint64_t sequence) {
+        if (allocations.empty()) return;
+        std::lock_guard lock(mutex_);
+        for (__unsafe_unretained id<MTLAllocation> allocation : allocations) {
+            auto [entry, inserted] = entries_.try_emplace((__bridge void*)allocation);
+            entry->second.last = sequence;
+            if (!inserted) continue;
+            entry->second.allocation = allocation;
+            [set_ addAllocation:allocation];
+            dirty_ = true;
+        }
+    }
+
+    void commit() {
+        std::lock_guard lock(mutex_);
+        if (!dirty_) return;
+        [set_ commit];
+        dirty_ = false;
+    }
+
+    // Removes the allocations last used before `oldest_running`, the
+    // sequence of the oldest submission still in flight, and not used for
+    // `window` submissions before `newest`.
+    void sweep(std::uint64_t oldest_running, std::uint64_t newest) {
+        std::lock_guard lock(mutex_);
+        for (auto entry = entries_.begin(); entry != entries_.end();) {
+            const auto last = entry->second.last;
+            if (last < oldest_running && last + window <= newest) {
+                [set_ removeAllocation:entry->second.allocation];
+                dirty_ = true;
+                removals_.fetch_add(1, std::memory_order_release);
+                entry = entries_.erase(entry);
+            } else {
+                ++entry;
+            }
+        }
+    }
+
+private:
+    struct Entry {
+        id<MTLAllocation> allocation = nil;
+        std::uint64_t last = 0;
+    };
+    std::mutex mutex_;
+    id<MTLResidencySet> set_ = nil;
+    std::unordered_map<void*, Entry> entries_;
+    bool dirty_ = false;
+    std::atomic<std::uint64_t> removals_{0};
+};
+
+// ARMIGO_NVN_GPUPROF=every:<n> (diagnostic): the GPU time of every encoder the
+// replay opens in one frame of every n. A relaxed timestamp is written into a
+// counter heap when an encoder begins (after its first active render stage)
+// and when it ends (the latest available render-stage completion), so no
+// synchronization is added
+// beyond the replay's own barriers. Once the frame's last fence completed, the
+// log lists each encoder ("nvn_gpuprof") and the frame's totals
+// ("nvn_gpuprof_frame"). Encode calls (clears, resolves) make encoders of their
+// own: a command-buffer timestamp before and after each such call times it
+// as a whole ("kind=call").
+class GpuProfile {
+public:
+    static constexpr std::size_t capacity = 4096;  // the largest timestamp heap Metal makes
+    static constexpr std::size_t timestamp_slots = 5;
+    static constexpr std::array<MTLRenderStages, 4> end_stages{
+        MTLRenderStageVertex, MTLRenderStageObject, MTLRenderStageMesh, MTLRenderStageFragment};
+
+    struct Label {
+        char kind = 'R';  // R render pass, C compute / copy, X encode call
+        MTLRenderStages begin_stage = 0;
+        bool end_recorded = false;
+        std::uint32_t width = 0, height = 0, colors = 0;
+        bool depth = false;
+        std::uint64_t fence = 0, pass = 0;
+        std::uint32_t segment = 0;  // the segment of its submission
+        std::uint64_t draws = 0, dispatches = 0, fills = 0;
+        // The package identity of the program the encoder opened with: the
+        // fragment (else mesh, else vertex) stage of a render pass, the
+        // compute stage of a compute encoder; and a render pass's mesh (else
+        // vertex) stage. Empty when not from a package.
+        std::array<char, 72> program{}, geometry{};
+    };
+
+    explicit GpuProfile(id<MTLDevice> device) : device_(device) {
+        const char* value = std::getenv("ARMIGO_NVN_GPUPROF");
+        if (value && !std::strncmp(value, "every:", 6)) every_ = std::strtoull(value + 6, nullptr, 10);
+    }
+
+    // Worker only, at each frame boundary.
+    void frame_boundary(std::uint64_t last_encoded_fence, std::uint64_t completed) {
+        if (!every_) return;
+        if (state_ == State::capturing) {
+            state_ = State::waiting;
+            target_fence_ = last_encoded_fence;
+        }
+        if (state_ == State::waiting && completed >= target_fence_) report();
+        ++frame_;
+        if (state_ == State::idle && frame_ % every_ == 0 && heap()) {
+            [heap_ invalidateCounterRange:NSMakeRange(0, capacity)];
+            labels_.clear();
+            dropped_ = 0;
+            captured_frame_ = frame_;
+            state_ = State::capturing;
+        }
+    }
+
+    // A slot for an encoder being opened, or -1 when this frame is not
+    // profiled or the heap is full.
+    int begin(const Label& label) {
+        if (state_ != State::capturing) return -1;
+        if (timestamp_slots * (labels_.size() + 1) > capacity) {
+            ++dropped_;
+            return -1;
+        }
+        labels_.push_back(label);
+        return static_cast<int>(labels_.size() - 1);
+    }
+
+    void end(int slot, std::uint64_t draws, std::uint64_t dispatches, std::uint64_t fills) {
+        if (slot < 0 || std::size_t(slot) >= labels_.size()) return;
+        auto& label = labels_[std::size_t(slot)];
+        label.end_recorded = true;
+        label.draws = draws - label.draws;
+        label.dispatches = dispatches - label.dispatches;
+        label.fills = fills - label.fills;
+    }
+
+    void mark_call_end(int slot) {
+        labels_[std::size_t(slot)].end_recorded = true;
+    }
+
+    id<MTL4CounterHeap> heap() {
+        if (heap_ || failed_) return heap_;
+        auto* descriptor = [MTL4CounterHeapDescriptor new];
+        descriptor.type = MTL4CounterHeapTypeTimestamp;
+        descriptor.count = capacity;
+        NSError* error = nil;
+        heap_ = [device_ newCounterHeapWithDescriptor:descriptor error:&error];
+        if (!heap_) {
+            failed_ = true;
+            armigo::diag::write(armigo::diag::Level::warning,
+                                "Armigo NVN: ARMIGO_NVN_GPUPROF has no counter heap; profiling is off\n");
+        }
+        return heap_;
+    }
+
+    static void stamp_render(id<MTL4RenderCommandEncoder> encoder, id<MTL4CounterHeap> heap, std::size_t index,
+                             bool end, MTLRenderStages begin_stage = MTLRenderStageVertex) {
+        if (!end) {
+            [encoder writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed
+                                        afterStage:begin_stage intoHeap:heap atIndex:index];
+            return;
+        }
+        // A stage with no work can leave its timestamp unwritten. Collect
+        // every programmable stage and use the latest available completion.
+        for (std::size_t stage = 0; stage < end_stages.size(); ++stage)
+            [encoder writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed
+                                        afterStage:end_stages[stage] intoHeap:heap atIndex:index + stage];
+    }
+
+    static void stamp_compute(id<MTL4ComputeCommandEncoder> encoder, id<MTL4CounterHeap> heap, std::size_t index) {
+        [encoder writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed intoHeap:heap atIndex:index];
+    }
+
+private:
+    enum class State { idle, capturing, waiting };
+
+    void report() {
+        state_ = State::idle;
+        const auto count = labels_.size();
+        if (!count) return;
+        NSData* data = [heap_ resolveCounterRange:NSMakeRange(0, timestamp_slots * count)];
+        const auto* stamps = static_cast<const std::uint64_t*>(data.bytes);
+        if (!stamps || data.length < timestamp_slots * count * sizeof(std::uint64_t)) return;
+        const double tick_ns = 1e9 / double([device_ queryTimestampFrequency]);
+        double render_us = 0, compute_us = 0, call_us = 0;
+        std::uint64_t first = 0, last = 0;
+        std::size_t timed = 0, passes = 0;
+        const auto completion = [&](std::size_t index) {
+            const auto* first_end = stamps + timestamp_slots * index + 1;
+            const auto ends = labels_[index].kind == 'R' ? end_stages.size() : 1;
+            return std::max_element(first_end, first_end + ends);
+        };
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto begin = stamps[timestamp_slots * index], end = *completion(index);
+            if (!begin || !end || end < begin) continue;
+            if (!first || begin < first) first = begin;
+            last = std::max(last, end);
+        }
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto begin = stamps[timestamp_slots * index], end = *completion(index);
+            const auto& label = labels_[index];
+            if (!begin || !end || end < begin) {
+                armigo::diag::write(armigo::diag::Level::info,
+                    "nvn_gpuprof_untimed frame=%llu index=%zu kind=%c fence=%llu segment=%u "
+                    "begin_stage=%llu end_recorded=%u begin_ticks=%llu end_ticks=%llu end_vertex=%llu end_object=%llu "
+                    "end_mesh=%llu end_fragment=%llu program=%s geometry=%s\n",
+                    static_cast<unsigned long long>(captured_frame_), index, label.kind,
+                    static_cast<unsigned long long>(label.fence), label.segment,
+                    static_cast<unsigned long long>(label.begin_stage),
+                    unsigned(label.end_recorded),
+                    static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end),
+                    static_cast<unsigned long long>(stamps[timestamp_slots * index + 1]),
+                    static_cast<unsigned long long>(stamps[timestamp_slots * index + 2]),
+                    static_cast<unsigned long long>(stamps[timestamp_slots * index + 3]),
+                    static_cast<unsigned long long>(stamps[timestamp_slots * index + 4]),
+                    label.program[0] ? label.program.data() : "-",
+                    label.geometry[0] ? label.geometry.data() : "-");
+                continue;
+            }
+            const double us = double(end - begin) * tick_ns / 1e3;
+            ++timed;
+            if (label.kind == 'R') {
+                render_us += us;
+                ++passes;
+                armigo::diag::write(armigo::diag::Level::info,
+                    "nvn_gpuprof frame=%llu index=%zu us=%.1f kind=render start_us=%.1f fence=%llu segment=%u pass=%llu "
+                    "size=%ux%u colors=%u depth=%u draws=%llu begin_stage=%llu end_stage=%llu program=%s geometry=%s\n",
+                    static_cast<unsigned long long>(captured_frame_), index, us, double(begin - first) * tick_ns / 1e3,
+                    static_cast<unsigned long long>(label.fence), label.segment,
+                    static_cast<unsigned long long>(label.pass), label.width, label.height, label.colors,
+                    unsigned(label.depth), static_cast<unsigned long long>(label.draws),
+                    static_cast<unsigned long long>(label.begin_stage),
+                    static_cast<unsigned long long>(end_stages[completion(index) -
+                        (stamps + timestamp_slots * index + 1)]),
+                    label.program[0] ? label.program.data() : "-",
+                    label.geometry[0] ? label.geometry.data() : "-");
+            } else if (label.kind == 'X') {
+                call_us += us;
+                armigo::diag::write(armigo::diag::Level::info,
+                    "nvn_gpuprof frame=%llu index=%zu us=%.1f kind=call start_us=%.1f fence=%llu segment=%u "
+                    "after_pass=%llu\n",
+                    static_cast<unsigned long long>(captured_frame_), index, us, double(begin - first) * tick_ns / 1e3,
+                    static_cast<unsigned long long>(label.fence), label.segment,
+                    static_cast<unsigned long long>(label.pass));
+            } else {
+                compute_us += us;
+                armigo::diag::write(armigo::diag::Level::info,
+                    "nvn_gpuprof frame=%llu index=%zu us=%.1f kind=compute start_us=%.1f fence=%llu segment=%u "
+                    "after_pass=%llu dispatches=%llu fills=%llu program=%s\n",
+                    static_cast<unsigned long long>(captured_frame_), index, us, double(begin - first) * tick_ns / 1e3,
+                    static_cast<unsigned long long>(label.fence), label.segment,
+                    static_cast<unsigned long long>(label.pass), static_cast<unsigned long long>(label.dispatches),
+                    static_cast<unsigned long long>(label.fills), label.program[0] ? label.program.data() : "-");
+            }
+        }
+        armigo::diag::write(armigo::diag::Level::info,
+            "nvn_gpuprof_frame frame=%llu render_ms=%.2f compute_ms=%.2f call_ms=%.2f encoders=%zu timed=%zu "
+            "render_passes=%zu dropped=%zu span_ms=%.2f\n",
+            static_cast<unsigned long long>(captured_frame_), render_us / 1e3, compute_us / 1e3, call_us / 1e3, count + dropped_,
+            timed, passes, dropped_,
+            last > first ? double(last - first) * tick_ns / 1e6 : 0.0);
+    }
+
+    id<MTLDevice> device_ = nil;
+    id<MTL4CounterHeap> heap_ = nil;
+    bool failed_ = false;
+    std::uint64_t every_ = 0, frame_ = 0, captured_frame_ = 0, target_fence_ = 0;
+    State state_ = State::idle;
+    std::vector<Label> labels_;
+    std::size_t dropped_ = 0;
+};
+
+// The allocations the parts of one guest submission made resident so far,
+// shared by its parts so a later part does not add them again. The parts hold
+// it; it keeps the allocations alive. The sweep keeps their entries while any
+// part of the submission is in flight (first_sequence), and a sweep that
+// removed anything since `removals` makes the table start over.
+struct ResidencyCarry {
+    std::weak_ptr<const CommandSubmission> submission;
+    ResidentTable residents;
+    NSMutableArray<id>* retained = [NSMutableArray array];
+    std::uint64_t removals = 0, first_sequence = 0;
+};
+
+// Native frames own this small result after command/history storage retires.
+struct NativeProducerResult {
+    std::mutex mutex;
+    bool retired = false;
+    std::string error;
+    std::string check() {
+        std::lock_guard lock(mutex);
+        return retired ? error : "Native producer fence has not retired";
+    }
+    void finish(std::string detail) {
+        std::lock_guard lock(mutex);
+        error = std::move(detail);
+        retired = true;
+    }
+};
+
 struct PendingSubmission : std::enable_shared_from_this<PendingSubmission> {
     std::uint64_t scheduling_period_ns = 0;
     // The guest-memory pool table shaders of this submission read, once a
     // stage needs it (its submission slot's buffer), and the guest addresses
-    // its pools cover as sorted disjoint ranges. guest_writes: a stage that
-    // stores through the table ran, so it may have written any of them.
+    // a storing stage may have written, as sorted disjoint ranges. Until the
+    // learned set has settled that is every pool; once stores are predicted
+    // it is the learned pools. guest_writes: a storing stage ran.
+    // guest_writes_predicted: this submission was encoded from that set.
     id<MTLBuffer> guest_table = nil;
     std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> guest_ranges;
     bool guest_writes = false;
+    bool guest_writes_predicted = false;
     // The two status words task stages of this submission record a launch
     // beyond Metal's mesh grid in (in its upload arena, zeroed), once a task
     // stage needs them.
@@ -1090,6 +1690,10 @@ struct PendingSubmission : std::enable_shared_from_this<PendingSubmission> {
     // which differs from fence order once a held submission is encoded after
     // later ones (under fence_mutex_ once set).
     std::uint64_t sequence = 0;
+    // This submission evaluates conditional renders from the report table.
+    // Writers are stamped with `sequence`, because completion publishes
+    // effects in encode order.
+    bool replay_conditionals = false;
     // Set when the encode thread replays this submission's Metal encoding;
     // commands is then nil on the worker.
     EncodeThread* encode_thread = nullptr;
@@ -1143,6 +1747,7 @@ struct PendingSubmission : std::enable_shared_from_this<PendingSubmission> {
         std::uint64_t syncs_registration = 0, syncs_writes = 0, uniform_invalidations = 0;
         // Texture uses that waited for guest-memory stores to be published.
         std::uint64_t guest_waits = 0;
+        std::uint64_t dispatches = 0;
     };
     Counters counters;
     UploadArena* upload_arena = nullptr;
@@ -1156,10 +1761,27 @@ struct PendingSubmission : std::enable_shared_from_this<PendingSubmission> {
     ReplayError encode_warning;
     id<MTL4CommandAllocator> allocator = nil;
     id<MTL4CommandBuffer> commands = nil;
+    SharedResidency* shared_residency = nullptr;
+    // The work counters at the last segment commit: the timeline labels each
+    // segment with its own draws, passes, dispatches and window uploads.
+    std::uint64_t segment_draws = 0, segment_passes = 0, segment_dispatches = 0, segment_uploads = 0;
+    // Allocations first used since the last segment commit, which adds them
+    // to the shared set; `retained` keeps them alive.
+    std::vector<__unsafe_unretained id<MTLAllocation>> resident_adds;
+    // Allocations of encode calls (clears), which add to the set they are
+    // handed: made at the first such call, used by the command buffers it
+    // was handed to (the last one in residency_commands).
     id<MTLResidencySet> residency = nil;
+    __unsafe_unretained id<MTL4CommandBuffer> residency_commands = nil;
     id<MTLBuffer> visibility = nil;
     NSMutableArray<id>* retained = [NSMutableArray array];
-    ResidentTable residents;
+    std::shared_ptr<ResidencyCarry> carry;
+    bool count_residency = false;
+    std::unordered_set<void*> command_residency_sets;
+    // The timestamp heaps it took from the pool, one per 1024 reports.
+    std::vector<id<MTL4CounterHeap>> timestamp_heaps;
+    // The sequence of the first part of its guest submission.
+    std::uint64_t first_sequence = 0;
     ResidentTable retains;
     std::vector<CompletionEffect> effects;
     std::vector<SyncState*> fenced_syncs;
@@ -1167,6 +1789,12 @@ struct PendingSubmission : std::enable_shared_from_this<PendingSubmission> {
     std::size_t timestamp_count = 0;
     std::vector<TextureState> texture_writes;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> buffer_writes;
+    // Pool-table versions this submission bound. They stay unmodified until
+    // retirement drops the last reference.
+    std::vector<std::shared_ptr<PoolTableVersion>> pool_versions;
+    // Pass-dump records for this submission. The worker appends them while
+    // encoding; retirement publishes them after releasing fence_mutex_.
+    std::vector<PassDumpLine> pass_dumps;
 };
 
 // ---------- Encode thread ----------
@@ -1184,7 +1812,7 @@ struct PendingSubmission : std::enable_shared_from_this<PendingSubmission> {
 // options, copy operands and calls a record retains itself. On by default;
 // ARMIGO_NVN_ENCODE_THREAD=0 encodes on the worker.
 enum class EncodeOp : std::uint16_t {
-    stop = EncodeRing::wrap + 1, begin_commands, end_commands, commit, resident, call,
+    stop = EncodeRing::wrap + 1, begin_commands, end_commands, commit, upload_commit, call,
     render_begin, transfer_begin, end_encoder, encoder_barrier,
     render_pipeline, depth_stencil, stencil_reference, cull, winding, fill, depth_clip,
     depth_bias, blend_color, viewports, scissors, visibility,
@@ -1192,10 +1820,11 @@ enum class EncodeOp : std::uint16_t {
     draw, draw_indexed, compute_pipeline_compile, compute_table, dispatch, dispatch_indirect,
     copy_buffer, copy_buffer_texture, copy_texture_buffer, copy_texture, timestamp,
     copy_memory, predicate, draw_indirect_args, draw_indexed_indirect_args, render_timestamp, predicate_draw,
-    mesh_tables, draw_mesh,
+    profile_stamp,
+    mesh_tables, draw_mesh, residency_set,
 };
 
-struct CommitRecord { void* options; PendingSubmission* owner; std::uint64_t segment; void* upload_event; std::uint64_t upload_value; };
+struct CommitRecord { void* completion; PendingSubmission* owner; std::uint64_t segment, publication; };
 struct ResidentRecord { PendingSubmission* owner; void* allocation; };
 struct RenderBeginRecord { void* descriptor; void* vertex_table; void* fragment_table; bool relaxed; };
 struct BarrierRecord { std::uint64_t after, before; };
@@ -1270,6 +1899,11 @@ public:
     template <class T> void put(EncodeOp op, std::uint32_t argument, const T& value) {
         std::memcpy(reserve(op, argument, sizeof value), &value, sizeof value);
     }
+    void upload_commit(std::function<void()> commit) {
+        auto* owned = new std::function<void()>(std::move(commit));
+        put(EncodeOp::upload_commit, 0, static_cast<void*>(owned));
+        ring_.publish();
+    }
     void publish() { ring_.publish(); }
     // Returns once the encode thread has replayed every record put so far.
     void drain() { ring_.drain(); }
@@ -1320,15 +1954,35 @@ static void retain_once(PendingSubmission& pending, id object) {
     [pending.retained addObject:object];
 }
 
-// With the encode thread the residency set belongs to it: the adds go as
-// records ahead of the commit that makes them resident.
+// The shared set is committed before the segment that uses it, on the thread
+// that commits.
 static void add_resident(PendingSubmission& pending, id<MTLAllocation> allocation) {
-    if (pending.encode_thread)
-        pending.encode_thread->put(EncodeOp::resident, 0,
-                                   ResidentRecord{&pending, (__bridge void*)allocation});
-    else
-        [pending.residency addAllocation:allocation];
-    [pending.retained addObject:allocation];
+    pending.resident_adds.push_back(allocation);
+    [pending.carry->retained addObject:allocation];
+}
+
+static void use_residency_set(PendingSubmission& pending, id<MTL4CommandBuffer> commands,
+                               id<MTLResidencySet> set) {
+    [commands useResidencySet:set];
+    if (pending.count_residency) pending.command_residency_sets.insert((__bridge void*)set);
+}
+
+// The residency set an encode call adds to, made at the first call and used
+// by each command buffer a call encodes into.
+static id<MTLResidencySet> call_residency(PendingSubmission& pending, id<MTL4CommandBuffer> commands) {
+    if (!commands) return nil;
+    if (!pending.residency) {
+        auto* descriptor = [MTLResidencySetDescriptor new];
+        descriptor.initialCapacity = 8;
+        NSError* error = nil;
+        pending.residency = [commands.device newResidencySetWithDescriptor:descriptor error:&error];
+        if (!pending.residency) return nil;
+    }
+    if (pending.residency_commands != commands) {
+        use_residency_set(pending, commands, pending.residency);
+        pending.residency_commands = commands;
+    }
+    return pending.residency;
 }
 
 // Whether an allocation is a texture, cached per class: the Metal objects a
@@ -1346,18 +2000,25 @@ static bool is_texture_allocation(id allocation) {
     return texture;
 }
 
-// The texture type a shader declares for a sampled resource, for the types a
-// view can convert between: two-dimensional, two-dimensional array, cube and
-// cube array.
+// The texture type declared by a sampled resource. A compatible view or zero
+// fallback must be bound in this type.
 static std::optional<MTLTextureType> declared_texture_type(
     const platform::CompiledShaderResource& resource) {
-    if (!resource.texture_descriptor || resource.texture_descriptor->multisample) return std::nullopt;
+    if (!resource.texture_descriptor) return std::nullopt;
     const auto& declared = *resource.texture_descriptor;
     switch (declared.dimension) {
+    case platform::CompiledShaderTextureDimension::d1:
+        return declared.array ? MTLTextureType1DArray : MTLTextureType1D;
     case platform::CompiledShaderTextureDimension::d2:
+        if (declared.multisample)
+            return declared.array ? MTLTextureType2DMultisampleArray : MTLTextureType2DMultisample;
         return declared.array ? MTLTextureType2DArray : MTLTextureType2D;
     case platform::CompiledShaderTextureDimension::cube:
         return declared.array ? MTLTextureTypeCubeArray : MTLTextureTypeCube;
+    case platform::CompiledShaderTextureDimension::d3:
+        return MTLTextureType3D;
+    case platform::CompiledShaderTextureDimension::buffer:
+        return MTLTextureTypeTextureBuffer;
     default:
         return std::nullopt;
     }
@@ -1365,12 +2026,12 @@ static std::optional<MTLTextureType> declared_texture_type(
 
 static void make_resident(PendingSubmission& pending, __unsafe_unretained id<MTLAllocation> allocation) {
     if (!allocation) return;
-    if (!pending.residents.insert_unique((__bridge void*)allocation)) return;
+    if (!pending.carry->residents.insert_unique((__bridge void*)allocation)) return;
     add_resident(pending, allocation);
     if (is_texture_allocation(allocation)) {
         for (id<MTLTexture> parent = ((id<MTLTexture>)allocation).parentTexture; parent;
              parent = parent.parentTexture) {
-            if (!pending.residents.insert_unique((__bridge void*)parent)) break;
+            if (!pending.carry->residents.insert_unique((__bridge void*)parent)) break;
             add_resident(pending, parent);
         }
     }
@@ -1442,6 +2103,7 @@ const char* fill_mesh_pipeline_key(const ReplayState& s, const std::array<MTLPix
     };
     const auto* task = stage_of(NVN_SHADER_STAGE_TESS_CONTROL);
     const auto* mesh = stage_of(NVN_SHADER_STAGE_TESS_EVALUATION);
+    if (s.geometry_mode == 0) return "mesh draw requires a mesh geometry processing mode";
     if (!mesh || !mesh->mesh) return "mesh draw has no translated mesh stage";
     if (task && !task->task) return "mesh draw's task stage has no task launch";
     if (mesh->mesh->launched_by_task != (task != nullptr))
@@ -1528,6 +2190,19 @@ struct Encoder {
     ReplayState state;
     id<MTL4RenderCommandEncoder> render = nil;
     id<MTL4ComputeCommandEncoder> transfer = nil;
+    // The operation that would open the next transfer encoder (diagnostics).
+    TransferSite transfer_site = TransferSite::other;
+    struct SiteScope {
+        Encoder& encoder;
+        TransferSite previous;
+        SiteScope(Encoder& owner, TransferSite site, bool keep_outer = false)
+            : encoder(owner), previous(owner.transfer_site) {
+            if (!keep_outer || previous == TransferSite::other) owner.transfer_site = site;
+        }
+        ~SiteScope() { encoder.transfer_site = previous; }
+        SiteScope(const SiteScope&) = delete;
+        SiteScope& operator=(const SiteScope&) = delete;
+    };
     // Guest ranges the open transfer encoder's operations accessed since its
     // last barrier. An operation that states its guest accesses runs without
     // a barrier when none conflicts with these (a write against any access, a
@@ -1558,6 +2233,48 @@ struct Encoder {
     // A storage image a stage writes: dispatches only, through a texture
     // made shader-writable, published as a GPU write of its texture.
     bool note_image_write(std::int32_t texture_id, __strong id<MTLTexture>& texture, bool compute);
+    // Copies storage replaced for an image write. A texture that already
+    // shares the previous texture's buffer keeps those bytes, with the same
+    // barrier around the point the copy would have run.
+    bool copy_replaced_image(id<MTLTexture> previous, id<MTLTexture> upgraded);
+    // An atomic storage image. Storage that can move to R32 is replaced by
+    // prepare_images before any stage writes an argument slot. Replacing
+    // it here is a fallback: slots already written keep the old storage. A bind
+    // that uses the stand-in records no write of the real texture. `texture`
+    // becomes the texture the stage binds.
+    void report_type_mismatch(const platform::CompiledGraphicsStage& shader,
+                              const platform::CompiledShaderResource& resource, std::int32_t texture_id,
+                              id<MTLTexture> texture, MTLTextureType want);
+    bool note_image_atomic(std::size_t stage_index, const platform::CompiledShaderResource& resource,
+                           std::uint32_t element, std::int32_t texture_id,
+                           __strong id<MTLTexture>& texture, bool compute);
+    // Replaces atomic-image storage for every stage this draw or dispatch
+    // binds, before any of those stages writes an argument slot.
+    bool prepare_images(
+        std::initializer_list<std::pair<std::size_t, const platform::CompiledGraphicsStage*>> stages);
+    // Drops descriptor and argument-slot caches of storage that just moved,
+    // and marks every stage's arguments dirty so the next bind writes the new
+    // texture.
+    void forget_replaced_image(std::uint64_t serial, id<MTLTexture> previous);
+    void note_image_atomic_replacement(std::uint64_t serial, id<MTLTexture> previous, bool late);
+    [[nodiscard]] std::uint64_t bound_c2_handle(std::size_t stage_index, std::uint64_t offset) const;
+    [[nodiscard]] std::int32_t bound_texture_id_at(std::size_t stage_index, std::size_t slot, bool image) const;
+    std::uint64_t read_stage_cbuf_word(std::size_t stage_index, std::uint32_t slot, std::uint64_t offset);
+    std::uint32_t read_stage_guest_word(std::uint64_t address);
+    std::uint64_t read_stage_handle(std::size_t stage_index, const platform::CompiledGraphicsStage& shader,
+                                    const platform::CompiledShaderResource& resource, std::uint32_t element,
+                                    std::vector<std::optional<std::uint64_t>>& handle_program_words);
+    // One warning per stage and slot in this submission.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> image_atomic_warnings;
+    std::uint8_t feedback_written = 0, feedback_direct_reads = 0, feedback_draw_writes = 0;
+    bool feedback_depth_written = false, feedback_depth_direct_reads = false;
+    bool feedback_draw_depth_write = false;
+    std::uint64_t feedback_epoch = 0;
+    bool feedback_reopen = false, feedback_rebind = false;
+    struct FeedbackUse { std::uint64_t original = 0; id<MTLTexture> texture = nil; bool image = false; };
+    std::vector<FeedbackUse> feedback_uses;
+    id<MTLTexture> feedback_texture(id<MTLTexture> texture, bool image,
+                                  std::optional<std::uint32_t> pinned_level = {});
     // Under ARMIGO_NVN_DISPATCH_PROFILE: commits the work encoded so far as a
     // segment holding `label` (empty: other work).
     bool profile_cut(std::string label);
@@ -1591,6 +2308,7 @@ struct Encoder {
     struct WindowUpload {
         std::uint64_t gpu = 0, source = 0, source_size = 0, generation = 0;
         std::uint32_t bytes = 0;
+        std::uint8_t zero_padding_bytes = 0;
         std::byte* cpu = nullptr;
         // GPU writes recorded when the snapshot was taken: a later one over
         // the source makes the snapshot stale, as does a later guest-memory
@@ -1598,6 +2316,7 @@ struct Encoder {
         std::size_t writes = 0;
         std::uint64_t guest_writes = 0;
     };
+    static_assert(sizeof(WindowUpload) == 64);
     // A stage owns its table shadow, reflected read extents and write list.
     // All resolved addresses and uploads live only for this submission.
     struct StageBindings {
@@ -1613,6 +2332,9 @@ struct Encoder {
         std::array<std::uint32_t, buffer_slots + 3> window_extents{};
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         bool writes_buffers = false;
+        // Pool-table cache generation last bound for this stage. A newer
+        // generation rebinds; an older version is never bound after it.
+        std::uint64_t pool_generation = 0;
         // The shader reads hardware constant buffer 16 (push block or slot 13).
         bool reads_push_bank = false;
         std::uint32_t uniform_slots = UINT32_MAX;
@@ -1621,6 +2343,17 @@ struct Encoder {
         // and storage descriptors are read from.
         struct ContentRead { std::uint32_t slot, offset, length; };
         std::vector<ContentRead> content_reads;
+        // Cached with the resolved bindings, so a selected dump frame can
+        // describe stages whose argument tables were reused.
+        std::vector<std::string> dump_reads;
+        struct DumpTexture { id<MTLTexture> texture; std::uint64_t serial; std::string kind; };
+        std::vector<DumpTexture> dump_textures;
+        std::array<std::uint64_t, 32> dump_buffer_sizes{};
+        // When the stage's handle programs last ran: inline updates, buffer
+        // writes and storing guest-memory stages so far in the submission.
+        // Any of them may change a word a handle program reads through a
+        // pointer, which the content reads above do not cover.
+        std::uint64_t handle_updates = 0, handle_writes = 0, handle_stores = 0;
     };
     std::array<StageBindings, stage_count> bindings;
     // Argument-table entries. An encoder reads a table's entries when it
@@ -1755,6 +2488,7 @@ struct Encoder {
     std::array<__unsafe_unretained id<MTLTexture>, 10> attachment_roots{};
     unsigned attachment_root_count = 0;
     bool depth_omitted = false;
+    bool attachmentless_pass = false;
     OmittedDepthKey depth_omitted_key{};
     id<MTLTexture> depth_barrier_allocation = nil;
     bool depth_barrier_reads = false;
@@ -1840,6 +2574,8 @@ struct Encoder {
     bool predicate_open() const { return predicate.arguments != nullptr; }
     bool gpu_predicate(const RenderEnableConditional& command, bool& handled);
     bool read_predicate(std::int32_t mode, std::uint64_t address);
+    void log_conditional(std::uint64_t address, bool if_equal, std::uint64_t left, bool left_known,
+                         std::uint64_t right, bool right_known, bool drawn);
     // Resolves an open GPU-predicated block on the CPU (a drain), for work
     // the GPU predicate cannot cover.
     bool resolve_predicate() {
@@ -1862,9 +2598,10 @@ struct Encoder {
     std::unordered_map<std::uint64_t, std::uint32_t> uniform_words;
     void refresh_uniform_words(std::uint64_t address, std::uint64_t size, const std::byte* bytes);
 
-    Encoder(ReplayImpl& owner, PendingSubmission& submission, const ReplayState& initial, bool canonical)
+    Encoder(ReplayImpl& owner, PendingSubmission& submission, const ReplayState& initial, bool canonical,
+            nvn::ConditionalReports* report_table = nullptr)
         : backend(owner), pending(submission), queue(submission.encode_thread), state(initial),
-          cpu_addressed_buffers(canonical) {
+          cpu_addressed_buffers(canonical), reports(report_table) {
         dirty.arguments.fill(true);
         refresh_attachment_cpu_bounds();
         trace_submission_id = trace_pass_submission();
@@ -1925,18 +2662,61 @@ struct Encoder {
     bool visit(const CommandRecordView& record);
     bool visit_command(const CommandRecordView& record);
     bool fail(ReplayErrorCode code, std::string detail);
+    struct MeshBindDiagnostic {
+        std::size_t ordinal = 0;
+        std::string identity;
+    };
+    struct MeshBindHistory {
+        std::array<MeshBindDiagnostic, 8> binds;
+        std::size_t total = 0;
+    };
+    std::optional<MeshBindHistory> mesh_bind_history;
+    std::string mesh_stage_identity() const;
+    void remember_mesh_bind(const BindProgram& command);
+    void diagnose_mesh_failure(const DrawMeshTasks& command);
+    bool program_capture_enabled = program_capture::enabled();
+    std::unique_ptr<program_capture::Event> begin_program_capture(const CommandRecordView& record) const noexcept;
+    void finish_program_capture(std::unique_ptr<program_capture::Event> event, const CommandRecordView& record,
+                                bool accepted, std::uint64_t previous_draws) const noexcept;
     Op current_op_ = Op::end;
     std::uint64_t trace_submission_id = 0;
+    // ARMIGO_NVN_GPUPROF slots of the open render and transfer encoders.
+    int profile_render = -1, profile_transfer = -1;
+    int profile_begin(char kind, MTL4RenderPassDescriptor* pass, id encoder);
+    void profile_end(int& slot, char kind, id encoder);
+    // Before an encode call (slot -1): labels it and stamps its start,
+    // returning its slot; after it (its slot): stamps its end.
+    int profile_call(int slot);
     std::uint64_t trace_encoder_sequence = 0, trace_active_encoder = 0;
     std::uint64_t trace_conditional = 0;
     std::size_t finalized_visibility = 0;
     std::size_t pass_buffer_writes_begin = 0;
     bool pass_storage_writes = false;
+    // Draws encoded before the open render pass, so its dump can report how
+    // many draws that pass itself encoded.
+    std::uint64_t pass_draws_at_open = 0;
+    struct ComputeDumpImage {
+        std::uint32_t slot = 0;
+        std::uint64_t serial = 0;
+        id<MTLTexture> texture = nil;
+    };
+    // Storage images the open compute dispatch writes, recorded only while a
+    // pass dump of this frame is enabled.
+    std::vector<ComputeDumpImage> compute_dump_images;
+    std::set<std::string> render_dump_reads;
+    std::vector<std::string> render_dump_draws;
+    std::vector<StageBindings::DumpTexture> render_dump_textures;
+    std::vector<PassDumpJob> render_dump_buffers;
     void trace_pass_event(const char* event, const char* reason,
                           std::uint64_t a = 0, std::uint64_t b = 0,
                           std::uint64_t c = 0, std::uint64_t d = 0) const;
     bool close_render(PassBreak why, bool keep_clears = false);
     bool close_transfer();
+    // Samples the attachments a pass just stored, or the storage images a
+    // dispatch just wrote. Both no-op unless the pass dump selected this frame.
+    std::vector<std::string> dump_binding_metadata(std::size_t stage) const;
+    void dump_render_pass(PassBreak why);
+    void dump_compute_dispatch();
     bool barrier(PassBreak why);
     bool synchronize_gpu();
     bool synchronize_gpu_commit();
@@ -1959,18 +2739,21 @@ struct Encoder {
     // The submission's leading event waits that the scheduler saw met while
     // it held the submission: they are passed without reading the event again.
     std::size_t passed_leading_waits = 0;
-    // Samplers resolve as registered when the current draw was recorded
-    // (as registered now before any stamp).
+    // Queued draws share their immutable submission's descriptor boundary.
     std::uint64_t draw_sampler_registrations() const {
-        return state.sampler_registrations ? state.sampler_registrations : UINT64_MAX;
+        // Handles capture descriptor indices, not descriptor contents. Freeze
+        // the submit-visible population before asynchronous replay can lag
+        // behind another registration or another use of the command handle.
+        return pending.captured ? submission_sampler_registrations(*pending.captured)
+            : state.sampler_registrations ? state.sampler_registrations : UINT64_MAX;
     }
     bool order_cpu_read(std::uint64_t address, std::uint64_t size, bool overlay,
                         const std::byte* cpu, bool current = true);
     bool current_buffer_write_overlap(std::uintptr_t cpu, std::uint64_t size);
     WriteRanges current_cpu_writes;
     std::size_t cpu_writes_indexed = 0, cpu_writes_completed = 0;
-    // A stage that reads the guest-memory table ran since the last GPU wait:
-    // until the next one, any address in its pools may have been written.
+    // A storing stage ran since the last GPU wait. Until the next one, an
+    // address in the submission's guest-write ranges may have been written.
     bool guest_writes_pending = false;
     // Guest-memory stages bound in this submission.
     std::uint64_t guest_write_serial = 0;
@@ -2066,6 +2849,20 @@ struct Encoder {
     void overlay_uniform(std::uint64_t address, std::byte* bytes, std::size_t size,
                          std::uint32_t* covered = nullptr, bool current_only = false) const;
     bool enqueue_counter(const ReportCounter& command, const BufferSpan& destination, std::byte* destination_cpu);
+    // Replay policy only. A timestamp counter is 0, samples-passed stays
+    // unknown until its fence completes, and any other kind stays unknown.
+    void note_report_writes(std::size_t stage);
+    void note_report_counter(std::int32_t type, std::uint64_t address) {
+        if (!reports) return;
+        using Kind = nvn::ConditionalReports::Kind;
+        auto kind = Kind::other;
+        if (type == NVN_COUNTER_TYPE_TIMESTAMP || type == NVN_COUNTER_TYPE_TIMESTAMP_TOP)
+            kind = Kind::timestamp;
+        else if (type == NVN_COUNTER_TYPE_SAMPLES_PASSED)
+            kind = Kind::samples_passed;
+        reports->note_report(address, kind);
+    }
+    nvn::ConditionalReports* reports = nullptr;
     bool order_completion_read(const BufferSpan& span, std::uint64_t size);
     bool order_completion_read(id<MTLBuffer> __unsafe_unretained buffer, std::uint64_t offset,
                                const std::byte* cpu, std::uint64_t size,
@@ -2100,6 +2897,14 @@ struct Encoder {
     bool bind_stage(std::size_t stage, const platform::CompiledGraphicsStage& shader,
                     __unsafe_unretained id<MTL4ArgumentTable> table, bool vertex,
                     bool uniforms_only = false);
+    bool stage_has_pool(const platform::CompiledGraphicsStage* shader) const;
+    bool refresh_pools(std::size_t stage, const platform::CompiledGraphicsStage& shader);
+    bool bind_pool_resource(std::size_t stage, const platform::CompiledShaderResource& resource,
+                            __unsafe_unretained id<MTL4ArgumentTable> table, bool fragment);
+    void retain_pool_version(const std::shared_ptr<PoolTableVersion>& version);
+    // Versions whose residency set is already on the open command buffer.
+    // A new segment starts this empty; the strong refs live on the submission.
+    std::vector<const PoolTableVersion*> pool_residency_attached;
     void invalidate_uniforms(std::uint64_t address, std::uint64_t size, std::uintptr_t cpu);
     bool bind_draw_support(std::uint32_t base_instance);
     bool bind_vertex_fetch(const platform::CompiledGraphicsStage& vertex);
@@ -2134,6 +2939,12 @@ struct Encoder {
     // DrawMeshTasks(first, count), or its indirect form reading {count, first}
     // from GPU memory at `indirect`.
     bool draw_mesh(std::uint32_t first, std::uint32_t count, std::uint64_t indirect);
+    // Threadgroup counts copied from indirect mesh records, by record address:
+    // valid until the replay reaches record mesh_groups_end, the next one that
+    // may write a record.
+    std::unordered_map<std::uint64_t, std::uint64_t> mesh_groups;
+    std::size_t mesh_groups_end = 0;
+    bool take_mesh_records(std::uint64_t indirect);
     // Records visited so far, and whether the look-ahead already ran for this
     // submission.
     std::size_t records_seen = 0;
@@ -2149,6 +2960,8 @@ struct Encoder {
     bool copy_buffer_to_texture(const CopyBufferToTexture& copy);
     bool copy_texture_to_buffer(const CopyBufferToTexture& copy);
     bool copy_texture_to_texture(const CopyTextureToTexture& copy);
+    bool scale_texture_copy(const CopyTextureToTexture& copy, id<MTLTexture> source,
+                            id<MTLTexture> destination);
     bool clear_bound_color(const ClearColor& clear);
     bool clear_bound_depth(const ClearDepthStencil& clear);
     bool clear_texture(const ClearTexture& clear);
@@ -2204,6 +3017,7 @@ id<MTL4RenderCommandEncoder> Encoder::begin_render(MTL4RenderPassDescriptor* pas
         queue->put(EncodeOp::render_begin, 0,
                    RenderBeginRecord{(__bridge_retained void*)[pass copy], (__bridge void*)vertex,
                                      (__bridge void*)fragment, relaxed});
+        profile_render = profile_begin('R', pass, nil);
         queue->publish();
         return (id<MTL4RenderCommandEncoder>)queue->token();
     }
@@ -2214,6 +3028,7 @@ id<MTL4RenderCommandEncoder> Encoder::begin_render(MTL4RenderPassDescriptor* pas
                    visibilityOptions:MTL4VisibilityOptionDevice];
     if (vertex) [encoder setArgumentTable:vertex atStages:MTLRenderStageVertex];
     if (fragment) [encoder setArgumentTable:fragment atStages:MTLRenderStageFragment];
+    profile_render = profile_begin('R', pass, encoder);
     return encoder;
 }
 
@@ -2221,6 +3036,7 @@ id<MTL4ComputeCommandEncoder> Encoder::begin_transfer() {
     after_render_pass = relaxed_producer = false;
     if (queue) {
         queue->put(EncodeOp::transfer_begin, 0);
+        profile_transfer = profile_begin('C', nil, nil);
         queue->publish();
         return (id<MTL4ComputeCommandEncoder>)queue->token();
     }
@@ -2228,6 +3044,7 @@ id<MTL4ComputeCommandEncoder> Encoder::begin_transfer() {
     if (!encoder) return nil;
     [encoder barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit | MTLStageDispatch
                    visibilityOptions:MTL4VisibilityOptionDevice];
+    profile_transfer = profile_begin('C', nil, encoder);
     return encoder;
 }
 
@@ -2529,13 +3346,17 @@ bool Encoder::encode_call(EncodeCall call, ReplayErrorCode code) {
     // The call's encoders order themselves after all earlier work; a pass
     // after them takes the full barrier.
     after_render_pass = false;
+    // A profiled frame times the call between two command-buffer timestamps.
+    const int slot = profile_call(-1);
     if (queue) {
         queue->put(EncodeOp::call, 0, (__bridge_retained void*)[call copy]);
+        profile_call(slot);
         queue->publish();
         return true;
     }
-    EncodeCallContext context{pending.commands, pending.residency, pending.retained, {}};
+    EncodeCallContext context{pending.commands, call_residency(pending, pending.commands), pending.retained, {}};
     call(context);
+    profile_call(slot);
     return context.error.empty() || fail(code, std::move(context.error));
 }
 
@@ -2568,6 +3389,42 @@ std::optional<PsoRow> pipeline_row(const DrawPipelineKey& key) {
     return PsoRow{'R', {key.vertex->identity, key.fragment ? key.fragment->identity : "-",
                         "v1:" + pso_hex_encode(reinterpret_cast<const std::byte*>(&key) + state_offset,
                                                sizeof key - state_offset)}};
+}
+
+// A program image can have several control/constant variants, and a mesh
+// can be tailored to its fragment inputs. Name the emitted source as well.
+std::string mesh_stage_reference(const platform::CompiledGraphicsStage& stage) {
+    auto text = stage.identity;
+    if (!stage.msl_source_digest.empty()) text += "@" + stage.msl_source_digest;
+    if (!stage.native_stage_identity.empty()) text += "#" + stage.native_stage_identity;
+    return text;
+}
+
+struct RecordedStageReference {
+    std::string identity, source_digest, native_identity;
+};
+
+std::optional<RecordedStageReference> recorded_stage_reference(const std::string& text) {
+    const auto hash = [](const std::string& digest) {
+        return digest.size() == 64 && digest.find_first_not_of("0123456789abcdef") == std::string::npos;
+    };
+    const auto native = text.find('#');
+    const auto base = text.substr(0, native);
+    const auto native_identity = native == std::string::npos ? std::string{} : text.substr(native + 1);
+    if (native != std::string::npos && !hash(native_identity)) return std::nullopt;
+    const auto at = base.find('@');
+    if (at == std::string::npos) return RecordedStageReference{base, {}, native_identity};
+    const auto digest = base.substr(at + 1);
+    if (at == 0 || !hash(digest))
+        return std::nullopt;
+    return RecordedStageReference{base.substr(0, at), digest, native_identity};
+}
+
+std::optional<PsoRow> mesh_pipeline_row(const MeshPipelineKey& key) {
+    auto draw = pipeline_row(key.draw);
+    if (!draw || (key.task && key.task->identity.empty())) return std::nullopt;
+    return PsoRow{'M', {key.task ? mesh_stage_reference(*key.task) : "-", mesh_stage_reference(*key.draw.vertex),
+                        key.draw.fragment ? mesh_stage_reference(*key.draw.fragment) : "-", draw->fields[2]}};
 }
 
 // A clear pipeline's manifest row, and the configuration a row names (none
@@ -2639,15 +3496,140 @@ std::string open_key(const DrawPipelineKey& key) {
 // the key layout changed since the manifest was written.
 enum class RowResolution { resolved, missing_stage, undecodable_state };
 
-// The key a row names, with its stages loaded from the package.
-RowResolution resolve_pipeline_row(const PsoRow& row, platform::MetalShaderPackage& package, DrawPipelineKey& key,
+// A shader package answers a row by the identity it stored. A native section
+// answers a run-time identity from the same program image. A generated compute
+// list names the packaged stage identity instead, and still resolves that way.
+enum class RecordedStageForm { runtime, runtime_or_packaged_compute };
+
+#ifdef ARMIGO_HAS_NATIVE_PACKAGE
+shader_input::Stage recorded_input_stage(armigo::shader_native::NativeStageKind stage) {
+    switch (stage) {
+    case armigo::shader_native::NativeStageKind::vertex: return shader_input::Stage::Vertex;
+    case armigo::shader_native::NativeStageKind::fragment: return shader_input::Stage::Fragment;
+    case armigo::shader_native::NativeStageKind::task: return shader_input::Stage::TessellationControl;
+    case armigo::shader_native::NativeStageKind::mesh: return shader_input::Stage::TessellationEvaluation;
+    case armigo::shader_native::NativeStageKind::compute: return shader_input::Stage::Compute;
+    }
+    return shader_input::Stage::Compute;
+}
+
+// make_source_stage hashes source text only when it is in memory. An omitted
+// source.metal names the stand-in "packaged" so the call accepts it, then the
+// packaged library replaces the source.
+std::shared_ptr<const platform::CompiledGraphicsStage> stage_from_native_files(
+    shader_input::Stage stage, const armigo::shader_native::NativeStageFiles& files, std::string native_identity) {
+    auto made = platform::make_source_stage(stage, files.program, {files.reflection.data(), files.reflection.size()},
+                                             files.source, files.source.empty() ? std::string("packaged") : std::string{});
+    const auto* built = std::get_if<std::shared_ptr<const platform::CompiledGraphicsStage>>(&made);
+    if (!built || !*built) return nullptr;
+    platform::CompiledGraphicsStage copy = **built;
+    copy.native_stage_identity = std::move(native_identity);
+    copy.metallib = files.library;
+    copy.msl_source.clear();
+    copy.msl_source_file.clear();
+    return std::make_shared<const platform::CompiledGraphicsStage>(std::move(copy));
+}
+
+// The native section of the warm-up's package, opened at its first use.
+struct NativeRowSource {
+    std::once_flag once;
+    std::unique_ptr<armigo::shader_native::NativePackage> package;
+};
+
+std::shared_ptr<const platform::CompiledGraphicsStage> resolve_recorded_stage(
+    platform::MetalShaderPackage& package, NativeRowSource& native, const std::string& identity,
+    RecordedStageForm form) {
+    const auto reference = recorded_stage_reference(identity);
+    if (!reference) return nullptr;
+    const auto matches = [&](const auto& stage) {
+        return stage && (reference->source_digest.empty() || stage->msl_source_digest == reference->source_digest) &&
+            (reference->native_identity.empty() || stage->native_stage_identity == reference->native_identity);
+    };
+    if (const auto stage = package.stage_by_identity(reference->identity)) return matches(stage) ? stage : nullptr;
+    std::call_once(native.once, [&] {
+        auto opened = armigo::shader_native::NativePackage::open(package.directory());
+        if (auto* opened_package = std::get_if<armigo::shader_native::NativePackage>(&opened))
+            native.package = std::make_unique<armigo::shader_native::NativePackage>(std::move(*opened_package));
+    });
+    const auto& native_package = native.package;
+    if (!native_package) return nullptr;
+    if (const auto parsed = armigo::shader_native::parse_runtime_stage_identity(reference->identity)) {
+        auto stage_identity = native_package->identity_for_program(parsed->program_digest, parsed->stage);
+        if (!reference->native_identity.empty()) stage_identity = reference->native_identity;
+        else if (!reference->source_digest.empty()) {
+            stage_identity.reset();
+            const auto depth = parsed->stage == armigo::shader_native::NativeStageKind::mesh ||
+                parsed->stage == armigo::shader_native::NativeStageKind::vertex
+                ? (parsed->vertex_depth_zero_to_one ? armigo::shader_native::NativeDepth::zero_to_one
+                                                    : armigo::shader_native::NativeDepth::minus_one_to_one)
+                : armigo::shader_native::NativeDepth::stage;
+            for (const auto& candidate : native_package->section().entries) {
+                if (candidate.stage != parsed->stage || candidate.program_digest != parsed->program_digest) continue;
+                for (const auto& variant : candidate.variants)
+                    if (variant.depth == depth && variant.source_digest == reference->source_digest) {
+                        stage_identity = candidate.stage_identity;
+                        break;
+                    }
+                if (stage_identity) break;
+            }
+        }
+        if (!stage_identity) return nullptr;
+        // The packer translates with pixel rate off, no vertex fetch, and a
+        // fragment position that matches the guest.
+        armigo::shader_native::NativeLookup lookup;
+        lookup.stage = parsed->stage;
+        lookup.pixel_rate_disabled = true;
+        lookup.vertex_fetch = false;
+        lookup.fragment_position_matches = true;
+        lookup.vertex_depth_zero_to_one = parsed->vertex_depth_zero_to_one;
+        auto found = native_package->find(*stage_identity, lookup);
+        const auto* files = std::get_if<armigo::shader_native::NativeStageFiles>(&found);
+        if (!files) return nullptr;
+        const auto stage = stage_from_native_files(recorded_input_stage(parsed->stage), *files, *stage_identity);
+        // The built identity carries the depth or compute suffix. A row is a
+        // hit only when that text is the one it named.
+        if (!matches(stage) || stage->identity != reference->identity) return nullptr;
+        return stage;
+    }
+    if (form != RecordedStageForm::runtime_or_packaged_compute) return nullptr;
+    armigo::shader_native::NativeLookup lookup;
+    lookup.stage = armigo::shader_native::NativeStageKind::compute;
+    lookup.pixel_rate_disabled = true;
+    auto found = native_package->find(reference->identity, lookup);
+    const auto* files = std::get_if<armigo::shader_native::NativeStageFiles>(&found);
+    if (!files) return nullptr;
+    const auto stage = stage_from_native_files(shader_input::Stage::Compute, *files, reference->identity);
+    return matches(stage) ? stage : nullptr;
+}
+
+#else
+// Without the native package reader a row resolves from the shader package only.
+struct NativeRowSource {};
+
+std::shared_ptr<const platform::CompiledGraphicsStage> resolve_recorded_stage(
+    platform::MetalShaderPackage& package, NativeRowSource&, const std::string& identity, RecordedStageForm) {
+    const auto reference = recorded_stage_reference(identity);
+    if (!reference) return nullptr;
+    const auto stage = package.stage_by_identity(reference->identity);
+    return stage && (reference->source_digest.empty() || stage->msl_source_digest == reference->source_digest)
+        && (reference->native_identity.empty() || stage->native_stage_identity == reference->native_identity)
+        ? stage : nullptr;
+}
+#endif
+
+// The key a row names, with its stages loaded from the shader package or,
+// when a run-time identity misses there, from the native section.
+RowResolution resolve_pipeline_row(const PsoRow& row, platform::MetalShaderPackage& package,
+                                   NativeRowSource& native, DrawPipelineKey& key,
                                    std::shared_ptr<const platform::CompiledGraphicsStage>& vertex,
                                    std::shared_ptr<const platform::CompiledGraphicsStage>& fragment) {
     constexpr auto state_offset = offsetof(DrawPipelineKey, colors);
     if ((row.kind != 'R' && row.kind != 'O') || row.fields.size() != 3 || row.fields[2].rfind("v1:", 0) != 0)
         return RowResolution::undecodable_state;
-    vertex = package.stage_by_identity(row.fields[0]);
-    fragment = row.fields[1] == "-" ? nullptr : package.stage_by_identity(row.fields[1]);
+    vertex = resolve_recorded_stage(package, native, row.fields[0], RecordedStageForm::runtime);
+    fragment = row.fields[1] == "-"
+                   ? nullptr
+                   : resolve_recorded_stage(package, native, row.fields[1], RecordedStageForm::runtime);
     if (!vertex || (row.fields[1] != "-" && !fragment)) return RowResolution::missing_stage;
     std::memset(&key, 0, sizeof key);
     if (!pso_hex_decode(std::string_view(row.fields[2]).substr(3),
@@ -2664,6 +3646,31 @@ RowResolution resolve_pipeline_row(const PsoRow& row, platform::MetalShaderPacka
     return RowResolution::resolved;
 }
 
+RowResolution resolve_mesh_pipeline_row(const PsoRow& row, platform::MetalShaderPackage& package,
+                                        NativeRowSource& native, MeshPipelineKey& key,
+                                        std::shared_ptr<const platform::CompiledGraphicsStage>& task,
+                                        std::shared_ptr<const platform::CompiledGraphicsStage>& mesh,
+                                        std::shared_ptr<const platform::CompiledGraphicsStage>& fragment) {
+    if (row.kind != 'M' || row.fields.size() != 4) return RowResolution::undecodable_state;
+    const auto resolution = resolve_pipeline_row({'R', {row.fields[1], row.fields[2], row.fields[3]}},
+                                                 package, native, key.draw, mesh, fragment);
+    if (resolution != RowResolution::resolved) return resolution;
+    task = row.fields[0] == "-" ? nullptr
+        : resolve_recorded_stage(package, native, row.fields[0], RecordedStageForm::runtime);
+    if (row.fields[0] != "-" && !task) return RowResolution::missing_stage;
+    if (!mesh->mesh || mesh->stage != shader_input::Stage::TessellationEvaluation ||
+        (task && (!task->task || task->stage != shader_input::Stage::TessellationControl)) ||
+        (fragment && fragment->stage != shader_input::Stage::Fragment) ||
+        mesh->mesh->launched_by_task != (task != nullptr) ||
+        (task && mesh->mesh->payload_bytes > task->task->payload_bytes) ||
+        key.draw.primitive != mesh_draw_primitive)
+        return RowResolution::undecodable_state;
+    key.task = task.get();
+    key.draw.attributes = {};
+    key.draw.streams = {};
+    return RowResolution::resolved;
+}
+
 // Builds the manifest's shaders and pipelines in row order on background
 // threads at low priority, from launch, so the first use of each finds it
 // built (or compiling). The replay takes an entry when it first needs that
@@ -2676,6 +3683,10 @@ public:
         std::function<std::unique_ptr<NativePipeline>(
             const DrawPipelineKey&, std::shared_ptr<const platform::CompiledGraphicsStage>,
             std::shared_ptr<const platform::CompiledGraphicsStage>)> render;
+        std::function<std::unique_ptr<NativePipeline>(
+            const MeshPipelineKey&, std::shared_ptr<const platform::CompiledGraphicsStage>,
+            std::shared_ptr<const platform::CompiledGraphicsStage>,
+            std::shared_ptr<const platform::CompiledGraphicsStage>)> mesh;
         std::function<std::optional<NativeComputePipeline>(
             std::shared_ptr<const platform::CompiledGraphicsStage>)> compute;
         std::function<bool(const ClearPipelineConfig&)> clear;
@@ -2761,42 +3772,6 @@ private:
         return claimed_.count(key) != 0;
     }
 
-    // A shader package answers a C row by its dotted stage identity. A native
-    // package answers the same row by the packaged compute identity. The stage
-    // is built the way a runtime hit is: the packaged library replaces the
-    // source, and the warm-up keeps the pipeline under the manifest identity.
-    std::shared_ptr<const platform::CompiledGraphicsStage> resolve_compute_stage(const std::string& identity) {
-        if (const auto stage = package_->stage_by_identity(identity)) return stage;
-#ifdef ARMIGO_HAS_NATIVE_PACKAGE
-        std::call_once(native_once_, [this] {
-            auto opened = armigo::shader_native::NativePackage::open(package_->directory());
-            if (auto* opened_package = std::get_if<armigo::shader_native::NativePackage>(&opened))
-                native_package_ = std::make_unique<armigo::shader_native::NativePackage>(std::move(*opened_package));
-        });
-        if (!native_package_) return nullptr;
-        armigo::shader_native::NativeLookup lookup;
-        lookup.stage = armigo::shader_native::NativeStageKind::compute;
-        lookup.pixel_rate_disabled = true;
-        auto found = native_package_->find(identity, lookup);
-        const auto* files = std::get_if<armigo::shader_native::NativeStageFiles>(&found);
-        if (!files) return nullptr;
-        // An omitted source.metal names the stand-in "packaged" so make_source_stage accepts it.
-        auto made = platform::make_source_stage(shader_input::Stage::Compute, files->program,
-                                                 {files->reflection.data(), files->reflection.size()}, files->source,
-                                                 files->source.empty() ? std::string("packaged") : std::string{});
-        const auto* stage = std::get_if<std::shared_ptr<const platform::CompiledGraphicsStage>>(&made);
-        if (!stage || !*stage) return nullptr;
-        platform::CompiledGraphicsStage copy = **stage;
-        copy.metallib = files->library;
-        copy.msl_source.clear();
-        copy.msl_source_file.clear();
-        return std::make_shared<const platform::CompiledGraphicsStage>(std::move(copy));
-#else
-        // Without the native package reader the row stays unresolved and is counted.
-        return nullptr;
-#endif
-    }
-
     void run() {
         warmup_thread_ = true;
         pthread_setname_np("nvn-pso-warm");
@@ -2829,12 +3804,13 @@ private:
     void build(const PsoRow& row) {
         std::shared_ptr<const platform::CompiledGraphicsStage> vertex, fragment;
         if (row.kind == 'S') {
-            const auto stage = package_->stage_by_identity(row.fields[0]);
+            const auto stage = resolve_recorded_stage(*package_, native_rows_, row.fields[0],
+                                                      RecordedStageForm::runtime);
             if (!stage) { ++unresolved_; return; }
             if (hooks_.library(stage)) ++built_; else ++failed_;
         } else if (row.kind == 'R') {
             DrawPipelineKey key;
-            const auto resolution = resolve_pipeline_row(row, *package_, key, vertex, fragment);
+            const auto resolution = resolve_pipeline_row(row, *package_, native_rows_, key, vertex, fragment);
             if (resolution != RowResolution::resolved) {
                 ++(resolution == RowResolution::missing_stage ? unresolved_ : undecodable_);
                 return;
@@ -2860,17 +3836,44 @@ private:
             // One compile in flight per thread keeps the warm-up from
             // flooding the compiler ahead of what the replay needs.
             compile->wait_silent();
+        } else if (row.kind == 'M') {
+            std::shared_ptr<const platform::CompiledGraphicsStage> task;
+            MeshPipelineKey key;
+            const auto resolution = resolve_mesh_pipeline_row(row, *package_, native_rows_, key,
+                                                               task, vertex, fragment);
+            if (resolution != RowResolution::resolved) {
+                ++(resolution == RowResolution::missing_stage ? unresolved_ : undecodable_);
+                return;
+            }
+            const auto canonical = mesh_pipeline_row(key);
+            const auto text = canonical ? canonical->text() : row.text();
+            {
+                const std::lock_guard lock(mutex_);
+                if (claimed_.count(text) || render_.count(text)) return;
+            }
+            auto pipeline = hooks_.mesh ? hooks_.mesh(key, task, vertex, fragment) : nullptr;
+            if (!pipeline) { ++failed_; return; }
+            // Publish only a successful ready mesh pipeline. A draw that
+            // outruns preparation uses its archive lookup instead; an
+            // incomplete archive can still require a draw-time compile.
+            if (!pipeline->compile->wait_silent()) { ++failed_; return; }
+            {
+                const std::lock_guard lock(mutex_);
+                if (claimed_.count(text) || !render_.emplace(text, std::move(pipeline)).second) return;
+            }
+            ++built_;
         } else if (row.kind == 'O') {
             if (!hooks_.open) return;
             DrawPipelineKey key;
-            const auto resolution = resolve_pipeline_row(row, *package_, key, vertex, fragment);
+            const auto resolution = resolve_pipeline_row(row, *package_, native_rows_, key, vertex, fragment);
             if (resolution != RowResolution::resolved) {
                 ++(resolution == RowResolution::missing_stage ? unresolved_ : undecodable_);
                 return;
             }
             if (hooks_.open(key, std::move(vertex), std::move(fragment))) ++built_; else ++failed_;
         } else if (row.kind == 'C') {
-            const auto stage = resolve_compute_stage(row.fields[0]);
+            const auto stage = resolve_recorded_stage(*package_, native_rows_, row.fields[0],
+                                                      RecordedStageForm::runtime_or_packaged_compute);
             if (!stage) { ++unresolved_; return; }
             if (claimed(row.fields[0])) return;
             auto pipeline = hooks_.compute(stage);
@@ -2893,10 +3896,7 @@ private:
     }
 
     std::shared_ptr<platform::MetalShaderPackage> package_;
-#ifdef ARMIGO_HAS_NATIVE_PACKAGE
-    std::once_flag native_once_;
-    std::unique_ptr<armigo::shader_native::NativePackage> native_package_;
-#endif
+    NativeRowSource native_rows_;
     const std::vector<PsoRow> rows_;
     Hooks hooks_;
     const std::uint64_t started_;
@@ -2958,11 +3958,63 @@ struct RetirementTailTicket {
     std::shared_ptr<RetirementTails> tails;
 };
 
+// Pools guest-memory stores have written, learned from each submission's
+// write log. Until that set has stayed the same across two logs, a storing
+// stage counts as a write anywhere in the table. After that, it counts as a
+// write of the learned pools only. Past the cap, stores count as a write
+// anywhere again.
+struct LearnedGuestWrites {
+    static constexpr std::size_t default_cap = 4096;
+    static constexpr int stable_after = 2;
+    static constexpr std::size_t ring_size = 256;
+    struct Read {
+        // Encoding sequence of the submission whose prediction this read
+        // relied on. Held queues encode out of guest-fence order, so the
+        // learning cutoff and the wrap check use this sequence.
+        std::uint64_t sequence = 0;
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+    };
+    mutable std::mutex mutex;
+    std::size_t cap = default_cap;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> snapshot =
+        std::make_shared<const std::vector<std::pair<std::uint64_t, std::uint64_t>>>();
+    int stable = 0;
+    bool over = false;
+    bool announced = false;
+    bool over_logged = false;
+    std::uint64_t logs = 0;
+    std::uint64_t misses = 0;
+    std::uint64_t predicted_submissions = 0;
+    int info_lines = 0;
+    // Reads that skipped a wait because a submission was encoded from the
+    // learned set and that set excluded the range: a CPU read, a texture
+    // whose backing feeds from those pools, or a uniform capture used after
+    // the storing stage. A later log that names a new pool checks reads at
+    // or after that submission's encoding sequence.
+    std::array<Read, ring_size> ring{};
+    std::uint64_t ring_n = 0;
+};
+
+bool guest_ranges_overlap(const std::vector<std::pair<std::uint64_t, std::uint64_t>>* ranges,
+                          std::uint64_t address, std::uint64_t size);
+
 class ReplayImpl final : public MetalReplayBackend {
 public:
     ReplayImpl(id<MTLDevice> device, id<MTL4CommandQueue> queue, std::shared_ptr<ReplayResources> resources,
                ReplaySchedulingPolicy scheduling)
-        : device_(device), queue_(queue), resources_(std::move(resources)), scheduling_(scheduling) {
+        : device_(device), pool_tables_(device), queue_(queue), resources_(std::move(resources)),
+          scheduling_(scheduling) {
+        submission_owner_ = resources_->submission_owner();
+        if (!submission_owner_)
+            submission_owner_ = std::make_shared<Metal4SubmissionOwner>(device_, queue_);
+        // Read per backend: a process-lifetime cache would keep a value set
+        // by an earlier test. Unset and any value other than 0 predict.
+        if (const char* value = std::getenv("ARMIGO_NVN_PREDICT_GUEST_WRITES"))
+            predict_guest_writes_ = *value != '0';
+        if (const char* value = std::getenv("ARMIGO_NVN_MESH_DIAGNOSTICS"))
+            mesh_diagnostics_enabled_ = std::string_view(value) == "1";
         NSError* error = nil;
         compiler_ = [device_ newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&error];
         if (!device_ || !queue_) {
@@ -2974,6 +4026,15 @@ public:
             last_error_ = {ReplayErrorCode::allocation,
                            std::string("Metal replay compiler creation failed: ") + detail};
         }
+        // Missing pool bytes are unknown, so a conditional on them draws.
+        reports_.set_reader([this](std::uint64_t address, std::uint64_t& value) {
+            const auto span = resources_->buffer_at(address, sizeof value);
+            const auto* contents = span.buffer ? static_cast<const std::byte*>(span.buffer.contents) : nullptr;
+            if (!contents || span.offset > span.buffer.length || sizeof value > span.buffer.length - span.offset)
+                return false;
+            std::memcpy(&value, contents + span.offset, sizeof value);
+            return true;
+        });
         resources_->set_completion_hook([this] {
             if (active_encoder && &active_encoder->backend == this)
                 return active_encoder->synchronize_gpu();
@@ -3026,8 +4087,47 @@ public:
         segment_policy_.draws = setting("ARMIGO_NVN_CUT", segment_policy_.draws);
         segment_policy_.inflight = setting("ARMIGO_NVN_CUT_INFLIGHT", segment_policy_.inflight);
         if (setting("ARMIGO_NVN_ENCODE_THREAD", 1)) encode_thread_ = std::make_unique<EncodeThread>(*this);
+        resources_->set_upload_publication([this](std::function<void()> commit) {
+            if (encode_thread_) encode_thread_->upload_commit(std::move(commit));
+            else commit();
+        });
+        if (const char* profile = std::getenv("ARMIGO_NVN_GPUPROF"); profile && !std::strncmp(profile, "every:", 6))
+            gpu_profile_ = std::make_unique<GpuProfile>(device_);
+        if (PassDumpConfig dump_config = read_pass_dump_config(); dump_config.enabled) {
+            pass_dump_ = std::make_unique<PassDump>(device_, std::move(dump_config));
+            pass_dump_enabled_ = true;
+        }
         worker_ = std::thread([this] { run_worker(); });
         set_event_signal_observer(&ReplayImpl::cpu_event_signaled, this);
+    }
+
+    std::shared_ptr<Metal4SubmissionOwner> submission_owner() const override { return submission_owner_; }
+
+    bool enqueue_frame_capture(std::uint64_t after_fence, std::function<void(bool)> capture) override {
+        std::lock_guard lock(mutex_);
+        if (stopping_ || after_fence >= next_fence_) return false;
+        QueuedSubmission item;
+        item.capture = std::move(capture);
+        if (after_fence) {
+            if (active_cpu_fence_ == after_fence) item.capture_after = active_cpu_ready_;
+            else for (const auto& queued : queued_)
+                if (queued.fence == after_fence) { item.capture_after = queued.cpu_ready; break; }
+        }
+        queued_.push_back(std::move(item));
+        schedule_generation_.fetch_add(1, std::memory_order_release);
+        queued_ready_.notify_all();
+        return true;
+    }
+
+    void track_native_submission(const std::shared_ptr<Metal4NativeSubmission>& submission) override {
+        std::lock_guard lock(native_mutex_);
+        if (!accepting_submissions_.load(std::memory_order_acquire)) {
+            submission->cancel();
+            return;
+        }
+        if (native_submissions_.size() >= 128)
+            std::erase_if(native_submissions_, [](const auto& entry) { return entry.expired(); });
+        native_submissions_.push_back(submission);
     }
 
     ~ReplayImpl() override {
@@ -3041,6 +4141,14 @@ public:
             if (archive_exit_target() == this) archive_exit_target() = nullptr;
         }
         (void)stop_submission_workers();
+        if (mesh_diagnostics_enabled_) {
+            const std::lock_guard lock(mesh_diagnostics_mutex_);
+            armigo::diag::opt_in("nvn_mesh_diag_summary seen=%llu emitted=%zu duplicates=%llu records_truncated=%llu\n",
+                static_cast<unsigned long long>(mesh_diagnostics_seen_), mesh_diagnostics_keys_.size(),
+                static_cast<unsigned long long>(mesh_diagnostics_duplicates_),
+                static_cast<unsigned long long>(mesh_diagnostics_truncated_));
+        }
+        reports_.forget();
     }
 
     bool stop_submission_workers(
@@ -3054,6 +4162,12 @@ public:
             stopping_ = true;
             fence = next_fence_ - 1;
         }
+        // A worker may be recycling an upload allocator whose GPU batch is
+        // behind an unfilled native frame. Release those positions before
+        // joining it; captures racing shutdown are canceled by tracking.
+        std::vector<std::weak_ptr<Metal4NativeSubmission>> native;
+        { std::lock_guard lock(native_mutex_); native.swap(native_submissions_); }
+        for (const auto& entry : native) if (const auto submission = entry.lock()) submission->cancel();
         queued_ready_.notify_all();
         {
             std::unique_lock lock(mutex_);
@@ -3064,12 +4178,24 @@ public:
             }
         }
         if (worker_.joinable()) worker_.join();
+        resources_->set_upload_publication({});
         if (scheduling_.observe_shutdown_workers_joined)
             scheduling_.observe_shutdown_workers_joined(scheduling_.context);
-        const auto remaining = deadline ? std::uint64_t(std::max<std::int64_t>(0,
-            std::chrono::duration_cast<std::chrono::nanoseconds>(*deadline - std::chrono::steady_clock::now()).count()))
-            : UINT64_MAX;
-        if (!wait_fence(fence, remaining)) return false;
+        // Cleanup still drains an abandoned submission after public fence
+        // waits report its fatal replay failure.
+        {
+            std::unique_lock lock(fence_mutex_);
+            const auto retired = [&] { return fence_retired_locked(fence); };
+            if (deadline) {
+                if (!completion_.wait_until(lock, *deadline, retired)) return false;
+            } else {
+                completion_.wait(lock, retired);
+            }
+        }
+        const auto owner_remaining = deadline ? std::max(std::chrono::nanoseconds::zero(),
+            std::chrono::duration_cast<std::chrono::nanoseconds>(*deadline - std::chrono::steady_clock::now()))
+            : std::chrono::nanoseconds::max();
+        if (!submission_owner_->wait(submission_owner_->issued(), owner_remaining)) return false;
         if (!retirement_tails_->drain(deadline)) return false;
         // GPU retirement proves every encode record completed. Keep the
         // backend/resources alive for late VI fence readers and archive flush.
@@ -3092,6 +4218,11 @@ public:
         std::vector<std::string> identities;
         for (const auto& row : rows) {
             if (row.fields.empty() || row.kind == 'K' || (row.kind == 'O' && !archive_build)) continue;
+            if (row.kind == 'M') {
+                for (std::size_t i = 0; i < 3; ++i)
+                    if (row.fields[i] != "-") identities.push_back(row.fields[i]);
+                continue;
+            }
             identities.push_back(row.fields[0]);
             if ((row.kind == 'R' || row.kind == 'O') && row.fields.size() > 1 && row.fields[1] != "-")
                 identities.push_back(row.fields[1]);
@@ -3142,6 +4273,13 @@ public:
         hooks.compute = [this](std::shared_ptr<const platform::CompiledGraphicsStage> stage) {
             std::string detail;
             return build_compute_pipeline(std::move(stage), detail);
+        };
+        hooks.mesh = [this](const MeshPipelineKey& key,
+                           std::shared_ptr<const platform::CompiledGraphicsStage> task,
+                           std::shared_ptr<const platform::CompiledGraphicsStage> mesh,
+                           std::shared_ptr<const platform::CompiledGraphicsStage> fragment) {
+            std::string detail;
+            return build_mesh_pipeline(key, std::move(task), std::move(mesh), std::move(fragment), detail);
         };
         hooks.clear = [this](const ClearPipelineConfig& config) { return prepare_clear_pipeline(device_, config); };
         if (config.archive_capture && config.archive_open_rows) {
@@ -3333,6 +4471,11 @@ public:
         report.archive_hits = archive_hits_.load();
         report.archive_open_hits = archive_open_hits_.load();
         report.archive_misses = archive_misses_.load() + archive_warmup_misses_.load();
+        {
+            const std::lock_guard keys(archive_keys_mutex_);
+            report.unarchived = unarchived_keys_;
+            report.warmup_missed = warmup_missed_keys_;
+        }
         const std::lock_guard lock(archive_mutex_);
         report.archive = last_archive_;
         report.archive_incomplete = archive_write_failed_;
@@ -3356,6 +4499,10 @@ public:
         const bool warming = PipelineWarmup::on_warmup_thread();
         auto& counter = warming ? archive_warmup_misses_ : archive_misses_;
         const auto count = counter.fetch_add(1) + 1;
+        if (warming && count <= 65536) {
+            const std::lock_guard lock(archive_keys_mutex_);
+            warmup_missed_keys_.push_back(first + " " + second);
+        }
         timeline_event("pso_archive_miss", kind + (warming ? 2 : 0), 0);
         const char* where = warming ? "warm-up" : "draw";
         if (count <= 16)
@@ -3415,11 +4562,15 @@ public:
     std::uint64_t submit_from(std::uintptr_t queue, std::span<const NVNcommandHandle> handles) override {
         if (!accepting_submissions_.load(std::memory_order_acquire)) {
             std::lock_guard lock(mutex_);
-            last_error_ = {ReplayErrorCode::invalid_command, "Replay submission was requested after shutdown."};
+            last_error_ = {ReplayErrorCode::invalid_command, "Replay submission admission is closed."};
             return 0;
         }
         const auto timeline_begin = timeline_now_ns();
         const auto cpu_start = thread_cpu_ns();
+        if (!replay_reported_.exchange(true, std::memory_order_relaxed))
+            armigo::diag::write(armigo::diag::Level::info, core_replay()
+                ? "Armigo NVN: the core replay runs this title's submissions\n"
+                : "Armigo NVN: the standard replay runs this title's submissions\n");
         CommandWalkStatus status;
         auto captured = prepare_commands(handles, status);
         if (!captured) {
@@ -3428,8 +4579,8 @@ public:
             return 0;
         }
         std::lock_guard lock(mutex_);
-        if (stopping_) {
-            last_error_ = {ReplayErrorCode::invalid_command, "Replay submission raced shutdown."};
+        if (stopping_ || !accepting_submissions_.load(std::memory_order_acquire)) {
+            last_error_ = {ReplayErrorCode::invalid_command, "Replay submission admission is closed."};
             return 0;
         }
         // The split's unmet waits are read and their parts' holds registered
@@ -3453,6 +4604,7 @@ public:
         std::uint64_t fence = 0;
         if (split.starts.empty()) {
             fence = next_fence_++;
+            register_native_producer(queue, fence);
             fence_commands(*captured, fence);
             queued_.push_back({fence, queue, std::move(captured), scheduling_period_ns_, preserve_encode_spin_});
         } else {
@@ -3469,6 +4621,7 @@ public:
             for (std::size_t part = 0; part <= split.starts.size(); ++part) {
                 const auto end = part < split.starts.size() ? split.starts[part] : SIZE_MAX;
                 fence = next_fence_++;
+                register_native_producer(queue, fence);
                 for (; sync < split.syncs.size() && split.syncs[sync].first < end; ++sync) {
                     split.syncs[sync].second->fence = fence;
                     split.syncs[sync].second->fenced = 1;
@@ -3509,6 +4662,7 @@ public:
         if (stopping_ || fence >= next_fence_) return std::nullopt;
         QueuedSubmission item{};
         item.fence = next_fence_++;
+        register_native_producer(queue, item.fence);
         item.queue = queue;
         item.wait_on = fence;
         const auto tail = item.fence;
@@ -3523,7 +4677,7 @@ public:
     void complete_queue_wait(std::uint64_t fence) {
         auto pending = std::make_shared<PendingSubmission>();
         pending->fence = fence;
-        pending->slot = submission_slots;
+        pending->slot = max_submission_slots;
         std::unique_lock lock(fence_mutex_);
         pending->sequence = ++encode_sequence_;
         inflight_[fence] = pending;
@@ -3546,6 +4700,11 @@ public:
     // Drops a finalized queue's replay state (worker only): a queue
     // initialized later starts from the defaults.
     void forget_queue_state(std::uintptr_t queue) {
+        {
+            std::lock_guard lock(native_results_mutex_);
+            native_latest_.erase(queue);
+            collect_native_results_locked();
+        }
         queue_states_.erase(queue);
         if (state_queue_ == queue) {
             state_ = initial_state_;
@@ -3589,6 +4748,32 @@ public:
                         return stopping_ || schedule_generation_.load(std::memory_order_acquire) != generation;
                     });
                 }
+                active_cpu_fence_ = item.fence;
+                active_cpu_ready_ = item.cpu_ready;
+            }
+            struct CpuWalkDone {
+                ReplayImpl& backend;
+                std::shared_ptr<std::atomic<bool>> ready;
+                ~CpuWalkDone() {
+                    ready->store(true, std::memory_order_release);
+                    {
+                        std::lock_guard lock(backend.mutex_);
+                        backend.active_cpu_fence_ = 0;
+                        backend.active_cpu_ready_.reset();
+                        backend.schedule_generation_.fetch_add(1, std::memory_order_release);
+                    }
+                    backend.queued_ready_.notify_all();
+                }
+            } cpu_walk_done{*this, item.cpu_ready};
+            if (item.capture) {
+                @autoreleasepool {
+                    try { item.capture(!abandoned && accepting_submissions_.load(std::memory_order_acquire)); }
+                    catch (...) {
+                        armigo::diag::write(armigo::diag::Level::error, "nvn_replay: native frame capture failed\n");
+                        try { item.capture(false); } catch (...) {}
+                    }
+                }
+                continue;
             }
             if (abandoned) {
                 {
@@ -3598,7 +4783,7 @@ public:
                         hold_count_.store(holds_.size(), std::memory_order_release);
                     }
                 }
-                if (!item.frame_boundary && !item.forget_queue) finish_failed(item.fence);
+                if (!item.frame_boundary && !item.forget_queue) finish_failed(item.fence, "Replay submission was abandoned during shutdown");
                 continue;
             }
             if (item.forget_queue) {
@@ -3610,6 +4795,8 @@ public:
                 continue;
             }
             if (item.frame_boundary) {
+                pool_tables_.note_present();
+                if (gpu_profile_) gpu_profile_->frame_boundary(last_encoded_fence_, completed_fence());
                 if (gpu_frame_work_enabled_.load(std::memory_order_acquire)) {
                     std::lock_guard timing_lock(fence_mutex_);
                     gpu_frame_work_.frame_boundary(item.frame_end_fence);
@@ -3770,6 +4957,15 @@ public:
             if (frame_work && applied_work_.size() < retired_work_limit) applied_work_[fence] = work;
             note_retired(fence);
         }
+        // Every 64 retirements, allocations no running submission uses and
+        // none used for a while leave the shared residency set.
+        if (!ready.empty() && (residency_sweep_retirements_ += ready.size()) >= 64) {
+            residency_sweep_retirements_ = 0;
+            std::uint64_t oldest = encode_sequence_ + 1;
+            for (const auto& [fence, pending] : inflight_)
+                oldest = std::min(oldest, pending->first_sequence ? pending->first_sequence : pending->sequence);
+            shared_residency_.sweep(oldest, encode_sequence_);
+        }
         // The published fence advances only over contiguous retired fences;
         // frame work follows that order.
         for (auto range = retired_.find(completed_fence_ + 1); range != retired_.end();
@@ -3819,9 +5015,39 @@ public:
     // its GPU work for the frame-work collector.
     std::optional<std::uint64_t> retire_one(std::uint64_t fence) {
         std::optional<std::uint64_t> frame_work;
+        std::string producer_error;
         if (const auto it = inflight_.find(fence); it != inflight_.end()) {
-            if (it->second->execution_error) execution_error_ = it->second->execution_error;
-            else apply_effects_locked(*it->second);
+            if (it->second->execution_error) {
+                producer_error = it->second->execution_error.detail;
+                execution_error_ = it->second->execution_error;
+                // Its report effects are skipped: their counters never land.
+                if (it->second->replay_conditionals) reports_.set_failed(it->second->sequence);
+            } else {
+                apply_effects_locked(*it->second, true);
+            }
+            // Publish the signals before retiring their writer records. A
+            // held queue must never see the older CPU value between them.
+            std::size_t retired_writes = 0;
+            {
+                std::lock_guard lock(encoded_writes_mutex_);
+                retired_writes = std::erase_if(encoded_writes_, [&](const auto& write) {
+                    return write.fence == fence;
+                });
+            }
+            if (retired_writes) {
+                // A wait registered after a signal was published may still
+                // have seen its pending ADD. Recheck the now-published word.
+                bool released = false;
+                {
+                    std::lock_guard hold(hold_mutex_);
+                    for (auto& [held_fence, held] : holds_)
+                        released = advance_hold(held) || released;
+                }
+                if (released) {
+                    schedule_generation_.fetch_add(1, std::memory_order_release);
+                    queued_ready_.notify_all();
+                }
+            }
             report_guest_misses(*it->second);
             report_task_launches(*it->second);
             if (it->second->encode_warning) encode_warning_ = it->second->encode_warning;
@@ -3838,10 +5064,14 @@ public:
             if (!it->second->execution_error && it->second->segments.submitted &&
                 it->second->timed_segments == it->second->segments.submitted && it->second->gpu_first_ns)
                 frame_work = it->second->gpu_interval_ns;
-            if (it->second->slot < submission_slots) free_slots_ |= 1u << it->second->slot;
+            if (it->second->slot < max_submission_slots) free_slots_ |= 1u << it->second->slot;
+            // Its reports were read above: the heaps go back to the pool.
+            for (id<MTL4CounterHeap> heap : it->second->timestamp_heaps) timestamp_pool_.push_back(heap);
+            it->second->timestamp_heaps.clear();
             it->second->retired.store(true, std::memory_order_release);
             inflight_.erase(it);
         }
+        finish_native_producer(fence, std::move(producer_error));
         return frame_work;
     }
 
@@ -3862,6 +5092,10 @@ public:
         for (const auto& entry : retired) {
             if (observe) observe(context, entry.fence);
             log_retired(entry);
+            // The lines and their pixel buffers outlive this backend. Nothing
+            // here touches the replay after the lock was released.
+            if (entry.pending && !entry.pending->pass_dumps.empty())
+                publish_pass_dumps(std::move(entry.pending->pass_dumps));
         }
     }
 
@@ -3872,7 +5106,12 @@ public:
     }
 
     // A submission that failed to encode completes in order with no GPU work.
-    void finish_failed(std::uint64_t fence) {
+    void finish_failed(std::uint64_t fence, std::string producer_error) {
+        {
+            std::lock_guard lock(native_results_mutex_);
+            if (const auto found = native_results_.find(fence); found != native_results_.end())
+                found->second.preflight_error = std::move(producer_error);
+        }
         publish_encoder();
         std::unique_lock lock(fence_mutex_);
         finished_[fence] = true;
@@ -3892,6 +5131,10 @@ public:
         std::size_t slot_index = 0;
         {
             std::unique_lock lock(fence_mutex_);
+            if (!slots_sized_) {
+                free_slots_ = (1u << submission_slot_count()) - 1;
+                slots_sized_ = true;
+            }
             completion_.wait(lock, [&] { return free_slots_ != 0; });
             slot_index = static_cast<std::size_t>(std::countr_zero(free_slots_));
             free_slots_ &= ~(1u << slot_index);
@@ -3900,9 +5143,10 @@ public:
         timeline_event("encode_begin", fence, 0);
         const auto encode_start = std::chrono::steady_clock::now();
         if (!compiler_) {
-            encoder_error_ = {ReplayErrorCode::allocation, "Metal replay compiler is unavailable"};
+            const ReplayError failure{ReplayErrorCode::allocation, "Metal replay compiler is unavailable"};
+            encoder_error_ = failure;
             release_slot(slot_index);
-            finish_failed(fence);
+            finish_failed(fence, failure.detail);
             return;
         }
         auto pending = std::make_shared<PendingSubmission>();
@@ -3932,12 +5176,9 @@ public:
         else [slot.allocator reset];
         pending->allocator = slot.allocator;
         pending->encode_thread = encode_thread_.get();
-        pending->residents.reserve(resident_hint_);
-        auto* residency_descriptor = [MTLResidencySetDescriptor new];
-        residency_descriptor.initialCapacity = 256;
-        NSError* error = nil;
-        pending->residency = [device_ newResidencySetWithDescriptor:residency_descriptor
-                                                               error:&error];
+        if (!shared_residency_.ready()) shared_residency_.create(device_);
+        pending->shared_residency = &shared_residency_;
+        pending->count_residency = residency_count_log_ || scheduling_.observe_residency_sets;
         // Reuse query storage only after the slot's previous fence retired.
         if (!slot.visibility) {
             slot.visibility = [device_ newBufferWithLength:64 * 1024
@@ -3947,29 +5188,45 @@ public:
         pending->visibility = slot.visibility;
         // Without the encode thread the command buffer is created here; with
         // it, no record names the submission until every allocation exists.
-        if (!pending->allocator || !pending->residency || !pending->visibility ||
+        if (!pending->allocator || !shared_residency_.ready() || !pending->visibility ||
             (!encode_thread_ && !begin_commands(*pending))) {
-            encoder_error_ = {ReplayErrorCode::allocation,
-                           "Metal replay submission allocation failed"};
+            const ReplayError failure{ReplayErrorCode::allocation, "Metal replay submission allocation failed"};
+            encoder_error_ = failure;
             release_slot(slot_index);
-            finish_failed(fence);
+            finish_failed(fence, failure.detail);
             return;
         }
         std::memset(pending->visibility.contents, 0, pending->visibility.length);
-        [pending->retained addObjectsFromArray:@[pending->allocator,
-                                                 pending->residency, pending->visibility]];
+        [pending->retained addObjectsFromArray:@[pending->allocator, pending->visibility]];
         if (encode_thread_) begin_commands(*pending);
-        make_resident(*pending, pending->visibility);
         encoding_submission_ = pending;
         {
             std::lock_guard lock(fence_mutex_);
+            // Validate the carry while publishing this part as in flight:
+            // retirement must not sweep its allocations between those steps.
+            pending->carry = residency_carry(pending->captured);
             pending->sequence = ++encode_sequence_;
+            if (!pending->carry->first_sequence) pending->carry->first_sequence = pending->sequence;
+            pending->first_sequence = pending->carry->first_sequence;
             inflight_[fence] = pending;
         }
+        // Resident from a submission in flight: the shared set keeps it until
+        // that submission retired.
+        make_resident(*pending, pending->visibility);
 
         std::vector<std::shared_ptr<PendingSubmission>> released_submissions;
         resources_->begin_walk();
-        Encoder encoder(*this, *pending, state_, resources_->buffer_addresses_are_cpu());
+        struct EndResourceWalk {
+            ReplayResources& resources;
+            ~EndResourceWalk() { resources.end_walk(); }
+        } end_resource_walk{*resources_};
+        // Held queues are encoded out of guest-fence order. The report table
+        // follows encode order, which is the order completion effects land.
+        const bool replay_conditionals =
+            nvn::title_policy().conditional_render == nvn::TitlePolicy::ConditionalRender::replay;
+        pending->replay_conditionals = replay_conditionals;
+        Encoder encoder(*this, *pending, state_, resources_->buffer_addresses_are_cpu(),
+                        replay_conditionals ? &reports_ : nullptr);
         encoder.retired_fence = completed_fence();
         encoder.passed_leading_waits = passed_waits;
         // Releasing a retired submission frees its command buffers, allocators
@@ -4011,7 +5268,7 @@ public:
             encoder.error = {ReplayErrorCode::invalid_command, std::string(command_walk_status_name(walk_status))};
         }
         pending->phases.walk = timeline_now_ns() - phase_walk;
-        resident_hint_ = pending->residents.count;
+        resident_hint_ = std::max(resident_hint_, pending->carry->residents.count);
         const auto phase_finish = timeline_now_ns();
         if (!encoder.failed && !encoder.finish()) {
             // finish records its exact error.
@@ -4021,6 +5278,15 @@ public:
             // A committed prefix owns this guest fence until all feedback has
             // arrived. Never recycle its allocator through finish_failed().
             const auto failure = encoder.error;
+            {
+                const std::lock_guard lock(fence_mutex_);
+                if (!abandoned_error_) {
+                    abandoned_error_ = failure;
+                    abandoned_fence_ = fence;
+                }
+            }
+            accepting_submissions_.store(false, std::memory_order_release);
+            completion_.notify_all();
             encoder.drain_failed_prefix();
             encoder_error_ = failure;
             pending->phases.finish = timeline_now_ns() - phase_finish;
@@ -4052,7 +5318,10 @@ public:
         }
         pending->phases.finish = timeline_now_ns() - phase_finish;
         ++statistics_.submissions;
+        if (pending->replay_conditionals) reports_.commit(pending->sequence);
         commit_segment(*pending, SegmentKind::final);
+        last_encoded_fence_ = std::max(last_encoded_fence_, pending->fence);
+        note_encoded_signals(*pending);
         statistics_.encode_ns += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - encode_start).count());
         pending->phases.encode_end = timeline_now_ns();
@@ -4060,12 +5329,8 @@ public:
     }
 
     void flush() override {
-        // Metal 4 commits begin asynchronously; submit has already handed all
-        // accepted work to the queue. Texture uploads made outside a
-        // submission (a texel write before a present) finish here, before a
-        // reader on another queue can see the texture.
-        if (!resources_->flush_uploads())
-            armigo::diag::write(armigo::diag::Level::error,  "nvn_replay: texture upload failed before a present\n");
+        if (!resources_->publish_uploads())
+            armigo::diag::write(armigo::diag::Level::error, "nvn_replay: texture upload publication failed\n");
     }
 
     // Lock-free: guests poll syncs with a zero timeout in a loop, and taking
@@ -4100,6 +5365,170 @@ public:
     }
     // Waits until `previous`, encoded before the caller's submission, applied
     // its effects.
+    // Records the signals a submission left pending once it is committed, and
+    // releases the holds its writes meet. A submission that already retired
+    // landed its signals itself.
+    void note_encoded_signals(const PendingSubmission& pending) {
+        if (event_wait_drains().release) return;
+        std::vector<std::pair<const volatile std::uint32_t*, std::uint32_t>> released;
+        {
+            std::lock_guard fences(fence_mutex_);
+            if (pending.retired.load(std::memory_order_acquire)) return;
+            std::lock_guard lock(encoded_writes_mutex_);
+            for (const auto& effect : pending.effects) {
+                if (effect.kind != CompletionEffect::Kind::signal) continue;
+                auto found = std::ranges::find(encoded_writes_, effect.event, &EncodedEventWrite::event);
+                if (found == encoded_writes_.end()) found = encoded_writes_.insert(encoded_writes_.end(), {effect.event});
+                *found = {effect.event, pending.fence, effect.value, !effect.add, pending.sequence};
+            }
+            for (const auto& write : encoded_writes_)
+                if (write.fence == pending.fence && write.exact) released.emplace_back(write.event, write.value);
+        }
+        for (const auto& [event, value] : released) evaluate_holds(event, value);
+    }
+
+    // Whether the newest encoded, unretired signal of `event` is a write that
+    // leaves a value meeting the wait. Work encoded later runs after it on
+    // the one Metal queue, whose next encoder takes a queue barrier, so such
+    // a wait needs no completion.
+    bool encoded_write_meets(const volatile std::uint32_t* event, std::int32_t mode, std::uint32_t value) const {
+        const auto write = newest_encoded_write(event);
+        return write && write->exact && wait_met_by({event, mode, value}, write->value);
+    }
+
+
+    // The residency carry of a guest submission's parts (worker only, with
+    // fence_mutex_ held until the part is in flight): reuse a live carry.
+    std::shared_ptr<ResidencyCarry> residency_carry(const std::shared_ptr<const CommandSubmission>& captured) {
+        if (carries_.size() > 64)
+            std::erase_if(carries_, [](const auto& entry) { return entry.second.expired(); });
+        auto& slot = carries_[captured.get()];
+        auto carry = slot.lock();
+        if (!carry || carry->submission.lock() != captured) {
+            carry = std::make_shared<ResidencyCarry>();
+            carry->submission = captured;
+            carry->residents.reserve(resident_hint_);
+            carry->removals = shared_residency_.removals();
+            slot = carry;
+        } else if (carry->removals != shared_residency_.removals()) {
+            carry->residents = ResidentTable{};
+            carry->residents.reserve(resident_hint_);
+            carry->removals = shared_residency_.removals();
+        }
+        return carry;
+    }
+
+    id<MTLTexture> border_coverage(NSUInteger width, NSUInteger height, NSUInteger levels) {
+        BorderCoverageImage* selected = nullptr;
+        for (auto& entry : border_coverage_) {
+            if (entry.texture && entry.texture.width == width && entry.texture.height == height &&
+                entry.texture.mipmapLevelCount == levels) {
+                entry.use = ++border_use_;
+                return entry.texture;
+            }
+            if (!selected || entry.use < selected->use) selected = &entry;
+        }
+        auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+            width:width height:height mipmapped:NO];
+        descriptor.mipmapLevelCount = levels;
+        descriptor.storageMode = MTLStorageModeShared;
+        descriptor.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> texture = [device_ newTextureWithDescriptor:descriptor];
+        if (!texture) return nil;
+        const std::vector<std::uint8_t> row(width, 255);
+        for (NSUInteger mip = 0; mip != levels; ++mip) {
+            const auto w = std::max<NSUInteger>(1, width >> mip), h = std::max<NSUInteger>(1, height >> mip);
+            for (NSUInteger y = 0; y != h; ++y)
+                [texture replaceRegion:MTLRegionMake2D(0, y, w, 1) mipmapLevel:mip
+                             withBytes:row.data() bytesPerRow:w];
+        }
+        *selected = {texture, ++border_use_};
+        return texture;
+    }
+
+    id<MTLTexture> border_identity(id<MTLTexture> original) {
+        const auto swizzle = original.swizzle;
+        if (swizzle.red == MTLTextureSwizzleRed && swizzle.green == MTLTextureSwizzleGreen &&
+            swizzle.blue == MTLTextureSwizzleBlue && swizzle.alpha == MTLTextureSwizzleAlpha) return original;
+        BorderIdentityView* selected = nullptr;
+        for (auto& entry : border_identity_) {
+            if (entry.source == original) { entry.use = ++border_use_; return entry.texture; }
+            if (!selected || entry.use < selected->use) selected = &entry;
+        }
+        id<MTLTexture> root = original;
+        NSUInteger level = 0, slice = 0;
+        while (root.parentTexture) {
+            level += root.parentRelativeLevel; slice += root.parentRelativeSlice; root = root.parentTexture;
+        }
+        const MTLTextureSwizzleChannels identity{MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
+                                                 MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha};
+        id<MTLTexture> use = [root newTextureViewWithPixelFormat:original.pixelFormat textureType:MTLTextureType2D
+            levels:NSMakeRange(level, original.mipmapLevelCount) slices:NSMakeRange(slice, 1) swizzle:identity];
+        if (!use) return nil;
+        *selected = {original, use, ++border_use_};
+        return use;
+    }
+
+    id<MTLTexture> feedback_snapshot(std::uint64_t source, NSUInteger level, NSUInteger slice,
+                                    MTLPixelFormat format, NSUInteger width, NSUInteger height,
+                                    MTLTextureType type, NSUInteger levels, NSUInteger array_length, bool depth,
+                                    std::uint64_t submission, std::uint64_t epoch, bool& fresh) {
+        const auto shape = [&](const auto& entry) {
+            return entry.texture && entry.texture.pixelFormat == format &&
+                entry.texture.width == width && entry.texture.height == height &&
+                entry.texture.textureType == type && entry.texture.mipmapLevelCount == levels &&
+                entry.texture.arrayLength == array_length;
+        };
+        const auto live = [&](const auto& entry) {
+            return entry.source && entry.submission == submission && entry.epoch == epoch;
+        };
+        FeedbackSnapshot* selected = nullptr;
+        for (auto& entry : feedback_snapshots_)
+            if (entry.source == source && entry.level == level && entry.slice == slice) {
+                if (shape(entry)) selected = &entry;
+                else entry.source = 0;
+                break;
+            }
+        if (selected && live(*selected)) {
+            selected->use = ++feedback_use_;
+            fresh = false;
+            return selected->texture;
+        }
+        if (!selected) {
+            int best = 4;
+            for (auto& entry : feedback_snapshots_) {
+                const int rank = live(entry) ? (shape(entry) ? 2 : 3) : (shape(entry) ? 0 : 1);
+                if (rank < best || (rank == best && entry.use < selected->use)) {
+                    selected = &entry;
+                    best = rank;
+                }
+            }
+        }
+        if (!shape(*selected)) {
+            auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+                width:width height:height mipmapped:NO];
+            descriptor.textureType = type;
+            descriptor.mipmapLevelCount = levels;
+            descriptor.arrayLength = array_length;
+            descriptor.storageMode = MTLStorageModePrivate;
+            descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+            if (!depth) descriptor.allowGPUOptimizedContents = NO;
+            selected->texture = [device_ newTextureWithDescriptor:descriptor];
+            if (!selected->texture) return nil;
+        }
+        selected->source = source;
+        selected->level = level;
+        selected->slice = slice;
+        selected->submission = submission;
+        selected->epoch = epoch;
+        selected->use = ++feedback_use_;
+        fresh = true;
+        return selected->texture;
+    }
+
+    // The frame profiler while ARMIGO_NVN_GPUPROF is set (worker only).
+    GpuProfile* gpu_profile() { return gpu_profile_.get(); }
+
     void wait_retired(const PendingSubmission& previous) {
         std::unique_lock lock(fence_mutex_);
         completion_.wait(lock, [&] { return previous.retired.load(std::memory_order_acquire); });
@@ -4120,29 +5549,73 @@ public:
 
     bool wait_fence(std::uint64_t fence, std::uint64_t timeout_ns) override {
         std::unique_lock lock(fence_mutex_);
+        if (abandoned_error_) return false;
         if (fence_retired_locked(fence)) return true;
         if (fence >= next_fence_) return false;
+        const auto ready = [&] { return fence_retired_locked(fence) || abandoned_error_; };
         if (timeout_ns == UINT64_MAX) {
-            completion_.wait(lock, [&] { return fence_retired_locked(fence); });
-            return true;
+            completion_.wait(lock, ready);
+            return !abandoned_error_ && fence_retired_locked(fence);
         }
-        return completion_.wait_for(lock, std::chrono::nanoseconds(std::min<std::uint64_t>(timeout_ns, INT64_MAX)),
-                                    [&] { return fence_retired_locked(fence); });
+        completion_.wait_for(lock, std::chrono::nanoseconds(std::min<std::uint64_t>(timeout_ns, INT64_MAX)), ready);
+        return !abandoned_error_ && fence_retired_locked(fence);
+    }
+
+    std::string fatal_error_detail() const override {
+        const std::lock_guard lock(fence_mutex_);
+        if (!abandoned_error_) return {};
+        return "NVN replay abandoned submission " + std::to_string(abandoned_fence_) + ": " +
+            abandoned_error_.detail;
+    }
+
+    std::optional<nvn::NativeProducerFence> snapshot_native_producer(std::uintptr_t queue) override {
+        std::lock_guard lock(native_results_mutex_);
+        const auto latest = native_latest_.find(queue);
+        if (latest == native_latest_.end()) return nvn::NativeProducerFence{};
+        const auto found = native_results_.find(latest->second);
+        if (found == native_results_.end())
+            return nvn::NativeProducerFence{latest->second, [] { return std::string{"Native producer result is not retained"}; }};
+        auto result = found->second.result;
+        return nvn::NativeProducerFence{latest->second, [result] { return result->check(); }};
+    }
+
+    std::function<std::string()> retain_native_producer_result(std::uint64_t fence) override {
+        if (!fence) return [] { return std::string{}; };
+        std::lock_guard lock(native_results_mutex_);
+        const auto found = native_results_.find(fence);
+        if (found == native_results_.end())
+            return [] { return std::string{"Native producer result is not retained"}; };
+        auto result = found->second.result;
+        return [result] { return result->check(); };
     }
 
     ReplayError last_error() const override {
         std::scoped_lock lock(mutex_, fence_mutex_);
-        return execution_error_ ? execution_error_ : last_error_ ? last_error_ : encode_warning_;
+        return abandoned_error_ ? abandoned_error_ : execution_error_ ? execution_error_ :
+            last_error_ ? last_error_ : encode_warning_;
     }
 
     ReplayStatistics statistics() const noexcept override {
-        std::scoped_lock lock(mutex_, fence_mutex_);
-        auto result = published_statistics_;
-        result.submit_cpu_ns = submit_cpu_ns_;
-        result.encode_thread_cpu_ns = encode_thread_ ? encode_thread_->cpu_ns() : stopped_encode_cpu_ns_;
-        result.gpu_ns = gpu_ns_;
-        result.completion_cpu_ns = completion_cpu_ns_;
-        result.counter_timestamp_fallbacks = counter_fallbacks_;
+        ReplayStatistics result;
+        {
+            std::scoped_lock lock(mutex_, fence_mutex_);
+            result = published_statistics_;
+            result.submit_cpu_ns = submit_cpu_ns_;
+            result.encode_thread_cpu_ns = encode_thread_ ? encode_thread_->cpu_ns() : stopped_encode_cpu_ns_;
+            result.gpu_ns = gpu_ns_;
+            result.completion_cpu_ns = completion_cpu_ns_;
+            result.counter_timestamp_fallbacks = counter_fallbacks_;
+        }
+        // Learned counters move on the worker and, at retirement, under
+        // fence_mutex_. Copy them after releasing those locks: retirement
+        // takes fence_mutex_ and then the learned mutex.
+        {
+            std::lock_guard lock(learned_.mutex);
+            result.guest_write_logs = learned_.logs;
+            result.guest_write_pools_learned = learned_.ranges.size();
+            result.guest_write_misses = learned_.misses;
+            result.guest_write_predicted_submissions = learned_.predicted_submissions;
+        }
         return result;
     }
 
@@ -4245,6 +5718,85 @@ public:
         return nil;
     }
 
+    // Worker-owned host copy resources. Native program reflection and the
+    // command-stream texture cache do not participate in this path.
+    id<MTLRenderPipelineState> texture_copy_pipeline(MTLPixelFormat format, std::string& detail) {
+        if (!texture_copy_.library_attempted) {
+            texture_copy_.library_attempted = true;
+            static constexpr char source[] = R"msl(
+#include <metal_stdlib>
+using namespace metal;
+struct CopyVertex { float4 position [[position]]; };
+struct CopyParameters { float4 source_origin_scale; float4 destination_source_size; };
+vertex CopyVertex armigo_copy_vertex(uint index [[vertex_id]]) {
+    const float2 positions[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};
+    return {float4(positions[index], 0, 1)};
+}
+fragment float4 armigo_copy_fragment(CopyVertex input [[stage_in]],
+    texture2d<float> source [[texture(0)]], sampler filter [[sampler(0)]],
+    constant CopyParameters& parameters [[buffer(0)]]) {
+    const float2 texel = parameters.source_origin_scale.xy +
+        (input.position.xy - parameters.destination_source_size.xy) * parameters.source_origin_scale.zw;
+    return source.sample(filter, texel / parameters.destination_source_size.zw, level(0.0f));
+}
+)msl";
+            auto* options = [MTLCompileOptions new];
+            options.languageVersion = MTLLanguageVersion4_0;
+            NSError* error = nil;
+            texture_copy_.library = [device_ newLibraryWithSource:[NSString stringWithUTF8String:source]
+                options:options error:&error];
+            if (texture_copy_.library) {
+                texture_copy_.vertex = [texture_copy_.library newFunctionWithName:@"armigo_copy_vertex"];
+                texture_copy_.fragment = [texture_copy_.library newFunctionWithName:@"armigo_copy_fragment"];
+            }
+            if (!texture_copy_.vertex || !texture_copy_.fragment)
+                texture_copy_.library_error = std::string("scaled texture copy shader compilation failed: ") +
+                    (error ? error.localizedDescription.UTF8String : "missing entry point");
+        }
+        if (!texture_copy_.library_error.empty()) {
+            detail = texture_copy_.library_error;
+            return nil;
+        }
+        auto [entry, inserted] = texture_copy_.pipelines.try_emplace(format);
+        if (inserted) {
+            const auto begin = timeline_now_ns();
+            auto* descriptor = [MTLRenderPipelineDescriptor new];
+            descriptor.vertexFunction = texture_copy_.vertex;
+            descriptor.fragmentFunction = texture_copy_.fragment;
+            descriptor.colorAttachments[0].pixelFormat = format;
+            descriptor.colorAttachments[0].blendingEnabled = NO;
+            descriptor.rasterSampleCount = 1;
+            NSError* error = nil;
+            entry->second.state = [device_ newRenderPipelineStateWithDescriptor:descriptor error:&error];
+            if (!entry->second.state)
+                entry->second.error = std::string("scaled texture copy pipeline compilation failed: ") +
+                    (error ? error.localizedDescription.UTF8String : "unknown error");
+            timeline_event("pso_compiled", 2, timeline_now_ns() - begin);
+        }
+        detail = entry->second.error;
+        return entry->second.state;
+    }
+    id<MTLSamplerState> texture_copy_sampler(bool linear) {
+        auto& sampler = texture_copy_.samplers[linear ? 1 : 0];
+        if (!sampler) {
+            auto* descriptor = [MTLSamplerDescriptor new];
+            descriptor.minFilter = descriptor.magFilter = linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+            descriptor.sAddressMode = descriptor.tAddressMode = MTLSamplerAddressModeClampToEdge;
+            descriptor.supportArgumentBuffers = YES;
+            sampler = [device_ newSamplerStateWithDescriptor:descriptor];
+        }
+        return sampler;
+    }
+    id<MTL4ArgumentTable> texture_copy_arguments() {
+        if (!texture_copy_.arguments) {
+            auto* descriptor = [MTL4ArgumentTableDescriptor new];
+            descriptor.maxBufferBindCount = descriptor.maxTextureBindCount = descriptor.maxSamplerStateBindCount = 1;
+            descriptor.initializeBindings = YES;
+            texture_copy_.arguments = [device_ newArgumentTableWithDescriptor:descriptor error:nil];
+        }
+        return texture_copy_.arguments;
+    }
+
     id<MTLBuffer> zero_buffer() {
         if (!zero_buffer_) {
             zero_buffer_ = [device_ newBufferWithLength:64 * 1024 options:MTLResourceStorageModeShared];
@@ -4264,37 +5816,80 @@ public:
     }
 
     static constexpr std::size_t timestamp_heap_capacity = 1024;
-    // Six in-flight slots retain at most 24 heaps, below Metal 4's per-process
-    // limit of 32. Additional reports fail explicitly instead of losing work.
-    static constexpr std::size_t timestamp_heap_limit = 4;
-    static_assert(submission_slots * timestamp_heap_limit <= 24);
+    // Timestamp heaps are one pool for every submission, at most 24, below
+    // Metal 4's per-process limit of 32. A submission takes a heap for each
+    // 1024 reports when it needs one and returns them when it retires: from
+    // the pool, a new heap below the cap, or, at the cap, the heaps an earlier
+    // submission returns. Only one submission needing more than all of them
+    // fails, explicitly.
+    static constexpr std::size_t timestamp_heap_limit = 24;
 
-    id<MTL4CounterHeap> counter_heap(std::size_t slot, std::size_t timestamp) {
+    id<MTL4CounterHeap> counter_heap(PendingSubmission& pending, std::size_t timestamp) {
         const auto page = timestamp / timestamp_heap_capacity;
         if (page >= timestamp_heap_limit) return nil;
-        // A slot keeps its pages until its submission retires. Allocate
-        // additional pages only for submissions that need them, then reuse them.
-        auto& heap = submission_storage_[slot].timestamps[page];
-        if (!heap) {
-            auto* descriptor = [MTL4CounterHeapDescriptor new];
-            descriptor.type = MTL4CounterHeapTypeTimestamp;
-            descriptor.count = timestamp_heap_capacity;
-            NSError* error = nil;
-            heap = [device_ newCounterHeapWithDescriptor:descriptor error:&error];
+        while (pending.timestamp_heaps.size() <= page) {
+            id<MTL4CounterHeap> heap = nil;
+            {
+                std::unique_lock lock(fence_mutex_);
+                // Earlier submissions retire without this worker; this one
+                // holds fewer than all heaps, so a wait ends.
+                completion_.wait(lock, [&] {
+                    return !timestamp_pool_.empty() || timestamp_heaps_made_ < timestamp_heap_limit ||
+                           pending.timestamp_heaps.size() >= timestamp_heap_limit;
+                });
+                if (!timestamp_pool_.empty()) {
+                    heap = timestamp_pool_.back();
+                    timestamp_pool_.pop_back();
+                } else if (timestamp_heaps_made_ < timestamp_heap_limit) {
+                    ++timestamp_heaps_made_;
+                } else {
+                    return nil;
+                }
+            }
+            if (!heap) {
+                auto* descriptor = [MTL4CounterHeapDescriptor new];
+                descriptor.type = MTL4CounterHeapTypeTimestamp;
+                descriptor.count = timestamp_heap_capacity;
+                NSError* error = nil;
+                heap = [device_ newCounterHeapWithDescriptor:descriptor error:&error];
+                if (!heap) {
+                    std::lock_guard lock(fence_mutex_);
+                    --timestamp_heaps_made_;
+                    return nil;
+                }
+            }
+            pending.timestamp_heaps.push_back(heap);
         }
-        return heap;
+        return pending.timestamp_heaps[page];
     }
 
     // Worker-owned; readers use the published snapshot. The first skip for
     // each reason is reported, so dropped work is never silent.
-    void note_skip(const std::string& reason, unsigned op, const std::string& detail) {
+    void note_skip(const std::string& reason, unsigned op, std::uint64_t fence,
+                   const std::string& detail) {
         ++statistics_.skipped;
         const auto count = ++skips_[reason];
         if (count == 1)
             armigo::diag::write(armigo::diag::Level::error,  "Armigo NVN: skipped unsupported work: %s\n", reason.c_str());
         if (count <= skip_detail_limit())
-            armigo::diag::opt_in( "Armigo NVN: skip %llu of \"%s\" at op %u: %s\n",
-                         static_cast<unsigned long long>(count), reason.c_str(), op, detail.c_str());
+            armigo::diag::opt_in( "Armigo NVN: skip %llu of \"%s\" at op %u frame=%llu fence=%llu: %s\n",
+                         static_cast<unsigned long long>(count), reason.c_str(), op,
+                         static_cast<unsigned long long>(pool_present_count()),
+                         static_cast<unsigned long long>(fence), detail.c_str());
+    }
+
+    bool mesh_diagnostics_enabled() const { return mesh_diagnostics_enabled_; }
+    void note_mesh_diagnostic(std::string key, const std::string& detail) {
+        const std::lock_guard lock(mesh_diagnostics_mutex_);
+        ++mesh_diagnostics_seen_;
+        if (mesh_diagnostics_keys_.count(key)) { ++mesh_diagnostics_duplicates_; return; }
+        if (mesh_diagnostics_keys_.size() == 16) {
+            if (++mesh_diagnostics_truncated_ == 1)
+                armigo::diag::opt_in("nvn_mesh_diag records_truncated=1 record_limit=16\n");
+            return;
+        }
+        mesh_diagnostics_keys_.insert(std::move(key));
+        armigo::diag::opt_in("nvn_mesh_diag %s\n", detail.c_str());
     }
 
     // ARMIGO_NVN_SKIP_DETAIL=N describes the first N skips of each reason.
@@ -4307,6 +5902,27 @@ public:
     }
 
     id<MTLDevice> device() const { return device_; }
+    // A plain member so the unset path is one predictable branch. The config
+    // is fixed when this backend is constructed.
+    bool pass_dump_enabled() const { return pass_dump_enabled_; }
+    bool pass_dump_wants(std::uint64_t frame) const {
+        return pass_dump_enabled_ && pass_dump_ && pass_dump_->wants(frame);
+    }
+    PassDump& pass_dump() { return *pass_dump_; }
+    PoolTableCache& pool_tables() { return pool_tables_; }
+    std::uint64_t pool_present_count() const { return pool_tables_.present_count(); }
+    void adopt_pool_stats() {
+        const auto stats = pool_tables_.statistics();
+        statistics_.pool_table_builds = stats.builds;
+        statistics_.pool_table_patches = stats.patches;
+        statistics_.pool_table_kept = stats.kept;
+        statistics_.pool_ids_read = stats.ids_read;
+        statistics_.pool_textures_made = stats.textures_made;
+        statistics_.pool_textures_left = stats.textures_left;
+        statistics_.pool_walk_us = stats.walk_us;
+    }
+    void set_pool_table_allocation_failure(bool fail) override { pool_tables_.set_allocation_failure(fail); }
+    id<MTLBuffer> current_texture_pool_buffer() const override { return pool_tables_.current_texture_buffer(); }
     id<MTL4CommandQueue> queue() const { return queue_; }
     id<MTL4Compiler> compiler() const { return compiler_; }
     ReplayResources& resources() { return *resources_; }
@@ -4382,6 +5998,11 @@ public:
                                   std::shared_ptr<const platform::CompiledGraphicsStage> mesh,
                                   std::shared_ptr<const platform::CompiledGraphicsStage> fragment,
                                   std::string& detail);
+    std::unique_ptr<NativePipeline> build_mesh_pipeline(const MeshPipelineKey& key,
+                                  std::shared_ptr<const platform::CompiledGraphicsStage> task,
+                                  std::shared_ptr<const platform::CompiledGraphicsStage> mesh,
+                                  std::shared_ptr<const platform::CompiledGraphicsStage> fragment,
+                                  std::string& detail);
     NativePipeline* pipeline(const DrawPipelineKey& key,
                                            std::shared_ptr<const platform::CompiledGraphicsStage> vertex,
                                            std::shared_ptr<const platform::CompiledGraphicsStage> fragment,
@@ -4420,7 +6041,8 @@ public:
             if (!pending.commands) return false;
             [pending.retained addObject:pending.commands];
             [pending.commands beginCommandBufferWithAllocator:pending.allocator];
-            [pending.commands useResidencySet:pending.residency];
+            if (pending.count_residency) pending.command_residency_sets.clear();
+            use_residency_set(pending, pending.commands, pending.shared_residency->set());
         }
         pending.commands_open = true;
         return true;
@@ -4440,38 +6062,48 @@ public:
     void commit_segment(PendingSubmission& submission, SegmentKind kind) {
         auto pending = submission.shared_from_this();
         const auto begin = timeline_now_ns();
-        // Texture uploads run on their own queue and are committed here; the
-        // queue orders the segment after them on the GPU (commit_now), except
-        // for the first fence with uploads in flight, which the resources
-        // settle on the CPU once. The event is owned by the resources, which
-        // outlive the replay's commits.
+        // Sealing uploads records their positions before this consumer.
         UploadFence uploads;
         resources_->commit_uploads(uploads);
+        // The segment's allocations join the shared set before its commit,
+        // which commits the set.
+        pending->shared_residency->add(pending->resident_adds, pending->sequence);
+        pending->resident_adds.clear();
         pending->commands_open = false;
         pending->committed_effects = pending->effects.size();
         const auto segment = ++next_segment_;
         const auto ordinal = pending->segments_committed++;
+        if (timeline_enabled()) {
+            // What the segment holds and its preceding logical upload range.
+            const auto& c = pending->counters;
+            timeline_event("segment_draws", segment, c.draws - std::exchange(pending->segment_draws, c.draws));
+            timeline_event("segment_passes", segment, c.passes - std::exchange(pending->segment_passes, c.passes));
+            timeline_event("segment_dispatches", segment,
+                           c.dispatches - std::exchange(pending->segment_dispatches, c.dispatches));
+            timeline_event("segment_uploads", segment,
+                           c.window_uploads - std::exchange(pending->segment_uploads, c.window_uploads));
+            if (uploads.value > uploads.floor) timeline_event("segment_upload_range", segment, uploads.value);
+        }
         {
             std::lock_guard lock(fence_mutex_);
             pending->segments.submit();
         }
         outstanding_segments_.fetch_add(1, std::memory_order_relaxed);
-        auto* options = [MTL4CommitOptions new];
-        const UploadFence range{nil, uploads.value, uploads.floor};
-        [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+        const UploadFence range{uploads.value, uploads.floor};
+        Metal4Completion completion = ^(id<MTL4CommitFeedback> feedback) {
             // A failed upload batch fails the segment that waited for it: its
             // draws sampled textures without their content.
             if (resources_->uploads_failed(range))
                 report_encode_error(*pending, "texture upload failed");
             complete_segment(pending, segment, ordinal, kind, feedback);
-        }];
+        };
+        const auto publication = submission_owner_->reserve();
         if (encode_thread_) {
             encode_thread_->put(EncodeOp::commit, static_cast<std::uint32_t>(kind),
-                                CommitRecord{(__bridge_retained void*)options, pending.get(), segment,
-                                         (__bridge void*)uploads.event, uploads.value});
+                                CommitRecord{(__bridge_retained void*)completion, pending.get(), segment, publication});
             encode_thread_->publish();
         } else {
-            commit_now(*pending, pending->commands, options, segment, kind, uploads.event, uploads.value);
+            commit_now(*pending, pending->commands, completion, segment, kind, publication);
         }
         pending->phases.commit += timeline_now_ns() - begin;
     }
@@ -4479,15 +6111,24 @@ public:
     // Makes the segment's residency current, ends its command buffer and
     // commits it: on the worker, or on the encode thread.
     void commit_now(PendingSubmission& pending, id<MTL4CommandBuffer> commands,
-                    MTL4CommitOptions* options, std::uint64_t segment, SegmentKind kind,
-                    id<MTLEvent> upload_event, std::uint64_t upload_value) {
+                    Metal4Completion completion, std::uint64_t segment, SegmentKind kind,
+                    std::uint64_t publication) {
         if (!commands) {
+            submission_owner_->cancel_reserved(publication);
             abandon_segment(pending, "Metal replay segment has no command buffer");
             return;
         }
-        [pending.residency commit];
+        pending.shared_residency->commit();
+        if (pending.residency) [pending.residency commit];
         [commands endCommandBuffer];
-        id<MTL4CommandBuffer> buffers[] = {commands};
+        if (pending.count_residency) {
+            const auto count = pending.command_residency_sets.size();
+            if (residency_count_log_)
+                armigo::diag::opt_in("nvn_residency_sets fence=%llu segment=%llu count=%zu\n",
+                    static_cast<unsigned long long>(pending.fence), static_cast<unsigned long long>(segment), count);
+            if (scheduling_.observe_residency_sets)
+                scheduling_.observe_residency_sets(scheduling_.context, pending.fence, segment, count);
+        }
         const auto committed = timeline_now_ns();
         if (!pending.first_commit_ns) {
             pending.first_commit_ns = committed;
@@ -4500,9 +6141,8 @@ public:
         }
         timeline_event_at(committed, "segment_owner", segment, pending.fence);
         timeline_event_at(committed, "segment_commit", segment, static_cast<unsigned>(kind));
-        // The texture uploads this segment may read complete on the GPU first.
-        if (upload_event) [queue_ waitForEvent:upload_event value:upload_value];
-        [queue_ commit:buffers count:1 options:options];
+        if (!submission_owner_->publish_reserved(publication, commands, completion))
+            abandon_segment(pending, "Metal replay publication position is unavailable");
     }
 
     // A failure the encode thread meets ends the submission with an
@@ -4545,7 +6185,7 @@ public:
 
     void apply_effects(PendingSubmission& pending) {
         std::lock_guard lock(fence_mutex_);
-        apply_effects_locked(pending);
+        apply_effects_locked(pending, false);
     }
 
     // Units of the timestamps a counter report is built from, fixed for the
@@ -4636,7 +6276,7 @@ public:
     }
     // The latest report under the segment timestamp policy (fence_mutex_).
     std::uint64_t last_report_ticks_ = 0;
-    void apply_effects_locked(PendingSubmission& pending) {
+    void apply_effects_locked(PendingSubmission& pending, bool publish) {
         const auto* visibility = static_cast<const std::uint64_t*>(pending.visibility.contents);
         const auto& clock = counter_clock();
         // Segment times overlap (a segment's start can precede the previous
@@ -4661,23 +6301,26 @@ public:
             value.counter = counter;
             std::memcpy(effect.destination_cpu, &value, sizeof value);
         };
-        for (const auto& effect : pending.effects) {
+        const auto apply_one = [&](const CompletionEffect& effect) {
             if (effect.kind == CompletionEffect::Kind::reset) {
                 samples_counter_ = 0;
-                continue;
+                return;
             }
             if (effect.kind == CompletionEffect::Kind::signal) {
                 auto left = effect.value;
                 if (effect.add) left = __atomic_add_fetch(effect.event, effect.value, __ATOMIC_SEQ_CST);
                 else __atomic_store_n(effect.event, effect.value, __ATOMIC_SEQ_CST);
+                const auto observe = scheduling_.observe_event_signal;
+                if (observe) observe(scheduling_.context, effect.event, pending.sequence, false);
                 // With the value this signal left, so an equal-mode wait sees
                 // it even if another signal replaces it first.
-                evaluate_holds(effect.event, left);
-                continue;
+                evaluate_holds(effect.event, left, false, pending.sequence);
+                if (observe) observe(scheduling_.context, effect.event, pending.sequence, true);
+                return;
             }
             for (auto index = effect.visibility_begin; index < effect.visibility_end; ++index)
                 samples_counter_ += visibility[index];
-            if (effect.kind != CompletionEffect::Kind::report) continue;
+            if (effect.kind != CompletionEffect::Kind::report) return;
             if (effect.segment_time) {
                 // Host seconds of the segment's start or end, on the clock
                 // sampleTimestamps' CPU values use; the completion time when
@@ -4698,14 +6341,14 @@ public:
                     ++counter_fallbacks_;
                 }
                 write_report(effect, ns, 0);
-                continue;
+                return;
             }
             MTLTimestamp cpu_after = 0, gpu_after = 0;
             [device_ sampleTimestamps:&cpu_after gpuTimestamp:&gpu_after];
             NSData* resolved = [effect.timestamp resolveCounterRange:NSMakeRange(effect.timestamp_index, 1)];
             if (!resolved || resolved.length < sizeof(MTL4TimestampHeapEntry)) {
                 execution_error_ = {ReplayErrorCode::execution, "GPU timestamp heap resolution failed"};
-                continue;
+                return;
             }
             MTL4TimestampHeapEntry entry{};
             std::memcpy(&entry, resolved.bytes, sizeof entry);
@@ -4736,6 +6379,21 @@ public:
                 ++counter_fallbacks_;
             }
             write_report(effect, ns, effect.samples ? samples_counter_ : 0);
+        };
+        // The exact policy applies effects in command order. Replay publishes
+        // report bytes, then the completion watermark, and only then the
+        // signals that can wake a CPU writer. A drain inside the encode
+        // stamps the landed prefix with fence 0 instead of moving the
+        // watermark, so a later writer in this submission stays pending.
+        if (!pending.replay_conditionals) {
+            for (const auto& effect : pending.effects) apply_one(effect);
+        } else {
+            for (const auto& effect : pending.effects)
+                if (effect.kind != CompletionEffect::Kind::signal) apply_one(effect);
+            if (publish) reports_.set_completed(pending.sequence);
+            else reports_.commit(0);
+            for (const auto& effect : pending.effects)
+                if (effect.kind == CompletionEffect::Kind::signal) apply_one(effect);
         }
         pending.effects.clear();
     }
@@ -4804,10 +6462,19 @@ private:
     }
 
     id<MTLDevice> device_ = nil;
+    bool pass_dump_enabled_ = false;
+    std::unique_ptr<PassDump> pass_dump_;
+    PoolTableCache pool_tables_;
     id<MTL4CommandQueue> queue_ = nil;
+    std::shared_ptr<Metal4SubmissionOwner> submission_owner_;
     id<MTL4Compiler> compiler_ = nil;
     std::shared_ptr<ReplayResources> resources_;
+    nvn::ConditionalReports reports_;
     const ReplaySchedulingPolicy scheduling_;
+    const bool residency_count_log_ = [] {
+        const char* value = std::getenv("ARMIGO_NVN_RESIDENCY_COUNT");
+        return value && std::string_view(value) == "1";
+    }();
     ReplayResources::LookupCounts reported_lookups_{};
     // Neither mutex is held while encoding or waiting for a GPU segment.
     mutable std::mutex mutex_;
@@ -4819,12 +6486,38 @@ private:
     ReplayState state_{};
     ReplayError last_error_{};
     ReplayStatistics statistics_{}, published_statistics_{};
+    // Guest-memory store prediction. Retirement holds fence_mutex_ and then
+    // this mutex; statistics() copies it only after releasing fence_mutex_.
+    // ARMIGO_NVN_PREDICT_GUEST_WRITES=0 keeps every storing stage a write
+    // anywhere. Any other value, including unset, predicts from learned pools.
+    mutable LearnedGuestWrites learned_{};
+    bool predict_guest_writes_ = true;
     ReplayError encoder_error_{}, execution_error_{};
+    // First abandoned submission, published before its GPU prefix drains.
+    ReplayError abandoned_error_{};
+    std::uint64_t abandoned_fence_ = 0;
     // The latest retired submission's encode warning (fence_mutex_).
     ReplayError encode_warning_{};
     std::uint64_t submit_cpu_ns_ = 0, gpu_ns_ = 0, completion_cpu_ns_ = 0;
     std::unordered_map<std::string, std::uint64_t> published_skips_;
     std::unordered_map<std::string, std::uint64_t> skips_;
+    // Configuration is immutable after construction; limiter state is guarded
+    // even though ordinary replay diagnostics are worker-owned.
+    bool mesh_diagnostics_enabled_ = false;
+    std::mutex mesh_diagnostics_mutex_;
+    std::set<std::string> mesh_diagnostics_keys_;
+    std::uint64_t mesh_diagnostics_seen_ = 0, mesh_diagnostics_duplicates_ = 0,
+                  mesh_diagnostics_truncated_ = 0;
+    struct TextureCopyResources {
+        struct Pipeline { id<MTLRenderPipelineState> state = nil; std::string error; };
+        bool library_attempted = false;
+        std::string library_error;
+        id<MTLLibrary> library = nil;
+        id<MTLFunction> vertex = nil, fragment = nil;
+        std::map<MTLPixelFormat, Pipeline> pipelines;
+        std::array<id<MTLSamplerState>, 2> samplers{};
+        id<MTL4ArgumentTable> arguments = nil;
+    } texture_copy_;
     id<MTLBuffer> zero_buffer_ = nil;
     id<MTLComputePipelineState> predicate_pipeline_ = nil;
     id<MTL4ArgumentTable> predicate_table_ = nil;
@@ -4846,12 +6539,16 @@ private:
         // The guest-memory pool table and the pool-set generation it holds.
         id<MTLBuffer> guest_table = nil;
         std::uint64_t guest_table_generation = 0;
-        std::array<id<MTL4CounterHeap>, timestamp_heap_limit> timestamps{};
     };
-    std::array<SubmissionSlot, submission_slots> submission_storage_;
+    std::array<SubmissionSlot, max_submission_slots> submission_storage_;
     // The slots no encoded, unretired submission holds (under fence_mutex_).
-    std::uint32_t free_slots_ = (1u << submission_slots) - 1;
-    // Allocations the last submission made resident: the next one's set starts that large.
+    std::uint32_t free_slots_ = 0;
+    bool slots_sized_ = false;
+    // The timestamp heap pool (under fence_mutex_) and the heaps made so far.
+    std::vector<id<MTL4CounterHeap>> timestamp_pool_;
+    std::size_t timestamp_heaps_made_ = 0;
+    // Allocations the last submission made resident: the next one reserves its
+    // resident table that large.
     std::size_t resident_hint_ = 0;
     id<MTLSamplerState> empty_sampler_ = nil;
     std::vector<std::unique_ptr<UploadArena>> upload_arenas_;
@@ -4863,6 +6560,30 @@ private:
     std::uint64_t samples_counter_ = 0;
     std::map<std::uint64_t, std::shared_ptr<PendingSubmission>> inflight_;
     std::uint64_t encode_sequence_ = 0;
+    // ARMIGO_NVN_GPUPROF, worker-owned; null when off.
+    std::unique_ptr<GpuProfile> gpu_profile_;
+    std::uint64_t last_encoded_fence_ = 0;
+    // The title's replay: core replaces the queue model and submission core
+    // in stages; a stage not yet landed runs as standard.
+    static bool core_replay() {
+        return nvn::title_policy().replay == nvn::TitlePolicy::Replay::core;
+    }
+    std::atomic<bool> replay_reported_{false};
+    SharedResidency shared_residency_;
+    struct FeedbackSnapshot {
+        std::uint64_t source = 0, submission = 0, epoch = 0, use = 0;
+        NSUInteger level = 0, slice = 0;
+        id<MTLTexture> texture = nil;
+    };
+    struct BorderCoverageImage { id<MTLTexture> texture = nil; std::uint64_t use = 0; };
+    struct BorderIdentityView { id<MTLTexture> source = nil, texture = nil; std::uint64_t use = 0; };
+    std::array<BorderCoverageImage, 8> border_coverage_;
+    std::array<BorderIdentityView, 8> border_identity_;
+    std::uint64_t border_use_ = 0;
+    std::array<FeedbackSnapshot, 8> feedback_snapshots_;
+    std::uint64_t feedback_use_ = 0;
+    std::unordered_map<const CommandSubmission*, std::weak_ptr<ResidencyCarry>> carries_;
+    std::size_t residency_sweep_retirements_ = 0;
     std::map<std::uint64_t, bool> finished_;
     struct QueuedSubmission {
         std::uint64_t fence = 0;
@@ -4885,7 +6606,45 @@ private:
         std::uint64_t wait_on = 0;
         // Leading waits already seen met when a part was held from submission.
         std::size_t passed_waits = 0;
+        std::shared_ptr<std::atomic<bool>> cpu_ready = std::make_shared<std::atomic<bool>>(false);
+        std::shared_ptr<std::atomic<bool>> capture_after;
+        std::function<void(bool)> capture;
     };
+    std::uint64_t active_cpu_fence_ = 0;
+    std::shared_ptr<std::atomic<bool>> active_cpu_ready_;
+    struct NativeResultEntry {
+        std::uintptr_t queue = 0;
+        std::shared_ptr<NativeProducerResult> result;
+        bool retired = false;
+        std::string preflight_error;
+    };
+    std::mutex native_results_mutex_;
+    std::unordered_map<std::uint64_t, NativeResultEntry> native_results_;
+    std::unordered_map<std::uintptr_t, std::uint64_t> native_latest_;
+    void collect_native_results_locked() {
+        std::erase_if(native_results_, [&](const auto& item) {
+            const auto latest = native_latest_.find(item.second.queue);
+            const bool current = latest != native_latest_.end() && latest->second == item.first;
+            return item.second.retired && !current && item.second.result.use_count() == 1;
+        });
+    }
+    void register_native_producer(std::uintptr_t queue, std::uint64_t fence) {
+        std::lock_guard lock(native_results_mutex_);
+        native_latest_[queue] = fence;
+        native_results_[fence] = {queue, std::make_shared<NativeProducerResult>(), false, {}};
+        collect_native_results_locked();
+    }
+    void finish_native_producer(std::uint64_t fence, std::string error) {
+        std::lock_guard lock(native_results_mutex_);
+        const auto found = native_results_.find(fence);
+        if (found == native_results_.end()) return;
+        if (!found->second.preflight_error.empty()) error = std::move(found->second.preflight_error);
+        found->second.result->finish(std::move(error));
+        found->second.retired = true;
+        collect_native_results_locked();
+    }
+    std::mutex native_mutex_;
+    std::vector<std::weak_ptr<Metal4NativeSubmission>> native_submissions_;
     // The queue mutex keeps both hint fields coherent when a submission captures them.
     std::uint64_t scheduling_period_ns_ = 0;
     bool preserve_encode_spin_ = false;
@@ -4898,6 +6657,9 @@ private:
         const volatile std::uint32_t* value = nullptr;
         std::int32_t mode = 0;
         std::uint32_t wait_value = 0;
+        // Captured only when this wait is first reached, in encoding order.
+        mutable std::uint64_t predecessor = 0;
+        mutable bool reached = false;
     };
     struct QueueHold {
         std::uint64_t fence = 0;
@@ -4905,6 +6667,20 @@ private:
         std::size_t passed = 0;
     };
     std::mutex hold_mutex_;
+    // The newest signal of each event word whose submission was encoded and
+    // has not retired: the value a write leaves, or an add, whose result
+    // depends on the writes before it landing. Taken after fence_mutex_ and
+    // hold_mutex_.
+    struct EncodedEventWrite {
+        const volatile std::uint32_t* event = nullptr;
+        std::uint64_t fence = 0;
+        std::uint32_t value = 0;
+        bool exact = false;
+        // Guest fences can be held and encoded out of order; sequences cannot.
+        std::uint64_t sequence = 0;
+    };
+    mutable std::mutex encoded_writes_mutex_;
+    std::vector<EncodedEventWrite> encoded_writes_;
     // By the fence of the held submission or part.
     std::unordered_map<std::uint64_t, QueueHold> holds_;
     // holds_.size() and the submissions being split (their holds not yet
@@ -4933,6 +6709,8 @@ private:
     // the program tags whose misses or task launches were reported (under
     // fence_mutex_).
     std::uint64_t guest_table_generation_ = 0;
+    // How many rebuilt tables have reported the pools left out as never addressed.
+    int guest_table_admission_logs_ = 0;
     std::vector<std::uint32_t> guest_table_words_;
     std::vector<id<MTLBuffer>> guest_table_buffers_;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> guest_table_pools_;
@@ -4976,10 +6754,19 @@ public:
             guest_table_ranges_ = std::make_shared<const std::vector<std::pair<std::uint64_t, std::uint64_t>>>(
                 std::move(merged));
             guest_table_generation_ = generation;
-            armigo::diag::write(armigo::diag::Level::info,
-                                "Armigo NVN: guest-memory table of %zu pools (%zu dropped as contained, %zu trimmed, "
-                                "%zu hint collisions)\n", built->entries, built->dropped, built->trimmed,
-                                built->hint_collisions);
+            const auto left_out = resources_->guest_memory_admission();
+            if (guest_table_admission_logs_++ < 8)
+                armigo::diag::write(armigo::diag::Level::info,
+                                    "Armigo NVN: guest-memory table of %zu pools (%zu dropped as contained, %zu trimmed, "
+                                    "%zu hint collisions); %zu pools left out as never addressed (%llu MB)\n",
+                                    built->entries, built->dropped, built->trimmed, built->hint_collisions,
+                                    left_out.omitted_pools,
+                                    static_cast<unsigned long long>(left_out.omitted_bytes >> 20));
+            else
+                armigo::diag::write(armigo::diag::Level::info,
+                                    "Armigo NVN: guest-memory table of %zu pools (%zu dropped as contained, %zu trimmed, "
+                                    "%zu hint collisions)\n", built->entries, built->dropped, built->trimmed,
+                                    built->hint_collisions);
         }
         auto& slot = submission_storage_[pending.slot];
         if (!slot.guest_table) {
@@ -5012,22 +6799,174 @@ public:
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>* guest_table_pools() const {
         return &guest_table_pools_;
     }
+    // The covered ranges of the latest guest-memory table: what a storing
+    // stage may write when no prediction applies.
+    std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> guest_table_ranges() const {
+        return guest_table_ranges_;
+    }
 
     // Hands the pools a submission's guest-memory stages wrote (its table's
     // write log) to the resources as completed writes, once the GPU has run
     // every stage that could set a bit: at retirement, or at a CPU wait inside
     // the submission, which clears the log so retirement names only later
-    // writes.
+    // writes. A storing submission also teaches the learned-pool set, including
+    // a retirement whose log the wait already cleared.
     void publish_guest_writes(const PendingSubmission& pending, bool clear) {
         if (!pending.guest_table || pending.execution_error) return;
         auto* contents = static_cast<std::byte*>(pending.guest_table.contents);
         const std::span words(reinterpret_cast<const std::uint32_t*>(contents), guest_memory_table_bytes / 4);
         const std::span log(reinterpret_cast<std::uint32_t*>(contents + guest_memory_table_bytes),
                             guest_memory_write_log_bytes / 4);
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
         visit_guest_memory_writes(words, log, [&](std::uint64_t start, std::uint64_t end) {
             resources_->note_completed_gpu_write(start, end - start);
+            written.emplace_back(start, end);
         });
         if (clear) std::ranges::fill(log, 0u);
+        if (predict_guest_writes_ && pending.guest_writes) learn_guest_writes(pending, written);
+    }
+
+    // Replaces the submission's write-anywhere ranges with the learned pools
+    // when that set has settled. False leaves the table ranges in place.
+    bool apply_guest_write_prediction(PendingSubmission& pending) {
+        if (!predict_guest_writes_) return false;
+        std::size_t learned = 0;
+        std::uint64_t logs = 0;
+        bool announce = false;
+        {
+            std::lock_guard lock(learned_.mutex);
+            if (learned_.over || learned_.stable < LearnedGuestWrites::stable_after) return false;
+            pending.guest_writes_predicted = true;
+            pending.guest_ranges = learned_.snapshot;
+            ++learned_.predicted_submissions;
+            if (!learned_.announced) {
+                learned_.announced = true;
+                announce = true;
+                learned = learned_.ranges.size();
+                logs = learned_.logs;
+            }
+        }
+        if (announce)
+            armigo::diag::write(armigo::diag::Level::info,
+                                "Armigo NVN: guest-memory stores are predicted from %zu learned pools after %llu logs\n",
+                                learned, static_cast<unsigned long long>(logs));
+        return true;
+    }
+
+    // A read that did not wait, of an address the full table covers and the
+    // learned set does not. `pending` is the submission whose prediction was
+    // relied on (this one, or an earlier one a later read skipped), and the
+    // ring records its encoding sequence.
+    void note_predicted_guest_read(const PendingSubmission& pending, std::uint64_t address,
+                                   std::uint64_t size) {
+        if (!pending.guest_writes_predicted || !size || size > UINT64_MAX - address) return;
+        if (guest_ranges_overlap(pending.guest_ranges.get(), address, size)) return;
+        if (!guest_ranges_overlap(guest_table_ranges_.get(), address, size)) return;
+        std::lock_guard lock(learned_.mutex);
+        auto& read = learned_.ring[learned_.ring_n % LearnedGuestWrites::ring_size];
+        read = {pending.sequence, address, address + size};
+        ++learned_.ring_n;
+    }
+
+    void set_learned_guest_write_cap(std::size_t cap) override {
+        std::lock_guard lock(learned_.mutex);
+        learned_.cap = cap == 0 ? LearnedGuestWrites::default_cap : cap;
+        if (learned_.ranges.size() > learned_.cap) learned_.over = true;
+    }
+
+private:
+    // One publish of a storing submission. A pool no learned range contains is
+    // added, unless the set is already at its cap, which ends prediction.
+    // Adding a pool before the set has settled restarts the count; after that,
+    // prediction continues and a read that relied on the old set is reported.
+    void learn_guest_writes(const PendingSubmission& pending,
+                            const std::vector<std::pair<std::uint64_t, std::uint64_t>>& written) {
+        int added = 0;
+        int shadowed = 0;
+        bool unchecked = false;
+        bool emit_miss = false;
+        bool miss_warning = false;
+        bool emit_over = false;
+        std::size_t learned = 0;
+        std::size_t over_cap = 0;
+        std::uint64_t logs = 0;
+        std::uint64_t misses = 0;
+        {
+            std::lock_guard lock(learned_.mutex);
+            ++learned_.logs;
+            bool became_over = false;
+            for (const auto& pool : written) {
+                if (learned_.over) break;
+                if (pool.second <= pool.first) continue;
+                bool known = false;
+                for (const auto& range : learned_.ranges)
+                    if (pool.first >= range.first && pool.second <= range.second) {
+                        known = true;
+                        break;
+                    }
+                if (known) continue;
+                if (learned_.ranges.size() == learned_.cap) {
+                    learned_.over = true;
+                    became_over = true;
+                    break;
+                }
+                if (pending.guest_writes_predicted) {
+                    const auto count = learned_.ring_n;
+                    const auto first = count > LearnedGuestWrites::ring_size
+                        ? count - LearnedGuestWrites::ring_size : 0;
+                    for (std::uint64_t index = first; index < count; ++index) {
+                        const auto& read = learned_.ring[index % LearnedGuestWrites::ring_size];
+                        if (read.sequence < pending.sequence) continue;
+                        if (pool.first < read.end && read.begin < pool.second) {
+                            ++shadowed;
+                            break;
+                        }
+                    }
+                }
+                const auto at = std::lower_bound(learned_.ranges.begin(), learned_.ranges.end(), pool.first,
+                    [](const auto& range, std::uint64_t start) { return range.first < start; });
+                learned_.ranges.insert(at, pool);
+                ++added;
+            }
+            if (added && learned_.stable < LearnedGuestWrites::stable_after) learned_.stable = 0;
+            else if (learned_.stable < std::numeric_limits<int>::max()) ++learned_.stable;
+            if (pending.guest_writes_predicted && added)
+                learned_.misses += static_cast<std::uint64_t>(added);
+            if (added)
+                learned_.snapshot = std::make_shared<const std::vector<std::pair<std::uint64_t, std::uint64_t>>>(
+                    learned_.ranges);
+            if (pending.guest_writes_predicted && added) {
+                const auto count = learned_.ring_n;
+                const auto first = count > LearnedGuestWrites::ring_size
+                    ? count - LearnedGuestWrites::ring_size : 0;
+                if (first && learned_.ring[first % LearnedGuestWrites::ring_size].sequence >= pending.sequence)
+                    unchecked = true;
+                const bool bad = shadowed || unchecked;
+                emit_miss = bad || learned_.info_lines++ < 8;
+                miss_warning = bad;
+                learned = learned_.ranges.size();
+                logs = learned_.logs;
+                misses = learned_.misses;
+            }
+            if (became_over && !learned_.over_logged) {
+                learned_.over_logged = true;
+                emit_over = true;
+                over_cap = learned_.cap;
+            }
+        }
+        if (emit_over)
+            armigo::diag::write(armigo::diag::Level::warning,
+                                "Armigo NVN: guest-memory stores wrote in more than %zu pools; they count as a write "
+                                "anywhere from now on\n", over_cap);
+        if (emit_miss) {
+            const char* suffix = shadowed ? "; a CPU read of that submission relied on one"
+                : unchecked ? "; the read record had wrapped, so not all could be checked" : "";
+            armigo::diag::write(miss_warning ? armigo::diag::Level::warning : armigo::diag::Level::info,
+                                "Armigo NVN: guest-memory stores wrote in %d pool(s) the host had not learned "
+                                "(log %llu, %llu such pools so far, %zu learned)%s\n",
+                                added, static_cast<unsigned long long>(logs),
+                                static_cast<unsigned long long>(misses), learned, suffix);
+        }
     }
 
 private:
@@ -5039,12 +6978,20 @@ private:
         if (!pending.guest_table) return;
         const auto* words = static_cast<const std::uint32_t*>(pending.guest_table.contents);
         if (!words[5] || !reported_guest_misses_.insert(words[2]).second) return;
-        armigo::diag::write(armigo::diag::Level::warning,
-                            "Armigo NVN: program %08x read or wrote guest memory outside every pool, first at "
-                            "%#llx (%u misses in the submission, by any program); those accesses read zero and drop stores\n",
-                            words[2], static_cast<unsigned long long>(std::uint64_t(words[3]) |
-                                                                     std::uint64_t(words[4]) << 32),
-                            words[1]);
+        const auto first = std::uint64_t(words[3]) | std::uint64_t(words[4]) << 32;
+        if (resources_->address_in_unaddressed_pool(first))
+            armigo::diag::write(armigo::diag::Level::warning,
+                                "Armigo NVN: program %08x read or wrote guest memory outside every pool, first at "
+                                "%#llx (%u misses in the submission, by any program); it fell in an unaddressed pool, "
+                                "so those accesses read zero and drop stores\n",
+                                words[2], static_cast<unsigned long long>(first), words[1]);
+        else
+            armigo::diag::write(armigo::diag::Level::warning,
+                                "Armigo NVN: program %08x read or wrote guest memory outside every pool, first at "
+                                "%#llx (%u misses in the submission, by any program); those accesses read zero and drop stores;"
+                                "%s\n",
+                                words[2], static_cast<unsigned long long>(first), words[1],
+                                resources_->describe_guest_address(first).c_str());
     }
 
     // Reports a task workgroup that asked for more mesh workgroups than Metal
@@ -5093,12 +7040,14 @@ private:
         std::vector<std::size_t> starts;
         std::vector<std::pair<std::size_t, SyncState*>> syncs;
     };
-    static SubmissionSplit split_at_unmet_waits(const CommandSubmission& submission) {
+    SubmissionSplit split_at_unmet_waits(const CommandSubmission& submission) const {
         struct Scan {
+            const ReplayImpl* self = nullptr;
             SubmissionSplit split;
             std::size_t index = 0;
             bool work = false, in_split_waits = false;
         } scan;
+        scan.self = this;
         static_cast<void>(walk_commands(submission, [](const CommandRecordView& record, void* context) {
             auto& scan = *static_cast<Scan*>(context);
             const auto at = scan.index++;
@@ -5120,7 +7069,7 @@ private:
             if (!scan.work || scan.in_split_waits || !command.value ||
                 (command.mode != NVN_EVENT_WAIT_MODE_EQUAL && command.mode != NVN_EVENT_WAIT_MODE_GEQUAL_WRAP))
                 return true;
-            if (!wait_met({command.value, command.mode, command.wait_value})) {
+            if (!scan.self->wait_met({command.value, command.mode, command.wait_value})) {
                 scan.split.starts.push_back(at);
                 scan.in_split_waits = true;
             }
@@ -5134,21 +7083,69 @@ private:
             : std::int32_t(value - wait.wait_value) >= 0;
     }
 
-    static bool wait_met(const LeadingWait& wait) {
-        return wait_met_by(wait, __atomic_load_n(wait.value, __ATOMIC_SEQ_CST));
+    // The newest encoded, unretired signal of `event`, if any: it runs
+    // before work encoded later, so it decides what such work sees.
+    std::optional<EncodedEventWrite> newest_encoded_write(const volatile std::uint32_t* event) const {
+        std::lock_guard lock(encoded_writes_mutex_);
+        const auto found = std::ranges::find(encoded_writes_, event, &EncodedEventWrite::event);
+        if (found == encoded_writes_.end()) return std::nullopt;
+        return *found;
+    }
+
+    // Whether a wait is met once a signal left `value` in its event. A newer
+    // encoded writer of the event still runs before the waiting work, so it
+    // decides; an add's result is known only when it lands. CPU memory is
+    // not evidence that a pending writer has yet to execute: its deferred
+    // completion effect may still be waiting for retirement.
+    bool met_after(const LeadingWait& wait, std::uint32_t value,
+                   std::uint64_t publishing_sequence = 0) const {
+        // A GPU signal from the writer this wait reached, or one encoded
+        // after it, latches the parked wait. A later writer cannot erase
+        // that pulse merely by having been encoded in the meantime.
+        if (publishing_sequence && publishing_sequence >= wait.predecessor)
+            return wait_met_by(wait, value);
+        // Encode-time release still uses the newest pending exact write.
+        if (const auto write = newest_encoded_write(wait.value))
+            return write->exact && wait_met_by(wait, write->value);
+        return wait_met_by(wait, value);
+    }
+
+    // Met by the newest encoded write of the event, which the queue runs
+    // before anything encoded after it, or without one by the value in
+    // memory.
+    bool wait_met(const LeadingWait& wait) const {
+        // Read the pending writer and CPU word as one snapshot. Loading the
+        // word before this lock could carry an old value past retirement.
+        std::lock_guard lock(encoded_writes_mutex_);
+        const auto write = std::ranges::find(encoded_writes_, wait.value, &EncodedEventWrite::event);
+        const bool first = !wait.reached;
+        if (first) {
+            wait.predecessor = write == encoded_writes_.end() ? 0 : write->sequence;
+            wait.reached = true;
+        }
+        const bool met = write != encoded_writes_.end()
+            ? write->exact && wait_met_by(wait, write->value)
+            : wait_met_by(wait, __atomic_load_n(wait.value, __ATOMIC_SEQ_CST));
+        if (first && !met && scheduling_.observe_event_wait)
+            scheduling_.observe_event_wait(scheduling_.context, wait.value, wait.wait_value, wait.predecessor);
+        return met;
     }
 
     // Passes the waits that are met now, in record order (hold_mutex_ held).
     // Returns whether all are passed.
-    static bool advance_hold(QueueHold& hold) {
+    bool advance_hold(QueueHold& hold) const {
         while (hold.passed < hold.waits.size() && wait_met(hold.waits[hold.passed])) ++hold.passed;
         return hold.passed == hold.waits.size();
     }
 
     // Re-evaluates every held queue right after a signal left `value` in
     // `event`. A wait on that event is judged by the value the signal left,
-    // not by a later store's; the waits after it read their events now.
-    void evaluate_holds(const volatile std::uint32_t* event, std::uint32_t value) {
+    // not by a later store's; the waits after it read their events now. A
+    // CPU signal releases a held queue's wait on its own value even with an
+    // encoded write of the event still pending: the queue is parked at the
+    // wait and sees the value before that write lands.
+    void evaluate_holds(const volatile std::uint32_t* event, std::uint32_t value, bool cpu = false,
+                        std::uint64_t publishing_sequence = 0) {
         // A submission being split may be about to hold on this event: its
         // read of the event and this signal's store are ordered, so either
         // the read saw the store or this evaluation waits for its holds.
@@ -5158,7 +7155,9 @@ private:
             std::lock_guard hold(hold_mutex_);
             for (auto& [fence, held] : holds_) {
                 if (held.passed == held.waits.size()) continue;
-                if (held.waits[held.passed].value == event && wait_met_by(held.waits[held.passed], value))
+                if (held.waits[held.passed].value == event &&
+                    (cpu ? wait_met_by(held.waits[held.passed], value)
+                         : met_after(held.waits[held.passed], value, publishing_sequence)))
                     ++held.passed;
                 if (advance_hold(held)) released = true;
             }
@@ -5170,7 +7169,8 @@ private:
     }
 
     static void cpu_event_signaled(void* context, const volatile std::uint32_t* event, std::uint32_t value) noexcept {
-        static_cast<ReplayImpl*>(context)->evaluate_holds(event, value);
+        auto& self = *static_cast<ReplayImpl*>(context);
+        self.evaluate_holds(event, value, true);
     }
 
     // Picks the first queued submission that may be encoded now (mutex_
@@ -5181,6 +7181,12 @@ private:
     bool pick_locked(QueuedSubmission& item, std::size_t& passed_waits) {
         std::vector<std::uintptr_t> blocked;
         for (auto it = queued_.begin(); it != queued_.end(); ++it) {
+            if (it->capture) {
+                if (it->capture_after && !it->capture_after->load(std::memory_order_acquire)) continue;
+                item = std::move(*it);
+                queued_.erase(it);
+                return true;
+            }
             if (!it->frame_boundary) {
                 const auto skip = [&] { blocked.push_back(it->queue); };
                 if (std::ranges::find(blocked, it->queue) != blocked.end()) {
@@ -5319,6 +7325,9 @@ private:
     // Open (color-unspecialized) forms a capturing build has compiled.
     std::unordered_set<std::string> captured_open_;
     std::mutex archive_mutex_;
+    // Guarded by archive_keys_mutex_: see PipelineWarmupReport.
+    std::mutex archive_keys_mutex_;
+    std::vector<std::string> unarchived_keys_, warmup_missed_keys_;
     // Capturing compiles hold it shared; a flush holds it alone.
     std::shared_mutex capture_mutex_;
     std::atomic<std::uint64_t> captures_since_flush_{0};
@@ -5402,7 +7411,8 @@ bool EncodeThread::exec(const EncodeRing::Header& header, const void* payload) {
         }
         [owner_->encode_retained addObject:commands_];
         [commands_ beginCommandBufferWithAllocator:owner_->allocator];
-        [commands_ useResidencySet:owner_->residency];
+        if (owner_->count_residency) owner_->command_residency_sets.clear();
+        use_residency_set(*owner_, commands_, owner_->shared_residency->set());
         break;
     case EncodeOp::end_commands:
         [commands_ endCommandBuffer];
@@ -5410,19 +7420,23 @@ bool EncodeThread::exec(const EncodeRing::Header& header, const void* payload) {
         owner_ = nullptr;
         owned_.reset();
         break;
+    case EncodeOp::upload_commit: {
+        std::unique_ptr<std::function<void()>> commit(record_value<std::function<void()>*>(payload));
+        (*commit)();
+        break;
+    }
     case EncodeOp::commit: {
         const auto record = record_value<CommitRecord>(payload);
         const auto scheduling_period_ns = record.owner->scheduling_period_ns;
         const auto kind = static_cast<SegmentKind>(argument);
-        MTL4CommitOptions* options = (__bridge_transfer MTL4CommitOptions*)record.options;
-        backend_.commit_now(*record.owner, commands_, options, record.segment, kind,
-                            (__bridge id<MTLEvent>)record.upload_event, record.upload_value);
+        Metal4Completion completion = (__bridge_transfer Metal4Completion)record.completion;
+        backend_.commit_now(*record.owner, commands_, completion, record.segment, kind, record.publication);
         commands_ = nil;
         owner_ = nullptr;
         owned_.reset();
         if (kind == SegmentKind::final) {
             idle_ = true;
-            options = nil;
+            completion = nil;
             if (pool_) objc_autoreleasePoolPop(pool_);
             pool_ = nullptr;
             const auto now = thread_cpu_ns();
@@ -5432,14 +7446,15 @@ bool EncodeThread::exec(const EncodeRing::Header& header, const void* payload) {
         }
         break;
     }
-    case EncodeOp::resident: {
+    case EncodeOp::residency_set: {
         const auto record = record_value<ResidentRecord>(payload);
-        [record.owner->residency addAllocation:(__bridge id<MTLAllocation>)record.allocation];
+        if (commands_)
+            use_residency_set(*owner_, commands_, (__bridge id<MTLResidencySet>)record.allocation);
         break;
     }
     case EncodeOp::call: {
         EncodeCall call = (__bridge_transfer EncodeCall)record_value<void*>(payload);
-        EncodeCallContext context{commands_, owner_ ? owner_->residency : nil,
+        EncodeCallContext context{commands_, owner_ ? call_residency(*owner_, commands_) : nil,
                                   owner_ ? owner_->encode_retained : nil, {}};
         call(context);
         if (!context.error.empty()) report(context.error.c_str());
@@ -5668,6 +7683,17 @@ bool EncodeThread::exec(const EncodeRing::Header& header, const void* payload) {
         [commands_ writeTimestampIntoHeap:(__bridge id<MTL4CounterHeap>)record.heap atIndex:record.index];
         break;
     }
+    case EncodeOp::profile_stamp: {
+        // Bits 0/1 select render/end; higher bits carry the begin stage.
+        const auto record = record_value<TimestampRecord>(payload);
+        auto* heap = (__bridge id<MTL4CounterHeap>)record.heap;
+        if (argument & 1u)
+            GpuProfile::stamp_render((id<MTL4RenderCommandEncoder>)encoder_, heap, record.index, argument & 2u,
+                                     static_cast<MTLRenderStages>(argument >> 2));
+        else
+            GpuProfile::stamp_compute((id<MTL4ComputeCommandEncoder>)encoder_, heap, record.index);
+        break;
+    }
     case EncodeOp::render_timestamp: {
         const auto record = record_value<TimestampRecord>(payload);
         [render writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed afterStage:MTLRenderStageFragment
@@ -5837,11 +7863,6 @@ bool configure_color_attachments(MTL4RenderPipelineColorAttachmentDescriptorArra
     return true;
 }
 
-// A mesh draw's pipeline, compiled on the replay worker at its first use and
-// kept for the key: the task stage as the object function (when the program
-// has one), the mesh stage, the fragment stage, and the threadgroup sizes and
-// payload their launches declare. Pipeline archives and look-ahead do not
-// cover mesh pipelines yet.
 // The fragment function of a pipeline key, specialized with the function
 // constants its stage declares.
 MTL4SpecializedFunctionDescriptor* fragment_function(const DrawPipelineKey& key, id<MTLLibrary> library) {
@@ -5858,9 +7879,15 @@ MTL4SpecializedFunctionDescriptor* fragment_function(const DrawPipelineKey& key,
         bool enabled = false;
         [constants setConstantValue:&enabled type:MTLDataTypeBool atIndex:8];
     }
-    // The replay binds disabled custom-border records (see bind_stage).
+    if (key.fragment->consumes_y_direction) {
+        // Native fragment coordinates use the upper-left Metal convention.
+        // An omitted function constant does not provide a library default.
+        const bool negate = false;
+        [constants setConstantValue:&negate type:MTLDataTypeBool atIndex:9];
+    }
+    // Reflected coverage records are populated for each admitted sampling pair.
     if (key.fragment->custom_border) {
-        bool records = false;
+        bool records = true;
         [constants setConstantValue:&records type:MTLDataTypeBool atIndex:12];
     }
     auto* specialized = [MTL4SpecializedFunctionDescriptor new];
@@ -5874,11 +7901,64 @@ NativePipeline* ReplayImpl::mesh_pipeline(const MeshPipelineKey& key,
                                           std::shared_ptr<const platform::CompiledGraphicsStage> mesh,
                                           std::shared_ptr<const platform::CompiledGraphicsStage> fragment,
                                           std::string& detail) {
+    created_pipeline_ = false;
     const std::string bytes(reinterpret_cast<const char*>(&key), sizeof key);
     if (const auto found = mesh_pipelines_.find(bytes); found != mesh_pipelines_.end()) {
-        if (!found->second->compile->wait()) detail = "mesh draw pipeline failed to compile";
-        return found->second->compile->wait() ? found->second.get() : nullptr;
+        if (!found->second->compile->wait()) {
+            detail = "mesh draw pipeline failed to compile";
+            return nullptr;
+        }
+        return found->second.get();
     }
+    const bool recording = recorder_ && recorder_->enabled();
+    auto effective_mesh = mesh;
+    if ((warm_ || recording) && fragment) {
+#ifdef ARMIGO_HAS_NATIVE_SHADERS
+        effective_mesh = nvn::mesh_stage_for(mesh, *fragment, detail);
+        if (!effective_mesh) return nullptr;
+#endif
+    }
+    auto recorded_key = key;
+    recorded_key.draw.vertex = effective_mesh.get();
+    const auto row = warm_ || recording ? mesh_pipeline_row(recorded_key) : std::nullopt;
+    // Record before first use can wait on the compiler, so a slow first draw
+    // still teaches the next launch which task/mesh pipeline to prepare.
+    if (recording && row) {
+        if (task) recorder_->note({'S', {row->fields[0]}});
+        recorder_->note({'S', {row->fields[1]}});
+        if (fragment) recorder_->note({'S', {row->fields[2]}});
+        recorder_->note(*row);
+    }
+    std::unique_ptr<NativePipeline> built;
+    if (warm_ && row) built = warm_->take_render(row->text());
+    const bool warmed = built != nullptr;
+    if (!built) built = build_mesh_pipeline(key, task, mesh, fragment, detail);
+    if (!built) return nullptr;
+    // The warmed pipeline may retain package-loaded stages with different
+    // addresses. Keep the runtime stages named by the pointer cache key too.
+    built->mesh_source_stage = std::move(mesh);
+    built->task_stage = std::move(task);
+    built->fragment_stage = std::move(fragment);
+    ++statistics_.graphics_pipelines;
+    created_pipeline_ = !warmed;
+    auto* pointer = built.get();
+    const bool ready = pointer->compile->wait() != nil;
+    mesh_pipelines_.emplace(bytes, std::move(built));
+    if (!ready) detail = "mesh draw pipeline failed to compile";
+    return ready ? pointer : nullptr;
+}
+
+std::unique_ptr<NativePipeline> ReplayImpl::build_mesh_pipeline(const MeshPipelineKey& key,
+                                          std::shared_ptr<const platform::CompiledGraphicsStage> task,
+                                          std::shared_ptr<const platform::CompiledGraphicsStage> mesh,
+                                          std::shared_ptr<const platform::CompiledGraphicsStage> fragment,
+                                          std::string& detail) {
+    if (!mesh || !mesh->mesh || mesh.get() != key.draw.vertex || task.get() != key.task ||
+        fragment.get() != key.draw.fragment || (task && !task->task)) {
+        detail = "mesh pipeline stages differ from its key or lack launch facts";
+        return nullptr;
+    }
+    auto source_mesh = mesh;
     // The mesh stage as its fragment stage reads it: Metal links each
     // fragment input to a mesh output.
     if (fragment) {
@@ -5894,10 +7974,11 @@ NativePipeline* ReplayImpl::mesh_pipeline(const MeshPipelineKey& key,
     }
     auto result = std::make_unique<NativePipeline>();
     result->vertex_slots.fill(-1);
+    result->mesh_source_stage = std::move(source_mesh);
+    result->task_stage = task;
     result->vertex_stage = mesh;
     result->fragment_stage = fragment;
-    id<MTLLibrary> task_library = nil;
-    if (task && !(task_library = stage_library(task, detail))) return nullptr;
+    if (task && !(result->task_library = stage_library(task, detail))) return nullptr;
     result->vertex_library = stage_library(mesh, detail);
     if (!result->vertex_library) return nullptr;
     if (fragment && !(result->fragment_library = stage_library(fragment, detail))) return nullptr;
@@ -5909,7 +7990,7 @@ NativePipeline* ReplayImpl::mesh_pipeline(const MeshPipelineKey& key,
     };
     auto* descriptor = [MTL4MeshRenderPipelineDescriptor new];
     if (task) {
-        descriptor.objectFunctionDescriptor = function(task_library, task->entry_point);
+        descriptor.objectFunctionDescriptor = function(result->task_library, task->entry_point);
         const auto& size = task->task->local_size;
         descriptor.maxTotalThreadsPerObjectThreadgroup = size[0] * size[1] * size[2];
         // Metal sizes the payload in 16-byte units; the task stage sets its
@@ -5926,11 +8007,32 @@ NativePipeline* ReplayImpl::mesh_pipeline(const MeshPipelineKey& key,
     descriptor.alphaToCoverageState = key.draw.alpha_to_coverage
         ? MTL4AlphaToCoverageStateEnabled : MTL4AlphaToCoverageStateDisabled;
     if (!configure_color_attachments(descriptor.colorAttachments, key.draw, detail)) return nullptr;
-    NSError* error = nil;
-    id<MTLRenderPipelineState> state = [compiler_ newRenderPipelineStateWithDescriptor:descriptor
-                                                                  compilerTaskOptions:nil
-                                                                                error:&error];
     result->compile = std::make_shared<PipelineCompile>();
+    if (NSArray* archives = loaded_archives()) {
+        const auto lookup_begin = timeline_now_ns();
+        for (id<MTL4Archive> archive in archives) {
+            if (id<MTLRenderPipelineState> state = [archive newRenderPipelineStateWithDescriptor:descriptor error:nil]) {
+                ++archive_hits_;
+                timeline_event("pso_archive_hit", 0, timeline_now_ns() - lookup_begin);
+                result->compile->finish(state, {});
+                return result;
+            }
+        }
+    }
+    const std::string stages = (task ? task->identity : "-") + " " + mesh->identity;
+    if (archive_lookup_.load(std::memory_order_acquire))
+        note_archive_miss(0, stages, fragment ? fragment->identity : "-");
+    const auto compile_begin = timeline_now_ns();
+    NSError* error = nil;
+    const auto create = [&] {
+        return [compiler_ newRenderPipelineStateWithDescriptor:descriptor
+                                         compilerTaskOptions:task_options_ error:&error];
+    };
+    // Capture synchronously, as render/compute pipelines do: the serializer
+    // cannot safely record asynchronous compiles. No shared replay cache is
+    // modified here, so the warm-up may call this factory on its threads.
+    id<MTLRenderPipelineState> state = serializer_ ? capture(create) : create();
+    timeline_event("pso_compiled", 0, timeline_now_ns() - compile_begin);
     result->compile->finish(state, state ? std::string{}
         : std::string("mesh draw pipeline failed to compile: ") +
             (error ? error.localizedDescription.UTF8String : "unknown error"));
@@ -5939,9 +8041,7 @@ NativePipeline* ReplayImpl::mesh_pipeline(const MeshPipelineKey& key,
         armigo::diag::write(armigo::diag::Level::warning, "Armigo NVN: %s: %s\n", detail.c_str(),
                             error ? error.localizedDescription.UTF8String : "unknown error");
     }
-    auto* pointer = result.get();
-    mesh_pipelines_.emplace(bytes, std::move(result));
-    return state ? pointer : nullptr;
+    return result;
 }
 
 // Builds the pipeline for a key and starts its compile. Safe off the replay
@@ -5976,10 +8076,13 @@ std::unique_ptr<NativePipeline> ReplayImpl::build_pipeline(
 
     auto* vertex = [MTL4LibraryFunctionDescriptor new];
     vertex.library = result.vertex_library;
-    vertex.name = [NSString stringWithUTF8String:key.vertex->entry_point.c_str()];
+    const auto& vertex_entry = key.rasterizer_discard && !key.vertex->discard_entry_point.empty()
+        ? key.vertex->discard_entry_point : key.vertex->entry_point;
+    vertex.name = [NSString stringWithUTF8String:vertex_entry.c_str()];
     auto* descriptor = [MTL4RenderPipelineDescriptor new];
     descriptor.vertexFunctionDescriptor = vertex;
-    if (key.fragment) descriptor.fragmentFunctionDescriptor = fragment_function(key, result.fragment_library);
+    if (key.fragment && !key.rasterizer_discard)
+        descriptor.fragmentFunctionDescriptor = fragment_function(key, result.fragment_library);
     descriptor.rasterizationEnabled = !key.rasterizer_discard;
     // Metal refuses a point-size export with a triangle or line topology
     // class but accepts it with the class unspecified.
@@ -5999,6 +8102,14 @@ std::unique_ptr<NativePipeline> ReplayImpl::build_pipeline(
         for (const auto& binding : key.vertex->constant_buffers) reserve(binding.metal_buffer_index);
         for (const auto& binding : key.vertex->constant_buffer_windows) reserve(binding.metal_buffer_index);
         for (const auto& binding : key.vertex->storage_buffers) reserve(binding.metal_buffer_index);
+        for (const auto& resource : key.vertex->resources) {
+            if (resource.kind != platform::CompiledShaderResourceKind::TexturePool &&
+                resource.kind != platform::CompiledShaderResourceKind::SamplerPool)
+                continue;
+            if (resource.location.kind == platform::CompiledShaderResourceLocationKind::Direct &&
+                resource.location.resource_namespace == platform::CompiledShaderResourceNamespace::Buffer)
+                reserve(resource.location.first);
+        }
         if (key.vertex->constant_buffer_support_index) reserve(*key.vertex->constant_buffer_support_index);
         if (key.vertex->draw_support_buffer_index) reserve(*key.vertex->draw_support_buffer_index);
         if (key.vertex->argument_buffer) reserve(key.vertex->argument_buffer->buffer_index);
@@ -6149,9 +8260,12 @@ std::unique_ptr<NativePipeline> ReplayImpl::build_pipeline(
     // A capturing build also archives the open form.
     if (open && serializer_) {
         std::string failure;
-        if (!capture_open_form(key, open, failure))
+        if (!capture_open_form(key, open, failure)) {
             armigo::diag::write(armigo::diag::Level::info,  "Armigo NVN: open form not archived (%s %s): %s\n", key.vertex->identity.c_str(),
                          key.fragment->identity.c_str(), failure.c_str());
+            const std::lock_guard lock(archive_keys_mutex_);
+            unarchived_keys_.push_back(key.vertex->identity + " " + key.fragment->identity);
+        }
     }
     const auto compile_begin = timeline_now_ns();
     // Metal's asynchronous compiles fail inside the compiler service while a
@@ -6316,6 +8430,7 @@ bool Encoder::flush_clears(std::size_t count) {
 // fails its command, and the Metal work runs there.
 bool Encoder::encode_planned_clear(const graphics::ClearPlan& plan, ClearBindings bindings,
                                    const char* prefix) {
+    note_clear(true);
     if (queue) {
         const auto checked = validate_clear(plan, bindings);
         if (const auto* failure = std::get_if<graphics::RendererError>(&checked))
@@ -6392,6 +8507,7 @@ bool Encoder::apply_clears(MTL4RenderPassDescriptor* pass) {
         [&](std::size_t index) { return foldable(deferred_clears[index]); });
     if (landing && !flush_clears(landing)) return false;
     for (const auto& clear : deferred_clears) {
+        note_clear(false);
         if (clear.plan.color_mask) {
             const auto values = metal_clear_color(clear.plan.color_bits, clear.plan.target.texture.format);
             const auto* color = std::get_if<std::array<double, 4>>(&values);
@@ -6434,10 +8550,115 @@ void Encoder::trace_pass_event(const char* event, const char* reason,
         static_cast<unsigned long long>(c), static_cast<unsigned long long>(d));
 }
 
+// Labels an encoder the profiled frame opens and stamps its start; `encoder`
+// is nil when the encode thread makes it, which then stamps it.
+int Encoder::profile_begin(char kind, MTL4RenderPassDescriptor* pass, id encoder) {
+    auto* profile = backend.gpu_profile();
+    if (!profile) return -1;
+    GpuProfile::Label label;
+    label.kind = kind;
+    if (kind == 'R') {
+        const auto& task = state.stage_programs[NVN_SHADER_STAGE_TESS_CONTROL];
+        const auto* stage = task ? task->stages[NVN_SHADER_STAGE_TESS_CONTROL].get() : nullptr;
+        label.begin_stage = mesh_draw ? (stage && stage->task ? MTLRenderStageObject : MTLRenderStageMesh)
+                                      : MTLRenderStageVertex;
+    }
+    label.fence = pending.fence;
+    label.segment = static_cast<std::uint32_t>(pending.segments_committed);
+    label.pass = pending.counters.passes;
+    label.draws = pending.counters.draws;
+    label.dispatches = pending.counters.dispatches;
+    label.fills = pending.counters.fill_calls;
+    const auto stage_identity = [&](std::size_t stage) -> const std::string* {
+        const auto& program = state.stage_programs[stage];
+        const auto* shader = program ? program->stages[stage].get() : nullptr;
+        return shader && !shader->identity.empty() ? &shader->identity : nullptr;
+    };
+    const std::string* identity = nullptr;
+    if (kind == 'R') {
+        for (const auto stage : {NVN_SHADER_STAGE_FRAGMENT, NVN_SHADER_STAGE_TESS_EVALUATION, NVN_SHADER_STAGE_VERTEX})
+            if (!identity) identity = stage_identity(stage);
+    } else if (kind == 'C') {
+        identity = stage_identity(NVN_SHADER_STAGE_COMPUTE);
+    }
+    if (identity)
+        std::snprintf(label.program.data(), label.program.size(), "%s", identity->c_str());
+    if (kind == 'R') {
+        const auto* geometry = stage_identity(NVN_SHADER_STAGE_TESS_EVALUATION);
+        if (!geometry) geometry = stage_identity(NVN_SHADER_STAGE_VERTEX);
+        if (geometry) std::snprintf(label.geometry.data(), label.geometry.size(), "%s", geometry->c_str());
+    }
+    if (pass) {
+        for (NSUInteger index = 0; index < 8; ++index) {
+            id<MTLTexture> texture = pass.colorAttachments[index].texture;
+            if (!texture) continue;
+            ++label.colors;
+            label.width = static_cast<std::uint32_t>(std::max<NSUInteger>(texture.width >> pass.colorAttachments[index].level, 1));
+            label.height = static_cast<std::uint32_t>(std::max<NSUInteger>(texture.height >> pass.colorAttachments[index].level, 1));
+        }
+        if (id<MTLTexture> depth = pass.depthAttachment.texture) {
+            label.depth = true;
+            label.width = static_cast<std::uint32_t>(std::max<NSUInteger>(depth.width >> pass.depthAttachment.level, 1));
+            label.height = static_cast<std::uint32_t>(std::max<NSUInteger>(depth.height >> pass.depthAttachment.level, 1));
+        }
+    }
+    const int slot = profile->begin(label);
+    if (slot < 0) return -1;
+    const auto index = std::size_t(slot) * GpuProfile::timestamp_slots;
+    if (queue)
+        queue->put(EncodeOp::profile_stamp, kind == 'R' ? 1u | (std::uint32_t(label.begin_stage) << 2) : 0u,
+                   TimestampRecord{(__bridge void*)profile->heap(), index});
+    else if (kind == 'R')
+        GpuProfile::stamp_render((id<MTL4RenderCommandEncoder>)encoder, profile->heap(), index, false,
+                                 label.begin_stage);
+    else
+        GpuProfile::stamp_compute((id<MTL4ComputeCommandEncoder>)encoder, profile->heap(), index);
+    return slot;
+}
+
+int Encoder::profile_call(int slot) {
+    auto* profile = backend.gpu_profile();
+    if (!profile) return -1;
+    std::size_t index = 0;
+    if (slot < 0) {
+        GpuProfile::Label label;
+        label.kind = 'X';
+        label.fence = pending.fence;
+        label.segment = static_cast<std::uint32_t>(pending.segments_committed);
+        label.pass = pending.counters.passes;
+        slot = profile->begin(label);
+        if (slot < 0) return -1;
+        index = std::size_t(slot) * GpuProfile::timestamp_slots;
+    } else {
+        profile->mark_call_end(slot);
+        index = std::size_t(slot) * GpuProfile::timestamp_slots + 1;
+    }
+    if (queue) queue->put(EncodeOp::timestamp, 0, TimestampRecord{(__bridge void*)profile->heap(), index});
+    else [pending.commands writeTimestampIntoHeap:profile->heap() atIndex:index];
+    return slot;
+}
+
+void Encoder::profile_end(int& slot, char kind, id encoder) {
+    if (slot < 0) return;
+    auto* profile = backend.gpu_profile();
+    if (!profile) return;
+    profile->end(slot, pending.counters.draws, pending.counters.dispatches, pending.counters.fill_calls);
+    const auto index = std::size_t(slot) * GpuProfile::timestamp_slots + 1;
+    if (queue)
+        queue->put(EncodeOp::profile_stamp, kind == 'R' ? 3u : 0u, TimestampRecord{(__bridge void*)profile->heap(), index});
+    else if (kind == 'R')
+        GpuProfile::stamp_render((id<MTL4RenderCommandEncoder>)encoder, profile->heap(), index, true);
+    else
+        GpuProfile::stamp_compute((id<MTL4ComputeCommandEncoder>)encoder, profile->heap(), index);
+    slot = -1;
+}
+
 bool Encoder::close_render(PassBreak why, bool keep_clears) {
     if (render) {
         trace_pass_event("end", pass_break_names[std::size_t(why)]);
         finalized_visibility = visibility_cursor;
+        if (why == PassBreak::depth_sampled)
+            ++backend.mutable_statistics().pass_break_depth_sampled;
         note_pass_break(why);
         // Why a pass ended is what decides whether two passes with the same
         // attachments could have been one encoder.
@@ -6451,13 +8672,19 @@ bool Encoder::close_render(PassBreak why, bool keep_clears) {
                          unsigned(current_op_), unsigned(pending.counters.passes));
         if (std::exchange(pass_relaxed, false)) ++backend.mutable_statistics().relaxed_pass_barriers;
         relaxed_producer = game_barriers();
+        profile_end(profile_render, 'R', render);
         end_encoder(render, MTLStageAll, relaxed_producer);
         after_render_pass = !pass_storage_writes;
         render = nil;
+        feedback_written = feedback_direct_reads = 0;
+        feedback_depth_written = feedback_depth_direct_reads = false;
+        if (backend.pass_dump_enabled() && backend.pass_dump_wants(backend.pool_present_count()))
+            dump_render_pass(why);
         pass_depth_only = true;
         depth_barrier_allocation = nil;
         depth_barrier_reads = false;
         depth_omitted = false;
+        attachmentless_pass = false;
         if (!copy_block_aliases(false)) return false;
         block_aliases.fill({});
         fixed_valid = 0;
@@ -6471,8 +8698,241 @@ bool Encoder::close_render(PassBreak why, bool keep_clears) {
     return keep_clears || flush_clears();
 }
 
+namespace {
+
+std::string stage_label(const platform::CompiledGraphicsStage* shader) {
+    if (!shader) return "-";
+    if (!shader->identity.empty()) return shader->identity;
+    if (!shader->entry_point.empty()) return shader->entry_point;
+    return "?";
+}
+
+bool dump_input_shader_matches(const platform::CompiledGraphicsStage* shader, std::string_view filters) {
+    if (filters.empty()) return true;
+    if (!shader) return false;
+    while (!filters.empty()) {
+        const auto comma = filters.find(',');
+        const auto filter = filters.substr(0, comma);
+        if (!filter.empty() && shader->identity.find(filter) != std::string::npos) return true;
+        if (comma == std::string_view::npos) break;
+        filters.remove_prefix(comma + 1);
+    }
+    return false;
+}
+
+void append_attachment(std::string& text, const PassDumpImage& image) {
+    if (!text.empty()) text += ' ';
+    text += image.kind;
+    text += ':';
+    text += std::to_string(image.serial);
+    text += ':';
+    text += image.format.empty() ? "?" : image.format;
+    text += ':';
+    text += std::to_string(image.width);
+    text += 'x';
+    text += std::to_string(image.height);
+    char native[48];
+    std::snprintf(native, sizeof native, ":native_id:%#llx", static_cast<unsigned long long>(image.native_id));
+    text += native;
+    std::snprintf(native, sizeof native, ":root_id:%#llx", static_cast<unsigned long long>(image.native_root_id));
+    text += native;
+}
+
+} // namespace
+
+std::vector<std::string> Encoder::dump_binding_metadata(std::size_t stage) const {
+    std::vector<std::string> rows;
+    const auto& bound = bindings[stage];
+    const auto take = [&](const auto& slots, const char* kind) {
+        for (std::size_t index = 0; index < slots.size(); ++index) {
+            const auto& value = slots[index];
+            if (!value.present) continue;
+            char text[192];
+            std::snprintf(text, sizeof text,
+                "binding submission_draw=%llu stage=%zu kind=%s index=%zu gpu=%#llx stride=%u",
+                static_cast<unsigned long long>(pending.counters.draws), stage, kind, index,
+                static_cast<unsigned long long>(value.value), value.stride);
+            rows.emplace_back(text);
+        }
+    };
+    take(bound.buffers, "buffer");
+    take(bound.textures, "texture");
+    take(bound.samplers, "sampler");
+    return rows;
+}
+
+void Encoder::dump_render_pass(PassBreak why) {
+    auto reads = std::exchange(render_dump_reads, {});
+    auto draws = std::exchange(render_dump_draws, {});
+    auto inputs = std::exchange(render_dump_textures, {});
+    auto buffers = std::exchange(render_dump_buffers, {});
+    auto& dump = backend.pass_dump();
+    if (dump.stopped() || !dump.ensure_directory() || !render_descriptor) return;
+    PassDumpLine line;
+    line.directory = dump.directory();
+    line.metadata_only = dump.metadata_only();
+    line.frame = backend.pool_present_count();
+    line.index = dump.next_index(line.frame);
+    line.why = pass_break_names[std::size_t(why)];
+    line.draws = pending.counters.draws - pass_draws_at_open;
+    line.vs = stage_label(bindings[NVN_SHADER_STAGE_VERTEX].shader);
+    line.fs = stage_label(bindings[NVN_SHADER_STAGE_FRAGMENT].shader);
+    line.cs = "-";
+    line.reads.assign(reads.begin(), reads.end());
+    line.draw_metadata = std::move(draws);
+    std::vector<PassDumpJob> jobs;
+    const auto take = [&](std::string kind, id<MTLTexture> texture, id<MTLTexture> resolve, MTLStoreAction store,
+                          NSUInteger level, NSUInteger slice, NSUInteger plane, NSUInteger resolve_level,
+                          NSUInteger resolve_slice, NSUInteger resolve_plane, std::uint64_t serial) {
+        if (store == MTLStoreActionDontCare || store == MTLStoreActionUnknown) return;
+        id<MTLTexture> stored = texture;
+        NSUInteger stored_level = level, stored_slice = slice, stored_plane = plane;
+        if (texture && texture.sampleCount > 1 && resolve && resolve.sampleCount <= 1 &&
+            (store == MTLStoreActionMultisampleResolve || store == MTLStoreActionStoreAndMultisampleResolve)) {
+            stored = resolve;
+            stored_level = resolve_level;
+            stored_slice = resolve_slice;
+            stored_plane = resolve_plane;
+        }
+        if (!stored) return;
+        auto job = dump.prepare(stored, std::move(kind), serial, stored_level, stored_slice, stored_plane);
+        append_attachment(line.attachments, job.image);
+        line.images.push_back(job.image);
+        if (job.pipeline) {
+            make_resident(pending, job.sample);
+            make_resident(pending, job.blit_from);
+            make_resident(pending, job.image.pixels);
+            make_resident(pending, job.image.raw);
+            make_resident(pending, job.args);
+            make_resident(pending, job.bound_raw);
+            jobs.push_back(std::move(job));
+        }
+    };
+    for (unsigned index = 0; index < 8; ++index) {
+        auto* attachment = render_descriptor.colorAttachments[index];
+        const auto* texture_state = index < static_cast<unsigned>(std::clamp(state.targets.count, 0, 8))
+                                        ? state.targets.color[index] : nullptr;
+        take("c" + std::to_string(index), attachment.texture, attachment.resolveTexture, attachment.storeAction,
+             attachment.level, attachment.slice, attachment.depthPlane, attachment.resolveLevel, attachment.resolveSlice,
+             attachment.resolveDepthPlane, texture_state ? texture_state->serial : 0);
+    }
+    if (render_descriptor.depthAttachment.texture || render_descriptor.depthAttachment.resolveTexture) {
+        auto* attachment = render_descriptor.depthAttachment;
+        take("d", attachment.texture, attachment.resolveTexture, attachment.storeAction, attachment.level,
+             attachment.slice, attachment.depthPlane, attachment.resolveLevel, attachment.resolveSlice,
+             attachment.resolveDepthPlane, state.targets.depth ? state.targets.depth->serial : 0);
+    }
+    for (auto& job : buffers) {
+        line.images.push_back(job.image);
+        if (!job.pipeline) continue;
+        make_resident(pending, job.image.raw);
+        make_resident(pending, job.args);
+        jobs.push_back(std::move(job));
+    }
+    for (const auto& input : inputs) {
+        if (!dump.first_input(input.texture)) continue;
+        const auto type = input.texture.textureType;
+        const NSUInteger slices = type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray
+            ? input.texture.arrayLength * 6 : type == MTLTextureType2DArray ? input.texture.arrayLength : 1;
+        for (NSUInteger slice = 0; slice < std::min<NSUInteger>(slices, 64); ++slice) {
+            auto job = dump.prepare(input.texture, input.kind + "-s" + std::to_string(slice), input.serial,
+                                    0, slice, 0, true);
+            line.images.push_back(job.image);
+            if (job.pipeline) {
+                make_resident(pending, job.sample);
+                make_resident(pending, job.blit_from);
+                make_resident(pending, job.image.pixels);
+                make_resident(pending, job.image.raw);
+                make_resident(pending, job.args);
+                make_resident(pending, job.bound_raw);
+                jobs.push_back(std::move(job));
+            }
+        }
+    }
+    if (!jobs.empty()) {
+        auto held = std::make_shared<std::vector<PassDumpJob>>(std::move(jobs));
+        encode_call(^(EncodeCallContext& context) {
+            encode_pass_dump_jobs(context.commands, context.residency, context.retained, *held);
+        }, ReplayErrorCode::allocation);
+    }
+    pending.pass_dumps.push_back(std::move(line));
+}
+
+void Encoder::dump_compute_dispatch() {
+    auto& dump = backend.pass_dump();
+    if (dump.stopped() || !dump.ensure_directory() || (!dump.metadata_only() && compute_dump_images.empty())) return;
+    PassDumpLine line;
+    line.directory = dump.directory();
+    line.metadata_only = dump.metadata_only();
+    line.frame = backend.pool_present_count();
+    line.index = dump.next_index(line.frame);
+    line.compute = true;
+    line.why = pass_break_names[std::size_t(PassBreak::dispatch)];
+    line.vs = "-";
+    line.fs = "-";
+    line.cs = stage_label(bindings[NVN_SHADER_STAGE_COMPUTE].shader);
+    line.reads = bindings[NVN_SHADER_STAGE_COMPUTE].dump_reads;
+    if (dump.metadata_only()) {
+        auto metadata = dump_binding_metadata(NVN_SHADER_STAGE_COMPUTE);
+        line.reads.insert(line.reads.end(), std::make_move_iterator(metadata.begin()), std::make_move_iterator(metadata.end()));
+    }
+    std::vector<PassDumpJob> jobs;
+    if (const auto* layout = compute_layout()) {
+        std::string detail = "compute_driver texture_base=" + std::to_string(layout->texture_base()) +
+            " separate_texture_base=" + std::to_string(layout->separate_texture_base()) +
+            " image_base=" + std::to_string(layout->image_base()) + " size=" + std::to_string(layout->size);
+        for (std::size_t index = 0; index < layout->images && index < state.images_at(NVN_SHADER_STAGE_COMPUTE).size(); ++index)
+            detail += " image" + std::to_string(index) + "=" + std::to_string(state.images_at(NVN_SHADER_STAGE_COMPUTE)[index]);
+        line.reads.push_back(std::move(detail));
+        const auto& stage = bindings[NVN_SHADER_STAGE_COMPUTE];
+        std::uint64_t address = 0, bytes = 0;
+        const auto select = [&](std::uint32_t index, std::uint64_t size) {
+            if (index < stage.buffers.size() && stage.buffers[index].present) {
+                address = stage.buffers[index].value;
+                bytes = std::min<std::uint64_t>(layout->size, size);
+            }
+        };
+        if (stage.shader) {
+            for (const auto& buffer : stage.shader->constant_buffers)
+                if (buffer.guest_binding == 0)
+                    select(buffer.metal_buffer_index, buffer.minimum_size ? buffer.minimum_size : layout->size);
+            for (const auto& buffer : stage.shader->constant_buffer_windows)
+                if (buffer.guest_binding == 0) select(buffer.metal_buffer_index, buffer.window_bytes);
+        }
+        auto job = dump.prepare_buffer("compute-bound-c0", address, bytes);
+        line.images.push_back(job.image);
+        if (job.pipeline) {
+            make_resident(pending, job.image.raw);
+            make_resident(pending, job.args);
+            jobs.push_back(std::move(job));
+        }
+    }
+    for (const auto& image : compute_dump_images) {
+        auto job = dump.prepare(image.texture, "img" + std::to_string(image.slot), image.serial, 0, 0, 0);
+        append_attachment(line.attachments, job.image);
+        line.images.push_back(job.image);
+        if (job.pipeline) {
+            make_resident(pending, job.sample);
+            make_resident(pending, job.blit_from);
+            make_resident(pending, job.image.pixels);
+            make_resident(pending, job.image.raw);
+            make_resident(pending, job.args);
+            make_resident(pending, job.bound_raw);
+            jobs.push_back(std::move(job));
+        }
+    }
+    if (!jobs.empty()) {
+        auto held = std::make_shared<std::vector<PassDumpJob>>(std::move(jobs));
+        encode_call(^(EncodeCallContext& context) {
+            encode_pass_dump_jobs(context.commands, context.residency, context.retained, *held);
+        }, ReplayErrorCode::allocation);
+    }
+    pending.pass_dumps.push_back(std::move(line));
+}
+
 bool Encoder::close_transfer() {
     if (!transfer) return true;
+    profile_end(profile_transfer, 'C', transfer);
     end_encoder(transfer, MTLStageBlit | MTLStageDispatch);
     transfer = nil;
     return true;
@@ -6518,6 +8978,24 @@ void Encoder::note_shader_writes(std::size_t stage) {
     other_buffer_writes.insert(other_buffer_writes.end(), bindings[stage].writes.begin(), bindings[stage].writes.end());
     pending.buffer_writes.insert(pending.buffer_writes.end(), bindings[stage].writes.begin(), bindings[stage].writes.end());
     for (const auto& [address, size] : bindings[stage].writes) discard_gpu_uniform_captures(address, size);
+    note_report_writes(stage);
+}
+
+// The report table's view of a stage's storage and guest-memory stores.
+void Encoder::note_report_writes(std::size_t stage) {
+    if (!reports) return;
+    bool unknown = false;
+    for (const auto& [address, size] : bindings[stage].writes) {
+        if (!size) unknown = true;
+        else reports->gpu_write(address, size);
+    }
+    // A guest-memory store, a writable stage with no recorded range, or a
+    // zero-sized binding can replace any counter. The epoch covers those
+    // after the ranges that were named.
+    const auto* shader = bindings[stage].shader;
+    const bool guest_stores = shader && shader->guest_memory && shader->guest_memory->writes;
+    if (guest_stores || (bindings[stage].writes_buffers && bindings[stage].writes.empty()) || unknown)
+        reports->gpu_write_unbounded();
 }
 
 bool Encoder::order_buffer_writes() {
@@ -6540,6 +9018,9 @@ bool Encoder::restart_segment() {
     // residency/arena ownership remain tied to the final guest fence.
     if (!backend.begin_commands(pending))
         return fail(ReplayErrorCode::allocation, "replay segment allocation failed");
+    // The new command buffer has no residency sets yet. Versions already held
+    // for the submission are attached again the next time a stage binds them.
+    pool_residency_attached.clear();
     cut_draws = pending.counters.draws;
     return true;
 }
@@ -6579,6 +9060,7 @@ bool Encoder::synchronize_gpu() {
 }
 
 bool Encoder::synchronize_gpu_commit() {
+    const SiteScope site_scope(*this, TransferSite::synchronize);
     ++backend.mutable_statistics().synchronize_gpu_waits;
     ++gpu_synchronizations;
     if (!pending.commands_open)
@@ -6705,10 +9187,20 @@ bool Encoder::order_texture_backing(std::uint64_t begin, std::uint64_t size, boo
     if (!begin || !size) return true;
     if (size > UINT64_MAX - begin)
         return fail(ReplayErrorCode::missing_resource, "texture backing range overflows");
+    // A title whose stores reach textures at retirement uses the texels the
+    // texture holds and never waits for a store here, so whether the backing
+    // feeds a texture, and which predictions the use relied on, does not
+    // matter: only report writes into the range are ordered.
+    const bool ordered_stores =
+        nvn::title_policy().guest_store_textures == nvn::TitlePolicy::GuestStoreTextures::ordered;
+    if (!ordered_stores)
+        return order_completion_read(nil, 0, reinterpret_cast<const std::byte*>(begin),
+                                     size, "texture_report_wait", &ordered);
     // Guest-memory stores reach a texture with storage of its own through the
-    // write log alone, published once the GPU ran them: wait for an earlier
-    // submission's retirement, or for this submission's work so far, before a
-    // use whose texture data comes from those pools.
+    // write log alone, published once the GPU ran them. Under the ordered
+    // policy, wait for an earlier submission's retirement, or for this
+    // submission's work so far, before a use whose texture data comes from
+    // those pools.
     const auto prior_writer = [&](const auto& previous) {
         return previous->fence > retired_fence && previous->guest_writes &&
                guest_ranges_overlap(previous->guest_ranges.get(), begin, size);
@@ -6716,7 +9208,17 @@ bool Encoder::order_texture_backing(std::uint64_t begin, std::uint64_t size, boo
     const bool current_writer = guest_written(begin, size);
     const bool prior_writers = prior_guest_writer_fence > retired_fence &&
                                std::ranges::any_of(previous_submissions, prior_writer);
-    if ((current_writer || prior_writers) && backend.resources().backing_feeds_texture(begin, size)) {
+    const bool feeds = backend.resources().backing_feeds_texture(begin, size);
+    // A predicted earlier submission whose learned pools exclude this backing
+    // is not waited for. Record that skip even when this submission stores
+    // nothing; the wait below is unchanged.
+    if (feeds)
+        for (const auto& previous : previous_submissions) {
+            if (previous->fence <= retired_fence || !previous->guest_writes ||
+                !previous->guest_writes_predicted || prior_writer(previous)) continue;
+            backend.note_predicted_guest_read(*previous, begin, size);
+        }
+    if ((current_writer || prior_writers) && feeds) {
         for (const auto& previous : previous_submissions) {
             if (!prior_writer(previous)) continue;
             backend.wait_retired(*previous);
@@ -6726,6 +9228,9 @@ bool Encoder::order_texture_backing(std::uint64_t begin, std::uint64_t size, boo
         ++backend.mutable_statistics().guest_write_texture_waits;
         ++pending.counters.guest_waits;
         ordered = true;
+    } else if (feeds && !current_writer && pending.guest_writes_predicted && guest_writes_pending) {
+        // Write-anywhere would have drained a use of an unlearned pool.
+        backend.note_predicted_guest_read(pending, begin, size);
     }
     return order_completion_read(nil, 0, reinterpret_cast<const std::byte*>(begin),
                                  size, "texture_report_wait", &ordered);
@@ -6857,6 +9362,7 @@ bool Encoder::order_completion_read(id<MTLBuffer> __unsafe_unretained buffer, st
 
 bool Encoder::enqueue_counter(const ReportCounter& command, const BufferSpan& destination,
                               std::byte* destination_cpu) {
+    const SiteScope site_scope(*this, TransferSite::counter);
     if (!flush_uniforms()) return false;
     discard_uniform_captures(reinterpret_cast<std::uintptr_t>(destination_cpu), 0, sizeof(NVNcounterData));
     CompletionEffect effect{};
@@ -6878,6 +9384,7 @@ bool Encoder::enqueue_counter(const ReportCounter& command, const BufferSpan& de
         [pending.retained addObject:destination.buffer];
         note_report(false);
         pending.effects.push_back(effect);
+        note_report_counter(command.type, command.address);
         trace_pass_event("report", "segment", command.address, pending.effects.size() - 1, 0, 0);
         invalidate_args_all();
         pending.buffer_writes.emplace_back(command.address, sizeof(NVNcounterData));
@@ -6898,8 +9405,11 @@ bool Encoder::enqueue_counter(const ReportCounter& command, const BufferSpan& de
         if (relaxed_producer && (!open_transfer() || !close_transfer())) return false;
     }
     if (pending.timestamp_count >= ReplayImpl::timestamp_heap_capacity * ReplayImpl::timestamp_heap_limit)
-        return fail(ReplayErrorCode::allocation, "submission timestamp limit of 4096 reports is exhausted");
-    effect.timestamp = backend.counter_heap(pending.slot, pending.timestamp_count);
+        return fail(ReplayErrorCode::allocation,
+                    "submission timestamp limit of " +
+                        std::to_string(ReplayImpl::timestamp_heap_capacity * ReplayImpl::timestamp_heap_limit) +
+                        " reports is exhausted");
+    effect.timestamp = backend.counter_heap(pending, pending.timestamp_count);
     if (!effect.timestamp)
         return fail(ReplayErrorCode::allocation, "GPU counter heap creation failed");
     effect.timestamp_index = pending.timestamp_count++ % ReplayImpl::timestamp_heap_capacity;
@@ -6919,6 +9429,7 @@ bool Encoder::enqueue_counter(const ReportCounter& command, const BufferSpan& de
     pending.buffer_writes.emplace_back(command.address, sizeof(NVNcounterData));
     other_buffer_writes.emplace_back(command.address, sizeof(NVNcounterData));
     note_writes();
+    note_report_counter(command.type, command.address);
     return true;
 }
 
@@ -6928,6 +9439,24 @@ bool Encoder::resolve_carried_predicate() {
     backend.wait_prior_effects(pending);
     retired_fence = backend.completed_fence();
     return read_predicate(state.predicate_mode, state.predicate_address);
+}
+
+// ARMIGO_NVN_CONDITIONAL_LOG=N names the first N conditional-render decisions:
+// the record, both counters (with whether each was known) and the outcome.
+// A CPU-drained condition logs its outcome only.
+void Encoder::log_conditional(std::uint64_t address, bool if_equal, std::uint64_t left, bool left_known,
+                              std::uint64_t right, bool right_known, bool drawn) {
+    static const unsigned long limit = [] {
+        const char* value = std::getenv("ARMIGO_NVN_CONDITIONAL_LOG");
+        return value ? std::strtoul(value, nullptr, 10) : 0ul;
+    }();
+    static std::atomic<unsigned long> logged{0};
+    if (!limit || logged.fetch_add(1, std::memory_order_relaxed) >= limit) return;
+    armigo::diag::write(armigo::diag::Level::warning,
+        "nvn_conditional fence=%llu addr=%llx %s left=%llu%s right=%llu%s -> %s\n",
+        static_cast<unsigned long long>(pending.fence), static_cast<unsigned long long>(address),
+        if_equal ? "if_equal" : "if_not_equal", static_cast<unsigned long long>(left), left_known ? "" : "?",
+        static_cast<unsigned long long>(right), right_known ? "" : "?", drawn ? "drawn" : "skipped");
 }
 
 // Sets render_enabled from the two counters at `address` in memory; their
@@ -7070,6 +9599,7 @@ bool Encoder::gpu_predicate(const RenderEnableConditional& command, bool& handle
 
 // The predicate as a compute kernel, in its own compute encoder.
 bool Encoder::dispatch_predicate(std::uint64_t job) {
+    const SiteScope site_scope(*this, TransferSite::predicate);
     trace_pass_event("predicate_execute", "compute", job);
     id<MTLComputePipelineState> pipeline = backend.predicate_pipeline();
     if (!pipeline) return fail(ReplayErrorCode::unsupported, "the conditional-render kernel is unavailable");
@@ -7088,6 +9618,7 @@ bool Encoder::dispatch_predicate(std::uint64_t job) {
     }
     transfer_untracked = true;
     ++backend.mutable_statistics().dispatches;
+    ++pending.counters.dispatches;
     ++backend.mutable_statistics().predicate_kernels;
     return true;
 }
@@ -7204,6 +9735,7 @@ bool Encoder::block_alias(const nvn::TextureState& state, const nvn::TextureView
         width:out.blocks_x height:out.blocks_y mipmapped:NO];
     descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     descriptor.storageMode = MTLStorageModePrivate;
+    descriptor.allowGPUOptimizedContents = NO;
     out.alias = [backend.device() newTextureWithDescriptor:descriptor];
     out.staging = [backend.device() newBufferWithLength:out.pitch * out.blocks_y
                                                 options:MTLResourceStorageModePrivate];
@@ -7305,6 +9837,104 @@ static id<MTLTexture> writable_image_texture(id<MTLTexture> texture, id<MTLTextu
                                         slices:NSMakeRange(slice, count)];
 }
 
+// An R32 view of the texture's root covering the descriptor view's levels and
+// slices. The root itself when that view is the whole two-dimensional texture
+// and the root is already the requested format.
+static id<MTLTexture> atomic_image_view(id<MTLTexture> texture, MTLPixelFormat format) {
+    if (!texture) return nil;
+    id<MTLTexture> cursor = texture;
+    NSUInteger level = 0, slice = 0;
+    while (id<MTLTexture> parent = cursor.parentTexture) {
+        level += cursor.parentRelativeLevel;
+        slice += cursor.parentRelativeSlice;
+        cursor = parent;
+    }
+    const NSUInteger levels = std::max<NSUInteger>(texture.mipmapLevelCount, 1);
+    const bool whole = level == 0 && slice == 0 && levels == cursor.mipmapLevelCount &&
+                       cursor.pixelFormat == format && cursor.textureType == MTLTextureType2D &&
+                       cursor.sampleCount == 1 && cursor.arrayLength <= 1;
+    if (whole) return cursor;
+    if (cursor.textureType != MTLTextureType2D && cursor.textureType != MTLTextureType2DArray)
+        return nil;
+    if (level >= cursor.mipmapLevelCount || levels > cursor.mipmapLevelCount - level)
+        return nil;
+    return [cursor newTextureViewWithPixelFormat:format
+                                     textureType:MTLTextureType2D
+                                          levels:NSMakeRange(level, levels)
+                                          slices:NSMakeRange(slice, 1)];
+}
+
+// One stand-in per signedness. A texture Metal cannot run the atomic on binds
+// this instead, so the dispatch still has a matching image to write.
+static id<MTLTexture> atomic_sink(id<MTLDevice> device, bool is_signed) {
+    struct Sink {
+        __unsafe_unretained id<MTLDevice> device = nil;
+        id<MTLTexture> textures[2] = {};
+    };
+    static Sink sink;
+    if (sink.device != device) {
+        sink.textures[0] = sink.textures[1] = nil;
+        sink.device = device;
+    }
+    const int index = is_signed ? 1 : 0;
+    if (sink.textures[index]) return sink.textures[index];
+    auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+                            is_signed ? MTLPixelFormatR32Sint : MTLPixelFormatR32Uint
+                                                                          width:1
+                                                                         height:1
+                                                                      mipmapped:NO];
+    descriptor.storageMode = MTLStorageModePrivate;
+    descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+                       MTLTextureUsageShaderAtomic;
+    sink.textures[index] = [device newTextureWithDescriptor:descriptor];
+    return sink.textures[index];
+}
+
+// Whether this storage image slot (stage and resource) is reported for the
+// first time: one warning per slot for the life of the process.
+static bool first_image_sink_report(std::uint64_t key) {
+    static std::mutex mutex;
+    static std::set<std::uint64_t> reported;
+    const std::lock_guard lock(mutex);
+    return reported.insert(key).second;
+}
+
+// The texture a storage image slot binds when its handle names no texture: a
+// 1x1 write sink of the slot's declared type, in a format of its component
+// class, so the stage still runs and its stores go nowhere. Nil for types a
+// sink cannot have (buffer images).
+static id<MTLTexture> image_sink(id<MTLDevice> device, MTLTextureType type,
+                                 platform::CompiledShaderTextureScalar scalar) {
+    struct Sinks {
+        __unsafe_unretained id<MTLDevice> device = nil;
+        std::map<std::pair<unsigned, unsigned>, id<MTLTexture>> textures;
+    };
+    static std::mutex mutex;
+    static Sinks sinks;
+    const std::lock_guard lock(mutex);
+    if (sinks.device != device) {
+        sinks.textures.clear();
+        sinks.device = device;
+    }
+    const auto key = std::make_pair(unsigned(type), unsigned(scalar));
+    if (const auto found = sinks.textures.find(key); found != sinks.textures.end()) return found->second;
+    if (type != MTLTextureType1D && type != MTLTextureType1DArray && type != MTLTextureType2D &&
+        type != MTLTextureType2DArray && type != MTLTextureType3D)
+        return nil;
+    const bool sint = scalar == platform::CompiledShaderTextureScalar::s32;
+    const bool uint = scalar == platform::CompiledShaderTextureScalar::u32;
+    auto* descriptor = [MTLTextureDescriptor new];
+    descriptor.textureType = type;
+    descriptor.pixelFormat = sint ? MTLPixelFormatR32Sint : uint ? MTLPixelFormatR32Uint : MTLPixelFormatR32Float;
+    descriptor.width = descriptor.height = descriptor.depth = 1;
+    descriptor.storageMode = MTLStorageModePrivate;
+    descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+        (sint || uint ? MTLTextureUsageShaderAtomic : MTLTextureUsageUnknown);
+    id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
+    sinks.textures[key] = texture;
+    return texture;
+}
+
 bool Encoder::note_image_write(std::int32_t texture_id, __strong id<MTLTexture>& texture, bool compute) {
     if (!compute)
         return fail(ReplayErrorCode::unsupported, "storage image writes from draw stages are unsupported");
@@ -7330,23 +9960,7 @@ bool Encoder::note_image_write(std::int32_t texture_id, __strong id<MTLTexture>&
             return fail(ReplayErrorCode::unsupported, detail);
         }
         if (previous) {
-            if (!close_transfer()) return false;
-            [pending.retained addObjectsFromArray:@[previous, upgraded]];
-            make_resident(pending, previous);
-            make_resident(pending, upgraded);
-            if (!encode_call(^(EncodeCallContext& context) {
-                    id<MTL4ComputeCommandEncoder> copy = [context.commands computeCommandEncoder];
-                    if (!copy) {
-                        context.error = "storage image upgrade copy encoder creation failed";
-                        return;
-                    }
-                    [copy barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit
-                                visibilityOptions:MTL4VisibilityOptionDevice];
-                    [copy copyFromTexture:previous toTexture:upgraded];
-                    [copy barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll
-                                visibilityOptions:MTL4VisibilityOptionDevice];
-                    [copy endEncoding];
-                }, ReplayErrorCode::allocation)) return false;
+            if (!copy_replaced_image(previous, upgraded)) return false;
             // The encoder cached the pre-upgrade texture for this submission.
             // A descriptor stamp that does not move would hand that object
             // back; drop every entry of this storage and resolve it again.
@@ -7373,12 +9987,262 @@ bool Encoder::note_image_write(std::int32_t texture_id, __strong id<MTLTexture>&
     return true;
 }
 
+bool Encoder::copy_replaced_image(id<MTLTexture> previous, id<MTLTexture> upgraded) {
+    if (!close_transfer()) return false;
+    [pending.retained addObjectsFromArray:@[previous, upgraded]];
+    make_resident(pending, previous);
+    make_resident(pending, upgraded);
+    const bool same_buffer = previous.buffer && previous.buffer == upgraded.buffer;
+    return encode_call(^(EncodeCallContext& context) {
+        id<MTL4ComputeCommandEncoder> copy = [context.commands computeCommandEncoder];
+        if (!copy) {
+            context.error = "storage image upgrade copy encoder creation failed";
+            return;
+        }
+        [copy barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit
+                    visibilityOptions:MTL4VisibilityOptionDevice];
+        if (!same_buffer)
+            [copy copyFromTexture:previous toTexture:upgraded];
+        [copy barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll
+                    visibilityOptions:MTL4VisibilityOptionDevice];
+        [copy endEncoding];
+    }, ReplayErrorCode::allocation);
+}
+
+struct AtomicImageKind {
+    bool integer = false;
+    bool signed_image = false;
+};
+
+static AtomicImageKind atomic_image_kind(const platform::CompiledShaderResource& resource) {
+    AtomicImageKind kind;
+    kind.signed_image = resource.texture_descriptor &&
+        resource.texture_descriptor->scalar == platform::CompiledShaderTextureScalar::s32;
+    kind.integer = kind.signed_image || (resource.texture_descriptor &&
+        resource.texture_descriptor->scalar == platform::CompiledShaderTextureScalar::u32);
+    return kind;
+}
+
+void Encoder::forget_replaced_image(std::uint64_t serial, id<MTLTexture> previous) {
+    std::vector<std::uint64_t> retired;
+    const auto remember = [&](id<MTLTexture> texture) {
+        if (!texture) return;
+        const auto identifier = texture.gpuResourceID._impl;
+        if (std::find(retired.begin(), retired.end(), identifier) == retired.end())
+            retired.push_back(identifier);
+    };
+    remember(previous);
+    for (auto& entry : resolved_textures) {
+        if (entry.stamp.serial != serial) continue;
+        remember(entry.texture);
+        entry = {};
+    }
+    for (auto& stage : bindings)
+        for (auto& slot : stage.textures)
+            if (slot.present &&
+                std::find(retired.begin(), retired.end(), slot.value) != retired.end())
+                slot = {};
+    invalidate_args_all();
+}
+
+void Encoder::note_image_atomic_replacement(std::uint64_t serial, id<MTLTexture> previous, bool late) {
+    if (late) {
+        // Preparation is supposed to replace this storage before binding.
+        // Counting survives release builds, where the assert is compiled out.
+        ++backend.mutable_statistics().image_atomic_late_upgrades;
+        assert(false && "image atomic storage replaced during bind");
+    }
+    const bool moved = previous.pixelFormat != MTLPixelFormatR32Uint &&
+                       previous.pixelFormat != MTLPixelFormatR32Sint;
+    if (moved) {
+        ++backend.mutable_statistics().image_atomic_upgrades;
+        armigo::diag::write(armigo::diag::Level::info,
+            "nvn_replay: texture moved to R32 storage for image atomics (serial %llu, format %lu)\n",
+            static_cast<unsigned long long>(serial),
+            static_cast<unsigned long>(previous.pixelFormat));
+    } else {
+        armigo::diag::write(armigo::diag::Level::info,
+            "nvn_replay: R32 texture remade with shader-atomic usage (serial %llu)\n",
+            static_cast<unsigned long long>(serial));
+    }
+    forget_replaced_image(serial, previous);
+}
+
+// A sampled texture of another type than the shader declares, with no view
+// in that type: the first ones are named with the stage and the texture, as
+// Metal then reads it in the wrong type.
+void Encoder::report_type_mismatch(const platform::CompiledGraphicsStage& shader,
+                                   const platform::CompiledShaderResource& resource, std::int32_t texture_id,
+                                   id<MTLTexture> texture, MTLTextureType want) {
+    static std::atomic<unsigned> shown{0};
+    if (shown.fetch_add(1, std::memory_order_relaxed) >= 16) return;
+    armigo::diag::write(armigo::diag::Level::warning,
+        "Armigo NVN: stage %s samples resource %u as Metal texture type %lu but texture ID %d is type %lu "
+        "(format %lu, %lux%lux%lu, %lu layers, %lu levels); it is read in the wrong type\n",
+        shader.identity.c_str(), resource.resource_id, static_cast<unsigned long>(want), texture_id,
+        static_cast<unsigned long>(texture.textureType), static_cast<unsigned long>(texture.pixelFormat),
+        static_cast<unsigned long>(texture.width), static_cast<unsigned long>(texture.height),
+        static_cast<unsigned long>(texture.depth), static_cast<unsigned long>(texture.arrayLength),
+        static_cast<unsigned long>(texture.mipmapLevelCount));
+}
+
+bool Encoder::note_image_atomic(std::size_t stage_index, const platform::CompiledShaderResource& resource,
+                                std::uint32_t element, std::int32_t texture_id,
+                                __strong id<MTLTexture>& texture, bool compute) {
+    const auto index = static_cast<std::uint32_t>(texture_id) & (resolved_textures.size() - 1);
+    const auto& cached = resolved_textures[index];
+    if (cached.texture_id != texture_id || !cached.stamp.serial)
+        return fail(ReplayErrorCode::unsupported, "storage image texture has no known serial for its writes");
+    const auto serial = cached.stamp.serial;
+    const auto backing_begin = cached.stamp.backing_begin;
+    const auto backing_size = cached.stamp.backing_size;
+    const auto kind = atomic_image_kind(resource);
+    const auto want = kind.signed_image ? MTLPixelFormatR32Sint : MTLPixelFormatR32Uint;
+    id<MTLTexture> previous = nil;
+    id<MTLTexture> storage = nil;
+    if (kind.integer)
+        storage = backend.resources().upgrade_for_image_atomic(serial, kind.signed_image, previous);
+    if (previous) {
+        // Closing a pass that is already closed would drop the arguments this
+        // bind is writing. The copy still has to follow the pass that used the
+        // old storage.
+        if (render && !close_render(PassBreak::dispatch)) return false;
+        if (!copy_replaced_image(previous, storage)) return false;
+        note_image_atomic_replacement(serial, previous, true);
+        texture = sampled_texture(texture_id);
+        if (!texture)
+            return fail(ReplayErrorCode::missing_resource, "resolved storage image is unavailable");
+    }
+    id<MTLTexture> bound = kind.integer && storage ? atomic_image_view(texture, want) : nil;
+    const bool ready = bound && bound.pixelFormat == want && bound.sampleCount == 1 &&
+                       bound.textureType == MTLTextureType2D &&
+                       backend.resources().image_atomic_capable(serial);
+    // The first atomic binds name what each one runs on.
+    static std::atomic<unsigned> shown{0};
+    if (shown.fetch_add(1, std::memory_order_relaxed) < 16) {
+        id<MTLTexture> root = texture;
+        while (root.parentTexture) root = root.parentTexture;
+        armigo::diag::write(armigo::diag::Level::info,
+            "nvn_replay: image atomic bind serial %llu texture ID %d: format %lu %lux%lu of base format %lu "
+            "(base usage 0x%lx), bound format %lu, %s%s\n",
+            static_cast<unsigned long long>(serial), texture_id, static_cast<unsigned long>(texture.pixelFormat),
+            static_cast<unsigned long>(texture.width), static_cast<unsigned long>(texture.height),
+            static_cast<unsigned long>(root.pixelFormat), static_cast<unsigned long>(root.usage),
+            static_cast<unsigned long>(bound.pixelFormat), ready ? "ready" : "sink",
+            previous ? " after a late replacement" : "");
+    }
+    if (!ready) {
+        bound = atomic_sink(backend.device(), kind.signed_image);
+        if (!bound)
+            return fail(ReplayErrorCode::allocation, "image atomic sink allocation failed");
+        ++backend.mutable_statistics().image_atomic_sinks;
+        const auto slot = resource.resource_id + element;
+        const auto key = std::make_pair(static_cast<std::uint32_t>(stage_index), slot);
+        if (std::find(image_atomic_warnings.begin(), image_atomic_warnings.end(), key) ==
+            image_atomic_warnings.end()) {
+            image_atomic_warnings.push_back(key);
+            id<MTLTexture> root = texture;
+            while (root.parentTexture) root = root.parentTexture;
+            armigo::diag::write(armigo::diag::Level::warning,
+                "nvn_replay: image atomics on a texture Metal cannot run them on "
+                "(stage %u slot %u texture ID %d: Metal format %lu of base format %lu, type %lu)\n",
+                static_cast<unsigned>(stage_index), slot, texture_id,
+                static_cast<unsigned long>(texture.pixelFormat),
+                static_cast<unsigned long>(root.pixelFormat),
+                static_cast<unsigned long>(texture.textureType));
+        }
+    } else {
+        // The stand-in is what the dispatch writes. Publishing the real
+        // texture would make a later atomic treat an uploaded image as
+        // GPU-written and move it.
+        TextureState written{};
+        written.serial = serial;
+        written.memory = reinterpret_cast<std::uint8_t*>(backing_begin);
+        written.size = backing_size;
+        note_texture_write(written);
+    }
+    if (compute) compute_untracked = true;
+    // The bound view's root (through its parents) and the colour view.
+    make_resident(pending, texture);
+    if (storage) make_resident(pending, storage);
+    make_resident(pending, bound);
+    texture = bound;
+    return true;
+}
+
+bool Encoder::prepare_images(
+    std::initializer_list<std::pair<std::size_t, const platform::CompiledGraphicsStage*>> stages) {
+    for (const auto& [stage_index, shader] : stages) {
+        if (!shader || stage_index >= stage_count) continue;
+        std::vector<std::optional<std::uint64_t>> words(shader->handle_programs.size());
+        for (const auto& resource : shader->resources) {
+            if (resource.kind != platform::CompiledShaderResourceKind::StorageImage ||
+                (!resource.atomic && resource.access == platform::CompiledShaderResourceAccess::Read)) continue;
+            if (!resource.array_length || resource.location.count != resource.array_length)
+                return fail(ReplayErrorCode::unsupported, "storage image array contract is invalid");
+            const auto kind = atomic_image_kind(resource);
+            const bool atomic = resource.atomic && kind.integer && image_atomics_enabled();
+            for (std::uint32_t element = 0; element != resource.array_length; ++element) {
+                const auto handle = read_stage_handle(stage_index, *shader, resource, element, words);
+                if (failed) return false;
+                auto texture_id = static_cast<std::int32_t>(handle_texture_id(handle));
+                if (!texture_id) continue;
+                ReplayResources::DescriptorStamp stamp;
+                id<MTLTexture> base = backend.resources().image_base_for_id(texture_id, stamp);
+                if (!base) {
+                    if (backend.resources().texture_id_empty(texture_id)) continue;
+                    return fail(ReplayErrorCode::missing_resource, "storage image descriptor backing is unavailable");
+                }
+                while (base.parentTexture) base = base.parentTexture;
+                const bool upgrade = atomic ? backend.resources().image_atomic_needs_upgrade(stamp.serial, kind.signed_image)
+                    : !(base.usage & MTLTextureUsageShaderWrite);
+                if (!upgrade) continue;
+                // A carried clear can still target the old allocation with
+                // no encoder open. Land it before replacing that backing.
+                if (!close_render(PassBreak::dispatch)) return false;
+                id<MTLTexture> previous = nil;
+                id<MTLTexture> storage = atomic
+                    ? backend.resources().upgrade_for_image_atomic(stamp.serial, kind.signed_image, previous)
+                    : backend.resources().upgrade_for_image_write(stamp.serial, previous);
+                if (!storage) return fail(ReplayErrorCode::unsupported, "storage image backing cannot acquire required usage");
+                if (!previous) continue;
+                if (!copy_replaced_image(previous, storage)) return false;
+                if (atomic) note_image_atomic_replacement(stamp.serial, previous, false);
+                else for (auto& entry : resolved_textures)
+                    if (entry.stamp.serial == stamp.serial) entry = {};
+            }
+        }
+    }
+    return true;
+}
+
 void Encoder::note_texture_write(const TextureState& texture) {
     pending.texture_writes.push_back(texture);
+    static const std::uint64_t watched = [] {
+        const char* value = std::getenv("ARMIGO_NVN_TEXTURE_PROVENANCE");
+        return value ? std::strtoull(value, nullptr, 0) : 0ull;
+    }();
+    static std::atomic<std::uint64_t> producer_reports{0};
+    if (watched && texture.serial == watched && producer_reports.fetch_add(1) < 64) {
+        const auto label = [&](std::size_t slot) {
+            const auto& program = state.stage_programs[slot];
+            return stage_label(program ? program->stages[slot].get() : nullptr);
+        };
+        armigo::diag::info("nvn_texture_provenance_producer frame=%llu draw=%llu serial=%llu address=%#llx bytes=%llu "
+            "bound_vs=%s bound_ts=%s bound_ms=%s bound_fs=%s bound_cs=%s\n",
+            static_cast<unsigned long long>(backend.pool_present_count()),
+            static_cast<unsigned long long>(pending.counters.draws), static_cast<unsigned long long>(texture.serial),
+            static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(texture.memory)),
+            static_cast<unsigned long long>(texture.size), label(NVN_SHADER_STAGE_VERTEX).c_str(),
+            label(NVN_SHADER_STAGE_TESS_CONTROL).c_str(), label(NVN_SHADER_STAGE_TESS_EVALUATION).c_str(),
+            label(NVN_SHADER_STAGE_FRAGMENT).c_str(), label(NVN_SHADER_STAGE_COMPUTE).c_str());
+    }
     if (texture.memory && texture.size && backend.resources().texture_is_in_place(texture)) {
         const auto cpu = reinterpret_cast<std::uintptr_t>(texture.memory);
         other_buffer_writes.emplace_back(cpu, texture.size);
         discard_uniform_captures(cpu, 0, texture.size);
+        // A report record can live in a texture's storage.
+        if (reports) reports->gpu_write(cpu, texture.size);
     }
 }
 
@@ -7403,6 +10267,7 @@ bool Encoder::open_transfer_with(std::span<const GuestAccess> accesses, bool dec
             ++backend.mutable_statistics().transfer_barriers_skipped;
         }
     } else {
+        note_transfer_open(transfer_site, render != nil);
         close_render(PassBreak::transfer);
         transfer = begin_transfer();
         ++backend.mutable_statistics().compute_passes;
@@ -7427,17 +10292,218 @@ void Encoder::note_compute_texture(__unsafe_unretained id<MTLTexture> texture) {
 }
 
 
+id<MTLTexture> Encoder::feedback_texture(id<MTLTexture> texture, bool image,
+                                        std::optional<std::uint32_t> pinned_level) {
+    if (!texture || !render_descriptor) return texture;
+    const std::uint64_t original = texture.gpuResourceID._impl;
+    for (const auto& use : feedback_uses)
+        if (use.original == original && use.image == image) {
+            feedback_rebind = true;
+            return use.texture;
+        }
+    struct Subresource { id<MTLTexture> root; NSUInteger level = 0, slice = 0; };
+    const auto root_of = [](id<MTLTexture> view) {
+        Subresource sub{view};
+        while (sub.root.parentTexture) {
+            sub.level += sub.root.parentRelativeLevel;
+            sub.slice += sub.root.parentRelativeSlice;
+            sub.root = sub.root.parentTexture;
+        }
+        return sub;
+    };
+    const auto sampled = root_of(texture);
+    const NSUInteger layers = texture.arrayLength *
+        ((texture.textureType == MTLTextureTypeCube || texture.textureType == MTLTextureTypeCubeArray) ? 6 : 1);
+    for (unsigned index = 0; index != 9; ++index) {
+        const bool depth = index == 8;
+        const MTLRenderPassAttachmentDescriptor* attachment = depth
+            ? render_descriptor.depthAttachment : render_descriptor.colorAttachments[index];
+        if (!attachment.texture) continue;
+        const auto attached = root_of(attachment.texture);
+        const NSUInteger level = attached.level + attachment.level;
+        const NSUInteger slice = attached.slice + attachment.slice;
+        if (sampled.root != attached.root || level < sampled.level ||
+            level - sampled.level >= texture.mipmapLevelCount || slice < sampled.slice ||
+            slice - sampled.slice >= layers) continue;
+        // Image reinterpretations retain their original pixel-class access.
+        if (!depth && image && texture.pixelFormat != attachment.texture.pixelFormat &&
+            !raw_image_format_twins(texture.pixelFormat, attachment.texture.pixelFormat)) continue;
+        if (depth) {
+            // A read after a depth write must leave that pass before sampling,
+            // including when the pass has no color attachments.
+            if (!feedback_draw_depth_write) {
+                if (render && feedback_depth_written) {
+                    if (!close_render(PassBreak::depth_sampled)) return nil;
+                    feedback_reopen = true;
+                }
+                feedback_depth_direct_reads = true;
+                return texture;
+            }
+            if (image) {
+                fail(ReplayErrorCode::unsupported_resource,
+                     "depth attachment image feedback while writing requires an image-compatible snapshot");
+                return nil;
+            }
+        } else {
+            const auto bit = std::uint8_t(1u << index);
+            if (!((feedback_draw_writes | feedback_written) & bit)) {
+                feedback_direct_reads |= bit;
+                continue;
+            }
+        }
+        // A mip-chain draw must not expose its attached level to the texture
+        // unit, even when its sampling weight for that level would be zero.
+        NSUInteger first_level = sampled.level, level_count = texture.mipmapLevelCount;
+        bool narrow = false;
+        if (!depth && !image && pinned_level && texture.mipmapLevelCount > 1) {
+            const auto pin = std::min<NSUInteger>(*pinned_level, texture.mipmapLevelCount - 1);
+            if (sampled.level + pin != level) {
+                first_level = sampled.level + pin;
+                level_count = 1;
+                narrow = true;
+            }
+        }
+        if (!depth && !narrow && texture.mipmapLevelCount > 1 && level > sampled.level) {
+            level_count = level - sampled.level;
+            narrow = true;
+        }
+        if (narrow) {
+            id<MTLTexture> use = [sampled.root newTextureViewWithPixelFormat:texture.pixelFormat
+                textureType:texture.textureType levels:NSMakeRange(first_level, level_count)
+                slices:NSMakeRange(sampled.slice, layers) swizzle:texture.swizzle];
+            if (!use) {
+                fail(ReplayErrorCode::allocation, "attachment feedback mip view creation failed");
+                return nil;
+            }
+            feedback_uses.push_back({original, use, image});
+            feedback_rebind = true;
+            ++backend.mutable_statistics().feedback_mip_view_narrows;
+            return use;
+        }
+        const auto type = texture.textureType;
+        if (texture.sampleCount != 1 || (depth && (texture.mipmapLevelCount != 1 || layers != 1)) ||
+            (type != MTLTextureType2D && type != MTLTextureType2DArray &&
+             type != MTLTextureTypeCube && type != MTLTextureTypeCubeArray) ||
+            sampled.root.textureType == MTLTextureType3D) {
+            fail(ReplayErrorCode::unsupported_resource,
+                 std::string("attachment feedback snapshot does not support ") + (depth ? "depth" : "color") +
+                 " texture type " + std::to_string(type) + " with " + std::to_string(texture.sampleCount) +
+                 " samples, " + std::to_string(texture.mipmapLevelCount) + " levels and " +
+                 std::to_string(layers) + " layers");
+            return nil;
+        }
+        // A shader can address every mip and layer exposed by its view. Keep
+        // that shape and its relative coordinates, even when only one of its
+        // subresources is attached. Copying only that attachment would change
+        // the other reads, while leaving the original view bound aliases it.
+        const NSUInteger width = std::max<NSUInteger>(1, sampled.root.width >> sampled.level);
+        const NSUInteger height = std::max<NSUInteger>(1, sampled.root.height >> sampled.level);
+        bool fresh = false;
+        id<MTLTexture> snapshot = backend.feedback_snapshot(sampled.root.gpuResourceID._impl,
+            sampled.level, sampled.slice, sampled.root.pixelFormat, width, height, type,
+            texture.mipmapLevelCount, texture.arrayLength, depth, pending.sequence, feedback_epoch, fresh);
+        if (!snapshot) {
+            fail(ReplayErrorCode::allocation, "attachment feedback snapshot allocation failed");
+            return nil;
+        }
+        if (fresh) {
+            if (!close_render(PassBreak::attachment_feedback) || !open_transfer()) return nil;
+            make_resident(pending, sampled.root);
+            make_resident(pending, snapshot);
+            for (NSUInteger mip = 0; mip != texture.mipmapLevelCount; ++mip) {
+                const auto extent = MTLSizeMake(std::max<NSUInteger>(1, width >> mip),
+                                               std::max<NSUInteger>(1, height >> mip), 1);
+                for (NSUInteger layer = 0; layer != layers; ++layer)
+                    copy_texture_range(sampled.root, static_cast<std::uint32_t>(sampled.slice + layer),
+                        static_cast<std::uint32_t>(sampled.level + mip), MTLOriginMake(0, 0, 0), extent,
+                        snapshot, static_cast<std::uint32_t>(layer), static_cast<std::uint32_t>(mip),
+                        MTLOriginMake(0, 0, 0));
+            }
+            if (!close_transfer()) return nil;
+            feedback_reopen = true;
+            const auto count = ++backend.mutable_statistics().feedback_snapshots;
+            if (count <= 4) {
+                const auto shader = stage_label(bindings[NVN_SHADER_STAGE_FRAGMENT].shader);
+                armigo::diag::write(armigo::diag::Level::info,
+                    "Armigo NVN: attachment feedback snapshot %llu frame=%llu draw=%llu attachment=%u level=%lu layer=%lu shader=%s\n",
+                    static_cast<unsigned long long>(count), static_cast<unsigned long long>(backend.pool_present_count()),
+                    static_cast<unsigned long long>(pending.counters.draws), index,
+                    static_cast<unsigned long>(level), static_cast<unsigned long>(slice), shader.c_str());
+            }
+        } else {
+            ++backend.mutable_statistics().feedback_snapshot_reuses;
+        }
+        const auto swizzle = texture.swizzle;
+        const bool identity = swizzle.red == MTLTextureSwizzleRed && swizzle.green == MTLTextureSwizzleGreen &&
+            swizzle.blue == MTLTextureSwizzleBlue && swizzle.alpha == MTLTextureSwizzleAlpha;
+        id<MTLTexture> use = snapshot;
+        if (texture.pixelFormat != snapshot.pixelFormat || !identity)
+            use = [snapshot newTextureViewWithPixelFormat:texture.pixelFormat textureType:texture.textureType
+                levels:NSMakeRange(0, texture.mipmapLevelCount) slices:NSMakeRange(0, layers) swizzle:swizzle];
+        if (!use) {
+            fail(ReplayErrorCode::allocation, "attachment feedback snapshot view creation failed");
+            return nil;
+        }
+        feedback_uses.push_back({original, use, image});
+        feedback_rebind = true;
+        return use;
+    }
+    return texture;
+}
+
 bool Encoder::open_render(std::int32_t primitive) {
+    if (feedback_rebind) {
+        dirty.arguments[NVN_SHADER_STAGE_FRAGMENT] = true;
+        feedback_rebind = false;
+    }
     close_transfer();
+    const auto attachmentless_dimensions = [&] {
+        const auto& viewport = state.viewports[0];
+        const auto& scissor = state.scissors[0];
+        const double x = state.viewport_count
+            ? std::max(viewport.originX, viewport.originX + viewport.width)
+            : state.scissor_count ? double(scissor.x) + scissor.width : 1.0;
+        const double y = state.viewport_count
+            ? std::max(viewport.originY, viewport.originY + viewport.height)
+            : state.scissor_count ? double(scissor.y) + scissor.height : 1.0;
+        return std::pair{NSUInteger(std::fmin(16384.0, std::fmax(1.0, std::ceil(x)))),
+                         NSUInteger(std::fmin(16384.0, std::fmax(1.0, std::ceil(y))))};
+    };
+    if (render && attachmentless_pass) {
+        const auto [width, height] = attachmentless_dimensions();
+        if ((width != attachment_width || height != attachment_height) &&
+            !close_render(PassBreak::render_targets)) return false;
+    }
+    const auto& fragment_program = state.stage_programs[NVN_SHADER_STAGE_FRAGMENT];
+    const auto* fragment_shader = fragment_program
+        ? fragment_program->stages[NVN_SHADER_STAGE_FRAGMENT].get() : nullptr;
+    const bool color_draw = fragment_shader &&
+        (state.channel_mask.mask & fragment_shader->interface.color_output_mask);
+    if (render && color_draw && backend.pass_dump_enabled() &&
+        backend.pass_dump_wants(backend.pool_present_count()) &&
+        pending.counters.draws > pass_draws_at_open && render_descriptor) {
+        const auto* attachment = render_descriptor.colorAttachments[0];
+        id<MTLTexture> texture = attachment.texture;
+        auto& dump = backend.pass_dump();
+        const char* selection = std::getenv("ARMIGO_NVN_PASS_DUMP_INPUT_SHADER");
+        const std::string_view filters = selection ? selection : "";
+        const bool selected = dump.inputs() && !dump.metadata_only() && !filters.empty() &&
+            (dump_input_shader_matches(fragment_shader, filters) ||
+             dump_input_shader_matches(bindings[NVN_SHADER_STAGE_FRAGMENT].shader, filters));
+        if (texture && (selected || dump.splits_draws(
+                std::max<NSUInteger>(1, texture.width >> attachment.level),
+                std::max<NSUInteger>(1, texture.height >> attachment.level)))) {
+            // Keep selected draws isolated, or split color-writing draws of
+            // the configured size. Depth-only prefixes keep their image budget.
+            if (!close_render(PassBreak::draw_dump)) return false;
+        }
+    }
     // A relaxed pass ordered only fragment work after the previous pass: a
     // draw with earlier-stage writes or a mesh draw reopens it fully ordered.
     if (render && pass_relaxed && pre_fragment_hazard()) {
         barrier_requested = true;
         if (!close_render(PassBreak::relaxed_hazard)) return false;
     }
-    const auto& fragment_program = state.stage_programs[NVN_SHADER_STAGE_FRAGMENT];
-    const auto* fragment_shader = fragment_program
-        ? fragment_program->stages[NVN_SHADER_STAGE_FRAGMENT].get() : nullptr;
     const auto uses_depth_stencil = [&] {
         return nvn_driver::uses_depth_stencil({state.depth_stencil.depth_test, state.depth_stencil.depth_write,
             state.depth_stencil.stencil_test, fragment_shader && fragment_shader->writes_fragment_depth});
@@ -7462,10 +10528,25 @@ bool Encoder::open_render(std::int32_t primitive) {
     // Color slots this draw writes: the fragment stage's exports under the
     // channel mask.
     std::uint8_t color_writers = 0;
-    if ((!render || color_aliases.any) && fragment_shader && !state.rasterizer_discard) {
+    if (fragment_shader && !state.rasterizer_discard) {
         const auto channels = state.channel_mask.mask & fragment_shader->interface.color_output_mask;
         for (unsigned i = 0; i < 8; ++i)
             if ((channels >> (i * 4)) & 15) color_writers |= 1u << i;
+    }
+    feedback_draw_writes = color_writers;
+    const auto stencil_writes = [&](bool front) {
+        return (front ? state.stencil_front_write : state.stencil_back_write) &&
+            ((front ? state.depth_stencil.front_fail : state.depth_stencil.back_fail) != NVN_STENCIL_OP_KEEP ||
+             (front ? state.depth_stencil.front_depth_fail : state.depth_stencil.back_depth_fail) != NVN_STENCIL_OP_KEEP ||
+             (front ? state.depth_stencil.front_pass : state.depth_stencil.back_pass) != NVN_STENCIL_OP_KEEP);
+    };
+    feedback_draw_depth_write = state.targets.depth && !state.rasterizer_discard &&
+        ((state.depth_stencil.depth_test && state.depth_stencil.depth_write) ||
+         (state.depth_stencil.stencil_test && (stencil_writes(true) || stencil_writes(false))));
+    if (render && ((color_writers & feedback_direct_reads) ||
+                   (feedback_draw_depth_write && feedback_depth_direct_reads))) {
+        ++backend.mutable_statistics().feedback_read_pass_splits;
+        if (!close_render(PassBreak::attachment_feedback)) return false;
     }
     if (render && color_aliases.any && color_aliases.needs_reopen(color_writers, attached_colors) &&
         !close_render(PassBreak::color_alias))
@@ -7478,6 +10559,7 @@ bool Encoder::open_render(std::int32_t primitive) {
         dirty.begin_pass();
         created = [MTL4RenderPassDescriptor new];
         pass = created;
+        attachmentless_pass = false;
         attachment_width = attachment_height = attachment_samples = 0;
         attachment_formats = {};
         for (std::int32_t index = 0; index < std::clamp(state.targets.count, 0, 8); ++index) {
@@ -7567,9 +10649,19 @@ bool Encoder::open_render(std::int32_t primitive) {
                 make_resident(pending, texture);
             }
         }
-        if (!attachment_width || !attachment_height)
-            return fail(ReplayErrorCode::unsupported,
-                        "draw requires at least one render attachment");
+        if (!attachment_width || !attachment_height) {
+            bool bound_attachment = state.targets.depth != nullptr;
+            for (std::int32_t index = 0; index < std::clamp(state.targets.count, 0, 8); ++index)
+                bound_attachment |= state.targets.color[index] != nullptr;
+            if (bound_attachment)
+                return fail(ReplayErrorCode::unsupported,
+                            "bound render attachments have no raster extent");
+            const auto [width, height] = attachmentless_dimensions();
+            attachment_width = pass.renderTargetWidth = width;
+            attachment_height = pass.renderTargetHeight = height;
+            attachment_samples = pass.defaultRasterSampleCount = 1;
+            attachmentless_pass = true;
+        }
         color_aliases = RenderColorAliases(pass);
         attached_colors = color_aliases.attachments(color_writers);
         for (unsigned i = 0; i < 8; ++i) {
@@ -7687,15 +10779,35 @@ bool Encoder::open_render(std::int32_t primitive) {
             return fail(ReplayErrorCode::allocation, "Metal replay mesh argument table creation failed");
     }
     // A handle program reads guest memory that can change between draws. Reusing
-    // the argument table would keep the previous draw's handle.
-    if (vertex_shader && !vertex_shader->handle_programs.empty())
-        dirty.arguments[NVN_SHADER_STAGE_VERTEX] = true;
-    if (fragment_shader && !fragment_shader->handle_programs.empty())
-        dirty.arguments[NVN_SHADER_STAGE_FRAGMENT] = true;
+    // the argument table would keep the previous draw's handle. A title with
+    // current handle reads keeps a stage's handles, like its other bindings,
+    // until a binding, an inline update it reads, a registration or a CPU
+    // write the replay tracks changes them (sync_draw_resources).
+    const bool current_handles = nvn::title_policy().handle_reads == nvn::TitlePolicy::HandleReads::current;
+    // ... an inline update, a buffer write or a storing guest-memory stage
+    // since the handles were read also rereads them.
+    const auto handles_stale = [&](std::size_t stage, const platform::CompiledGraphicsStage* shader) {
+        if (!shader || shader->handle_programs.empty()) return false;
+        if (!current_handles) return true;
+        const auto& bound = bindings[stage];
+        return bound.handle_updates != pending.counters.uniform_updates ||
+               bound.handle_writes != other_buffer_writes.size() || bound.handle_stores != guest_write_serial;
+    };
+    if (handles_stale(NVN_SHADER_STAGE_VERTEX, vertex_shader)) dirty.arguments[NVN_SHADER_STAGE_VERTEX] = true;
+    if (handles_stale(NVN_SHADER_STAGE_FRAGMENT, fragment_shader)) dirty.arguments[NVN_SHADER_STAGE_FRAGMENT] = true;
     if (sync_draw_resources()) {
         for (auto& stage : bindings) stage.windows.fill({});
     }
     if (mesh_draw) {
+        const auto stage_shader = [&](std::size_t slot) -> const platform::CompiledGraphicsStage* {
+            const auto& program = state.stage_programs[slot];
+            return program ? program->stages[slot].get() : nullptr;
+        };
+        if (!prepare_images({
+                {NVN_SHADER_STAGE_TESS_CONTROL, stage_shader(NVN_SHADER_STAGE_TESS_CONTROL)},
+                {NVN_SHADER_STAGE_TESS_EVALUATION, stage_shader(NVN_SHADER_STAGE_TESS_EVALUATION)},
+                {NVN_SHADER_STAGE_FRAGMENT, fragment_shader}}))
+            return false;
         // The task and mesh stages bind to their own tables; there are no
         // vertex streams.
         for (const auto& [slot, table] : {std::pair{std::size_t(NVN_SHADER_STAGE_TESS_CONTROL), object_table},
@@ -7703,24 +10815,42 @@ bool Encoder::open_render(std::int32_t primitive) {
             const auto& program = state.stage_programs[slot];
             const auto* shader = program ? program->stages[slot].get() : nullptr;
             if (!shader) continue;
+            if (stage_has_pool(shader) && !refresh_pools(slot, *shader)) return false;
+            // Under current handle reads an unchanged stage keeps its table,
+            // as the vertex and fragment stages do.
+            if (current_handles && !dirty.arguments[slot] && !dirty.uniforms[slot] &&
+                bindings[slot].shader == shader && !handles_stale(slot, shader)) {
+                ++backend.mutable_statistics().stage_reuses;
+                ++pending.counters.stage_reuses;
+                continue;
+            }
             if (!bind_stage(slot, *shader, table, true, false)) return false;
             dirty.arguments[slot] = false;
             dirty.uniforms[slot] = false;
             bindings[slot].shader = shader;
         }
         dirty.vertices = false;
-    } else if (dirty.arguments[NVN_SHADER_STAGE_VERTEX] || dirty.uniforms[NVN_SHADER_STAGE_VERTEX] ||
-        bindings[NVN_SHADER_STAGE_VERTEX].shader != vertex_shader) {
-        const bool uniforms_only = !dirty.arguments[NVN_SHADER_STAGE_VERTEX] &&
-            bindings[NVN_SHADER_STAGE_VERTEX].shader == vertex_shader;
-        if (!bind_stage(NVN_SHADER_STAGE_VERTEX, *vertex_shader, vertex_table, true, uniforms_only))
-            return false;
-        dirty.arguments[NVN_SHADER_STAGE_VERTEX] = false;
-        dirty.uniforms[NVN_SHADER_STAGE_VERTEX] = false;
-        bindings[NVN_SHADER_STAGE_VERTEX].shader = vertex_shader;
     } else {
-        ++backend.mutable_statistics().stage_reuses;
-        ++pending.counters.stage_reuses;
+        if (vertex_shader && stage_has_pool(vertex_shader) &&
+            !refresh_pools(NVN_SHADER_STAGE_VERTEX, *vertex_shader))
+            return false;
+        if (!prepare_images({
+                {NVN_SHADER_STAGE_VERTEX, vertex_shader},
+                {NVN_SHADER_STAGE_FRAGMENT, fragment_shader}}))
+            return false;
+        if (dirty.arguments[NVN_SHADER_STAGE_VERTEX] || dirty.uniforms[NVN_SHADER_STAGE_VERTEX] ||
+            bindings[NVN_SHADER_STAGE_VERTEX].shader != vertex_shader) {
+            const bool uniforms_only = !dirty.arguments[NVN_SHADER_STAGE_VERTEX] &&
+                bindings[NVN_SHADER_STAGE_VERTEX].shader == vertex_shader;
+            if (!bind_stage(NVN_SHADER_STAGE_VERTEX, *vertex_shader, vertex_table, true, uniforms_only))
+                return false;
+            dirty.arguments[NVN_SHADER_STAGE_VERTEX] = false;
+            dirty.uniforms[NVN_SHADER_STAGE_VERTEX] = false;
+            bindings[NVN_SHADER_STAGE_VERTEX].shader = vertex_shader;
+        } else {
+            ++backend.mutable_statistics().stage_reuses;
+            ++pending.counters.stage_reuses;
+        }
     }
     if (dirty.vertices && !mesh_draw) {
         for (std::size_t index = 0; index != state.vertex_buffers.size(); ++index) {
@@ -7746,6 +10876,9 @@ bool Encoder::open_render(std::int32_t primitive) {
         if (vertex_shader->vertex_fetch_buffer_index && !bind_vertex_fetch(*vertex_shader)) return false;
         dirty.vertices = false;
     }
+    if (fragment_shader && stage_has_pool(fragment_shader) &&
+        !refresh_pools(NVN_SHADER_STAGE_FRAGMENT, *fragment_shader))
+        return false;
     if (fragment_shader && (dirty.arguments[NVN_SHADER_STAGE_FRAGMENT] ||
                          dirty.uniforms[NVN_SHADER_STAGE_FRAGMENT] ||
                          bindings[NVN_SHADER_STAGE_FRAGMENT].shader != fragment_shader)) {
@@ -7762,6 +10895,10 @@ bool Encoder::open_render(std::int32_t primitive) {
         ++pending.counters.stage_reuses;
     }
 
+    if (feedback_reopen) {
+        feedback_reopen = false;
+        return open_render(primitive);
+    }
     if (depth_barrier_reads) {
         if (!close_render(PassBreak::depth_sampled)) return false;
         return open_render(primitive);
@@ -7817,6 +10954,7 @@ bool Encoder::open_render(std::int32_t primitive) {
             return fail(ReplayErrorCode::allocation, "Metal replay render encoder creation failed");
         ++backend.mutable_statistics().render_passes;
         ++pending.counters.passes;
+        pass_draws_at_open = pending.counters.draws;
         // A pending conditional block's predicate runs first in its pass.
         if (predicate_draw) encode_predicate_draw(predicate_draw);
         {
@@ -8019,12 +11157,111 @@ bool Encoder::open_render(std::int32_t primitive) {
     dirty.fixed = 0;
     if (state.samples_active)
         set_visibility(MTLVisibilityResultModeCounting, pass_visibility * sizeof(std::uint64_t));
+    if (backend.pass_dump_enabled() && backend.pass_dump_wants(backend.pool_present_count())) {
+        const char* selection = std::getenv("ARMIGO_NVN_PASS_DUMP_INPUT_SHADER");
+        const std::string_view filters = selection ? selection : "";
+        const bool selected_inputs = dump_input_shader_matches(fragment_shader, filters);
+        const auto take_reads = [&](std::size_t slot) {
+            const auto& reads = bindings[slot].dump_reads;
+            render_dump_reads.insert(reads.begin(), reads.end());
+            auto& dump = backend.pass_dump();
+            if (dump.metadata_only() || (dump.inputs() && selected_inputs)) {
+                const auto metadata = dump_binding_metadata(slot);
+                render_dump_reads.insert(metadata.begin(), metadata.end());
+            }
+            id<MTLTexture> color = render_descriptor.colorAttachments[0].texture;
+            if (dump.inputs() && selected_inputs && color_draw && color &&
+                ((!dump.metadata_only() && !filters.empty()) || dump.splits_draws(
+                    std::max<NSUInteger>(1, color.width >> render_descriptor.colorAttachments[0].level),
+                    std::max<NSUInteger>(1, color.height >> render_descriptor.colorAttachments[0].level)))) {
+                const auto& textures = bindings[slot].dump_textures;
+                render_dump_textures.insert(render_dump_textures.end(), textures.begin(), textures.end());
+                const auto* shader = bindings[slot].shader;
+                const auto snapshot = [&](std::uint32_t index, std::uint64_t size, std::string name) {
+                    if (index >= bindings[slot].buffers.size()) return;
+                    const auto& buffer = bindings[slot].buffers[index];
+                    if (!buffer.present) return;
+                    const auto prefix = std::move(name) + "-d" + std::to_string(pending.counters.draws);
+                    constexpr std::uint64_t chunk_bytes = 1024 * 1024;
+                    if (size <= chunk_bytes) {
+                        render_dump_buffers.push_back(dump.prepare_buffer(prefix, buffer.value, size));
+                        return;
+                    }
+                    std::uint64_t available = 0, allocation_gpu = 0;
+                    for (id object : pending.carry->retained) {
+                        if (![object conformsToProtocol:@protocol(MTLBuffer)]) continue;
+                        id<MTLBuffer> allocation = object;
+                        const auto base = allocation.gpuAddress;
+                        if (buffer.value < base || buffer.value - base >= allocation.length) continue;
+                        allocation_gpu = base;
+                        available = allocation.length - (buffer.value - base);
+                        break;
+                    }
+                    const auto captured = std::min({size, available, 16 * chunk_bytes});
+                    render_dump_reads.insert("input_buffer stage=" + std::to_string(slot) +
+                        " index=" + std::to_string(index) + " gpu=" + std::to_string(buffer.value) +
+                        " allocation_gpu=" + std::to_string(allocation_gpu) + " requested=" + std::to_string(size) +
+                        " available=" + std::to_string(available) + " captured=" + std::to_string(captured));
+                    if (!captured) {
+                        render_dump_buffers.push_back(dump.prepare_buffer(prefix, buffer.value, 0));
+                        return;
+                    }
+                    for (std::uint64_t offset = 0; offset < captured && !dump.stopped(); offset += chunk_bytes)
+                        render_dump_buffers.push_back(dump.prepare_buffer(prefix + "-o" + std::to_string(offset),
+                            buffer.value + offset, std::min(chunk_bytes, captured - offset)));
+                };
+                if (shader) {
+                    for (const auto& buffer : shader->constant_buffers) {
+                        const auto guest = hardware_buffer(slot, buffer.guest_binding);
+                        const bool driver = buffer.guest_binding == 0 || buffer.guest_binding == 2 ||
+                            (state.push_bank_at(slot) && buffer.guest_binding == state.push_bank_at(slot));
+                        const auto size = driver ? std::uint64_t(compute_driver_data_bytes)
+                            : std::min<std::uint64_t>(guest.size,
+                                buffer.minimum_size ? buffer.minimum_size : guest.size);
+                        snapshot(buffer.metal_buffer_index, size, "cb" + std::to_string(slot) +
+                            "-hw" + std::to_string(buffer.guest_binding));
+                    }
+                    for (const auto& buffer : shader->constant_buffer_windows)
+                        snapshot(buffer.metal_buffer_index, buffer.window_bytes, "cw" + std::to_string(slot) +
+                            "-hw" + std::to_string(buffer.guest_binding));
+                    for (const auto& buffer : shader->storage_buffers)
+                        if (buffer.metal_buffer_index < bindings[slot].dump_buffer_sizes.size())
+                            snapshot(buffer.metal_buffer_index, bindings[slot].dump_buffer_sizes[buffer.metal_buffer_index],
+                                "sb" + std::to_string(slot) + "-" + std::to_string(buffer.metal_buffer_index));
+                    if (shader->guest_memory && pending.guest_table)
+                        snapshot(shader->guest_memory->buffer_index, pending.guest_table.length,
+                                 "gm" + std::to_string(slot));
+                }
+            }
+        };
+        if (mesh_draw) {
+            for (const auto slot : {NVN_SHADER_STAGE_TESS_CONTROL, NVN_SHADER_STAGE_TESS_EVALUATION}) {
+                const auto& program = state.stage_programs[slot];
+                if (program && program->stages[slot]) take_reads(slot);
+            }
+        } else {
+            take_reads(NVN_SHADER_STAGE_VERTEX);
+        }
+        if (fragment_shader) take_reads(NVN_SHADER_STAGE_FRAGMENT);
+        const auto label = [&](std::size_t slot) {
+            return stage_label(bindings[slot].shader);
+        };
+        render_dump_draws.push_back("ordinal=" + std::to_string(pending.counters.draws - pass_draws_at_open) +
+            " submission_draw=" + std::to_string(pending.counters.draws) +
+            " vs=" + (mesh_draw ? std::string("-") : label(NVN_SHADER_STAGE_VERTEX)) +
+            " ts=" + (mesh_draw ? label(NVN_SHADER_STAGE_TESS_CONTROL) : std::string("-")) +
+            " ms=" + (mesh_draw ? label(NVN_SHADER_STAGE_TESS_EVALUATION) : std::string("-")) +
+            " fs=" + (fragment_shader ? label(NVN_SHADER_STAGE_FRAGMENT) : std::string("-")));
+    }
+    feedback_written |= color_writers;
+    feedback_depth_written |= feedback_draw_depth_write;
+    feedback_uses.clear();
     return true;
 }
 
 BoundBuffer Encoder::hardware_buffer(std::size_t stage, std::uint32_t slot) const {
-    if (slot >= 3 && slot == state.push_bank[stage]) return {};
-    if (slot >= 3) return slot - 3 < buffer_slots ? state.uniform[stage][slot - 3] : BoundBuffer{};
+    if (slot >= 3 && slot == state.push_bank_at(stage)) return {};
+    if (slot >= 3) return slot - 3 < buffer_slots ? state.uniform_at(stage)[slot - 3] : BoundBuffer{};
     if (slot == 1 && state.stage_programs[stage]) {
         const auto& constants = state.stage_programs[stage]->constants[stage];
         return {constants.address, constants.size};
@@ -8066,8 +11303,8 @@ std::array<std::byte, compute_driver_data_bytes> Encoder::driver_constants(std::
     std::array<std::byte, compute_driver_data_bytes> bytes{};
     bytes.fill(std::byte{0});
     // The push block: past it the constant buffer reads zero.
-    if (slot >= 3 && slot == state.push_bank[stage]) {
-        std::memcpy(bytes.data(), state.push_constants[stage].data(), push_constant_bytes);
+    if (slot >= 3 && slot == state.push_bank_at(stage)) {
+        std::memcpy(bytes.data(), state.push_at(stage).data(), push_constant_bytes);
         return bytes;
     }
     const auto put = [&](std::size_t offset, const void* value, std::size_t size) {
@@ -8076,7 +11313,7 @@ std::array<std::byte, compute_driver_data_bytes> Encoder::driver_constants(std::
     const auto* layout = stage == NVN_SHADER_STAGE_COMPUTE && slot == 0 ? compute_layout() : nullptr;
     if (layout) {
         put(4, dispatch_groups.data(), sizeof dispatch_groups);
-        put(0x10, state.push_constants[stage].data(), std::min<std::size_t>(layout->push_bytes, push_constant_bytes));
+        put(0x10, state.push_at(stage).data(), std::min<std::size_t>(layout->push_bytes, push_constant_bytes));
         const auto put_buffers = [&](std::uint32_t base, std::uint32_t count, const auto& buffers) {
             for (std::size_t row = 0; row < std::min<std::size_t>(count, buffer_slots); ++row) {
                 const auto size = static_cast<std::uint32_t>(std::min<std::uint64_t>(buffers[row].size, UINT32_MAX));
@@ -8084,16 +11321,17 @@ std::array<std::byte, compute_driver_data_bytes> Encoder::driver_constants(std::
                 put(base + 16 * row + 8, &size, 4);
             }
         };
-        put_buffers(layout->uniform_base(), layout->uniforms, state.uniform[stage]);
-        put_buffers(layout->storage_base(), layout->storages, state.storage[stage]);
-        const auto put_handles = [&](std::uint32_t base, std::uint32_t count, const auto& handles) {
-            for (std::size_t index = 0; index < std::min<std::size_t>(count, handles.size()); ++index)
-                put(base + 8 * index, &handles[index], 8);
+        put_buffers(layout->uniform_base(), layout->uniforms, state.uniform_at(stage));
+        put_buffers(layout->storage_base(), layout->storages, state.storage_at(stage));
+        const auto put_handles = [&](std::uint32_t base, std::uint32_t count, const auto& handles,
+                                     std::size_t first = 0) {
+            for (std::size_t index = 0; index < std::min<std::size_t>(count, handles.size() - first); ++index)
+                put(base + 8 * index, &handles[first + index], 8);
         };
-        put_handles(layout->texture_base(), layout->textures, state.textures[stage]);
-        put_handles(layout->separate_texture_base(), layout->separate_textures, state.textures[stage]);
-        put_handles(layout->separate_sampler_base(), layout->separate_samplers, state.samplers[stage]);
-        put_handles(layout->image_base(), layout->images, state.images[stage]);
+        put_handles(layout->texture_base(), layout->textures, state.textures_at(stage));
+        put_handles(layout->separate_texture_base(), layout->separate_textures, state.textures_at(stage), separate_texture_slot_base);
+        put_handles(layout->separate_sampler_base(), layout->separate_samplers, state.samplers_at(stage));
+        put_handles(layout->image_base(), layout->images, state.images_at(stage));
         return bytes;
     }
     if (slot == 0) {
@@ -8110,7 +11348,7 @@ std::array<std::byte, compute_driver_data_bytes> Encoder::driver_constants(std::
             : stage == NVN_SHADER_STAGE_TESS_EVALUATION && bound && bound->mesh ? 0x770 : -1;
         if (base >= 0)
             for (std::size_t row = 0; row < buffer_slots; ++row) {
-                const auto& buffer = state.storage[stage][row];
+                const auto& buffer = state.storage_at(stage)[row];
                 const auto size = static_cast<std::uint32_t>(std::min<std::uint64_t>(buffer.size, UINT32_MAX));
                 put(base + 16 * row, &buffer.address, 8);
                 put(base + 16 * row + 8, &size, 4);
@@ -8119,15 +11357,16 @@ std::array<std::byte, compute_driver_data_bytes> Encoder::driver_constants(std::
             put(graphics_base_instance_offset, &draw_base_instance, sizeof draw_base_instance);
         if (stage == NVN_SHADER_STAGE_COMPUTE)
             for (std::size_t row = 0; row < buffer_slots; ++row) {
-                const auto& buffer = state.uniform[stage][row];
+                const auto& buffer = state.uniform_at(stage)[row];
                 const auto size = static_cast<std::uint32_t>(std::min<std::uint64_t>(buffer.size, UINT32_MAX));
                 put(0x210 + 16 * row, &buffer.address, 8);
                 put(0x210 + 16 * row + 8, &size, 4);
             }
     } else if (slot == 2) {
-        for (std::size_t texture = 0; texture < 32; ++texture) {
-            const auto handle = static_cast<std::uint32_t>(state.textures[stage][texture]);
-            put(0x20 + 8 * texture, &handle, 4);
+        put(0x18, &state.prefix_at(stage), sizeof(std::uint64_t));
+        for (std::size_t offset = 0x20; offset < 0x968; offset += 8) {
+            const auto handle = static_cast<std::uint32_t>(bound_c2_handle(stage, offset));
+            put(offset, &handle, 4);
         }
     }
     return bytes;
@@ -8174,32 +11413,48 @@ bool Encoder::guest_written(std::uint64_t address, std::uint64_t size) const {
     return guest_writes_pending && guest_ranges_overlap(pending.guest_ranges.get(), address, size);
 }
 
-// The first stage since the last GPU wait that reads the guest-memory table:
-// captured uniform bytes in its pools may be overwritten before they are read.
+// The first storing stage since the last GPU wait. Captured uniform bytes in
+// the pools it may write are discarded: the learned pools once stores are
+// predicted, and otherwise every pool of the table.
 void Encoder::note_guest_writes() {
     ++guest_write_serial;
     pending.guest_writes = true;
     if (std::exchange(guest_writes_pending, true)) return;
+    if (backend.apply_guest_write_prediction(pending)) {
+        if (const auto* ranges = pending.guest_ranges.get())
+            for (const auto& [begin, end] : *ranges)
+                if (end > begin) discard_gpu_uniform_captures(begin, end - begin);
+        return;
+    }
+    // No prediction for this store (not settled, switched off, or over the
+    // cap): it may write anywhere in the table, also when an earlier segment
+    // of this submission was encoded from a prediction.
+    if (auto ranges = backend.guest_table_ranges()) pending.guest_ranges = std::move(ranges);
     if (const auto* pools = backend.guest_table_pools())
         for (const auto& [begin, length] : *pools) discard_gpu_uniform_captures(begin, length);
 }
 
 bool Encoder::order_cpu_read(std::uint64_t address, std::uint64_t size, bool overlay,
                              const std::byte* cpu, bool current) {
+    const SiteScope site_scope(*this, TransferSite::cpu_read, true);
     for (const auto& previous : previous_submissions) {
         if (previous->fence <= retired_fence) continue;
         // Captured uniform bytes can be overlaid without waiting; ordinary
         // GPU writers must finish before their backing is read on the CPU.
         const auto& writes = overlay ? previous->other_buffer_writes : previous->buffer_writes;
-        // A guest-memory stage that stores may have written anywhere in its pools.
-        const bool written = (previous->guest_writes &&
-                              guest_ranges_overlap(previous->guest_ranges.get(), address, size)) ||
-            std::ranges::any_of(writes, [&](const auto& write) {
-                return address < write.first + write.second && write.first < address + size;
-            });
-        if (written) {
+        // A guest-memory stage that stores may have written the pools recorded for it.
+        const bool guest = previous->guest_writes &&
+            guest_ranges_overlap(previous->guest_ranges.get(), address, size);
+        const bool buffer = std::ranges::any_of(writes, [&](const auto& write) {
+            return address < write.first + write.second && write.first < address + size;
+        });
+        if (guest || buffer) {
             backend.wait_retired(*previous);
             retired_fence = backend.completed_fence();
+        } else if (previous->guest_writes && previous->guest_writes_predicted) {
+            // The learned pools excluded this read, so the wait was skipped.
+            // The current submission may store nothing of its own.
+            backend.note_predicted_guest_read(*previous, address, size);
         }
     }
     if (current) {
@@ -8215,6 +11470,8 @@ bool Encoder::order_cpu_read(std::uint64_t address, std::uint64_t size, bool ove
             (uniform_copy_unknown || mapping_alias(uniform_copy_mappings, pointer, address, size));
         const bool written = copied_alias || guest_written(address, size) || current_buffer_write_overlap(pointer, size);
         if (failed || (written && !synchronize_gpu())) return false;
+        if (!written && pending.guest_writes_predicted && guest_writes_pending)
+            backend.note_predicted_guest_read(pending, address, size);
     }
     return !failed;
 }
@@ -8411,6 +11668,11 @@ void Encoder::overlay_uniform(std::uint64_t address, std::byte* bytes, std::size
             const auto end = std::min(address + size, update.address + update.size);
             pending.counters.overlay_bytes += end - begin;
             std::memcpy(bytes + begin - address, update.bytes + begin - update.address, end - begin);
+            // A capture kept past a predicted store can supply bytes that
+            // store may still be writing. The submission that predicted is
+            // the one a later new pool is checked against.
+            if (pending.guest_writes_predicted && pending.guest_writes)
+                backend.note_predicted_guest_read(pending, begin, end - begin);
             if (covered)
                 for (auto byte = begin - address; byte < std::min<std::uint64_t>(end - address, 32); ++byte)
                     *covered |= 1u << byte;
@@ -8565,6 +11827,7 @@ void Encoder::record_uniform_copy(std::uint64_t address, std::uint64_t size, con
 }
 
 bool Encoder::prepare_uniform_access(std::uint64_t address, std::uint64_t size, std::uint64_t second) {
+    const SiteScope site_scope(*this, TransferSite::uniform_access, true);
     const bool first_conflict = uniform_conflict(address, size);
     const bool second_conflict = second && uniform_conflict(second, size);
     if (failed || ((first_conflict || second_conflict) && !flush_uniforms())) return false;
@@ -8595,6 +11858,7 @@ bool Encoder::prepare_uniform_access(std::uint64_t address, std::uint64_t size, 
 }
 
 bool Encoder::prepare_graphics_uniform_writes() {
+    const SiteScope site_scope(*this, TransferSite::graphics_writes);
     if (uniform_versions.empty()) return true;
     constexpr auto graphics_writers = (1u << NVN_SHADER_STAGE_VERTEX) | (1u << NVN_SHADER_STAGE_FRAGMENT) |
         (1u << NVN_SHADER_STAGE_GEOMETRY) | (1u << NVN_SHADER_STAGE_TESS_CONTROL) |
@@ -8640,13 +11904,15 @@ bool Encoder::version_uniform(std::uint64_t address, std::uint64_t size, const s
     const auto overlaps = [&](std::uint64_t address, std::uint64_t size) {
         return address && size && address < end && begin < address + size;
     };
-    for (std::size_t stage = 0; stage < stage_count; ++stage) {
-        for (const auto& binding : state.uniform[stage])
+    // Inactive logical banks remain observable after a geometry-mode change.
+    // A version must cover every overlapping binding, not only active slots.
+    for (const auto& stage : state.uniform)
+        for (const auto& binding : stage)
             if (overlaps(binding.address, binding.size) &&
                 (binding.address < begin || binding.address + binding.size > end)) return false;
-        for (const auto& binding : state.storage[stage])
+    for (const auto& stage : state.storage)
+        for (const auto& binding : stage)
             if (overlaps(binding.address, binding.size)) return false;
-    }
     for (const auto& binding : state.vertex_buffers)
         if (overlaps(binding.address, binding.size)) return false;
     for (const auto& [address, size] : other_buffer_writes)
@@ -8815,6 +12081,347 @@ bool Encoder::buffer_writes_overlap(std::uint64_t address, std::uint64_t size, s
     });
 }
 
+namespace {
+
+PoolTableKey pool_table_key(const platform::CompiledShaderResource& resource) {
+    PoolTableKey key;
+    key.sampler = resource.kind == platform::CompiledShaderResourceKind::SamplerPool;
+    if (key.sampler) {
+        key.normalized_coordinates = true;
+        key.comparison = false;
+        return key;
+    }
+    key.normalized_coordinates = false;
+    key.comparison = false;
+    if (!resource.texture_descriptor) return key;
+    const auto& descriptor = *resource.texture_descriptor;
+    const bool array = descriptor.array;
+    const bool multisample = descriptor.multisample;
+    using Dimension = platform::CompiledShaderTextureDimension;
+    switch (descriptor.dimension) {
+    case Dimension::d1:
+        key.type = array ? MTLTextureType1DArray : MTLTextureType1D;
+        break;
+    case Dimension::d2:
+        key.type = multisample ? (array ? MTLTextureType2DMultisampleArray : MTLTextureType2DMultisample)
+                               : (array ? MTLTextureType2DArray : MTLTextureType2D);
+        break;
+    case Dimension::d3:
+        key.type = MTLTextureType3D;
+        break;
+    case Dimension::cube:
+        key.type = array ? MTLTextureTypeCubeArray : MTLTextureTypeCube;
+        break;
+    case Dimension::buffer:
+        key.type = MTLTextureTypeTextureBuffer;
+        break;
+    }
+    using Format = platform::TextureComponentFormat;
+    switch (descriptor.component_format) {
+    case Format::signed_integer: key.component = PoolComponent::Sint; break;
+    case Format::unsigned_integer: key.component = PoolComponent::Uint; break;
+    case Format::depth: key.component = PoolComponent::Depth; break;
+    default: key.component = PoolComponent::Float; break;
+    }
+    return key;
+}
+
+} // namespace
+
+bool Encoder::stage_has_pool(const platform::CompiledGraphicsStage* shader) const {
+    if (!shader) return false;
+    for (const auto& resource : shader->resources)
+        if (resource.kind == platform::CompiledShaderResourceKind::TexturePool ||
+            resource.kind == platform::CompiledShaderResourceKind::SamplerPool)
+            return true;
+    return false;
+}
+
+bool Encoder::refresh_pools(std::size_t stage, const platform::CompiledGraphicsStage& shader) {
+    const auto bound = bindings[stage].pool_generation;
+    for (const auto& resource : shader.resources) {
+        if (resource.kind != platform::CompiledShaderResourceKind::TexturePool &&
+            resource.kind != platform::CompiledShaderResourceKind::SamplerPool)
+            continue;
+        const auto found = backend.pool_tables().lookup(pool_table_key(resource), backend.resources(),
+                                                        pending.fence, backend.completed_fence(),
+                                                        backend.pool_present_count());
+        backend.adopt_pool_stats();
+        if (!found.ok)
+            return fail(ReplayErrorCode::allocation, "texture pool table is unavailable");
+    }
+    if (backend.pool_tables().generation() != bound) dirty.arguments[stage] = true;
+    return true;
+}
+
+void Encoder::retain_pool_version(const std::shared_ptr<PoolTableVersion>& version) {
+    if (!version) return;
+    auto current = version->retire_fence.load(std::memory_order_relaxed);
+    while (current < pending.fence &&
+           !version->retire_fence.compare_exchange_weak(current, pending.fence, std::memory_order_relaxed)) {
+    }
+    // One strong ref for the submission. Each command buffer that binds the
+    // version still needs its residency set; a later segment does not keep
+    // the previous buffer's sets.
+    bool held = false;
+    for (const auto& existing : pending.pool_versions) {
+        if (existing.get() == version.get()) {
+            held = true;
+            break;
+        }
+    }
+    if (!held)
+        pending.pool_versions.push_back(version);
+    if (!version->residency) return;
+    for (const auto* attached : pool_residency_attached)
+        if (attached == version.get()) return;
+    bool attached = false;
+    if (pending.encode_thread) {
+        pending.encode_thread->put(EncodeOp::residency_set, 0,
+                                   ResidentRecord{&pending, (__bridge void*)version->residency});
+        attached = true;
+    } else if (pending.commands) {
+        use_residency_set(pending, pending.commands, version->residency);
+        attached = true;
+    }
+    if (attached)
+        pool_residency_attached.push_back(version.get());
+}
+
+bool Encoder::bind_pool_resource(std::size_t stage, const platform::CompiledShaderResource& resource,
+                                 __unsafe_unretained id<MTL4ArgumentTable> table, bool fragment) {
+    if (resource.kind == platform::CompiledShaderResourceKind::TexturePool && !resource.texture_descriptor)
+        return fail(ReplayErrorCode::unsupported, "texture pool resource has no element type");
+    const auto& location = resource.location;
+    if (location.kind != platform::CompiledShaderResourceLocationKind::Direct ||
+        location.resource_namespace != platform::CompiledShaderResourceNamespace::Buffer ||
+        location.first >= 31)
+        return fail(ReplayErrorCode::unsupported, "texture pool table binding is outside the buffer namespace");
+    const auto found = backend.pool_tables().lookup(pool_table_key(resource), backend.resources(), pending.fence,
+                                                    backend.completed_fence(), backend.pool_present_count());
+    backend.adopt_pool_stats();
+    if (!found.diagnostic.empty())
+        return fail(ReplayErrorCode::unsupported_resource, found.diagnostic);
+    if (!found.ok || !found.version)
+        return fail(ReplayErrorCode::allocation, "texture pool table is unavailable");
+    write_buffer_slot(table, stage, location.first, found.version->gpu);
+    make_resident(pending, found.version->buffer);
+    if (found.bitmap) make_resident(pending, found.bitmap);
+    retain_pool_version(found.version);
+    bindings[stage].pool_generation = backend.pool_tables().generation();
+    if (fragment && render && resource.kind == platform::CompiledShaderResourceKind::TexturePool &&
+        state.targets.depth) {
+        const auto& depth = *state.targets.depth;
+        const auto storage = pool_storage_key(reinterpret_cast<std::uint64_t>(depth.memory), depth.size,
+                                              &depth.description, sizeof depth.description);
+        if (backend.resources().pool_depth_read(depth.serial, storage)) depth_barrier_reads = true;
+    }
+    return true;
+}
+
+std::uint64_t Encoder::bound_c2_handle(std::size_t stage_index, std::uint64_t offset) const {
+    if (offset == 0x18) return static_cast<std::uint32_t>(state.prefix_at(stage_index));
+    if (offset < 0x20 || (offset - 0x20) % 8) return 0;
+    if (offset < 0x168) {
+        const auto slot = (offset - 0x20) / 8;
+        if (slot >= 32 && slot < 40 && state.images_at(stage_index)[slot - 32])
+            return state.images_at(stage_index)[slot - 32];
+        return state.textures_at(stage_index)[slot];
+    }
+    if (offset < 0x568)
+        return state.textures_at(stage_index)[separate_texture_slot_base + (offset - 0x168) / 8];
+    if (offset < 0x968) return state.samplers_at(stage_index)[(offset - 0x568) / 8];
+    return 0;
+}
+
+std::int32_t Encoder::bound_texture_id_at(std::size_t stage_index, std::size_t slot, bool image) const {
+    if (slot >= (image ? image_slots : texture_slots)) return 0;
+    const auto handle = image ? state.images_at(stage_index)[slot]
+                              : state.textures_at(stage_index)[slot];
+    return static_cast<std::int32_t>(handle_texture_id(handle));
+}
+
+// The constant-buffer word a bound handle, or a handle program's cbuf
+// operation, reads. `offset` is the byte offset in that slot.
+std::uint64_t Encoder::read_stage_cbuf_word(std::size_t stage_index, std::uint32_t slot,
+                                            std::uint64_t offset) {
+    const bool compute = stage_index == NVN_SHADER_STAGE_COMPUTE;
+    if (slot == 2) {
+        if (offset == 0x1c) return state.prefix_at(stage_index) >> 32;
+        return static_cast<std::uint32_t>(bound_c2_handle(stage_index, offset));
+    }
+    if (slot == 0 && compute) {
+        // An API 231 compute stage's handle runs, 8 bytes a slot.
+        const auto* layout = compute_layout();
+        if (!layout) return 0;
+        const auto entry = [&](std::uint32_t base, std::uint32_t count, const auto& handles,
+                               std::size_t first = 0) -> std::optional<std::uint64_t> {
+            if (offset < base || offset >= base + 8ull * count) return std::nullopt;
+            const auto index = (offset - base) / 8;
+            return (offset - base) % 8 || first + index >= handles.size() ? 0 : handles[first + index];
+        };
+        for (const auto& found : {entry(layout->texture_base(), layout->textures, state.textures_at(stage_index)),
+                entry(layout->separate_texture_base(), layout->separate_textures, state.textures_at(stage_index), separate_texture_slot_base),
+                entry(layout->separate_sampler_base(), layout->separate_samplers, state.samplers_at(stage_index)),
+                entry(layout->image_base(), layout->images, state.images_at(stage_index))})
+            if (found) return *found;
+    }
+    if (slot == 0 || (slot >= 3 && slot == state.push_bank_at(stage_index))) {
+        // Handle programs read the same generated words as the GPU stage,
+        // including the addresses in the graphics storage-buffer tables.
+        const auto driver = driver_constants(stage_index, slot);
+        if (offset > driver.size() || sizeof(std::uint32_t) > driver.size() - offset) return 0;
+        std::uint32_t word = 0;
+        std::memcpy(&word, driver.data() + offset, sizeof word);
+        return word;
+    }
+    if (slot >= buffer_slots + 3) return 0;
+    const auto binding = hardware_buffer(stage_index, slot);
+    if (!binding.address || offset > binding.size || sizeof(std::uint32_t) > binding.size - offset)
+        return 0;
+    const auto address = binding.address + offset;
+    if ((address & 3) == 0)
+        if (const auto found = uniform_words.find(address); found != uniform_words.end())
+            return found->second;
+    std::uint32_t handle = 0, covered = 0;
+    if (!uniform_updates.empty() && captured_guest_bytes.may_intersect(address, sizeof handle)) {
+        // A complete current capture supersedes earlier writes without a
+        // backing read. Partial captures and prior submissions cannot be
+        // cached: their remaining bytes still need normal read ordering.
+        overlay_uniform(address, reinterpret_cast<std::byte*>(&handle), sizeof handle, &covered, true);
+        if (covered == 0xf) {
+            if (!(address & 3)) uniform_words.emplace(address, handle);
+            return handle;
+        }
+        handle = covered = 0;
+    }
+    const auto span = buffer_at(address, sizeof(std::uint32_t));
+    const auto* contents = static_cast<const std::byte*>(span.buffer.contents);
+    if (contents && span.offset <= span.buffer.length && sizeof handle <= span.buffer.length - span.offset) {
+        // With the title's current handle reads, GPU writers of this
+        // submission are not waited for: the handle is memory as it is now,
+        // under the captured uniform updates applied below.
+        const bool current = nvn::title_policy().handle_reads == nvn::TitlePolicy::HandleReads::ordered;
+        if (!order_cpu_read(address, sizeof handle, true, contents + span.offset, current)) return 0;
+        std::memcpy(&handle, contents + span.offset, sizeof handle);
+        covered = 0xf;
+    }
+    // A later writer may invalidate one cached word while leaving earlier
+    // captured bytes in the rest of it. Apply only those surviving bytes.
+    overlay_uniform(address, reinterpret_cast<std::byte*>(&handle), sizeof handle, &covered);
+    if (covered != 0xf) {
+        fail(ReplayErrorCode::missing_resource, "texture handle backing is not CPU-visible");
+        return 0;
+    }
+    return handle;
+}
+
+// Naturally aligned guest word. Zero where nothing mapped covers it.
+// Guest-memory stores and ordinary GPU buffer writes that may overlap the
+// word finish before the load. An in-place texture write is not one of
+// those buffer writes: it is recorded on the texture and as a CPU range,
+// so this load waits for that too. Deferred uniform captures are applied
+// after the backing read, including captures an earlier submission still
+// holds because a lower fence has not retired.
+std::uint32_t Encoder::read_stage_guest_word(std::uint64_t address) {
+    address &= ~std::uint64_t{3};
+    const auto span = buffer_at(address, sizeof(std::uint32_t));
+    const auto* contents = static_cast<const std::byte*>(span.buffer.contents);
+    const bool mapped = contents && span.offset <= span.buffer.length &&
+        sizeof(std::uint32_t) <= span.buffer.length - span.offset;
+    const auto* cpu = mapped ? contents + span.offset : nullptr;
+    // An address in no memory pool reads 0, under the submission's captured
+    // uniform updates: no GPU work writes there, so nothing orders the read.
+    if (!mapped) {
+        std::uint32_t word = 0, covered = 0;
+        overlay_uniform(address, reinterpret_cast<std::byte*>(&word), sizeof word, &covered);
+        return covered == 0xf ? word : 0;
+    }
+    const auto synchronizations = gpu_synchronizations;
+    // A title with current handle reads does not wait for this submission's
+    // GPU writers here either; earlier submissions' writers still finish.
+    const bool current = nvn::title_policy().handle_reads == nvn::TitlePolicy::HandleReads::ordered;
+    if (!order_cpu_read(address, sizeof(std::uint32_t), false, cpu, current)) return 0;
+    const auto overlaps = [&](std::uint64_t begin, std::uint64_t length) {
+        if (!length) return false;
+        const auto meets = [](std::uint64_t left, std::uint64_t left_size, std::uint64_t right) {
+            return left < right + sizeof(std::uint32_t) && right < left + left_size;
+        };
+        if (meets(begin, length, address)) return true;
+        const auto pointer = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(cpu));
+        return cpu && meets(begin, length, pointer);
+    };
+    const auto texture_overlaps = [&](const TextureState& texture) {
+        const auto backing = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texture.memory));
+        return texture.memory && texture.size && backend.resources().texture_is_in_place(texture) &&
+            overlaps(backing, texture.size);
+    };
+    for (const auto& previous : previous_submissions) {
+        if (previous->fence <= retired_fence) continue;
+        const bool written = std::ranges::any_of(previous->other_buffer_writes, [&](const auto& write) {
+                return overlaps(write.first, write.second);
+            }) || std::ranges::any_of(previous->texture_writes, texture_overlaps);
+        if (!written) continue;
+        backend.wait_retired(*previous);
+        retired_fence = backend.completed_fence();
+    }
+    // order_cpu_read already drained this submission when it synchronized.
+    // A later in-place write is still only in the uncompleted suffix.
+    if (current && gpu_synchronizations == synchronizations) {
+        bool pending_write = false;
+        for (std::size_t index = cpu_writes_completed; index < other_buffer_writes.size(); ++index)
+            pending_write = pending_write || overlaps(other_buffer_writes[index].first,
+                                                      other_buffer_writes[index].second);
+        if (!pending_write)
+            for (const auto& texture : pending.texture_writes) {
+                if (!texture_overlaps(texture)) continue;
+                const auto backing = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texture.memory));
+                for (std::size_t index = cpu_writes_completed; index < other_buffer_writes.size(); ++index)
+                    pending_write = pending_write || (other_buffer_writes[index].first == backing &&
+                                                      other_buffer_writes[index].second == texture.size);
+            }
+        if (pending_write && !synchronize_gpu()) return 0;
+    }
+    std::uint32_t word = 0, covered = 0;
+    if (mapped) {
+        std::memcpy(&word, cpu, sizeof word);
+        covered = 0xf;
+    }
+    overlay_uniform(address, reinterpret_cast<std::byte*>(&word), sizeof word, &covered);
+    if (!mapped && covered != 0xf) return 0;
+    return word;
+}
+
+std::uint64_t Encoder::read_stage_handle(
+    std::size_t stage_index, const platform::CompiledGraphicsStage& shader,
+    const platform::CompiledShaderResource& resource, std::uint32_t element,
+    std::vector<std::optional<std::uint64_t>>& handle_program_words) {
+    if (resource.cbuf_slot == armigo::shader::pipeline::handle_program_slot) {
+        const auto byte_offset = std::uint64_t(resource.handle_byte_offset) + element * 4ull;
+        if ((byte_offset & 3u) || byte_offset / 4 >= shader.handle_programs.size()) {
+            fail(ReplayErrorCode::unsupported, "handle program is malformed");
+            return 0;
+        }
+        const auto index = static_cast<std::size_t>(byte_offset / 4);
+        if (handle_program_words[index]) return *handle_program_words[index];
+        const auto value = armigo::shader::pipeline::evaluate_handle_program(
+            std::span<const std::uint32_t>{shader.handle_programs[index]},
+            [&](std::uint32_t slot, std::uint32_t byte_offset) -> std::uint32_t {
+                return static_cast<std::uint32_t>(read_stage_cbuf_word(stage_index, slot, byte_offset & ~3u));
+            },
+            [&](std::uint64_t address) { return read_stage_guest_word(address); });
+        if (failed) return 0;
+        if (!value) {
+            fail(ReplayErrorCode::unsupported, "handle program is malformed");
+            return 0;
+        }
+        handle_program_words[index] = *value;
+        return *value;
+    }
+    return read_stage_cbuf_word(stage_index, resource.cbuf_slot,
+                          std::uint64_t(resource.handle_byte_offset) + element * 4ull);
+}
+
 bool Encoder::bind_stage(std::size_t stage_index,
                          const platform::CompiledGraphicsStage& shader,
                          __unsafe_unretained id<MTL4ArgumentTable> table, bool vertex,
@@ -8833,6 +12440,12 @@ bool Encoder::bind_stage(std::size_t stage_index,
     }
     if (stage_index >= stage_count)
         return fail(ReplayErrorCode::invalid_command, "shader stage index exceeds the replay limit");
+    if (!uniforms_only) {
+        auto& bound = bindings[stage_index];
+        bound.handle_updates = pending.counters.uniform_updates;
+        bound.handle_writes = other_buffer_writes.size();
+        bound.handle_stores = guest_write_serial;
+    }
     // Stages that address guest memory read the submission's pool table.
     if (shader.guest_memory) {
         if (shader.guest_memory->buffer_index >= 31)
@@ -8861,6 +12474,9 @@ bool Encoder::bind_stage(std::size_t stage_index,
         stage.uniform_writes = other_buffer_writes.size();
     };
     if (stage.shader != &shader) {
+        for (const auto& window : shader.constant_buffer_windows)
+            if (window.zero_padding_bytes != 0 && window.zero_padding_bytes != 16)
+                return fail(ReplayErrorCode::unsupported, "constant-buffer padding reflection is invalid");
         stage.window_extents.fill(0);
         for (const auto& window : shader.constant_buffer_windows)
             if (window.guest_binding < stage.window_extents.size())
@@ -8887,18 +12503,6 @@ bool Encoder::bind_stage(std::size_t stage_index,
                     {reflected.cbuf_slot, reflected.descriptor_byte_offset, 12});
         stage.shader = &shader;
     }
-    if (shader.custom_border) {
-        // Disabled border records: the shader samples with the Metal sampler's
-        // own border colour (transparent black, opaque black or opaque white,
-        // the nearest to the NVN colour); exact custom colours are not applied.
-        id<MTLBuffer> records = backend.zero_buffer();
-        if (shader.custom_border->buffer_index >= 31 || !records ||
-            shader.custom_border->pairs.size() * 64 > records.length)
-            return fail(ReplayErrorCode::unsupported, "custom border records exceed the replay limit");
-        write_buffer_slot(table, stage_index, shader.custom_border->buffer_index,
-                          records.gpuAddress);
-        make_resident(pending, records);
-    }
     const auto bind_buffer = [&](const BoundBuffer& binding, std::uint32_t index,
                                  std::uint64_t minimum, bool uniform = false,
                                  bool writable = false) -> bool {
@@ -8910,7 +12514,12 @@ bool Encoder::bind_stage(std::size_t stage_index,
             return fail(ReplayErrorCode::unsupported,
                         "shader buffer index exceeds the Metal argument-table limit");
         if (!binding.address) {
-            write_buffer_slot(table, stage_index, index, 0);
+            const auto scratch = writable ? upload(64 * 1024) : UploadSlice{};
+            id<MTLBuffer> zeros = writable ? scratch.buffer : backend.zero_buffer();
+            if (!zeros)
+                return fail(ReplayErrorCode::allocation, "empty binding buffer is unavailable");
+            write_buffer_slot(table, stage_index, index, writable ? scratch.gpu : zeros.gpuAddress);
+            make_resident(pending, zeros);
             return true;
         }
         const auto span = buffer_address(binding.address, std::max(binding.size, minimum));
@@ -8942,13 +12551,13 @@ bool Encoder::bind_stage(std::size_t stage_index,
     };
     // Blocks the driver writes rather than the game: driver data, the
     // bound-texture table and the push block.
-    const auto push_bank = state.push_bank[stage_index];
+    const auto push_bank = state.push_bank_at(stage_index);
     const auto driver_block = [&](std::uint32_t slot) {
         return slot == 0 || slot == 2 || (push_bank && slot == push_bank);
     };
     if (stage.reads_push_bank && selected_api_version() && selected_api_version()->major == 231)
         note_push_bank_reads(stage_index, push_bank == push_constant_bank,
-                             state.uniform[stage_index][push_constant_bank - 3].size != 0);
+                             state.uniform_at(stage_index)[push_constant_bank - 3].size != 0);
     const auto bind_driver = [&](std::uint32_t slot, std::uint32_t index) -> bool {
         if (index >= 31)
             return fail(ReplayErrorCode::unsupported,
@@ -8992,14 +12601,14 @@ bool Encoder::bind_stage(std::size_t stage_index,
                         "constant-buffer window reflection is invalid");
         if (!(uniform_slots & (1u << binding.guest_binding))) continue;
         const auto source_binding = hardware_buffer(stage_index, binding.guest_binding);
-        // A guest buffer that covers the whole window binds in place, and the
-        // GPU reads the bytes at execution as the hardware does. Shaders read
+        // An unpadded window can bind full guest storage in place.
+        // Padded windows always own their zero tail. Shaders read
         // every word of the window without checking the bound size, so a
         // smaller buffer gets a window copy that is zero past its bound size.
         // Earlier in-stream updates reach memory by GPU copies ordered before
         // this draw; an active version carries the later ones. Driver data
         // and ranges the GPU wrote in this submission still use a window.
-        if (!driver_block(binding.guest_binding) &&
+        if (!binding.zero_padding_bytes && !driver_block(binding.guest_binding) &&
             source_binding.address && source_binding.size >= binding.window_bytes) {
             const std::uint64_t extent = binding.window_bytes;
             const bool gpu_written = buffer_writes_overlap(source_binding.address, extent);
@@ -9023,6 +12632,7 @@ bool Encoder::bind_stage(std::size_t stage_index,
                  guest_ranges_overlap(pending.guest_ranges.get(), snapshot.source, end - snapshot.source));
         };
         if (cached.gpu && cached.bytes == binding.window_bytes &&
+            cached.zero_padding_bytes == binding.zero_padding_bytes &&
             cached.source == source_binding.address && cached.source_size == source_binding.size &&
             cached.generation == update_generation &&
             cached.cpu && cached.writes <= other_buffer_writes.size() && !written_since(cached)) {
@@ -9030,7 +12640,7 @@ bool Encoder::bind_stage(std::size_t stage_index,
             write_buffer_slot(table, stage_index, binding.metal_buffer_index, cached.gpu);
             continue;
         }
-        const auto window = upload(binding.window_bytes);
+        const auto window = upload(binding.backing_bytes());
         if (!window) return false;
         ++pending.counters.window_uploads;
         write_buffer_slot(table, stage_index, binding.metal_buffer_index, window.gpu);
@@ -9055,6 +12665,7 @@ bool Encoder::bind_stage(std::size_t stage_index,
             const bool gpu_written = buffer_writes_overlap(source_binding.address, copied) ||
                 guest_written(source_binding.address, copied);
             if (gpu_written) {
+                const SiteScope site_scope(*this, TransferSite::uniform_window);
                 if (!flush_uniforms() || !open_transfer()) return false;
                 make_resident(pending, source.buffer);
                 if (filled)
@@ -9071,7 +12682,8 @@ bool Encoder::bind_stage(std::size_t stage_index,
             }
         }
         cached = {window.gpu, source_binding.address, source_binding.size, update_generation,
-                  binding.window_bytes, window.cpu, other_buffer_writes.size(), guest_write_serial};
+                  binding.window_bytes, binding.zero_padding_bytes, window.cpu,
+                  other_buffer_writes.size(), guest_write_serial};
         write_buffer_slot(table, stage_index, binding.metal_buffer_index, window.gpu);
     }
 
@@ -9087,6 +12699,7 @@ bool Encoder::bind_stage(std::size_t stage_index,
         return true;
     }
     bindings[stage_index].writes.clear();
+    if (backend.pass_dump_enabled()) { stage.dump_reads.clear(); stage.dump_textures.clear(); }
     const bool compute = stage_index == NVN_SHADER_STAGE_COMPUTE;
     if (compute) {
         // Guest constant buffers the GPU reads: every bound range the shader
@@ -9106,10 +12719,10 @@ bool Encoder::bind_stage(std::size_t stage_index,
     for (std::size_t index = 0; index != shader.storage_buffers.size(); ++index) {
         const auto& reflected = shader.storage_buffers[index];
         BoundBuffer resolved{};
-        // Only the driver-data tables give the dispatch's exact range; a
-        // descriptor read from guest memory or the binding-index fallback
-        // leaves the dispatch's accesses incomplete.
+        // Only the driver-data tables give the dispatch's exact range;
+        // descriptors read from guest memory leave its accesses incomplete.
         bool from_table = false;
+        bool descriptor_read = false;
         const auto* layout = compute ? compute_layout() : nullptr;
         if (reflected.cbuf_slot == 0 && layout) {
             // An API 231 compute stage's uniform and storage entries.
@@ -9117,11 +12730,11 @@ bool Encoder::bind_stage(std::size_t stage_index,
             const auto uniforms = layout->uniform_base(), storages = layout->storage_base();
             if (offset >= uniforms && offset < storages && !((offset - uniforms) % 16) &&
                 (offset - uniforms) / 16 < buffer_slots) {
-                resolved = state.uniform[stage_index][(offset - uniforms) / 16];
+                resolved = state.uniform_at(stage_index)[(offset - uniforms) / 16];
                 from_table = true;
             } else if (offset >= storages && offset < layout->texture_base() && !((offset - storages) % 16) &&
                        (offset - storages) / 16 < buffer_slots) {
-                resolved = state.storage[stage_index][(offset - storages) / 16];
+                resolved = state.storage_at(stage_index)[(offset - storages) / 16];
                 from_table = true;
             }
         } else if (reflected.cbuf_slot == 0) {
@@ -9129,13 +12742,15 @@ bool Encoder::bind_stage(std::size_t stage_index,
             const auto offset = reflected.descriptor_byte_offset;
             const int base = stage_index == NVN_SHADER_STAGE_VERTEX ? 0x110
                 : stage_index == NVN_SHADER_STAGE_COMPUTE ? 0x310
-                : stage_index == NVN_SHADER_STAGE_FRAGMENT ? 0x510 : -1;
+                : stage_index == NVN_SHADER_STAGE_FRAGMENT ? 0x510
+                : stage_index == NVN_SHADER_STAGE_TESS_CONTROL && shader.task ? 0x670
+                : stage_index == NVN_SHADER_STAGE_TESS_EVALUATION && shader.mesh ? 0x770 : -1;
             if (base >= 0 && offset >= std::uint32_t(base) && offset < base + 16 * buffer_slots && !(offset % 16)) {
-                resolved = state.storage[stage_index][(offset - base) / 16];
+                resolved = state.storage_at(stage_index)[(offset - base) / 16];
                 from_table = true;
             } else if (stage_index == NVN_SHADER_STAGE_COMPUTE && offset >= 0x210 &&
                        offset < 0x210 + 16 * buffer_slots && !(offset % 16)) {
-                resolved = state.uniform[stage_index][(offset - 0x210) / 16];
+                resolved = state.uniform_at(stage_index)[(offset - 0x210) / 16];
                 from_table = true;
             }
         } else if (reflected.cbuf_slot >= 3 && reflected.cbuf_slot < buffer_slots + 3) {
@@ -9161,13 +12776,17 @@ bool Encoder::bind_stage(std::size_t stage_index,
                     std::uint32_t size = 0;
                     std::memcpy(&size, bytes + 8, sizeof size);
                     resolved.size = size;
+                    descriptor_read = true;
                 }
             }
         }
-        if (!resolved.address && index < buffer_slots)
-            resolved = state.storage[stage_index][index];
+        if (!from_table && !descriptor_read)
+            return fail(ReplayErrorCode::missing_resource,
+                        "storage buffer descriptor is unavailable");
         if (!bind_buffer(resolved, reflected.metal_buffer_index, reflected.alignment, false,
                          reflected.access != platform::CompiledShaderResourceAccess::Read)) return false;
+        if (backend.pass_dump_enabled() && reflected.metal_buffer_index < stage.dump_buffer_sizes.size())
+            stage.dump_buffer_sizes[reflected.metal_buffer_index] = resolved.size;
         if (resolved.address &&
             reflected.access != platform::CompiledShaderResourceAccess::Read)
             bindings[stage_index].writes.emplace_back(resolved.address, resolved.size);
@@ -9192,186 +12811,90 @@ bool Encoder::bind_stage(std::size_t stage_index,
 
     const auto registrations = draw_sampler_registrations();
     const auto bound_texture_id = [&](std::size_t slot, bool image) -> std::int32_t {
-        if (slot >= (image ? image_slots : texture_slots)) return 0;
-        const auto handle = image ? state.images[stage_index][slot]
-                                  : state.textures[stage_index][slot];
-        return static_cast<std::int32_t>(handle_texture_id(handle));
+        return bound_texture_id_at(stage_index, slot, image);
     };
     const auto bound_texture = [&](std::size_t slot, bool image) -> id<MTLTexture> {
         const auto id = bound_texture_id(slot, image);
         return id ? sampled_texture(id) : nil;
+    };
+    const auto resolve_sampler = [&](std::int32_t descriptor_id) -> id<MTLSamplerState> {
+        if (!descriptor_id) return nil;
+        id<MTLSamplerState> sampler = backend.resources().sampler_for_id(descriptor_id, registrations);
+        if (!sampler)
+            if (const auto detail = backend.resources().take_sampler_failure(); !detail.empty())
+                fail(ReplayErrorCode::unsupported_resource, detail + " shader=" + stage_label(&shader));
+        return sampler;
     };
     // The sampler bound at `slot`, else the one in the texture handle bound at
     // `texture_slot`.
     const auto bound_sampler = [&](std::size_t slot, std::size_t texture_slot)
         -> id<MTLSamplerState> {
         const std::uint64_t texture_handle =
-            texture_slot < texture_slots ? state.textures[stage_index][texture_slot] : 0;
+            texture_slot < texture_slots ? state.textures_at(stage_index)[texture_slot] : 0;
         std::int32_t id = 0;
-        if (slot < sampler_slots && state.samplers[stage_index][slot])
+        if (slot < sampler_slots && state.samplers_at(stage_index)[slot])
             id = static_cast<std::int32_t>(handle_sampler_id(
-                state.samplers[stage_index][slot]));
+                state.samplers_at(stage_index)[slot]));
         if (!id) id = static_cast<std::int32_t>(handle_sampler_id(texture_handle));
-        return id ? backend.resources().sampler_for_id(id, registrations) : nil;
-    };
-    // The constant-buffer word a bound handle, or a handle program's cbuf
-    // operation, reads. `offset` is the byte offset in that slot.
-    const auto read_cbuf_word = [&](std::uint32_t slot, std::uint64_t offset) -> std::uint64_t {
-        if (slot == 2) {
-            // Bound-texture handle table: slot n at 0x20 + 8 n.
-            if (offset < 0x20 || (offset - 0x20) % 8 || (offset - 0x20) / 8 >= texture_slots) return 0;
-            return static_cast<std::uint32_t>(state.textures[stage_index][(offset - 0x20) / 8]);
-        }
-        if (slot == 0 && compute) {
-            // An API 231 compute stage's handle runs, 8 bytes a slot.
-            const auto* layout = compute_layout();
-            if (!layout) return 0;
-            const auto entry = [&](std::uint32_t base, std::uint32_t count, const auto& handles)
-                -> std::optional<std::uint64_t> {
-                if (offset < base || offset >= base + 8ull * count) return std::nullopt;
-                const auto index = (offset - base) / 8;
-                return (offset - base) % 8 || index >= handles.size() ? 0 : handles[index];
-            };
-            for (const auto& found : {entry(layout->texture_base(), layout->textures, state.textures[stage_index]),
-                    entry(layout->separate_texture_base(), layout->separate_textures, state.textures[stage_index]),
-                    entry(layout->separate_sampler_base(), layout->separate_samplers, state.samplers[stage_index]),
-                    entry(layout->image_base(), layout->images, state.images[stage_index])})
-                if (found) return *found;
-            return 0;
-        }
-        if (slot == 0 || slot >= buffer_slots + 3) return 0;
-        const auto binding = hardware_buffer(stage_index, slot);
-        if (!binding.address || offset > binding.size || sizeof(std::uint32_t) > binding.size - offset)
-            return 0;
-        const auto address = binding.address + offset;
-        if ((address & 3) == 0)
-            if (const auto found = uniform_words.find(address); found != uniform_words.end())
-                return found->second;
-        std::uint32_t handle = 0, covered = 0;
-        if (!uniform_updates.empty() && captured_guest_bytes.may_intersect(address, sizeof handle)) {
-            // A complete current capture supersedes earlier writes without a
-            // backing read. Partial captures and prior submissions cannot be
-            // cached: their remaining bytes still need normal read ordering.
-            overlay_uniform(address, reinterpret_cast<std::byte*>(&handle), sizeof handle, &covered, true);
-            if (covered == 0xf) {
-                if (!(address & 3)) uniform_words.emplace(address, handle);
-                return handle;
-            }
-            handle = covered = 0;
-        }
-        const auto span = buffer_at(address, sizeof(std::uint32_t));
-        const auto* contents = static_cast<const std::byte*>(span.buffer.contents);
-        if (contents && span.offset <= span.buffer.length && sizeof handle <= span.buffer.length - span.offset) {
-            if (!order_cpu_read(address, sizeof handle, true, contents + span.offset)) return 0;
-            std::memcpy(&handle, contents + span.offset, sizeof handle);
-            covered = 0xf;
-        }
-        // A later writer may invalidate one cached word while leaving earlier
-        // captured bytes in the rest of it. Apply only those surviving bytes.
-        overlay_uniform(address, reinterpret_cast<std::byte*>(&handle), sizeof handle, &covered);
-        if (covered != 0xf) {
-            fail(ReplayErrorCode::missing_resource, "texture handle backing is not CPU-visible");
-            return 0;
-        }
-        return handle;
-    };
-    // Naturally aligned guest word. Zero where nothing mapped covers it.
-    // Guest-memory stores and ordinary GPU buffer writes that may overlap the
-    // word finish before the load. An in-place texture write is not one of
-    // those buffer writes: it is recorded on the texture and as a CPU range,
-    // so this load waits for that too. Deferred uniform captures are applied
-    // after the backing read, including captures an earlier submission still
-    // holds because a lower fence has not retired.
-    const auto read_guest_word = [&](std::uint64_t address) -> std::uint32_t {
-        address &= ~std::uint64_t{3};
-        const auto span = buffer_at(address, sizeof(std::uint32_t));
-        const auto* contents = static_cast<const std::byte*>(span.buffer.contents);
-        const bool mapped = contents && span.offset <= span.buffer.length &&
-            sizeof(std::uint32_t) <= span.buffer.length - span.offset;
-        const auto* cpu = mapped ? contents + span.offset : nullptr;
-        const auto synchronizations = gpu_synchronizations;
-        if (!order_cpu_read(address, sizeof(std::uint32_t), false, cpu)) return 0;
-        const auto overlaps = [&](std::uint64_t begin, std::uint64_t length) {
-            if (!length) return false;
-            const auto meets = [](std::uint64_t left, std::uint64_t left_size, std::uint64_t right) {
-                return left < right + sizeof(std::uint32_t) && right < left + left_size;
-            };
-            if (meets(begin, length, address)) return true;
-            const auto pointer = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(cpu));
-            return cpu && meets(begin, length, pointer);
-        };
-        const auto texture_overlaps = [&](const TextureState& texture) {
-            const auto backing = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texture.memory));
-            return texture.memory && texture.size && backend.resources().texture_is_in_place(texture) &&
-                overlaps(backing, texture.size);
-        };
-        for (const auto& previous : previous_submissions) {
-            if (previous->fence <= retired_fence) continue;
-            const bool written = std::ranges::any_of(previous->other_buffer_writes, [&](const auto& write) {
-                    return overlaps(write.first, write.second);
-                }) || std::ranges::any_of(previous->texture_writes, texture_overlaps);
-            if (!written) continue;
-            backend.wait_retired(*previous);
-            retired_fence = backend.completed_fence();
-        }
-        // order_cpu_read already drained this submission when it synchronized.
-        // A later in-place write is still only in the uncompleted suffix.
-        if (gpu_synchronizations == synchronizations) {
-            bool pending_write = false;
-            for (std::size_t index = cpu_writes_completed; index < other_buffer_writes.size(); ++index)
-                pending_write = pending_write || overlaps(other_buffer_writes[index].first,
-                                                          other_buffer_writes[index].second);
-            if (!pending_write)
-                for (const auto& texture : pending.texture_writes) {
-                    if (!texture_overlaps(texture)) continue;
-                    const auto backing = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texture.memory));
-                    for (std::size_t index = cpu_writes_completed; index < other_buffer_writes.size(); ++index)
-                        pending_write = pending_write || (other_buffer_writes[index].first == backing &&
-                                                          other_buffer_writes[index].second == texture.size);
-                }
-            if (pending_write && !synchronize_gpu()) return 0;
-        }
-        std::uint32_t word = 0, covered = 0;
-        if (mapped) {
-            std::memcpy(&word, cpu, sizeof word);
-            covered = 0xf;
-        }
-        overlay_uniform(address, reinterpret_cast<std::byte*>(&word), sizeof word, &covered);
-        if (!mapped && covered != 0xf) return 0;
-        return word;
+        return resolve_sampler(id);
     };
     // One result per program for this bind. The next draw evaluates again.
     std::vector<std::optional<std::uint64_t>> handle_program_words;
     if (!shader.handle_programs.empty())
         handle_program_words.resize(shader.handle_programs.size());
     const auto read_handle = [&](const platform::CompiledShaderResource& resource,
-                                 std::uint32_t element)
-        -> std::uint64_t {
-        if (resource.cbuf_slot == armigo::shader::pipeline::handle_program_slot) {
-            const auto byte_offset = std::uint64_t(resource.handle_byte_offset) + element * 4ull;
-            if ((byte_offset & 3u) || byte_offset / 4 >= shader.handle_programs.size()) {
-                fail(ReplayErrorCode::unsupported, "handle program is malformed");
-                return 0;
-            }
-            const auto index = static_cast<std::size_t>(byte_offset / 4);
-            if (handle_program_words[index]) return *handle_program_words[index];
-            const auto value = armigo::shader::pipeline::evaluate_handle_program(
-                std::span<const std::uint32_t>{shader.handle_programs[index]},
-                [&](std::uint32_t slot, std::uint32_t byte_offset) -> std::uint32_t {
-                    return static_cast<std::uint32_t>(read_cbuf_word(slot, byte_offset & ~3u));
-                },
-                read_guest_word);
-            if (failed) return 0;
-            if (!value) {
-                fail(ReplayErrorCode::unsupported, "handle program is malformed");
-                return 0;
-            }
-            handle_program_words[index] = *value;
-            return *value;
-        }
-        return read_cbuf_word(resource.cbuf_slot,
-                              std::uint64_t(resource.handle_byte_offset) + element * 4ull);
+                                 std::uint32_t element) -> std::uint64_t {
+        return read_stage_handle(stage_index, shader, resource, element, handle_program_words);
     };
+
+
+    struct BorderContext {
+        CoverageSampler sampler;
+        bool bound = false;
+    };
+    std::vector<BorderContext> borders;
+    CoverageBorderRecord* border_records = nullptr;
+    if (shader.custom_border) {
+        const auto& support = *shader.custom_border;
+        if (support.buffer_index >= 31 || support.pairs.empty() || support.pairs.size() > 4096)
+            return fail(ReplayErrorCode::unsupported, "custom border record layout is invalid");
+        const auto records = upload(support.pairs.size() * sizeof(CoverageBorderRecord));
+        if (!records) return false;
+        border_records = reinterpret_cast<CoverageBorderRecord*>(records.cpu);
+        for (std::size_t i = 0; i != support.pairs.size(); ++i) std::construct_at(border_records + i);
+        write_buffer_slot(table, stage_index, support.buffer_index, records.gpu);
+        borders.resize(support.pairs.size());
+        for (std::size_t i = 0; i != support.pairs.size(); ++i) {
+            const auto pair = support.pairs[i];
+            const auto texture = std::ranges::find(shader.resources, pair.texture_resource,
+                                                  &platform::CompiledShaderResource::resource_id);
+            const auto sampler = std::ranges::find(shader.resources, pair.sampler_resource,
+                                                  &platform::CompiledShaderResource::resource_id);
+            if (texture == shader.resources.end() || sampler == shader.resources.end() ||
+                texture->kind != platform::CompiledShaderResourceKind::SampledTexture ||
+                sampler->kind != platform::CompiledShaderResourceKind::Sampler ||
+                texture->array_length != 1 || sampler->array_length != 1 || !texture->texture_descriptor ||
+                texture->texture_descriptor->dimension != platform::CompiledShaderTextureDimension::d2 ||
+                texture->texture_descriptor->array || texture->texture_descriptor->multisample ||
+                texture->texture_descriptor->comparison ||
+                texture->texture_descriptor->component_format == platform::TextureComponentFormat::depth ||
+                !texture->texture_descriptor->normalized_coordinates ||
+                texture->texture_descriptor->scalar != platform::CompiledShaderTextureScalar::f32)
+                return fail(ReplayErrorCode::unsupported, "custom border reflection is not a coverage-v1 pair");
+            const auto handle = read_handle(*sampler, 0);
+            if (failed) return false;
+            const auto id = static_cast<std::int32_t>(handle_sampler_id(handle));
+            if (!id) continue;
+            borders[i].sampler = backend.resources().coverage_sampler_for_id(id, registrations);
+            if (!borders[i].sampler.sampler) {
+                const auto detail = backend.resources().take_sampler_failure();
+                return fail(ReplayErrorCode::unsupported_resource,
+                    (detail.empty() ? "custom border sampler state is unavailable" : detail) +
+                    " descriptor=" + std::to_string(id) + " stage=" + std::to_string(stage_index) +
+                    " shader=" + stage_label(&shader));
+            }
+        }
+    }
 
     // Common layouts fit the fixed reflected slot table. Larger admitted
     // layouts retain the dynamic fallback without changing their ABI.
@@ -9429,18 +12952,26 @@ bool Encoder::bind_stage(std::size_t stage_index,
             if (!resource.array_length || resource.location.count != resource.array_length)
                 return fail(ReplayErrorCode::unsupported,
                             "resolved shader resource array contract is invalid");
+            if (resource.kind == platform::CompiledShaderResourceKind::TexturePool ||
+                resource.kind == platform::CompiledShaderResourceKind::SamplerPool) {
+                if (!bind_pool_resource(stage_index, resource, table,
+                                        !compute && stage_index == NVN_SHADER_STAGE_FRAGMENT))
+                    return false;
+                continue;
+            }
             for (std::uint32_t element = 0; element != resource.array_length; ++element) {
                 const auto handle = read_handle(resource, element);
                 if (failed) return false;
                 if (resource.kind == platform::CompiledShaderResourceKind::Sampler) {
-                    id<MTLSamplerState> sampler = handle
-                        ? backend.resources().sampler_for_id(
-                              static_cast<std::int32_t>(handle_sampler_id(handle)),
-                              registrations) : nil;
-                    if (!sampler) {
-                        const auto slot = resource.resource_id + element;
-                        sampler = bound_sampler(slot, slot);
-                    }
+                    id<MTLSamplerState> sampler = nil;
+                    bool covered = false;
+                    for (std::size_t i = 0; i != borders.size(); ++i)
+                        if (shader.custom_border->pairs[i].sampler_resource == resource.resource_id) {
+                            sampler = borders[i].sampler.sampler; covered = true; break;
+                        }
+                    if (!covered && handle)
+                        sampler = resolve_sampler(static_cast<std::int32_t>(handle_sampler_id(handle)));
+                    if (failed) return false;
                     if (!sampler) sampler = backend.empty_sampler();
                     if (!sampler)
                         return fail(ReplayErrorCode::allocation, "empty sampler creation failed");
@@ -9452,13 +12983,39 @@ bool Encoder::bind_stage(std::size_t stage_index,
                     resource.kind == platform::CompiledShaderResourceKind::StorageImage;
                 id<MTLTexture> texture = nil;
                 std::int32_t texture_id = 0;
-                if (handle) {
-                    texture_id = static_cast<std::int32_t>(handle_texture_id(handle));
-                    texture = sampled_texture(texture_id);
+                constexpr bool direct_substitution = false;
+                texture_id = static_cast<std::int32_t>(handle_texture_id(handle));
+                if (texture_id) texture = sampled_texture(texture_id);
+                const bool empty = !texture_id || (!texture && backend.resources().texture_id_empty(texture_id));
+                if (!texture && !image && empty && resource.texture_descriptor) {
+                    const auto& descriptor = *resource.texture_descriptor;
+                    const auto format = descriptor.comparison || descriptor.component_format == platform::TextureComponentFormat::depth
+                        ? MTLPixelFormatDepth32Float : descriptor.scalar == platform::CompiledShaderTextureScalar::u32
+                        ? MTLPixelFormatRGBA32Uint : descriptor.scalar == platform::CompiledShaderTextureScalar::s32
+                        ? MTLPixelFormatRGBA32Sint : MTLPixelFormatRGBA8Unorm;
+                    if (const auto type = declared_texture_type(resource))
+                        texture = backend.resources().fitted_texture(0, nil, *type, true, format);
                 }
-                if (!texture) {
-                    texture_id = bound_texture_id(resource.resource_id + element, image);
-                    texture = texture_id ? sampled_texture(texture_id) : nil;
+                if (!texture && image && empty) {
+                    // A storage image whose handle names no texture writes a
+                    // sink, as the guest's driver lets such a slot go
+                    // unwritten, instead of dropping the whole dispatch.
+                    // Without a reflected descriptor the slot is a 2D float image.
+                    const auto type = declared_texture_type(resource).value_or(MTLTextureType2D);
+                    const auto scalar = resource.texture_descriptor ? resource.texture_descriptor->scalar
+                                                                    : platform::CompiledShaderTextureScalar::f32;
+                    id<MTLTexture> sink = image_sink(backend.device(), type, scalar);
+                    if (sink) {
+                        if (first_image_sink_report((std::uint64_t(stage_index) << 32) | resource.resource_id))
+                            armigo::diag::write(armigo::diag::Level::warning,
+                                "Armigo NVN: storage image slot %u of stage %zu names no texture (handle %#llx); "
+                                "it writes a sink\n", unsigned(resource.resource_id + element), stage_index,
+                                static_cast<unsigned long long>(handle));
+                        ++backend.mutable_statistics().image_sinks;
+                        if (!set_resource(resource, element, sink.gpuResourceID)) return false;
+                        make_resident(pending, sink);
+                        continue;
+                    }
                 }
                 if (!texture)
                     return fail(ReplayErrorCode::missing_resource,
@@ -9467,21 +13024,161 @@ bool Encoder::bind_stage(std::size_t stage_index,
                 note_depth_barrier_read(texture);
                 note_attachment_sample(texture);
                 if (compute) note_compute_texture(texture);
+                const auto descriptor_type = texture.textureType;
                 // A texture of another type than the shader declares reads
                 // undefined values: bind the view in the declared type.
                 if (const auto type = declared_texture_type(resource);
-                    !image && type && texture.textureType != *type)
+                    !image && type && texture.textureType != *type) {
+                    // A host-resolved handle program still selects an element
+                    // of a typed table, just as a shader-indexed handle array does.
+                    const bool typed_handle = resource.texture_descriptor &&
+                        resource.texture_descriptor->scalar == platform::CompiledShaderTextureScalar::f32 &&
+                        (resource.cbuf_slot == armigo::shader::pipeline::handle_program_slot ||
+                         resource.array_length > 1);
                     if (id<MTLTexture> fitted =
-                            backend.resources().fitted_texture(texture_id, texture, *type))
+                            backend.resources().fitted_texture(texture_id, texture, *type, typed_handle))
                         texture = fitted;
-                if (image && resource.access != platform::CompiledShaderResourceAccess::Read &&
-                    !note_image_write(texture_id, texture, compute))
+                    else
+                        report_type_mismatch(shader, resource, texture_id, texture, *type);
+                }
+                if (stage_index == NVN_SHADER_STAGE_FRAGMENT &&
+                    (!image || (resource.access == platform::CompiledShaderResourceAccess::Read && !resource.atomic))) {
+                    std::optional<std::uint32_t> pin;
+                    if (!image && texture.mipmapLevelCount > 1 && handle_sampler_id(handle) &&
+                        std::ranges::any_of(shader.resources, [&](const auto& sampler) {
+                            return sampler.kind == platform::CompiledShaderResourceKind::Sampler &&
+                                sampler.cbuf_slot == resource.cbuf_slot &&
+                                sampler.handle_byte_offset == resource.handle_byte_offset &&
+                                sampler.array_length == resource.array_length;
+                        }))
+                        pin = backend.resources().sampler_pinned_level(
+                            static_cast<std::int32_t>(handle_sampler_id(handle)), registrations);
+                    texture = feedback_texture(texture, image, pin);
+                    if (failed) return false;
+                }
+                if (backend.pass_dump_enabled()) {
+                    std::uint64_t serial = 0;
+                    if (texture_id && !resolved_textures.empty()) {
+                        const auto index = static_cast<std::uint32_t>(texture_id) & (resolved_textures.size() - 1);
+                        const auto& cached = resolved_textures[index];
+                        if (cached.texture_id == texture_id) serial = cached.stamp.serial;
+                    }
+                    id<MTLTexture> root = texture;
+                    while (root.parentTexture) root = root.parentTexture;
+                    char detail[448];
+                    std::snprintf(detail, sizeof detail,
+                        " stage=%zu resource=%u element=%u handle=%#llx direct_substitution=%u image=%u descriptor=%d serial=%llu "
+                        "native_id=%#llx root_id=%#llx type=%lu declared_type=%ld bound_type=%lu format=%lu "
+                        "size=%lux%lux%lu layers=%lu levels=%lu cbuf=%u+%u",
+                        stage_index, resource.resource_id, element, static_cast<unsigned long long>(handle),
+                        unsigned(direct_substitution), unsigned(image), texture_id,
+                        static_cast<unsigned long long>(serial),
+                        static_cast<unsigned long long>(texture.gpuResourceID._impl),
+                        static_cast<unsigned long long>(root.gpuResourceID._impl), static_cast<unsigned long>(descriptor_type),
+                        declared_texture_type(resource) ? static_cast<long>(*declared_texture_type(resource)) : -1l,
+                        static_cast<unsigned long>(texture.textureType), static_cast<unsigned long>(texture.pixelFormat),
+                        static_cast<unsigned long>(texture.width), static_cast<unsigned long>(texture.height),
+                        static_cast<unsigned long>(texture.depth), static_cast<unsigned long>(texture.arrayLength),
+                        static_cast<unsigned long>(texture.mipmapLevelCount), resource.cbuf_slot,
+                        resource.handle_byte_offset);
+                    stage.dump_reads.push_back("shader=" + stage_label(&shader) + detail);
+                    if (!image && backend.pass_dump().inputs())
+                        stage.dump_textures.push_back({texture, serial, "r" + std::to_string(stage_index) +
+                            "-" + std::to_string(resource.resource_id) + "-" + std::to_string(element)});
+                }
+                const bool dump_image = compute && image && backend.pass_dump_enabled() &&
+                    !backend.pass_dump().metadata_only() &&
+                    (resource.atomic || resource.access != platform::CompiledShaderResourceAccess::Read) &&
+                    backend.pass_dump_wants(backend.pool_present_count());
+                std::uint64_t dump_serial = 0;
+                if (dump_image && texture_id && !resolved_textures.empty()) {
+                    const auto index = static_cast<std::uint32_t>(texture_id) & (resolved_textures.size() - 1);
+                    const auto& cached = resolved_textures[index];
+                    if (cached.texture_id == texture_id) dump_serial = cached.stamp.serial;
+                }
+                if (image && resource.atomic && image_atomics_enabled()) {
+                    if (!note_image_atomic(stage_index, resource, element, texture_id, texture, compute))
+                        return false;
+                } else if (image && resource.access != platform::CompiledShaderResourceAccess::Read &&
+                           !note_image_write(texture_id, texture, compute))
                     return false;
+                if (image && !resource.atomic && raw_image_view_required(texture)) {
+                    texture = backend.resources().raw_image_view(texture_id, texture);
+                    if (!texture)
+                        return fail(ReplayErrorCode::unsupported_resource,
+                                    "storage image format or channel mapping has no raw view");
+                }
+                if (dump_image && texture)
+                    compute_dump_images.push_back(
+                        {resource.resource_id + element, dump_serial, texture});
                 if (failed) return false;
+                id<MTLTexture> border_original = texture;
+                for (std::size_t i = 0; i != borders.size(); ++i) {
+                    if (shader.custom_border->pairs[i].texture_resource != resource.resource_id) continue;
+                    borders[i].bound = true;
+                    if (!borders[i].sampler.custom) continue;
+                    if (!texture_id || !texture || texture.textureType != MTLTextureType2D || texture.sampleCount != 1)
+                        return fail(ReplayErrorCode::unsupported_resource,
+                                    "custom border coverage needs its admitted 2D sampled view shader=" + stage_label(&shader));
+                    const auto swizzle = border_original.swizzle;
+                    const auto channel = [](MTLTextureSwizzle value) -> std::uint32_t {
+                        switch (value) {
+                        case MTLTextureSwizzleRed: return 0; case MTLTextureSwizzleGreen: return 1;
+                        case MTLTextureSwizzleBlue: return 2; case MTLTextureSwizzleAlpha: return 3;
+                        case MTLTextureSwizzleZero: return 4; case MTLTextureSwizzleOne: return 5;
+                        }
+                        return UINT32_MAX;
+                    };
+                    auto& record = border_records[i];
+                    record.color = borders[i].sampler.color;
+                    // Sampling preserves native defaults for absent channels,
+                    // including alpha one. Border reconstruction only changes
+                    // stored components, before applying the original swizzle.
+                    const unsigned components = [&] {
+                        switch (border_original.pixelFormat) {
+                        case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Unorm_sRGB:
+                        case MTLPixelFormatR8Snorm: case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint:
+                        case MTLPixelFormatR16Unorm: case MTLPixelFormatR16Snorm:
+                        case MTLPixelFormatR16Uint: case MTLPixelFormatR16Sint: case MTLPixelFormatR16Float:
+                        case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint: case MTLPixelFormatR32Float:
+                        case MTLPixelFormatBC4_RUnorm: case MTLPixelFormatBC4_RSnorm:
+                            return 1u;
+                        case MTLPixelFormatRG8Unorm: case MTLPixelFormatRG8Unorm_sRGB:
+                        case MTLPixelFormatRG8Snorm: case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint:
+                        case MTLPixelFormatRG16Unorm: case MTLPixelFormatRG16Snorm:
+                        case MTLPixelFormatRG16Uint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRG16Float:
+                        case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRG32Float:
+                        case MTLPixelFormatBC5_RGUnorm: case MTLPixelFormatBC5_RGSnorm:
+                            return 2u;
+                        case MTLPixelFormatB5G6R5Unorm: case MTLPixelFormatRG11B10Float:
+                        case MTLPixelFormatRGB9E5Float: case MTLPixelFormatBC6H_RGBFloat:
+                        case MTLPixelFormatBC6H_RGBUfloat: case MTLPixelFormatETC2_RGB8:
+                        case MTLPixelFormatETC2_RGB8_sRGB: case MTLPixelFormatBGR10_XR:
+                        case MTLPixelFormatBGR10_XR_sRGB:
+                            return 3u;
+                        default: return 4u;
+                        }
+                    }();
+                    for (unsigned c = components; c != 4; ++c) record.color[c] = 0;
+                    record.swizzle = {channel(swizzle.red), channel(swizzle.green), channel(swizzle.blue), channel(swizzle.alpha)};
+                    if (std::ranges::any_of(record.swizzle, [](auto value) { return value >= 6; }))
+                        return fail(ReplayErrorCode::unsupported_resource, "custom border channel mapping is invalid");
+                    id<MTLTexture> coverage = backend.border_coverage(border_original.width, border_original.height, border_original.mipmapLevelCount);
+                    texture = backend.border_identity(border_original);
+                    if (!coverage || !texture)
+                        return fail(ReplayErrorCode::allocation, "custom border coverage texture allocation failed");
+                    record.coverage = coverage.gpuResourceID._impl;
+                    record.enabled = 1;
+                    make_resident(pending, coverage);
+                    make_resident(pending, texture);
+                }
                 if (!set_resource(resource, element, texture.gpuResourceID)) return false;
                 if (resource_changed) make_resident(pending, texture);
             }
         }
+        for (std::size_t i = 0; i != borders.size(); ++i)
+            if (borders[i].sampler.custom && !borders[i].bound)
+                return fail(ReplayErrorCode::unsupported, "custom border reflected texture was not bound");
     } else {
         for (const auto& binding : shader.textures) {
             if (binding.texture_index >= texture_slots)
@@ -9491,6 +13188,17 @@ bool Encoder::bind_stage(std::size_t stage_index,
             if (!texture)
                 return fail(ReplayErrorCode::missing_resource,
                             "legacy sampled texture is unavailable");
+            if (stage_index == NVN_SHADER_STAGE_FRAGMENT) {
+                std::optional<std::uint32_t> pin;
+                if (texture.mipmapLevelCount > 1 && binding.sampler_index == binding.texture_index &&
+                    binding.sampler_index < sampler_slots && !state.samplers_at(stage_index)[binding.sampler_index]) {
+                    const auto handle = state.textures_at(stage_index)[binding.texture_index];
+                    if (handle_sampler_id(handle)) pin = backend.resources().sampler_pinned_level(
+                        static_cast<std::int32_t>(handle_sampler_id(handle)), registrations);
+                }
+                texture = feedback_texture(texture, false, pin);
+                if (failed) return false;
+            }
             note_depth_barrier_read(texture);
             note_attachment_sample(texture);
             if (compute) note_compute_texture(texture);
@@ -9500,6 +13208,7 @@ bool Encoder::bind_stage(std::size_t stage_index,
                 if (binding.sampler_index >= 16)
                     return fail(ReplayErrorCode::unsupported, "legacy sampler index exceeds the Metal limit");
                 id<MTLSamplerState> sampler = bound_sampler(binding.sampler_index, binding.texture_index);
+                if (failed) return false;
                 if (!sampler) sampler = backend.empty_sampler();
                 if (!sampler)
                     return fail(ReplayErrorCode::allocation, "empty sampler creation failed");
@@ -9729,24 +13438,16 @@ void Encoder::predict_pipelines() {
                 }
                 case Op::bind_program: {
                     const auto command = payload<BindProgram>(record);
-                    constexpr std::uint32_t all_stage_bits = (1u << stage_count) - 1;
-                    if (command.stages < 0 || (std::uint32_t(command.stages) & ~all_stage_bits)) break;
-                    // The look-ahead never waits for a program whose stages
-                    // are still being translated: its draws are not predicted
-                    // (as for a failed stage) until another program is bound.
+                    constexpr std::uint32_t all_stage_bits = (1u << logical_binding_stage_count) - 1;
+                    if (!command.stages || command.stages < 0 ||
+                        (std::uint32_t(command.stages) & ~all_stage_bits)) break;
+                    // An unresolved program may publish stages outside its
+                    // requested mask. Stop rather than guess its effects.
                     std::shared_ptr<const ResolvedProgram> program;
                     bool translating = false;
                     if (command.program) program = retain_ready_program(*command.program, translating);
-                    if (command.program && !program && !translating) break;
-                    for (std::size_t stage_index = 0; stage_index != stage_count; ++stage_index) {
-                        const auto bit = 1u << stage_index;
-                        if (!(std::uint32_t(command.stages) & bit)) continue;
-                        shadow.stage_programs[stage_index] =
-                            program && program->stages[stage_index] ? program : nullptr;
-                        shadow.update_write_stage(stage_index);
-                        const bool unusable = translating || (program && (program->failed_stages & bit));
-                        shadow.failed_stages = unusable ? shadow.failed_stages | bit : shadow.failed_stages & ~bit;
-                    }
+                    if (command.program && !program) return false;
+                    shadow.bind(command, program);
                     break;
                 }
                 case Op::bind_state: {
@@ -9786,6 +13487,10 @@ void Encoder::predict_pipelines() {
                                 command.count * sizeof(VertexStreamStateBits));
                     break;
                 }
+                case Op::geometry_processing_mode:
+                    shadow.geometry_mode = payload<ScalarInt>(record).value;
+                    shadow.select();
+                    break;
                 case Op::rasterizer_discard:
                     shadow.rasterizer_discard = payload<ScalarInt>(record).value != 0;
                     break;
@@ -9890,26 +13595,29 @@ bool Encoder::draw(const Draw& command) {
 // draw-parameter record. The indirect form's record {count, first} is written
 // by the GPU earlier in the submission: its count is copied into a {count, 1,
 // 1} threadgroup count before the pass, and the stages read first from the
-// record itself. Mesh draws are not predicated on the GPU: an open
-// conditional block is resolved first.
+// record itself (take_mesh_records). Mesh draws are not predicated on the
+// GPU: an open conditional block is resolved first.
 bool Encoder::draw_mesh(std::uint32_t first, std::uint32_t count, std::uint64_t indirect) {
+    const SiteScope site_scope(*this, TransferSite::mesh_indirect);
     if (!resolve_carried_predicate()) return false;
     if (predicate_open() && !resolve_predicate()) return false;
     if (!state.render_enabled) return true;
     if (!indirect && !count) return true;
-    UploadSlice groups{};
+    std::uint64_t groups = 0;
     BufferAddress record{};
     if (indirect) {
         record = buffer_address(indirect, 8);
         if (!record.buffer || (record.gpu & 3))
             return fail(ReplayErrorCode::missing_resource, "mesh draw's indirect record is unavailable or misaligned");
-        const std::array<std::uint32_t, 3> ones{0, 1, 1};
-        groups = upload(sizeof ones, ones.data());
-        if (!groups) return false;
-        if (!close_render(PassBreak::transfer) || !open_transfer()) return false;
-        copy_buffer_range(record.buffer, record.offset, groups.buffer, groups.offset, sizeof(std::uint32_t));
-        make_resident(pending, record.buffer);
-        if (!close_transfer()) return false;
+        auto found = records_seen < mesh_groups_end ? mesh_groups.find(indirect) : mesh_groups.end();
+        if (found == mesh_groups.end()) {
+            // A pending uniform update of the record lands before it is read.
+            if (!prepare_uniform_access(indirect, 8) || !take_mesh_records(indirect)) return false;
+            found = mesh_groups.find(indirect);
+            if (found == mesh_groups.end())
+                return fail(ReplayErrorCode::missing_resource, "mesh draw's indirect record was not copied");
+        }
+        groups = found->second;
     }
     if (!prepare_graphics_uniform_writes() || !order_buffer_writes()) return false;
     note_base_instance(0);
@@ -9955,7 +13663,7 @@ bool Encoder::draw_mesh(std::uint32_t first, std::uint32_t count, std::uint64_t 
     const auto threads = size_of(mesh->mesh);
     std::copy(object.begin(), object.end(), draw.object);
     std::copy(threads.begin(), threads.end(), draw.mesh);
-    draw.indirect = indirect ? groups.gpu : 0;
+    draw.indirect = groups;
     if (queue) {
         queue->put(EncodeOp::mesh_tables, 0,
                    MeshTablesRecord{(__bridge void*)object_table, (__bridge void*)mesh_table});
@@ -9973,18 +13681,184 @@ bool Encoder::draw_mesh(std::uint32_t first, std::uint32_t count, std::uint64_t 
             [render drawMeshThreadgroups:MTLSizeMake(count, 1, 1) threadsPerObjectThreadgroup:object_size
                  threadsPerMeshThreadgroup:mesh_size];
     }
-    if (indirect) make_resident(pending, groups.buffer);
     note_draw_writes();
     // Task and mesh stages write storage like a vertex stage does.
     for (const auto& [slot, shader] : {std::pair{std::size_t(NVN_SHADER_STAGE_TESS_CONTROL), task},
                                         std::pair{std::size_t(NVN_SHADER_STAGE_TESS_EVALUATION), mesh}}) {
+        if (shader) note_shader_writes(slot);
         if (!shader || shader->storage_buffers.empty()) continue;
         pass_depth_only = false;
         pass_storage_writes |= bindings[slot].writes_buffers;
     }
+    note_writes();
     ++backend.mutable_statistics().draws;
     ++pending.counters.draws;
     return true;
+}
+
+// A transfer cannot run inside a render pass, so indirect mesh records are
+// copied ahead: the first indirect mesh draw with no copy copies its record
+// and those of the indirect mesh draws after it in replay order, up to the
+// next record that may write one (a dispatch, buffer copy or fill, texture to
+// buffer copy, report, event, sync wait, transform feedback, a uniform update
+// over a taken record, or a draw whose program stores to memory). Only a draw
+// met inside an open render pass splits it. A later record is not taken where
+// a write may reach it without such a record: a uniform update it overlaps
+// (pending, or met earlier in the scan) lands at a later flush, and texture
+// storage over it is written by clears, copies and attachments.
+// ARMIGO_NVN_MESH_RECORD_BATCH=0 copies each draw's record alone.
+bool Encoder::take_mesh_records(std::uint64_t indirect) {
+    static const std::size_t limit = [] {
+        const char* value = std::getenv("ARMIGO_NVN_MESH_RECORD_BATCH");
+        return value && *value == '0' ? std::size_t(1) : std::size_t(1024);
+    }();
+    constexpr std::uint32_t render_stages = ((1u << stage_count) - 1) & ~(1u << NVN_SHADER_STAGE_COMPUTE);
+    struct Taken {
+        std::uint64_t address;
+        std::size_t index;
+    };
+    struct Scan {
+        ReplayPrograms programs;
+        const Encoder& encoder;
+        std::vector<Taken> records;
+        // Uniform updates met since the first record.
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> updated;
+        std::uint64_t low = ~0ull, high = 0;
+        std::uint32_t writes = 0;
+        std::size_t index = 0, end = std::numeric_limits<std::size_t>::max();
+
+        bool take(std::uint64_t address, std::size_t at) {
+            if (std::ranges::any_of(records, [&](const Taken& taken) { return taken.address == address; }))
+                return true;
+            for (const auto& [begin, last] : updated)
+                if (begin < address + 8 && address < last) return false;
+            records.push_back({address, at});
+            low = std::min(low, address);
+            high = std::max(high, address + 8);
+            return true;
+        }
+        bool stop(std::size_t at) {
+            end = at;
+            return false;
+        }
+        bool visit(const CommandRecordView& record) {
+            if (++index <= encoder.records_seen) return true;
+            switch (record.op) {
+                case Op::draw:
+                case Op::draw_indexed:
+                case Op::draw_indirect:
+                case Op::draw_indexed_indirect:
+                case Op::multi_draw_indirect:
+                case Op::multi_draw_indexed_indirect:
+                case Op::draw_texture:
+                case Op::draw_mesh_tasks:
+                    return !writes || stop(index + 1);
+                case Op::draw_mesh_tasks_indirect:
+                    if (records.size() >= limit || !take(payload<DrawMeshTasksIndirect>(record).address, index))
+                        return stop(index);
+                    return !writes || stop(index + 1);
+                case Op::bind_program: {
+                    const auto command = payload<BindProgram>(record);
+                    if (!command.stages) return true;
+                    std::shared_ptr<const ResolvedProgram> program;
+                    bool translating = false;
+                    if (command.program) program = retain_ready_program(*command.program, translating);
+                    if (command.program && !program) return stop(index);
+                    programs.bind(command, program);
+                    writes = (programs.write_stages | programs.failed_stages) & render_stages;
+                    return true;
+                }
+                case Op::geometry_processing_mode:
+                    programs.geometry_mode = payload<ScalarInt>(record).value;
+                    programs.select();
+                    writes = (programs.write_stages | programs.failed_stages) & render_stages;
+                    return true;
+                case Op::update_uniforms: {
+                    const auto command = payload<UpdateUniforms>(record);
+                    const auto last = command.destination + command.size;
+                    if (command.destination < high && low < last)
+                        for (const auto& taken : records)
+                            if (command.destination < taken.address + 8 && taken.address < last) return stop(index);
+                    updated.emplace_back(command.destination, last);
+                    return true;
+                }
+                case Op::dispatch:
+                case Op::dispatch_indirect:
+                case Op::copy_buffer:
+                case Op::clear_buffer:
+                case Op::copy_texture_to_buffer:
+                case Op::report_counter:
+                case Op::report_value:
+                case Op::reset_counter:
+                case Op::signal_event:
+                case Op::wait_event:
+                case Op::wait_sync:
+                case Op::bind_transform_feedback_buffer:
+                case Op::transform_feedback:
+                    return stop(index);
+                default: return true;
+            }
+        }
+    } scan{static_cast<const ReplayPrograms&>(state), *this, {}};
+    scan.writes = (state.write_stages | state.failed_stages) & render_stages;
+    scan.take(indirect, records_seen);
+    if (scan.writes) {
+        scan.end = records_seen + 1;
+    } else {
+        struct RangeWalk {
+            Scan* scan;
+            std::size_t index, first, end;
+        } range{&scan, 0, pending.first_record, pending.end_record};
+        const auto status = walk_commands(*pending.captured,
+            [](const CommandRecordView& record, void* context) {
+                auto& range = *static_cast<RangeWalk*>(context);
+                const auto at = range.index++;
+                return at < range.first || at >= range.end || range.scan->visit(record);
+            }, &range);
+        (void)status;
+    }
+    for (std::size_t i = 1; i < scan.records.size(); ++i) {
+        const auto address = scan.records[i].address;
+        if (uniform_conflict(address, 8) || backend.resources().overlaps_texture_backing(address, 8) ||
+            nvn::window_texture_overlaps(address, 8)) {
+            scan.end = scan.records[i].index;
+            scan.records.resize(i);
+            break;
+        }
+    }
+    if (failed) return false;
+    mesh_groups.clear();
+    mesh_groups_end = scan.end;
+    // Each copy gets {count, 1, 1}; the transfer writes count.
+    struct Copy {
+        BufferAddress record;
+        std::uint64_t address;
+    };
+    std::vector<Copy> copies;
+    copies.reserve(scan.records.size());
+    for (const auto& taken : scan.records) {
+        const auto record = buffer_address(taken.address, 8);
+        if (record.buffer && !(record.gpu & 3)) copies.push_back({record, taken.address});
+    }
+    if (copies.empty()) return true;
+    constexpr std::size_t stride = 4;
+    std::vector<std::uint32_t> ones(copies.size() * stride);
+    for (std::size_t i = 0; i != copies.size(); ++i) {
+        ones[i * stride + 1] = 1;
+        ones[i * stride + 2] = 1;
+    }
+    const auto groups = upload(ones.size() * sizeof(std::uint32_t), ones.data());
+    if (!groups) return false;
+    make_resident(pending, groups.buffer);
+    if (!close_render(PassBreak::transfer) || !open_transfer()) return false;
+    for (std::size_t i = 0; i != copies.size(); ++i) {
+        const auto offset = i * stride * sizeof(std::uint32_t);
+        copy_buffer_range(copies[i].record.buffer, copies[i].record.offset, groups.buffer, groups.offset + offset,
+                          sizeof(std::uint32_t));
+        make_resident(pending, copies[i].record.buffer);
+        mesh_groups.emplace(copies[i].address, groups.gpu + offset);
+    }
+    return close_transfer();
 }
 
 bool Encoder::draw_indexed(const DrawIndexed& command) {
@@ -10143,6 +14017,8 @@ bool Encoder::draw_indexed_indirect(const DrawIndexedIndirect& command) {
 }
 
 bool Encoder::dispatch(const Dispatch& command) {
+    const SiteScope site_scope(*this, TransferSite::dispatch);
+    compute_dump_images.clear();
     if (command.x < 0 || command.y < 0 || command.z < 0)
         return fail(ReplayErrorCode::invalid_command,
                     "compute dispatch contains a negative grid dimension");
@@ -10195,6 +14071,7 @@ bool Encoder::dispatch(const Dispatch& command) {
         [pending.retained addObject:compute_table];
     const bool profiled = dispatch_profile() && !predicate_open();
     if (profiled && !profile_cut({})) return false;
+    if (!prepare_images({{NVN_SHADER_STAGE_COMPUTE, &shader}})) return false;
     if (!bind_stage(NVN_SHADER_STAGE_COMPUTE, shader, compute_table, false)) return false;
     // A dispatch whose guest accesses are complete runs without a barrier
     // after independent transfer work.
@@ -10208,11 +14085,22 @@ bool Encoder::dispatch(const Dispatch& command) {
     note_shader_writes(NVN_SHADER_STAGE_COMPUTE);
     note_writes();
     ++backend.mutable_statistics().dispatches;
+    ++pending.counters.dispatches;
     buffer_write_order.write();
+    if (backend.pass_dump_enabled() && !compute_dump_images.empty()) {
+        if (!close_transfer()) {
+            compute_dump_images.clear();
+            return false;
+        }
+        dump_compute_dispatch();
+    }
+    compute_dump_images.clear();
     return !profiled || profile_cut(profile_label(shader));
 }
 
 bool Encoder::dispatch_indirect(const DispatchIndirect& command) {
+    const SiteScope site_scope(*this, TransferSite::dispatch);
+    compute_dump_images.clear();
     if (state.failed_stages & compute_stage_bit)
         return fail(ReplayErrorCode::missing_program, "program stage failed to translate");
     const auto& program = state.stage_programs[NVN_SHADER_STAGE_COMPUTE];
@@ -10255,6 +14143,7 @@ bool Encoder::dispatch_indirect(const DispatchIndirect& command) {
     if (!compute_table)
         return fail(ReplayErrorCode::allocation, "indirect compute argument table allocation failed");
     if (dispatch_profile() && !predicate_open() && !profile_cut({})) return false;
+    if (!prepare_images({{NVN_SHADER_STAGE_COMPUTE, &shader}})) return false;
     if (!bind_stage(NVN_SHADER_STAGE_COMPUTE, shader, compute_table, false)) return false;
     if (new_compute_table)
         [pending.retained addObject:compute_table];
@@ -10276,11 +14165,21 @@ bool Encoder::dispatch_indirect(const DispatchIndirect& command) {
     note_shader_writes(NVN_SHADER_STAGE_COMPUTE);
     note_writes();
     ++backend.mutable_statistics().dispatches;
+    ++pending.counters.dispatches;
     buffer_write_order.write();
+    if (backend.pass_dump_enabled() && !compute_dump_images.empty()) {
+        if (!close_transfer()) {
+            compute_dump_images.clear();
+            return false;
+        }
+        dump_compute_dispatch();
+    }
+    compute_dump_images.clear();
     return !dispatch_profile() || predicate_open() || profile_cut(profile_label(shader));
 }
 
 bool Encoder::copy_buffer(const CopyBuffer& command) {
+    const SiteScope site_scope(*this, TransferSite::copy);
     if (!prepare_uniform_access(command.source, command.size, command.destination)) return false;
     if (!command.size) return true;
     if (command.flags != NVN_COPY_FLAGS_NONE)
@@ -10314,6 +14213,7 @@ bool Encoder::copy_buffer(const CopyBuffer& command) {
     discard_gpu_uniform_captures(command.destination, command.size);
     buffer_write_order.write();
     note_writes();
+    if (reports) reports->copy(command.source, command.destination, command.size);
     ++backend.mutable_statistics().copies;
     return true;
 }
@@ -10327,6 +14227,7 @@ bool Encoder::copy_texture_to_buffer(const CopyBufferToTexture& command) {
 }
 
 bool Encoder::copy_buffer_texture(const CopyBufferToTexture& command, bool upload) {
+    const SiteScope site_scope(*this, upload ? TransferSite::upload : TransferSite::copy);
     if (!flush_uniforms()) return false;
     if (!command.texture)
         return fail(ReplayErrorCode::invalid_command, "buffer/texture copy has no texture");
@@ -10386,24 +14287,123 @@ bool Encoder::copy_buffer_texture(const CopyBufferToTexture& command, bool uploa
         other_buffer_writes.emplace_back(command.source, size);
         discard_gpu_uniform_captures(command.source, size);
         buffer_write_order.write();
+        if (reports && size) reports->gpu_write(command.source, size);
     }
     note_writes();
     ++backend.mutable_statistics().copies;
     return true;
 }
 
+bool Encoder::scale_texture_copy(const CopyTextureToTexture& command, id<MTLTexture> source,
+                                 id<MTLTexture> destination) {
+    const auto& target = command.destination_region;
+    const auto& input = command.source_region;
+    const auto format = texture_format(command.has_source_view && command.source_view.sets_format
+        ? command.source_view.format : command.source->description.format);
+    if (!format || graphics::texture_numeric_class(*format) != graphics::TextureNumericClass::Float ||
+        graphics::is_block_compressed(graphics::texture_format_info(*format)) ||
+        graphics::texture_format_info(*format).depth || graphics::texture_format_info(*format).stencil ||
+        source.textureType != MTLTextureType2D || destination.textureType != MTLTextureType2D ||
+        source.sampleCount != 1 || destination.sampleCount != 1 || input.depth != 1 ||
+        input.zoffset || target.zoffset || target.width <= 0 || target.height <= 0 ||
+        !(destination.usage & MTLTextureUsageRenderTarget))
+        return fail(ReplayErrorCode::unsupported, "scaled texture copies require single-sample 2D color textures");
+    id<MTLTexture> source_root = source, destination_root = destination;
+    while (source_root.parentTexture) source_root = source_root.parentTexture;
+    while (destination_root.parentTexture) destination_root = destination_root.parentTexture;
+    if (source_root == destination_root)
+        return fail(ReplayErrorCode::unsupported, "scaled in-place texture copies require staging");
+    id<MTLBuffer> source_buffer = source_root.buffer, destination_buffer = destination_root.buffer;
+    if (source_buffer && destination_buffer) {
+        // Linear textures can be distinct objects over the same buffer or
+        // mapped bytes. This unstaged path requires disjoint texture storage,
+        // including row padding; a cropped rectangle does not relax that rule.
+        const auto source_size = std::min<std::uint64_t>(
+            std::uint64_t(source_root.bufferBytesPerRow) * source_root.height,
+            source_buffer.length - source_root.bufferOffset);
+        const auto destination_size = std::min<std::uint64_t>(
+            std::uint64_t(destination_root.bufferBytesPerRow) * destination_root.height,
+            destination_buffer.length - destination_root.bufferOffset);
+        if (!source_size || !destination_size)
+            return fail(ReplayErrorCode::unsupported, "scaled linear texture storage span is unavailable");
+        const auto overlaps = [](std::uint64_t a, std::uint64_t a_size, std::uint64_t b, std::uint64_t b_size) {
+            return a <= b ? b - a < a_size : a - b < b_size;
+        };
+        bool alias = source_buffer == destination_buffer && overlaps(
+            source_root.bufferOffset, source_size, destination_root.bufferOffset, destination_size);
+        if (source_buffer != destination_buffer) {
+            if (source_buffer.contents && destination_buffer.contents)
+                alias = overlaps(reinterpret_cast<std::uintptr_t>(source_buffer.contents) + source_root.bufferOffset,
+                    source_size, reinterpret_cast<std::uintptr_t>(destination_buffer.contents) + destination_root.bufferOffset,
+                    destination_size);
+            if (!alias && source_buffer.gpuAddress && destination_buffer.gpuAddress)
+                alias = overlaps(source_buffer.gpuAddress + source_root.bufferOffset, source_size,
+                    destination_buffer.gpuAddress + destination_root.bufferOffset, destination_size);
+        }
+        if (alias)
+            return fail(ReplayErrorCode::unsupported, "scaled overlapping buffer texture copies require staging");
+    }
+    const bool linear = command.flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT;
+    if (linear && !backend.device().supports32BitFloatFiltering &&
+        (source.pixelFormat == MTLPixelFormatR32Float || source.pixelFormat == MTLPixelFormatRG32Float ||
+         source.pixelFormat == MTLPixelFormatRGBA32Float))
+        return fail(ReplayErrorCode::unsupported, "linear filtering of 32-bit float copy sources is unavailable");
+    std::string detail;
+    id<MTLRenderPipelineState> pipeline = backend.texture_copy_pipeline(destination.pixelFormat, detail);
+    if (!pipeline) return fail(ReplayErrorCode::unsupported, std::move(detail));
+    id<MTLSamplerState> sampler = backend.texture_copy_sampler(linear);
+    id<MTL4ArgumentTable> arguments = backend.texture_copy_arguments();
+    if (!sampler || !arguments)
+        return fail(ReplayErrorCode::allocation, "scaled texture copy binding allocation failed");
+    if (!close_render(PassBreak::transfer) || !close_transfer()) return false;
+    const auto parameters = backend.allocate_upload(pending, 8 * sizeof(float));
+    if (!parameters) return fail(ReplayErrorCode::allocation, "scaled texture copy parameter allocation failed");
+    const std::array<float, 8> values{float(input.xoffset), float(input.yoffset),
+        float(input.width) / float(target.width), float(input.height) / float(target.height),
+        float(target.xoffset), float(target.yoffset), float(source.width), float(source.height)};
+    std::memcpy(parameters.cpu, values.data(), sizeof values);
+    make_resident(pending, source); make_resident(pending, destination); make_resident(pending, parameters.buffer);
+    [pending.retained addObjectsFromArray:@[source, destination, parameters.buffer, pipeline, sampler, arguments]];
+    const auto region = target;
+    const bool whole = !target.xoffset && !target.yoffset && NSUInteger(target.width) == destination.width &&
+        NSUInteger(target.height) == destination.height;
+    if (!encode_call(^(EncodeCallContext& context) {
+        auto* pass = [MTL4RenderPassDescriptor new];
+        pass.colorAttachments[0].texture = destination;
+        pass.colorAttachments[0].loadAction = whole ? MTLLoadActionDontCare : MTLLoadActionLoad;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTL4RenderCommandEncoder> render = [context.commands renderCommandEncoderWithDescriptor:pass];
+        if (!render) { context.error = "scaled texture copy encoder creation failed"; return; }
+        [render barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageVertex | MTLStageFragment
+                     visibilityOptions:MTL4VisibilityOptionDevice];
+        [arguments setTexture:source.gpuResourceID atIndex:0];
+        [arguments setSamplerState:sampler.gpuResourceID atIndex:0];
+        [arguments setAddress:parameters.gpu atIndex:0];
+        [render setArgumentTable:arguments atStages:MTLRenderStageFragment];
+        [render setRenderPipelineState:pipeline];
+        [render setCullMode:MTLCullModeNone];
+        [render setViewport:MTLViewport{double(region.xoffset), double(region.yoffset),
+            double(region.width), double(region.height), 0, 1}];
+        [render setScissorRect:MTLScissorRect{NSUInteger(region.xoffset), NSUInteger(region.yoffset),
+            NSUInteger(region.width), NSUInteger(region.height)}];
+        [render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [render endEncoding];
+    }, ReplayErrorCode::encoding)) return false;
+    note_texture_write(*command.destination);
+    note_writes();
+    ++backend.mutable_statistics().copies;
+    return true;
+}
+
 bool Encoder::copy_texture_to_texture(const CopyTextureToTexture& command) {
+    const SiteScope site_scope(*this, TransferSite::copy);
     if (!command.source || !command.destination)
         return fail(ReplayErrorCode::invalid_command,
                     "texture copy has a missing source or destination");
-    if (command.flags != NVN_COPY_FLAGS_NONE)
-        return fail(ReplayErrorCode::unsupported,
-                    "filtered or mirrored texture copies are unsupported");
-    if (command.source_region.width != command.destination_region.width ||
-        command.source_region.height != command.destination_region.height ||
-        command.source_region.depth != command.destination_region.depth)
-        return fail(ReplayErrorCode::unsupported,
-                    "scaled texture copies require the two-dimensional blit path");
+    if (command.flags & ~NVN_COPY_FLAGS_LINEAR_FILTER_BIT)
+        return fail(ReplayErrorCode::unsupported, "mirrored or unknown texture copy flags are unsupported");
+    if (command.source_region.depth != command.destination_region.depth)
+        return fail(ReplayErrorCode::unsupported, "texture copies cannot scale layer or depth counts");
     const auto* source_view = command.has_source_view ? &command.source_view : nullptr;
     const auto* destination_view = command.has_destination_view ? &command.destination_view : nullptr;
     id<MTLTexture> source = texture_for_use(*command.source, source_view);
@@ -10432,6 +14432,9 @@ bool Encoder::copy_texture_to_texture(const CopyTextureToTexture& command) {
     if (command.destination->memory && backend.resources().texture_is_in_place(*command.destination) &&
         uniform_cpu_conflict(reinterpret_cast<std::uintptr_t>(command.destination->memory),
                              command.destination->size) && !flush_uniforms()) return false;
+    if (command.source_region.width != command.destination_region.width ||
+        command.source_region.height != command.destination_region.height)
+        return scale_texture_copy(command, source, destination);
     if (!open_transfer()) return false;
     make_resident(pending, source);
     make_resident(pending, destination);
@@ -10490,6 +14493,7 @@ bool Encoder::encode_clear_plan(const TextureState& texture_state,
                                 bool depth, float depth_value, bool stencil,
                                 std::uint32_t stencil_value,
                                 std::uint32_t stencil_mask) {
+    const SiteScope site_scope(*this, TransferSite::clear_texture);
     if (!copy_region.width || !copy_region.height || !copy_region.depth || (!color_mask && !depth && !stencil))
         return true;
     if (copy_region.xoffset < 0 || copy_region.yoffset < 0 || copy_region.zoffset < 0 ||
@@ -10695,10 +14699,122 @@ bool Encoder::clear_texture(const ClearTexture& clear) {
 // unsupported feature, a missing resource or program) is left out with a
 // counted reason; the rest of the submission still runs. Other failures
 // abandon the submission.
+std::string Encoder::mesh_stage_identity() const {
+    static constexpr const char* names[]{"vs", "fs", "gs", "task", "mesh", "cs"};
+    std::string result;
+    for (std::size_t slot = 0; slot != stage_count; ++slot) {
+        const auto& program = state.stage_programs[slot];
+        if (slot) result += ",";
+        result += names[slot];
+        result += "@" + std::to_string(program ? program->state.serial : 0) + ":";
+        result += stage_label(program ? program->stages[slot].get() : nullptr);
+    }
+    return result + ",failed=" + std::to_string(state.failed_stages);
+}
+
+void Encoder::remember_mesh_bind(const BindProgram& command) {
+    if (!backend.mesh_diagnostics_enabled()) return;
+    if (!mesh_bind_history) mesh_bind_history.emplace();
+    auto& history = *mesh_bind_history;
+    auto& bind = history.binds[history.total++ % history.binds.size()];
+    bind.ordinal = records_seen;
+    bind.identity = "mask=" + std::to_string(command.stages) +
+        ",program=" + std::to_string(command.program ? command.program->serial : 0) +
+        ",result=" + mesh_stage_identity();
+}
+
+void Encoder::diagnose_mesh_failure(const DrawMeshTasks& command) {
+    if (!backend.mesh_diagnostics_enabled()) return;
+    char address[32];
+    std::snprintf(address, sizeof address, "%#llx", static_cast<unsigned long long>(command.api_return));
+    std::string key = "first=" + std::to_string(command.first) + " count=" + std::to_string(command.count) +
+        " api_return=" + (command.api_return ? std::string(address) : "unavailable") +
+        " api_return_domain=" + (command.api_return ? "api231-entry-return" : "internal-record") +
+        " stages=" + mesh_stage_identity() + " reason=" + error.detail;
+    std::string detail = "command_id=" + std::to_string(pending.fence) + ":" + std::to_string(records_seen) +
+        " command_id_domain=submission-fence:flattened-record-ordinal " + key +
+        " history_scope=current-submission previous_submission=unavailable";
+    const auto total = mesh_bind_history ? mesh_bind_history->total : 0;
+    const auto count = std::min<std::size_t>(total, 8);
+    detail += " history_count=" + std::to_string(count) + " history_dropped=" + std::to_string(total - count);
+    for (std::size_t index = total - count; index != total; ++index) {
+        const auto& bind = mesh_bind_history->binds[index % 8];
+        key += " bind{" + bind.identity + "}";
+        detail += " bind{ordinal=" + std::to_string(bind.ordinal) + "," + bind.identity + "}";
+    }
+    backend.note_mesh_diagnostic(std::move(key), detail);
+}
+
+std::unique_ptr<program_capture::Event> Encoder::begin_program_capture(const CommandRecordView& record) const noexcept {
+    if (!program_capture::enabled() || (record.op != Op::bind_program && record.op != Op::geometry_processing_mode &&
+                                       record.op != Op::draw_mesh_tasks)) return {};
+    try {
+        auto event = std::make_unique<program_capture::Event>();
+        event->backend = reinterpret_cast<std::uint64_t>(&backend); event->submission = pending.fence;
+        event->ordinal = records_seen; event->mode_before = state.geometry_mode; event->before = state.capture_caches();
+        if (record.op == Op::bind_program) {
+            event->kind = program_capture::EventKind::bind;
+            event->requested = static_cast<std::uint32_t>(payload<BindProgram>(record).stages);
+        } else if (record.op == Op::geometry_processing_mode) {
+            event->kind = program_capture::EventKind::mode; event->requested_mode = payload<ScalarInt>(record).value;
+        } else {
+            event->kind = program_capture::EventKind::direct_draw;
+            const auto draw = payload<DrawMeshTasks>(record);
+            event->first = draw.first; event->count = draw.count; event->api_return = draw.api_return;
+        }
+        return event;
+    } catch (...) { program_capture::record_loss(); return {}; }
+}
+void Encoder::finish_program_capture(std::unique_ptr<program_capture::Event> event, const CommandRecordView& record,
+                                    bool accepted, std::uint64_t previous_draws) const noexcept {
+    if (!event) return;
+    try {
+        event->accepted = accepted; event->mode_after = state.geometry_mode; event->after = state.capture_caches();
+        event->failed = state.failed_stages;
+        std::shared_ptr<const ResolvedProgram> program;
+        if (record.op == Op::bind_program) {
+            const auto command = payload<BindProgram>(record);
+            if (command.program) {
+                // A zero-mask bind must not wait for a pending translation.
+                program = retain_program_snapshot(*command.program);
+                bool translating = false;
+                const auto ready = retain_ready_program(*command.program, translating);
+                if (ready) { event->present = ready->logical_stages; event->present_observed = true; }
+            } else event->present_observed = true;
+        } else if (record.op == Op::draw_mesh_tasks) {
+            const auto& selected_mesh = state.geometry_mode == 1 ? state.task_mesh : state.standalone_mesh;
+            const ReplayPrograms::Cached* candidates[]{&state.ordinary[NVN_SHADER_STAGE_FRAGMENT],
+                state.geometry_mode ? &selected_mesh : nullptr,
+                state.geometry_mode == 1 ? &state.task : nullptr,
+                state.geometry_mode == 0 ? &state.ordinary[NVN_SHADER_STAGE_VERTEX] : nullptr};
+            for (const auto* candidate : candidates)
+                if (candidate && candidate->program && candidate->program->capture_matches) {
+                    program = candidate->program; break;
+                }
+            if (program) { event->present = program->logical_stages; event->present_observed = true; }
+            event->encoded = pending.counters.draws > previous_draws;
+            if (accepted && !event->encoded) event->detail = "no mesh command encoded";
+        }
+        if (program) {
+            event->generation = program->state.serial; event->capture_call = program->capture_call;
+            event->matches = program->capture_matches;
+            if (program->capture_mesh_metadata) {
+                event->mesh_route = program->captured_mesh_route; event->auxiliary_word = program->captured_auxiliary_word;
+            }
+        }
+        if (!accepted && failed) { event->detail = error.detail; event->error_code = static_cast<int>(error.code); }
+        program_capture::observe(std::move(*event));
+    } catch (...) { program_capture::record_loss(); }
+}
+
 bool Encoder::visit(const CommandRecordView& record) {
     if (failed) return false;
     ++records_seen;
-    if (visit_command(record)) return true;
+    auto captured = program_capture_enabled ? begin_program_capture(record) : nullptr;
+    const auto previous_draws = captured ? pending.counters.draws : 0;
+    const bool accepted = visit_command(record);
+    if (captured) finish_program_capture(std::move(captured), record, accepted, previous_draws);
+    if (accepted) return true;
     if (!failed) return false;
     // A failure that is not a skippable draw, clear or copy abandons the rest of
     // the submission; the host log names each such failure once.
@@ -10738,21 +14854,50 @@ bool Encoder::visit(const CommandRecordView& record) {
     }
     std::string detail;
     if (ReplayImpl::skip_detail_limit()) {
+        const auto stage_of = [&](std::size_t slot) {
+            const auto& program = state.stage_programs[slot];
+            return stage_label(program ? program->stages[slot].get() : nullptr);
+        };
+        detail = "vs=" + stage_of(NVN_SHADER_STAGE_VERTEX) +
+            " task=" + stage_of(NVN_SHADER_STAGE_TESS_CONTROL) +
+            " mesh=" + stage_of(NVN_SHADER_STAGE_TESS_EVALUATION) +
+            " fs=" + stage_of(NVN_SHADER_STAGE_FRAGMENT) +
+            " cs=" + stage_of(NVN_SHADER_STAGE_COMPUTE) +
+            " failed_stages=" + std::to_string(state.failed_stages) +
+            " rasterizer_discard=" + std::to_string(state.rasterizer_discard);
+        const auto describe_texture = [&](const TextureState* texture) {
+            if (!texture) return std::string("-");
+            const auto& desc = texture->description;
+            return std::to_string(texture->serial) + ":target=" + std::to_string(desc.target) +
+                ":format=" + std::to_string(desc.format) + ":size=" + std::to_string(desc.width) +
+                "x" + std::to_string(desc.height) + "x" + std::to_string(desc.depth);
+        };
+        for (std::size_t index = 0; index < std::size(state.targets.color); ++index)
+            if (state.targets.color[index])
+                detail += " c" + std::to_string(index) + "=" + describe_texture(state.targets.color[index]);
+        detail += " depth=" + describe_texture(state.targets.depth);
+        if (record.op == Op::copy_texture_to_texture) {
+            const auto command = payload<CopyTextureToTexture>(record);
+            const auto describe_region = [](const NVNcopyRegion& region) {
+                return std::to_string(region.xoffset) + "," + std::to_string(region.yoffset) + "," +
+                    std::to_string(region.zoffset) + ":" + std::to_string(region.width) + "x" +
+                    std::to_string(region.height) + "x" + std::to_string(region.depth);
+            };
+            detail += " source=" + describe_texture(command.source) +
+                " source_region=" + describe_region(command.source_region) +
+                " destination=" + describe_texture(command.destination) +
+                " destination_region=" + describe_region(command.destination_region) +
+                " flags=" + std::to_string(command.flags);
+        }
         if (error.code == ReplayErrorCode::missing_resource) {
-            detail = backend.resources().take_texture_failure();
-        } else if (error.code == ReplayErrorCode::missing_program) {
-            const auto& vertex = state.stage_programs[NVN_SHADER_STAGE_VERTEX];
-            const auto& fragment = state.stage_programs[NVN_SHADER_STAGE_FRAGMENT];
-            char line[160];
-            std::snprintf(line, sizeof line,
-                          "vertex %s fragment %s rasterizer discard %d colors %d depth %s",
-                          vertex ? "bound" : "none", fragment ? "bound" : "none",
-                          int(state.rasterizer_discard), int(state.targets.count),
-                          state.targets.depth ? "bound" : "none");
-            detail = line;
+            detail += " resource=" + backend.resources().take_texture_failure();
         }
     }
-    backend.note_skip(error.detail, static_cast<unsigned>(record.op), detail);
+    if (record.op == Op::draw_mesh_tasks) diagnose_mesh_failure(payload<DrawMeshTasks>(record));
+    backend.note_skip(error.detail, static_cast<unsigned>(record.op), pending.fence, detail);
+    feedback_uses.clear();
+    feedback_reopen = false;
+    feedback_rebind = true;
     failed = false;
     error = {};
     // The render encoder may hold a partial setup; the next draw starts over.
@@ -10764,6 +14909,23 @@ bool Encoder::visit_command(const CommandRecordView& record) {
     if (failed) return false;
     if (capture_retirement_needed && !retire_captures_if_full()) return false;
     current_op_ = record.op;
+    // Transfer and non-draw writes publish new texture contents. Draw writes
+    // keep the snapshot visible until the next guest barrier instead.
+    switch (record.op) {
+        case Op::copy_buffer_to_texture:
+        case Op::copy_texture_to_texture:
+        case Op::clear_color:
+        case Op::clear_color_integer:
+        case Op::clear_depth_stencil:
+        case Op::clear_texture:
+        case Op::downsample:
+        case Op::dispatch:
+        case Op::dispatch_indirect:
+            ++feedback_epoch;
+            dirty.arguments[NVN_SHADER_STAGE_FRAGMENT] = true;
+            break;
+        default: break;
+    }
     if (trace_submission_id) {
         switch (record.op) {
             case Op::draw:
@@ -10821,11 +14983,59 @@ bool Encoder::visit_command(const CommandRecordView& record) {
             if (!command.value)
                 return fail(ReplayErrorCode::invalid_command,
                             "event wait has no source");
-            if (!synchronize_gpu()) return false;
+            const auto& drains = event_wait_drains();
+            // The scheduler released a held leading wait when the signal
+            // that meets it landed, or when it was encoded as a write in an
+            // earlier submission. A GPU signal lands as its submission
+            // retires, which publishes that submission's writes under the
+            // fence lock this submission's encoding took; an encoded write
+            // runs earlier on the one queue, and this submission's first
+            // encoder takes a queue barrier. Neither needs a GPU drain.
             if (passed_leading_waits) {
                 --passed_leading_waits;
-                return true;
+                return !drains.leading || synchronize_gpu();
             }
+            if (drains.pending && !synchronize_gpu()) return false;
+            // A signal of this submission that leaves the event satisfying the
+            // wait: the queue runs it before the wait's later commands, so a
+            // barrier orders them on the GPU and the CPU does not wait. Signals
+            // that add before any write depend on the earlier value and wait;
+            // a later write makes the value known again. A CPU or other-queue
+            // write racing the signal is unordered against the wait, so the
+            // wait passing right after the signal is one legal order.
+            {
+                bool signalled = false, known = true;
+                std::uint32_t left = 0;
+                for (const auto& effect : pending.effects) {
+                    if (effect.kind != CompletionEffect::Kind::signal || effect.event != command.value) continue;
+                    if (effect.add) {
+                        if (!signalled) known = false;
+                        left += effect.value;
+                    } else {
+                        left = effect.value;
+                        known = true;
+                    }
+                    signalled = true;
+                }
+                const bool met = command.mode == NVN_EVENT_WAIT_MODE_EQUAL
+                    ? left == command.wait_value
+                    : command.mode == NVN_EVENT_WAIT_MODE_GEQUAL_WRAP && std::int32_t(left - command.wait_value) >= 0;
+                if (signalled && known && met && !drains.own) return barrier(PassBreak::wait_event);
+                // An earlier submission's encoded write meets it: that
+                // submission runs first on the queue, and a barrier orders
+                // this one's later commands after its own earlier work.
+                if (!signalled && !drains.release &&
+                    backend.encoded_write_meets(command.value, command.mode, command.wait_value))
+                    return barrier(PassBreak::wait_event);
+            }
+            // Wait only for a writer of the event word that has not landed:
+            // a signal of this submission drains its prefix, one of an
+            // earlier submission waits for that submission. An event the CPU
+            // or completed work already set needs no GPU wait.
+            if (!order_completion_read(nil, 0,
+                    reinterpret_cast<const std::byte*>(const_cast<const std::uint32_t*>(command.value)),
+                    sizeof(std::uint32_t)))
+                return false;
             const auto value = __atomic_load_n(command.value, __ATOMIC_SEQ_CST);
             const bool ready = command.mode == NVN_EVENT_WAIT_MODE_EQUAL
                 ? value == command.wait_value
@@ -10875,9 +15085,11 @@ bool Encoder::visit_command(const CommandRecordView& record) {
                 return fail(ReplayErrorCode::missing_resource,
                             "counter report destination is not CPU-visible");
             if (command.type != NVN_COUNTER_TYPE_TIMESTAMP && command.type != NVN_COUNTER_TYPE_TIMESTAMP_TOP &&
-                command.type != NVN_COUNTER_TYPE_SAMPLES_PASSED)
+                command.type != NVN_COUNTER_TYPE_SAMPLES_PASSED) {
+                note_report_counter(command.type, command.address);
                 return fail(ReplayErrorCode::unsupported,
                             "requested hardware counter is unsupported by Metal replay");
+            }
             ++(isolated ? pending.counters.report_fast : pending.counters.report_ordered);
             ++(isolated ? backend.mutable_statistics().report_fast : backend.mutable_statistics().report_ordered);
             return enqueue_counter(command, destination, cpu + destination.offset);
@@ -10901,6 +15113,7 @@ bool Encoder::visit_command(const CommandRecordView& record) {
             return true;
         }
         case Op::report_value: {
+            const SiteScope site_scope(*this, TransferSite::report);
             const auto command = payload<ReportValue>(record);
             const auto destination = buffer_at(command.address,
                                                                     sizeof(command.value));
@@ -10918,10 +15131,12 @@ bool Encoder::visit_command(const CommandRecordView& record) {
             discard_gpu_uniform_captures(command.address, sizeof command.value);
             buffer_write_order.write();
             note_writes();
+            if (reports) reports->write(command.address, sizeof command.value, &command.value, 0);
             return true;
         }
         case Op::copy_buffer: return copy_buffer(payload<CopyBuffer>(record));
         case Op::update_uniforms: {
+            const SiteScope site_scope(*this, TransferSite::update_uniforms);
             const auto command = payload<UpdateUniforms>(record);
             const auto header = offsetof(UpdateUniforms, data);
             if (command.size > record.payload_size - header)
@@ -10961,11 +15176,13 @@ bool Encoder::visit_command(const CommandRecordView& record) {
             if (!uniform_words.empty()) refresh_uniform_words(command.destination, command.size, update_bytes);
             invalidate_uniforms(command.destination, command.size, cpu_addressed_buffers ? command.destination :
                 destination.buffer.contents ? reinterpret_cast<std::uintptr_t>(destination.buffer.contents) + destination.offset : 0);
+            if (reports) reports->write(command.destination, command.size, update_bytes, 0);
             if (failed) return false;
             ++pending.counters.uniform_invalidations;
             return true;
         }
         case Op::clear_buffer: {
+            const SiteScope site_scope(*this, TransferSite::clear_buffer);
             const auto command = payload<ClearBuffer>(record);
             if (!prepare_uniform_access(command.address, command.size)) return false;
             if (!command.size) return true;
@@ -10989,6 +15206,7 @@ bool Encoder::visit_command(const CommandRecordView& record) {
             discard_gpu_uniform_captures(command.address, command.size);
             buffer_write_order.write();
             note_writes();
+            if (reports) reports->write(command.address, command.size, &command.value, 4);
             ++backend.mutable_statistics().clears;
             return true;
         }
@@ -11124,35 +15342,19 @@ bool Encoder::visit_command(const CommandRecordView& record) {
         }
         case Op::bind_program: {
             const auto command = payload<BindProgram>(record);
+            constexpr auto logical_stage_bits = (1u << logical_binding_stage_count) - 1;
+            if (command.stages < 0 || (static_cast<std::uint32_t>(command.stages) & ~logical_stage_bits))
+                return fail(ReplayErrorCode::invalid_command, "program binding contains an invalid logical stage mask");
+            if (!command.stages) return true;
             std::shared_ptr<const ResolvedProgram> program;
             if (command.program) program = retain_program(*command.program);
             if (command.program && !program)
                 return fail(ReplayErrorCode::missing_program,
                             "bound program serial has no resolved artifacts");
-            constexpr std::uint32_t all_stage_bits = (1u << stage_count) - 1;
-            if (command.stages < 0 || (std::uint32_t(command.stages) & ~all_stage_bits))
-                return fail(ReplayErrorCode::invalid_command,
-                            "program binding contains an invalid stage mask");
-            bool changed = false;
-            for (std::size_t stage_index = 0; stage_index != stage_count; ++stage_index) {
-                const auto bit = 1u << stage_index;
-                if (!(std::uint32_t(command.stages) & bit)) continue;
-                const auto* next = program && program->stages[stage_index] ? program.get() : nullptr;
-                if (state.stage_programs[stage_index].get() != next) {
-                    const bool laid_out = compute_layout() != nullptr;
-                    state.stage_programs[stage_index] = program && program->stages[stage_index]
-                        ? program : nullptr;
-                    state.update_write_stage(stage_index);
-                    if (stage_index == NVN_SHADER_STAGE_COMPUTE && (laid_out || compute_layout()))
-                        invalidate_compute_driver();
-                    changed = true;
-                }
-                const auto failed = program ? program->failed_stages & bit : 0u;
-                if ((state.failed_stages & bit) != failed) {
-                    state.failed_stages = (state.failed_stages & ~bit) | failed;
-                    changed = true;
-                }
-            }
+            const auto previous_compute = state.stage_programs[NVN_SHADER_STAGE_COMPUTE];
+            const bool changed = state.bind(command, program);
+            if (previous_compute != state.stage_programs[NVN_SHADER_STAGE_COMPUTE]) invalidate_compute_driver();
+            remember_mesh_bind(command);
             // Rebinding the program a stage already uses changes no binding.
             if (changed) {
                 invalidate_args_all();
@@ -11251,8 +15453,9 @@ bool Encoder::visit_command(const CommandRecordView& record) {
         }
         case Op::bind_uniform_buffer:
         case Op::bind_storage_buffer: {
+            const SiteScope site_scope(*this, TransferSite::storage_bind);
             const auto command = payload<BindBuffer>(record);
-            if (command.stage < 0 || command.stage >= int(stage_count) || command.index < 0 ||
+            if (command.stage < 0 || command.stage >= int(logical_binding_stage_count) || command.index < 0 ||
                 command.index >= int(buffer_slots))
                 return fail(ReplayErrorCode::invalid_command,
                             "shader buffer binding range is invalid");
@@ -11271,13 +15474,37 @@ bool Encoder::visit_command(const CommandRecordView& record) {
                 : state.storage[command.stage][command.index];
             if (target.address != command.address || target.size != command.size) {
                 target = {command.address, command.size};
-                if (record.op == Op::bind_uniform_buffer)
-                    invalidate_uniform_binding(std::size_t(command.stage), std::uint32_t(command.index));
-                else
-                    invalidate_args(std::size_t(command.stage));
-                if (record.op == Op::bind_storage_buffer || command.stage == NVN_SHADER_STAGE_COMPUTE) {
-                    ++bindings[command.stage].driver_generation[0];
-                    bindings[command.stage].windows[0] = {};
+                if (const auto active = state.execution_stage(std::size_t(command.stage))) {
+                    if (record.op == Op::bind_uniform_buffer)
+                        invalidate_uniform_binding(*active, std::uint32_t(command.index));
+                    else invalidate_args(*active);
+                    if (record.op == Op::bind_storage_buffer || *active == NVN_SHADER_STAGE_COMPUTE) {
+                        ++bindings[*active].driver_generation[0];
+                        bindings[*active].windows[0] = {};
+                    }
+                }
+            }
+            return true;
+        }
+        case Op::bind_texture_prefix: {
+            const auto command = payload<BindTexturePrefix>(record);
+            if (command.stage < 0 || command.stage >= int(logical_binding_stage_count) ||
+                command.stage == NVN_SHADER_STAGE_COMPUTE ||
+                (command.bytes != 4 && command.bytes != 8))
+                return fail(ReplayErrorCode::invalid_command, "texture handle prefix update is invalid");
+            auto& prefix = state.texture_prefix[command.stage];
+            const auto value = command.bytes == 4
+                ? (prefix & 0xffffffff00000000ull) | static_cast<std::uint32_t>(command.handle) : command.handle;
+            if (command.sampler_registrations && command.sampler_registrations != state.sampler_registrations) {
+                state.sampler_registrations = command.sampler_registrations;
+                invalidate_args_all();
+            }
+            if (prefix != value) {
+                prefix = value;
+                if (const auto active = state.execution_stage(std::size_t(command.stage))) {
+                    invalidate_args(*active);
+                    ++bindings[*active].driver_generation[2];
+                    bindings[*active].windows[2] = {};
                 }
             }
             return true;
@@ -11287,8 +15514,8 @@ bool Encoder::visit_command(const CommandRecordView& record) {
         case Op::bind_images: {
             const auto command = payload<BindHandles>(record);
             const std::size_t limit = record.op == Op::bind_images
-                ? image_slots : record.op == Op::bind_samplers ? sampler_slots : texture_slots;
-            if (command.stage < 0 || command.stage >= int(stage_count) || command.first < 0 ||
+                ? image_slots : record.op == Op::bind_samplers ? sampler_slots : bound_texture_slots;
+            if (command.stage < 0 || command.stage >= int(logical_binding_stage_count) || command.first < 0 ||
                 command.count < 0 || std::size_t(command.first) > limit ||
                 std::size_t(command.count) > limit - std::size_t(command.first))
                 return fail(ReplayErrorCode::invalid_command,
@@ -11314,10 +15541,10 @@ bool Encoder::visit_command(const CommandRecordView& record) {
                 invalidate_args_all();
             }
             if (changed) {
-                invalidate_args(std::size_t(command.stage));
-                if (record.op == Op::bind_textures) {
-                    ++bindings[command.stage].driver_generation[2];
-                    bindings[command.stage].windows[2] = {};
+                if (const auto active = state.execution_stage(std::size_t(command.stage))) {
+                    invalidate_args(*active);
+                    ++bindings[*active].driver_generation[2];
+                    bindings[*active].windows[2] = {};
                 }
                 if (command.stage == NVN_SHADER_STAGE_COMPUTE && compute_layout()) invalidate_compute_driver();
             }
@@ -11399,6 +15626,10 @@ bool Encoder::visit_command(const CommandRecordView& record) {
         case Op::dispatch_indirect:
             return dispatch_indirect(payload<DispatchIndirect>(record));
         case Op::barrier:
+            if (payload<ScalarInt>(record).value) {
+                ++feedback_epoch;
+                dirty.arguments[NVN_SHADER_STAGE_FRAGMENT] = true;
+            }
             // Keep depth-only writes on tile for subsequent depth tests. Any
             // later shader read of that depth closes the pass before drawing.
             // Other passes retain the conservative full encoder boundary.
@@ -11538,6 +15769,19 @@ bool Encoder::visit_command(const CommandRecordView& record) {
             predicate.arguments = nullptr;
             predicate.job = 0;
             state.predicate_pending = false;
+            if (reports) {
+                // Each record is 16 bytes; the comparison uses the counter field.
+                std::uint64_t left = 0, right = 0;
+                const bool left_known = reports->value(command.address, left);
+                const bool right_known = reports->value(command.address + 16, right);
+                const bool if_equal = command.mode == NVN_CONDITIONAL_RENDER_MODE_RENDER_IF_EQUAL;
+                const bool known = left_known && right_known;
+                const bool skip = known && (if_equal ? left != right : left == right);
+                state.render_enabled = !skip;
+                note_conditional(false, if_equal);
+                log_conditional(command.address, if_equal, left, left_known, right, right_known, !skip);
+                return true;
+            }
             bool handled = false;
             if (!gpu_predicate(command, handled)) return false;
             note_conditional(handled, command.mode == NVN_CONDITIONAL_RENDER_MODE_RENDER_IF_EQUAL);
@@ -11546,7 +15790,10 @@ bool Encoder::visit_command(const CommandRecordView& record) {
                 return true;
             }
             if (!synchronize_gpu()) return false;
-            return read_predicate(command.mode, command.address);
+            if (!read_predicate(command.mode, command.address)) return false;
+            log_conditional(command.address, command.mode == NVN_CONDITIONAL_RENDER_MODE_RENDER_IF_EQUAL,
+                            0, false, 0, false, state.render_enabled);
+            return true;
         }
         case Op::render_enable:
             trace_pass_event("conditional", "end", payload<RenderEnable>(record).enable);
@@ -11598,20 +15845,38 @@ bool Encoder::visit_command(const CommandRecordView& record) {
         }
         case Op::draw_mesh_tasks_indirect:
             return draw_mesh(0, 0, payload<DrawMeshTasksIndirect>(record).address);
+        case Op::geometry_processing_mode: {
+            const auto mode = payload<ScalarInt>(record).value;
+            if (mode < 0 || mode > 2)
+                return fail(ReplayErrorCode::unsupported, "geometry processing mode is unsupported");
+            state.geometry_mode = mode;
+            state.select();
+            // Every setter carries followup program/resource state, even if
+            // its mode value repeats. Drop physical windows across bank swaps.
+            for (auto& bound : bindings) {
+                bound.windows.fill({});
+                for (auto& generation : bound.driver_generation) ++generation;
+            }
+            invalidate_args_all();
+            dirty.pipeline = true;
+            return true;
+        }
         case Op::push_constants: {
             const auto command = payload<PushConstants>(record);
-            if (command.stage < 0 || command.stage > int(NVN_SHADER_STAGE_COMPUTE) || command.bank < 3 ||
+            if (command.stage < 0 || command.stage >= int(logical_binding_stage_count) || command.bank < 3 ||
                 command.bank >= 32 || command.offset > push_constant_bytes ||
                 command.size > push_constant_bytes - command.offset)
                 return fail(ReplayErrorCode::invalid_command, "push-constant record is invalid");
             const auto stage = std::size_t(command.stage);
             std::memcpy(state.push_constants[stage].data() + command.offset, command.data, command.size);
             state.push_bank[stage] = command.bank;
-            ++bindings[stage].driver_generation[3];
-            if (command.bank < bindings[stage].windows.size()) bindings[stage].windows[command.bank] = {};
-            if (stage == NVN_SHADER_STAGE_COMPUTE && compute_layout()) invalidate_compute_driver();
-            bindings[stage].uniform_slots |= 1u << command.bank;
-            invalidate_args(stage);
+            if (const auto active = state.execution_stage(stage)) {
+                ++bindings[*active].driver_generation[3];
+                if (command.bank < bindings[*active].windows.size()) bindings[*active].windows[command.bank] = {};
+                if (*active == NVN_SHADER_STAGE_COMPUTE && compute_layout()) invalidate_compute_driver();
+                bindings[*active].uniform_slots |= 1u << command.bank;
+                invalidate_args(*active);
+            }
             return true;
         }
         case Op::sampler_registrations: {
@@ -11645,6 +15910,7 @@ bool Encoder::visit_command(const CommandRecordView& record) {
 }
 
 bool Encoder::finish() {
+    const SiteScope site_scope(*this, TransferSite::finish);
     if (capture_retirement_needed && !retire_captures_if_full()) return false;
     if (predicate_open()) {
         predicate.arguments = nullptr;
@@ -11700,6 +15966,15 @@ public:
                                            std::vector<Resources::GuestMemoryPool>& pools) override {
         return resources_.claim_guest_memory_pools(known, pools);
     }
+    Resources::GuestMemoryAdmission guest_memory_admission() const override {
+        return resources_.guest_memory_admission();
+    }
+    bool address_in_unaddressed_pool(std::uint64_t address) const override {
+        return resources_.address_in_unaddressed_pool(address);
+    }
+    std::string describe_guest_address(std::uint64_t address) const override {
+        return resources_.describe_guest_address(address);
+    }
     id<MTLTexture> texture(const nvn::TextureState& state, const nvn::TextureViewState* view) override {
         return resources_.texture(state, view);
     }
@@ -11713,21 +15988,48 @@ public:
     id<MTLTexture> upgrade_for_image_write(std::uint64_t serial, __strong id<MTLTexture>& previous) override {
         return resources_.upgrade_for_image_write(serial, previous);
     }
+    id<MTLTexture> upgrade_for_image_atomic(std::uint64_t serial, bool is_signed,
+                                            __strong id<MTLTexture>& previous) override {
+        return resources_.upgrade_for_image_atomic(serial, is_signed, previous);
+    }
+    bool image_atomic_capable(std::uint64_t serial) override {
+        return resources_.image_atomic_capable(serial);
+    }
+    bool image_atomic_needs_upgrade(std::uint64_t serial, bool is_signed) override {
+        return resources_.image_atomic_needs_upgrade(serial, is_signed);
+    }
     id<MTLTexture> texture_for_id_stamped(std::int32_t id, DescriptorStamp& stamp) override {
         return resources_.texture_for_id(id, stamp);
     }
+    id<MTLTexture> image_base_for_id(std::int32_t id, DescriptorStamp& stamp) override {
+        return resources_.image_base_for_id(id, stamp);
+    }
+    id<MTLTexture> raw_image_view(std::int32_t texture_id, id<MTLTexture> texture) override {
+        return resources_.raw_image_view(texture_id, texture);
+    }
     bool texture_stamp_current(std::int32_t id, const DescriptorStamp& stamp) const override {
         return resources_.texture_stamp_current(id, stamp);
+    }
+    std::string take_sampler_failure() override { return resources_.take_sampler_failure(); }
+    std::optional<std::uint32_t> sampler_pinned_level(std::int32_t id, std::uint64_t registrations) const override {
+        return resources_.sampler_pinned_level(id, registrations);
+    }
+    CoverageSampler coverage_sampler_for_id(std::int32_t id, std::uint64_t registrations) override {
+        return resources_.coverage_sampler_for_id(id, registrations);
     }
     id<MTLSamplerState> sampler_for_id(std::int32_t id) override { return resources_.sampler_for_id(id); }
     id<MTLSamplerState> sampler_for_id(std::int32_t id, std::uint64_t registrations) override {
         return resources_.sampler_for_id(id, registrations);
     }
     id<MTLTexture> fitted_texture(std::int32_t texture_id, id<MTLTexture> texture,
-                                  MTLTextureType type) override {
-        return resources_.fitted_texture(texture_id, texture, type);
+                                  MTLTextureType type, bool typed_handle, MTLPixelFormat empty_format) override {
+        return resources_.fitted_texture(texture_id, texture, type, typed_handle, empty_format);
     }
     void begin_walk() override { resources_.begin_walk(); }
+    void end_walk() override { resources_.end_walk(); }
+    std::shared_ptr<Metal4SubmissionOwner> submission_owner() const override { return resources_.submission_owner(); }
+    void set_upload_publication(UploadPublication publication) override { resources_.set_upload_publication(std::move(publication)); }
+    bool publish_uploads() override { return resources_.publish_uploads(); }
     bool flush_uploads() override { return resources_.flush_uploads(); }
     void commit_uploads(UploadFence& fence) override { resources_.commit_uploads(fence); }
     bool uploads_failed(const UploadFence& fence) override { return resources_.uploads_failed(fence); }
@@ -11756,6 +16058,51 @@ public:
         const auto counts = resources_.texture_lookup_counts();
         return {counts.lookups, counts.misses};
     }
+    std::uint64_t registration_log_generation() const override {
+        return resources_.registration_log_generation();
+    }
+    bool read_registration_note(std::uint64_t generation, RegistrationNote& note) const override {
+        Resources::RegistrationNote source;
+        if (!resources_.read_registration_note(generation, source)) return false;
+        note.id = source.id;
+        note.kind = source.kind;
+        return true;
+    }
+    std::uint64_t storage_log_generation() const override { return resources_.storage_log_generation(); }
+    bool read_storage_note(std::uint64_t generation, std::uint64_t& serial) const override {
+        return resources_.read_storage_note(generation, serial);
+    }
+    std::vector<std::int32_t> descriptor_ids_for_serial(std::uint64_t serial) const override {
+        return resources_.descriptor_ids_for_serial(serial);
+    }
+    bool texture_id_empty(std::int32_t id) const override { return resources_.texture_id_empty(id); }
+    std::int32_t registered_texture_count() const override { return resources_.registered_texture_count(); }
+    std::int32_t sampler_count() const override { return resources_.sampler_count(); }
+    bool texture_registered(std::int32_t id) const override { return resources_.texture_registered(id); }
+    bool texture_storage_made(std::int32_t id) const override { return resources_.texture_storage_made(id); }
+    bool texture_storage_shared(std::int32_t id) const override { return resources_.texture_storage_shared(id); }
+    bool texture_compressible(std::int32_t id) const override { return resources_.texture_compressible(id); }
+    std::uint64_t texture_storage_size(std::int32_t id) const override {
+        return resources_.texture_storage_size(id);
+    }
+    bool texture_storage_live(std::int32_t id) const override { return resources_.texture_storage_live(id); }
+    std::uint64_t texture_serial(std::int32_t id) const override { return resources_.texture_serial(id); }
+    std::uint64_t texture_descriptor_key(std::int32_t id) const override {
+        return resources_.texture_descriptor_key(id);
+    }
+    bool texture_read_identity(std::int32_t id, TextureReadIdentity& identity) const override {
+        return resources_.texture_read_identity(id, identity);
+    }
+    std::uint64_t texture_empty_generation() const override { return resources_.texture_empty_generation(); }
+    bool texture_is_depth(std::int32_t id) const override { return resources_.texture_is_depth(id); }
+    std::uint64_t texture_storage_key(std::int32_t id) const override { return resources_.texture_storage_key(id); }
+    std::uint64_t texture_pool_generation() const override { return resources_.texture_pool_generation(); }
+    void note_pool_depth_read(std::uint64_t serial, std::uint64_t storage_key) override {
+        resources_.note_pool_depth_read(serial, storage_key);
+    }
+    bool pool_depth_read(std::uint64_t serial, std::uint64_t storage_key) const override {
+        return resources_.pool_depth_read(serial, storage_key);
+    }
 private:
     Resources& resources_;
 };
@@ -11765,6 +16112,7 @@ create_replay_backend(id<MTLDevice> device, id<MTL4CommandQueue> queue, Resource
                       ReplaySchedulingPolicy scheduling) {
     if (!device || !queue || ![device supportsFamily:MTLGPUFamilyMetal4] ||
         !device.hasUnifiedMemory) return {};
+    if (!resources.submission_owner() || resources.submission_owner()->queue() != queue) return {};
     return std::make_unique<ReplayImpl>(device, queue, std::make_shared<ResourceLookup>(resources), scheduling);
 }
 #endif

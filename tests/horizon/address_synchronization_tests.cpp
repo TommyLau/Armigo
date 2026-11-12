@@ -547,7 +547,10 @@ void test_address_validation_and_missing_callbacks() {
         registers[0] = address;
         return std::pair{no_callbacks.dispatch(0x35, registers), registers};
     };
-    for (const auto address : {std::uint64_t{0x200000}, std::uint64_t{0x7ffffffffc}}) {
+    // The kernel's word envelope is [0x200000, 0x40000000000), broader than the
+    // mapped 39-bit space; a type-0 signal never reads its word.
+    for (const auto address : {std::uint64_t{0x200000}, std::uint64_t{0x7ffffffffc},
+                               std::uint64_t{0x8000000000}, std::uint64_t{0x3fffffffffc}}) {
         const auto [disposition, registers] = plain_signal(address);
         CHECK(disposition == QueryDisposition::handled);
         CHECK(registers[0] == 0);
@@ -555,7 +558,7 @@ void test_address_validation_and_missing_callbacks() {
 
     // Numeric range validation precedes alignment and type validation.
     for (const auto address : {std::uint64_t{0}, std::uint64_t{0x1fffff},
-                               std::uint64_t{0x8000000000}}) {
+                               std::uint64_t{0x40000000000}}) {
         auto wait = wait_arguments(99, 0, 0);
         wait[0] = address;
         CHECK(no_callbacks.dispatch(0x34, wait) == QueryDisposition::handled);
@@ -607,6 +610,34 @@ void test_address_validation_and_missing_callbacks() {
     signal[0] = word_address + 0x100;
     CHECK(fixture.queries.dispatch(0x35, signal) == QueryDisposition::handled);
     CHECK(signal[0] == invalid_memory);
+
+    // Words inside the kernel envelope but above the mapped 39-bit space pass the
+    // range and alignment checks; the failed access then gives the memory result
+    // for every type that touches the word, queues no waiter and changes nothing.
+    const auto word_before = fixture.backing.word.load(std::memory_order_acquire);
+    for (const auto address : {std::uint64_t{0x8000000000}, std::uint64_t{0x3fffffffff8}}) {
+        for (const auto type : {std::uint32_t{0}, std::uint32_t{1}, std::uint32_t{2},
+                                std::uint32_t{3}}) {
+            wait = wait_arguments(type, 0, 0);
+            wait[0] = address;
+            CHECK(fixture.queries.dispatch(0x34, wait) == QueryDisposition::handled);
+            CHECK(wait[0] == invalid_memory);
+            CHECK(fixture.queries.arbitration()->waiters(address) == 0);
+        }
+        for (const auto type : {std::uint32_t{1}, std::uint32_t{2}}) {
+            signal = signal_arguments(type, 0, 1);
+            signal[0] = address;
+            CHECK(fixture.queries.dispatch(0x35, signal) == QueryDisposition::handled);
+            CHECK(signal[0] == invalid_memory);
+        }
+        signal = signal_arguments(0, 0, 1);
+        signal[0] = address;
+        CHECK(fixture.queries.dispatch(0x35, signal) == QueryDisposition::handled);
+        CHECK(signal[0] == 0);
+    }
+    CHECK(fixture.backing.word.load(std::memory_order_acquire) == word_before);
+    CHECK(fixture.backing.writes.load(std::memory_order_relaxed) == 0);
+    CHECK(fixture.backing.exchange_mutations.load(std::memory_order_relaxed) == 0);
 }
 
 void test_priority_and_fifo_selection() {

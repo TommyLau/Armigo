@@ -52,7 +52,7 @@ struct PresentationFrame {
     // Whether the presenter must return this frame's completed pixels. A
     // headless presenter not asked for them still consumes the frame on the
     // GPU, copying a native texture into presenter-owned storage, and returns
-    // no readback. A windowed presenter never reads back.
+    // no readback. Windowed readback is requested explicitly by capture policy.
     bool readback = true;
 };
 enum class PresentationError {
@@ -66,9 +66,8 @@ struct PresentationFailure {
 struct PresentedFrame {
     std::uint64_t frame_number = 0;
     std::chrono::steady_clock::time_point completed_at{};
-    // Required in headless mode for a frame that asked for readback: pixels
-    // read after real consumer completion. Other frames and windowed mode may
-    // omit readback. The returned image owns its bytes.
+    // Required for a frame that asked for readback: pixels read after real
+    // consumer completion. Unread frames may omit it. The image owns its bytes.
     std::optional<graphics::Rgba8Image> readback;
 };
 using PresentResult = std::variant<PresentationFailure, PresentedFrame>;

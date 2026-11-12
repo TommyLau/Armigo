@@ -41,6 +41,17 @@ void control_prefix(Bytes control) {
         little_endian(control, 4, 4) != 0xc9 || (version != 20 && version != 17))
         throw InputError("Unsupported native shader control family or version");
 }
+// Bytes that belong to the control section itself. An NVN2 section's key is
+// its first 0x48 bytes. A Maxwell section uses the length at +0x20 when that
+// length is a short section, and 0x880 otherwise. The length an entry claims
+// is not this span.
+std::uint64_t control_own_length(Bytes control) {
+    if (control.size() >= 0x48 && little_endian(control, 0, 4) == 0x98761234 &&
+        little_endian(control, 4, 4) == 0xc9)
+        return 0x48;
+    const auto declared = control.size() >= 0x24 ? little_endian(control, 0x20, 4) : 0;
+    return declared >= 0x760 && declared < 0x880 ? declared : 0x880;
+}
 }
 std::uint64_t little_endian(Bytes bytes, std::size_t at, unsigned width) {
     if (width == 0 || width > 8 || !covers(bytes, at, width))
@@ -216,7 +227,14 @@ void Enumerator::bahs(Bytes b, const std::vector<Location>& ancestry, std::size_
     if (start < 32 || start > limits_.table_bytes || !covers(b, start, size))
         throw InputError("BAHS code region or table limit is invalid", offset);
     ++inventory_.bahs;
-    std::set<std::pair<std::uint64_t, std::uint64_t>> seen;
+    struct Candidate {
+        std::size_t at = 0;
+        std::uint64_t control = 0;
+        std::uint64_t code = 0;
+        Bytes control_bytes;
+        Bytes code_bytes;
+    };
+    std::vector<Candidate> candidates;
     for (std::size_t at = 0; at + 16 <= start; at += 4) {
         const auto code = little_endian(b, at, 4), extent = little_endian(b, at + 8, 4);
         const auto displacement = static_cast<std::int64_t>(little_endian(b, at + 12, 4));
@@ -226,11 +244,31 @@ void Enumerator::bahs(Bytes b, const std::vector<Location>& ancestry, std::size_
             control < 0 || std::uint64_t(control) > start || extent > start - control) continue;
         auto c = slice(b, control, extent);
         if (little_endian(c, 0, 4) != 0x98761234 || little_endian(c, 0xd4, 4) != extent) continue;
-        if (!seen.emplace(control, code).second) { ++inventory_.duplicate_candidates; continue; }
         const auto code_size = little_endian(c, 0x44, 4);
         if (code > size || code_size > size - code) throw InputError("BAHS recognized candidate code is out of range", at);
-        emit({ContainerKind::bahs, ancestry, offset, at, std::uint64_t(control), start + code, {}, {},
-              c, slice(b, start + code, code_size)});
+        candidates.push_back({at, std::uint64_t(control), code, c, slice(b, start + code, code_size)});
+    }
+    // A table position inside a candidate's own control span is that section's
+    // words read as an entry, not another program. Duplicate recognition follows
+    // the drop, so a later entry that names the same control and code is kept.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    spans.reserve(candidates.size());
+    for (const auto& candidate : candidates) {
+        const auto length = control_own_length(candidate.control_bytes);
+        spans.emplace_back(candidate.control, candidate.control + length);
+    }
+    std::set<std::pair<std::uint64_t, std::uint64_t>> seen;
+    for (const auto& candidate : candidates) {
+        const bool nested = std::any_of(spans.begin(), spans.end(), [&](const auto& span) {
+            return span.first <= candidate.at && candidate.at < span.second;
+        });
+        if (nested) { ++inventory_.nested_candidates; continue; }
+        if (!seen.emplace(candidate.control, candidate.code).second) {
+            ++inventory_.duplicate_candidates;
+            continue;
+        }
+        emit({ContainerKind::bahs, ancestry, offset, candidate.at, candidate.control, start + candidate.code, {}, {},
+              candidate.control_bytes, candidate.code_bytes});
     }
 }
 bool Enumerator::ndve(Bytes bytes, std::vector<Location>& ancestry, std::size_t offset) {

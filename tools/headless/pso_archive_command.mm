@@ -88,11 +88,12 @@ int run_pso_archive_command(int argc, char* argv[]) {
             return out;
         };
         std::printf("{\"ok\":%s,\"rows\":%llu,\"built\":%llu,\"unresolved\":%llu,\"undecodable\":%llu,"
-                    "\"failed\":%llu,\"seconds\":%.1f,\"archive_bytes\":%llu,\"archive_files\":%llu,"
-                    "\"archive\":\"%s\",\"error\":\"%s\"}\n",
+                    "\"failed\":%llu,\"expected_misses\":%llu,\"seconds\":%.1f,\"archive_bytes\":%llu,"
+                    "\"archive_files\":%llu,\"archive\":\"%s\",\"error\":\"%s\"}\n",
                     result.ok ? "true" : "false", (unsigned long long)result.rows, (unsigned long long)result.built,
                     (unsigned long long)result.unresolved, (unsigned long long)result.undecodable,
-                    (unsigned long long)result.failed, result.seconds, (unsigned long long)result.archive_bytes,
+                    (unsigned long long)result.failed, (unsigned long long)result.expected_misses, result.seconds,
+                    (unsigned long long)result.archive_bytes,
                     (unsigned long long)result.archive_files, escape(result.archive.string()).c_str(),
                     escape(result.error).c_str());
         return result.ok ? 0 : 1;

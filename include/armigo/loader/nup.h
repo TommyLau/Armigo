@@ -41,12 +41,16 @@ struct NupPackage {
     std::uint32_t exefs = ~std::uint32_t{0};
     std::uint32_t romfs = ~std::uint32_t{0};
     std::vector<std::byte> npdm;
+    // The package's display version (metadata type 4), empty when absent.
+    std::string display_version;
 };
 
 struct NupSelection {
     std::uint64_t title_id = 0;
     std::uint32_t version = 0;
     bool update_applied = false;
+    // The selected package's display version, empty when the package has none.
+    std::string display_version;
     // Paths are relative, slash-separated and validated. Payloads remain in the archive.
     std::map<std::string, std::uint32_t> exefs;
     std::map<std::string, std::uint32_t> romfs;

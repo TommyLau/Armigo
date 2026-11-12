@@ -10,6 +10,7 @@
 
 #include <armigo/common/diagnostics.h>
 #include "programs.h"
+#include "program_capture.h"
 #include "entry_table.h"
 
 #include <algorithm>
@@ -55,6 +56,8 @@ void finalize(NVNprogram* object) {
 }
 
 NVNboolean set_shaders(NVNprogram* object, int count, const NVNshaderData* shaders) {
+    program_capture::Call captured(reinterpret_cast<std::uint64_t>(object), count,
+                                   reinterpret_cast<std::uint64_t>(shaders), false);
     if (!object || state(object).tag != program_tag || count < 0 || count > 6 || (count && !shaders)) {
         diagnostic("Invalid shader descriptor range or program object");
         return 0;
@@ -95,6 +98,11 @@ NVNboolean set_shaders(NVNprogram* object, int count, const NVNshaderData* shade
             }
             resolved_count += bool(executable->stages[i]) || bool(pending[i]);
             any_pending |= bool(pending[i]);
+            if (const auto& shader = executable->stages[i]) {
+                const auto logical = shader->task ? 6u : shader->mesh ? 7u : static_cast<unsigned>(i);
+                executable->logical_stages |= 1u << logical;
+                if (shader->mesh) executable->mesh_uses_task = shader->mesh->launched_by_task;
+            }
         }
         if (any_pending) {
             executable->pending = std::make_shared<PendingStages>();
@@ -119,8 +127,23 @@ NVNboolean set_shaders(NVNprogram* object, int count, const NVNshaderData* shade
             std::memcpy(&c1_offset, control + (native ? 0x40 : 0x700), 4);
             if (native) stage = std::to_integer<std::uint32_t>(control[0x56]);
             else std::memcpy(&stage, control + 0x714, 4);
-            if (stage < executable->constants.size() && c1_size)
-                executable->constants[stage] = {shaders[i].data + c1_offset, c1_size};
+            if (stage < 8) executable->logical_stages |= 1u << stage;
+            if (native && stage == 7) {
+                const auto route = std::to_integer<std::uint8_t>(control[0x5e]);
+                executable->mesh_uses_task = route != 0;
+                std::uint16_t auxiliary = 0;
+                std::memcpy(&auxiliary, control + 0x68, sizeof auxiliary);
+                executable->mesh_primitive_header = auxiliary != 0;
+                if (captured.id()) {
+                    captured.metadata(i, stage, route, auxiliary);
+                    executable->capture_mesh_metadata = true;
+                    executable->captured_mesh_route = route;
+                    executable->captured_auxiliary_word = auxiliary;
+                }
+            } else if (captured.id()) captured.metadata(i, stage);
+            const auto artifact = native && stage == 6 ? 3u : native && stage == 7 ? 4u : stage;
+            if (artifact < executable->constants.size() && c1_size)
+                executable->constants[artifact] = {shaders[i].data + c1_offset, c1_size};
             // Compute driver data counts: push words at +0xa9, uniform and
             // storage entries at +0xb1 and +0xb2, texture, separate texture,
             // separate sampler and image handles at +0xb3..+0xb6, and the
@@ -149,6 +172,8 @@ NVNboolean set_shaders(NVNprogram* object, int count, const NVNshaderData* shade
                     executable->compute_layout = layout;
             }
         }
+        executable->capture_call = captured.id();
+        executable->capture_matches = captured.matches();
         // Descriptors are diagnostic metadata only; replay consumes the retained artifacts.
         if (count) std::copy_n(shaders, count, executable->state.stages);
         std::lock_guard lock(program_mutex);
@@ -170,6 +195,7 @@ NVNboolean set_shaders(NVNprogram* object, int count, const NVNshaderData* shade
             if (it->second.expired()) it = recorded_programs.erase(it);
             else ++it;
         }
+        captured.finish(true, executable->state.serial);
         return 1;
     } catch (const std::exception& error) {
         diagnostic(error.what());
@@ -177,6 +203,8 @@ NVNboolean set_shaders(NVNprogram* object, int count, const NVNshaderData* shade
     }
 }
 NVNboolean set_shaders_ext(NVNprogram* object, int count, const NVNshaderDataExt* shaders) {
+    program_capture::Call captured(reinterpret_cast<std::uint64_t>(object), count,
+                                   reinterpret_cast<std::uint64_t>(shaders), true);
     if (count < 0 || count > 6 || (count && !shaders)) return 0;
     NVNshaderData basic[6]{};
     for (int i = 0; i < count; ++i) {
@@ -197,7 +225,9 @@ NVNboolean set_shaders_ext(NVNprogram* object, int count, const NVNshaderDataExt
         }
         basic[i] = {shaders[i].data, shaders[i].control};
     }
-    return set_shaders(object, count, basic);
+    const auto result = set_shaders(object, count, basic);
+    captured.finish(result != 0, std::nullopt);
+    return result;
 }
 void set_label(NVNprogram*, const char*) {}
 NVNboolean subroutines(NVNprogram*, int count, const NVNsubroutineLinkageMapPtr*) {
@@ -249,6 +279,12 @@ std::shared_ptr<const ResolvedProgram> retain_program(const ProgramState& object
             for (std::size_t i = 0; i != filled.stages.size(); ++i) {
                 if (!pending.stages[i]) continue;
                 filled.stages[i] = std::exchange(pending.stages[i], nullptr)->wait();
+                const auto& shader = filled.stages[i];
+                const auto logical = shader && shader->task ? 6u : shader && shader->mesh ? 7u :
+                    i == 3 && (filled.logical_stages & (1u << 6)) ? 6u :
+                    i == 4 && (filled.logical_stages & (1u << 7)) ? 7u : static_cast<unsigned>(i);
+                filled.logical_stages |= 1u << logical;
+                if (shader && shader->mesh) filled.mesh_uses_task = shader->mesh->launched_by_task;
                 if (!filled.stages[i]) filled.failed_stages |= 1u << i;
             }
             pending.finished.store(true, std::memory_order_release);

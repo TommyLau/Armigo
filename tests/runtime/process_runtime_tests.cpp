@@ -9,6 +9,9 @@
 // ============================================================================
 
 #include "process_runtime_fixture.h"
+#include "../../src/nvn/program_capture.h"
+#include "../../src/nvn/objects.h"
+#include "../../src/nvn/entry_table.h"
 #include "player_settings.h"
 #include "../../src/runtime/service_registry.h"
 #include <future>
@@ -20,6 +23,102 @@
 #include <sstream>
 
 namespace {
+void test_program_capture_cooperative_stop() {
+    namespace capture = nvn::program_capture;
+    constexpr const char* digest = "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a";
+    struct Trace {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool stopped = false, durable_at_stop = false, started = false, expect_stop = false;
+        unsigned shutdowns = 0;
+        StopReason reason = StopReason::watchdog_timeout;
+        std::filesystem::path output;
+        std::array<int, 3> commands{2, 0, 32};
+    };
+    class CaptureRuntime final : public ProcessRuntime {
+    public:
+        CaptureRuntime(std::shared_ptr<Trace> trace, std::string digest) : trace_(std::move(trace)), digest_(std::move(digest)) {}
+        RunResult run(const RunLimits& limits, const ReportDestination&, std::stop_token) override {
+            CHECK(limits.completed_frame_target == 1);
+            { const std::lock_guard lock(trace_->mutex); trace_->started = true; }
+            auto code = std::make_shared<const std::vector<std::byte>>(
+                std::initializer_list<std::byte>{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}});
+            std::array<std::byte, 0xe0> control{};
+            const std::uint32_t extent = 4; std::memcpy(control.data() + 0x44, &extent, 4);
+            nvn::ProgramState object{}; object.tag = nvn::object_tag('P', 'R', 'O', 'G'); object.serial = 41;
+            const nvn::api::NVNshaderData descriptor{reinterpret_cast<std::uint64_t>(code->data()), control.data()};
+            capture::Call call(reinterpret_cast<std::uint64_t>(&object), 1,
+                               reinterpret_cast<std::uint64_t>(&descriptor), false);
+            call.control(0, control); call.code(0, code, *code, digest_, "synthetic-capture-input");
+            const auto id = call.id(); object.serial = 42; call.finish(true, 42);
+            capture::Event bound; bound.kind = capture::EventKind::bind; bound.backend = 1;
+            bound.generation = 42; bound.capture_call = id; bound.matches = true; bound.requested = 255;
+            capture::observe(bound);
+            capture::Event draw; draw.kind = capture::EventKind::direct_draw; draw.backend = 1;
+            draw.generation = 42; draw.capture_call = id; draw.matches = true;
+            draw.first = trace_->commands[1]; draw.count = trace_->commands[2];
+            capture::observe(draw);
+            std::unique_lock lock(trace_->mutex);
+            trace_->changed.wait_for(lock, trace_->expect_stop ? 5s : 150ms, [&] { return trace_->stopped; });
+            RunResult result;
+            result.outcome = trace_->stopped ? RunOutcome{RunCancelled{trace_->reason}} : RunOutcome{RunSuccess{1}};
+            return result;
+        }
+        void request_stop(StopReason reason) noexcept override {
+            const std::lock_guard lock(trace_->mutex);
+            CHECK(trace_->started);
+            std::ifstream payload(trace_->output / "call-1/code-0.bin", std::ios::binary);
+            const std::string bytes{std::istreambuf_iterator<char>(payload), {}};
+            trace_->durable_at_stop = bytes == std::string("\1\2\3\4", 4) &&
+                std::filesystem::exists(trace_->output / "capture.json");
+            trace_->reason = reason; trace_->stopped = true; trace_->changed.notify_all();
+        }
+        LaunchStatus shutdown(std::optional<ClockInstant>) override { ++trace_->shutdowns; return std::monostate{}; }
+    private:
+        std::shared_ptr<Trace> trace_;
+        std::string digest_;
+    };
+    Fixture storage;
+    const auto previous_api = nvn::selected_api_version().value_or(nvn::ApiVersion{55, 15});
+    nvn::select_api_version({231, 40});
+    for (unsigned mode = 0; mode != 3; ++mode) {
+        auto trace = std::make_shared<Trace>(); trace->expect_stop = mode == 0; trace->output = storage.temporary.path / ("program-capture-" + std::to_string(mode));
+        capture::Configuration settings; settings.output = trace->output; settings.payload_digests = {digest};
+        settings.first = 0; settings.count = 32; settings.stop_after_capture = true;
+        if (mode == 1) settings.limits.events = 1;
+        if (mode == 2) std::filesystem::create_directory(trace->output);
+        capture::configure(std::move(settings), [](void*, std::uint64_t address, std::span<std::byte> output) {
+            mach_vm_size_t actual = 0;
+            return address && mach_vm_read_overwrite(mach_task_self(), address, output.size(),
+                reinterpret_cast<mach_vm_address_t>(output.data()), &actual) == KERN_SUCCESS && actual == output.size();
+        });
+        auto presenter = std::make_shared<TestPresenter>(platform::PresentationMode::headless);
+        auto base = dependencies(presenter);
+        tools::ShellEnvironment environment;
+        environment.create_guest_clock = [clock = base.clock]() -> LaunchResult<std::shared_ptr<GuestClock>> { return clock; };
+        environment.create_presentation_clock = [](auto clock, auto configuration) { return create_presentation_clock(std::move(clock), configuration); };
+        environment.create_presenter = [presenter](const auto&) -> platform::PresenterCreation { return presenter; };
+        environment.create_runtime = [trace](const auto&, auto&&) -> LaunchResult<std::unique_ptr<ProcessRuntime>> {
+            return std::unique_ptr<ProcessRuntime>(new CaptureRuntime(trace, digest));
+        };
+        tools::RunnerArguments arguments; arguments.completed_frame_target = 1;
+        const auto report = tools::run_headless_shell(arguments, environment);
+        CHECK(report.result.quiescent && !report.runtime_retained && !report.result.teardown_failure);
+        CHECK(trace->shutdowns == 1 && (trace->commands == std::array<int, 3>{2, 0, 32}));
+        CHECK(trace->stopped == (mode == 0));
+        if (mode == 0) {
+            CHECK(trace->durable_at_stop && trace->reason == StopReason::user_request);
+            CHECK(std::holds_alternative<RunCancelled>(report.result.outcome));
+            CHECK(report.exit_code == tools::RunnerExitCode::cancelled);
+        } else {
+            CHECK(std::holds_alternative<RunSuccess>(report.result.outcome));
+            CHECK(report.exit_code == tools::RunnerExitCode::success);
+        }
+        unsetenv("ARMIGO_NVN_PROGRAM_CAPTURE_CONFIG"); capture::configure_from_environment(nullptr);
+    }
+    nvn::select_api_version(previous_api);
+}
+
 void test_explicit_and_platform_memory_budgets() {
     for (bool platform_default : {false, true}) {
         Fixture fixture;
@@ -797,22 +896,37 @@ void test_capture_policy_selects_readback_frames() {
     // The interval is read once, on the first frame a capture directory could
     // keep; no earlier test in this process names a capture directory.
     CHECK(::setenv("ARMIGO_CAPTURE_EVERY", "3", 1) == 0);
+    CHECK(::setenv("ARMIGO_CAPTURE_RANGE", "2-7", 1) == 0);
     ReportDestination output;
     for (std::uint64_t frame = 0; frame < 7; ++frame) CHECK(!captures_frame(output, frame));
     output.capture_directory = "captures";
-    for (std::uint64_t frame = 0; frame < 7; ++frame)
-        CHECK(captures_frame(output, frame) == (frame % 3 == 0));
+    for (std::uint64_t frame = 0; frame < 10; ++frame)
+        CHECK(captures_frame(output, frame) == (frame >= 2 && frame <= 7 && frame % 3 == 0));
     // The first read is final, so the frame writer and presentation readback
     // cannot disagree after a later change.
     CHECK(::unsetenv("ARMIGO_CAPTURE_EVERY") == 0);
-    CHECK(captures_frame(output, 6) && !captures_frame(output, 7));
+    CHECK(::unsetenv("ARMIGO_CAPTURE_RANGE") == 0);
+    CHECK(captures_frame(output, 6) && !captures_frame(output, 7) && !captures_frame(output, 9));
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc >= 2 && std::string_view(argv[1]) == "--capture-policy") {
+        const bool invalid_range = argc == 3;
+        CHECK(::setenv("ARMIGO_CAPTURE_EVERY", "1", 1) == 0);
+        if (invalid_range) CHECK(::setenv("ARMIGO_CAPTURE_RANGE", argv[2], 1) == 0);
+        else CHECK(::unsetenv("ARMIGO_CAPTURE_RANGE") == 0);
+        ReportDestination output;
+        CHECK(!captures_frame(output, 0));
+        output.capture_directory = "captures";
+        for (std::uint64_t frame = 0; frame < 10; ++frame)
+            CHECK(captures_frame(output, frame) == !invalid_range);
+        return failures ? 1 : 0;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--construction-drain-failure")
         return construction_drain_failure_child();
+    test_program_capture_cooperative_stop();
     test_explicit_and_platform_memory_budgets();
     test_title_rate_clock_warning_for_both_runners();
     test_capture_policy_selects_readback_frames();

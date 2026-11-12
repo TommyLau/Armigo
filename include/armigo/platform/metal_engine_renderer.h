@@ -69,7 +69,7 @@ struct MetalEngineOptions {
     // draws still flush earlier at every coherence or ownership boundary.
     // A budget flush ends the open packet that repeats extend, so the next
     // draw is prepared in full; 256 balanced that against commit latency
-    // for title 01007EF00011E000 (64 and 1024 were both slower).
+    // for the first acceptance workload (64 and 1024 were both slower).
     std::uint32_t max_batch_draws = 256;
     // Registries created by this engine observe native guest CPU stores
     // through the process page write tracker (one per process, installed on

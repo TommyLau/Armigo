@@ -51,6 +51,9 @@ struct Program {
     // control_digest covers the complete record control; the stage identity
     // uses canonical_control_digest (see parse_program).
     std::string image_digest, control_digest, canonical_control_digest, payload_digest, stage_identity;
+    // Fragment control +0x5b requests API early tests; a header depth output
+    // keeps the shader late even when that request is set.
+    bool early_fragment_tests{};
 };
 using ProgramResult = std::variant<Program, ProgramFailure>;
 // Architecture/control schema, the canonical control (reader span with the

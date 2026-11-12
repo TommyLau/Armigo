@@ -151,22 +151,45 @@ void test_environment() {
     check(!armigo::diag::frame_stats_enabled(), "env stats override development");
 
     clear_environment();
-    armigo::diag::use_player_defaults();
+    armigo::diag::use_player_defaults(true);
     check(armigo::diag::minimum_level() == armigo::diag::Level::warning, "player level");
     check(!armigo::diag::frame_stats_enabled(), "player frame stats off");
 
     setenv("ARMIGO_LOG", "trace", 1);
     setenv("ARMIGO_FRAME_STATS", "1", 1);
-    armigo::diag::use_player_defaults();
+    armigo::diag::use_player_defaults(true);
     check(armigo::diag::minimum_level() == armigo::diag::Level::trace, "env overrides the player level");
     check(armigo::diag::frame_stats_enabled(), "env overrides the player frame stats");
 
     setenv("ARMIGO_LOG", "nope", 1);
     unsetenv("ARMIGO_FRAME_STATS");
-    armigo::diag::use_player_defaults();
+    armigo::diag::use_player_defaults(true);
     check(armigo::diag::minimum_level() == armigo::diag::Level::warning, "invalid level keeps the player default");
     check(!armigo::diag::frame_stats_enabled(), "unset stats keep the player default");
     clear_environment();
+}
+
+void test_quiet_player() {
+    clear_environment();
+    armigo::diag::testing_reset();
+    Capture capture;
+    armigo::diag::testing_set_sink(sink, &capture);
+    setenv("ARMIGO_LOG", "trace", 1);
+    setenv("ARMIGO_FRAME_STATS", "1", 1);
+    armigo::diag::use_player_defaults();
+    const auto path = std::filesystem::temp_directory_path() / "armigo-quiet-player-test.log";
+    std::filesystem::remove(path);
+    check(!armigo::diag::open_last_run_log(path.c_str()) && !std::filesystem::exists(path),
+          "quiet player creates no diagnostic file even with log environment settings");
+    armigo::diag::warning("routine warning\n");
+    armigo::diag::info("routine info\n");
+    armigo::diag::opt_in("routine opt-in\n");
+    armigo::diag::frame("routine frame\n");
+    armigo::diag::error("actionable failure\n");
+    check(capture.lines.size() == 1 && capture.lines.front().second == "actionable failure\n",
+          "quiet player preserves errors without routine output");
+    clear_environment();
+    armigo::diag::testing_reset();
 }
 
 void test_last_run_log() {
@@ -332,6 +355,7 @@ int main(int argc, char** argv) {
     test_filtering();
     test_fragments();
     test_environment();
+    test_quiet_player();
     test_last_run_log();
     test_threads();
     test_exit_diagnostic();

@@ -17,6 +17,7 @@
 
 #include "native_preparation.h"
 #include "prepared_artifact.h"
+#include "title_plan_failure.h"
 #include "sha256.h"
 #include "../nvn/entry_table_231.h"
 #include "../nvn/redirect.h"
@@ -608,6 +609,15 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
                 if (patch->nvn_policy.game_barriers)
                     title_nvn_policy.barriers = nvn::TitlePolicy::Barriers::game;
                 title_nvn_policy.hoist_implicit_samples = patch->nvn_policy.hoist_implicit_samples;
+                if (patch->nvn_policy.replay_conditional_render)
+                    title_nvn_policy.conditional_render = nvn::TitlePolicy::ConditionalRender::replay;
+                if (patch->nvn_policy.current_handle_reads)
+                    title_nvn_policy.handle_reads = nvn::TitlePolicy::HandleReads::current;
+                if (patch->nvn_policy.retired_guest_store_textures)
+                    title_nvn_policy.guest_store_textures = nvn::TitlePolicy::GuestStoreTextures::retired;
+                if (patch->nvn_policy.core_replay)
+                    title_nvn_policy.replay = nvn::TitlePolicy::Replay::core;
+                title_nvn_policy.submission_slots = static_cast<std::uint8_t>(patch->nvn_policy.submission_slots);
                 if (auto error = compat::validate_patch(*patch, source); !error.empty())
                     return fail(LaunchError::artifact_mismatch, "compatibility-preflight", std::move(error));
                 // Embedded capture records the profile's default independently of
@@ -623,8 +633,7 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
                 auto planned = compat::plan_title_words(*patch, source,
                     {requested_rate ? requested_rate : "", ahead_of_time});
                 if (const auto* failure = std::get_if<compat::TitlePlanFailure>(&planned))
-                    return fail(failure->kind == compat::TitlePlanFailure::Kind::invalid_input
-                        ? LaunchError::invalid_input : LaunchError::artifact_mismatch, failure->stage, failure->detail);
+                    return fail(launch_error(*failure), failure->stage, failure->detail);
                 auto& plan = std::get<compat::TitlePlan>(planned);
                 auto words = std::move(plan.words);
                 auto launch_words = std::move(plan.launch_words);
@@ -677,21 +686,14 @@ LaunchResult<PreparedLaunch> load_native_launch(const loader::ExeFsDirectoryInpu
             }
         }
         // Words meant for the NVN driver apply only when it replaces the game's own.
-        std::uint32_t admitted_frame_rate = 0;
-        if (rate_patch) {
-            auto effective = compat::select_patch_words(*rate_patch, requested_title_rate,
-                loading.nvn_module.has_value(), &admitted_frame_rate);
-            if (const auto* failure = std::get_if<std::string>(&effective))
-                return fail(LaunchError::invalid_input, "compatibility-frame-rate", *failure);
-        }
+        const auto title_mode = compat::plan_title_mode(rate_patch,
+            loading.compatibility_patch ? &loading.compatibility_patch->description : nullptr,
+            requested_title_rate, loading.nvn_module.has_value(), loading.gpu_budget_hook.has_value());
+        if (const auto* failure = std::get_if<compat::TitlePlanFailure>(&title_mode))
+            return fail(launch_error(*failure), failure->stage, failure->detail);
+        const std::uint32_t admitted_frame_rate = std::get<std::uint32_t>(title_mode);
         if (loading.compatibility_patch) {
-            if (loading.gpu_budget_hook && !loading.nvn_module)
-                return fail(LaunchError::unsupported, "compatibility-resolution", "GPU-work feedback requires the NVN driver.");
-            auto& description = loading.compatibility_patch->description;
-            auto selected = compat::select_patch_calls(description, requested_title_rate, loading.nvn_module.has_value());
-            if (const auto* failure = std::get_if<std::string>(&selected))
-                return fail(LaunchError::invalid_input, "compatibility-frame-rate", *failure);
-            description.calls = std::get<std::vector<compat::CallPatch>>(std::move(selected));
+            const auto& description = loading.compatibility_patch->description;
             if (description.calls.empty()) {
                 loading.compatibility_patch.reset();
                 loading.compatibility_module.reset();

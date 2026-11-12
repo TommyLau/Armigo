@@ -22,11 +22,16 @@ template <class F> void term_inputs(Terminator& term, F&& visit) {
 }
 class Cleanup {
 public:
-    explicit Cleanup(Program& program) : p(program), budget(program) {}
+    explicit Cleanup(Program& program) : p(program), budget(program), discard_constant_reads(
+        std::any_of(program.operations.begin(), program.operations.end(), [](const auto& op) {
+            const auto* m = std::get_if<MemoryInfo>(&op.info);
+            return m && m->direct_storage.has_value();
+        })) {}
     void run();
 private:
     Program& p;
     Budget budget;
+    bool discard_constant_reads;
     bool propagate();
     bool branches();
     bool dead_code();
@@ -217,8 +222,12 @@ bool Cleanup::dead_code() {
             budget.spend();
             const auto& op = p.operations[id.value];
             for (const auto& output : op.outputs) definitions[std::get<ValueId>(output).value].op = id;
-            // Conservatively root every declared effect, including reads and derivatives.
-            if (op.effects != Effects::none) mark_op(id);
+            // Resolved storage bases leave immutable, non-faulting constant
+            // reads behind. Remove those when unused; retain other effects.
+            const auto* m = std::get_if<MemoryInfo>(&op.info);
+            const bool dead_constant = discard_constant_reads && op.opcode == Opcode::load &&
+                op.effects == Effects::read_memory && m && m->space == AddressSpace::constant_buffer && !m->is_volatile;
+            if (op.effects != Effects::none && !dead_constant) mark_op(id);
         }
         term_inputs(block.terminator, mark);
     }

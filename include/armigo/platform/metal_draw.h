@@ -46,11 +46,16 @@ struct DerivedTextureFact {
 };
 
 // Runtime word-zero windows are separate from legacy minimum-size bindings.
-// Each window has four-byte alignment and runtime_zero_words_v1 semantics.
+// Each window has four-byte alignment. Padded v2 windows add a zero tail;
+// proven v2 windows need only the logical prefix.
 struct ConstantBufferWindow {
     std::uint8_t guest_binding = 0;
     std::uint32_t window_bytes = 0;
     std::uint8_t metal_buffer_index = 0;
+    std::uint8_t zero_padding_bytes = 0;
+    [[nodiscard]] std::uint32_t backing_bytes() const noexcept {
+        return window_bytes + zero_padding_bytes;
+    }
 };
 
 // Component type of one reflected fragment colour output. Render targets admit
@@ -72,6 +77,8 @@ enum class CompiledShaderResourceKind : std::uint8_t {
     SampledTexture,
     StorageImage,
     Sampler,
+    TexturePool,
+    SamplerPool,
 };
 
 enum class CompiledShaderResourceAccess : std::uint8_t { Read, Write, ReadWrite };
@@ -82,13 +89,16 @@ struct CompiledStorageBufferBinding {
     std::uint8_t metal_buffer_index = 0;
     CompiledShaderResourceAccess access = CompiledShaderResourceAccess::Read;
     std::uint32_t alignment = 4;
+    // Direct native loads require a pointer into the complete registered
+    // memory pool, not a descriptor-sized resident copy or zero-size view.
+    bool pool_pointer = false;
 };
 
 enum class CompiledShaderResourceLocationKind : std::uint8_t {
     Direct,
     ArgumentBufferMember,
 };
-enum class CompiledShaderResourceNamespace : std::uint8_t { Texture, Sampler };
+enum class CompiledShaderResourceNamespace : std::uint8_t { Texture, Sampler, Buffer };
 enum class CompiledShaderTextureDimension : std::uint8_t { d1, d2, d3, cube, buffer };
 enum class CompiledShaderTextureScalar : std::uint8_t { f16, f32, u32, s32 };
 
@@ -123,6 +133,9 @@ struct CompiledShaderResource {
     CompiledShaderResourceAccess access = CompiledShaderResourceAccess::Read;
     bool comparison = false;
     bool normalized_coordinates = true;
+    // A storage image whose shader runs atomic operations on it. Omitted from
+    // reflection unless set, so existing packages keep their digests.
+    bool atomic = false;
     std::optional<CompiledShaderTextureDescriptor> texture_descriptor;
     CompiledShaderResourceLocation location;
 };
@@ -178,6 +191,10 @@ struct CompiledGraphicsStage {
     // What names this stage across package rebuilds (program digest plus its
     // variant discriminator); empty for stages not loaded from a package.
     std::string identity;
+    // Canonical native control/payload identity. Unlike the program-image
+    // identity, it distinguishes every native launch/constant variant.
+    // Empty for stages that do not come from the native front end.
+    std::string native_stage_identity;
     shader_input::Stage stage = shader_input::Stage::Vertex;
     std::string entry_point;
     shader::graphics_msl::VertexDepthConvention vertex_depth =
@@ -234,6 +251,8 @@ struct CompiledGraphicsStage {
     // A vertex stage with no outputs, whose entry returns void: it draws only
     // with rasterizer discard.
     bool requires_rasterizer_discard = false;
+    // Optional void entry of the same library for explicit rasterizer discard.
+    std::string discard_entry_point;
     // The texture_handle_cbuf fact this stage consumed offline: the constant
     // buffer its bound handles were proven to come from. Draw time must stop
     // unless the 3D texture buffer selector register (0x982) still selects it;

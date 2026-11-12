@@ -529,9 +529,22 @@ void runtime_windows_zero_fill_and_report_sizes() {
                           [](std::byte value) { return value == std::byte{0}; }) &&
               buffers.uploads[1][0] == std::byte{0},
           "disabled windows must ignore their address and report zero size");
+
+    buffers.uploads.clear();
+    vertex->constant_buffer_windows[0].zero_padding_bytes = 16;
+    stop.constant_buffers[0][0] = {0x1000, 32, true};
+    std::fill_n(memory.bytes().begin(), 32, std::byte{0x7f});
+    result = planner()->prepare(stop, admitted, draw, memory, buffers, textures);
+    check(std::holds_alternative<m::Bindings>(result) && buffers.uploads.size() == 2 &&
+              buffers.uploads[0].size() == 24 &&
+              std::all_of(buffers.uploads[0].begin(), buffers.uploads[0].begin() + 8,
+                          [](std::byte value) { return value == std::byte{0x7f}; }) &&
+              std::all_of(buffers.uploads[0].begin() + 8, buffers.uploads[0].end(),
+                          [](std::byte value) { return value == std::byte{0}; }),
+          "v2 window tail stays zero even when nonzero guest bytes cover the pad");
 }
 
-void unchanged_windows_reuse_their_snapshot() {
+void unchanged_windows_reuse_their_snapshot(std::uint8_t padding) {
     Memory memory;
     memory.cpu_tracking = true;
     Buffers buffers(memory);
@@ -539,7 +552,7 @@ void unchanged_windows_reuse_their_snapshot() {
     auto admitted = stages();
     auto vertex = std::make_shared<armigo::platform::CompiledGraphicsStage>(
         *admitted.stages.vertex);
-    vertex->constant_buffer_windows = {{0, 8, 0}};
+    vertex->constant_buffer_windows = {{0, 8, 0, padding}};
     vertex->constant_buffer_support_index = 1;
     admitted.stages.vertex = vertex;
     g::DrawPlan draw;
@@ -557,7 +570,14 @@ void unchanged_windows_reuse_their_snapshot() {
         check(std::holds_alternative<m::Bindings>(result) &&
                   (buffers.uploads.size() == 2 || buffers.uploads.size() == 1),
               "tracked constant-buffer windows must prepare");
-        if (buffers.uploads.size() == 2 && buffers.uploads[0].size() == 8) window_byte = buffers.uploads[0][0];
+        if (buffers.uploads.size() == 2) {
+            check(buffers.uploads[0].size() == 8u + padding,
+                  "cached windows retain their physical padding extent");
+            check(std::all_of(buffers.uploads[0].begin() + 4, buffers.uploads[0].end(),
+                              [](std::byte value) { return value == std::byte{0}; }),
+                  "reused and refreshed windows retain a zero suffix");
+            window_byte = buffers.uploads[0][0];
+        }
         return window_byte;
     };
     check(prepare(*shared) == std::byte{1} && !memory.reads.empty(),
@@ -654,14 +674,14 @@ void runtime_windows_preserve_fragments_and_keep_descriptors_strict() {
 
 // A window over GPU-written constants binds the resident image with a zero
 // tail to the window size; CPU-backed constants keep the immutable snapshot.
-void gpu_written_window_binds_resident_image() {
+void gpu_written_window_binds_resident_image(std::uint8_t padding) {
     Memory memory;
     Buffers buffers(memory);
     Textures textures(memory);
     auto admitted = stages();
     auto vertex = std::make_shared<armigo::platform::CompiledGraphicsStage>(*admitted.stages.vertex);
     vertex->constant_buffers.clear();
-    vertex->constant_buffer_windows = {{0, 0x20, 2}};
+    vertex->constant_buffer_windows = {{0, 0x20, 2, padding}};
     vertex->constant_buffer_support_index = 17;
     admitted.stages.vertex = vertex;
     g::DrawPlan draw;
@@ -675,7 +695,7 @@ void gpu_written_window_binds_resident_image() {
               buffers.uploads[0].size() == 72 && buffers.acquisitions.size() == 1 &&
               buffers.acquisitions[0].use == g::BufferUse::Uniform &&
               buffers.acquisitions[0].range.size == 0x10 &&
-              buffers.acquisitions[0].native_extent == 0x20,
+              buffers.acquisitions[0].native_extent == 0x20u + padding,
           "a GPU-written window must bind its resident image");
 
     memory.gpu_dirty = false;
@@ -683,8 +703,11 @@ void gpu_written_window_binds_resident_image() {
     buffers.uploads.clear();
     result = planner()->prepare(stop, admitted, draw, memory, buffers, textures);
     check(std::holds_alternative<m::Bindings>(result) && buffers.uploads.size() == 2 &&
-              buffers.uploads[0].size() == 0x20 && buffers.acquisitions.empty(),
+              buffers.uploads[0].size() == 0x20u + padding && buffers.acquisitions.empty(),
           "a CPU-backed window must keep its immutable snapshot");
+    check(std::all_of(buffers.uploads[0].begin() + 0x10, buffers.uploads[0].end(),
+                      [](std::byte value) { return value == std::byte{0}; }),
+          "the CPU refresh preserves logical and physical zero tails");
 }
 
 void legacy_uniform_snapshot_stops_without_substitution() {
@@ -2151,6 +2174,14 @@ void malformed_storage_descriptors_stop_structurally() {
               std::get<g::RendererError>(result).command().status ==
                   g::CommandStatus::Unsupported,
           "storage reflection with non-ABI alignment must be rejected");
+    auto pool_pointer = valid;
+    pool_pointer.pool_pointer = true;
+    for (unsigned size : {0u, 4u}) {
+        result = prepare(pool_pointer, {0x1000, 64, true}, {0x1200, 0, size});
+        check(std::holds_alternative<g::RendererError>(result) &&
+                  std::get<g::RendererError>(result).command().status == g::CommandStatus::Unsupported,
+              "a descriptor-copy backend must reject a whole-pool pointer stage before binding");
+    }
 }
 
 } // namespace
@@ -2163,9 +2194,9 @@ int main() {
     mixed_constant_stream_moves_constants_to_a_free_slot();
     divided_instance_stream_expands_absolute_indices();
     runtime_windows_zero_fill_and_report_sizes();
-    unchanged_windows_reuse_their_snapshot();
+    for (const std::uint8_t padding : {0, 16}) unchanged_windows_reuse_their_snapshot(padding);
     runtime_windows_preserve_fragments_and_keep_descriptors_strict();
-    gpu_written_window_binds_resident_image();
+    for (const std::uint8_t padding : {0, 16}) gpu_written_window_binds_resident_image(padding);
     legacy_uniform_snapshot_stops_without_substitution();
     custom_border_binding_profiles();
     custom_border_records_and_views();

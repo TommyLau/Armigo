@@ -65,7 +65,7 @@ def current_profile(translate_tool):
     metallib_path = _first_line(_run(["xcrun", "--sdk", "macosx", "--find", "metallib"]),
                                 "xcrun --find metallib")
     return {
-        "compile_options": ["-std=metal4.0", "-mmacosx-version-min=26.0", "-Werror"],
+        "compile_options": ["-std=metal4.0", "-mmacosx-version-min=26.0", "-fwrapv", "-Werror"],
         "deployment_target": "26.0",
         "identity": "span-prefix112-v1",
         "metal_binary_sha256": _sha256_file(metal_path),

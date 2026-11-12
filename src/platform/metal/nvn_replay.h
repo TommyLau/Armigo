@@ -12,9 +12,14 @@
 
 #import <Metal/Metal.h>
 
+#include "nvn_submission_owner.h"
+#include "nvn_border_sampler.h"
+
 #include "../../nvn/backend.h"
+#include "nvn_descriptor_identity.h"
 
 #include <chrono>
+#include <cstddef>
 #include <optional>
 #include <cstdint>
 #include <functional>
@@ -49,7 +54,6 @@ struct BufferAddress {
     std::byte* cpu = nullptr;
 };
 struct UploadFence {
-    id<MTLEvent> event = nil;
     std::uint64_t value = 0, floor = 0;
 };
 
@@ -73,12 +77,27 @@ public:
     buffer_at(std::uint64_t address, std::uint64_t size) = 0;
     // Leases the GPU-accessible pools for a submission's guest-memory table
     // (Resources::claim_guest_memory_pools): the pool-set generation, with
-    // `pools` replaced when it differs from `known`. 0 when the provider lists
-    // no pools; the replay refuses stages that read guest memory then, and
-    // when the set is empty.
+    // `pools` replaced when it differs from `known`. Resources lists a pool
+    // only once a handed-out address meets it, unless
+    // ARMIGO_NVN_ADDRESSED_POOLS=0. 0 when the provider lists no pools; the
+    // replay refuses stages that read guest memory then, and when the set is
+    // empty.
     virtual std::uint64_t claim_guest_memory_pools(std::uint64_t, std::vector<Resources::GuestMemoryPool>& pools) {
         pools.clear();
         return 0;
+    }
+    // Pools the latest claim left out as never addressed. Zero when the
+    // provider does not filter.
+    [[nodiscard]] virtual Resources::GuestMemoryAdmission guest_memory_admission() const { return {}; }
+    // True when `address` lies in a pool the guest-memory table left out
+    // because nothing had handed out an address in it.
+    [[nodiscard]] virtual bool address_in_unaddressed_pool(std::uint64_t address) const {
+        (void)address;
+        return false;
+    }
+    [[nodiscard]] virtual std::string describe_guest_address(std::uint64_t address) const {
+        (void)address;
+        return {};
     }
     // The same range by raw pointers; the buffer must outlive the binding
     // that uses it, as a registered pool's buffer does.
@@ -101,6 +120,15 @@ public:
         stamp = {};
         return texture_for_id(id);
     }
+    // Providers with descriptor views resolve the parent backing here. A
+    // provider whose descriptors already name backings uses its normal lookup.
+    [[nodiscard]] virtual id<MTLTexture> image_base_for_id(std::int32_t id, DescriptorStamp& stamp) {
+        return texture_for_id_stamped(id, stamp);
+    }
+    // Required format or channel conversion; providers without it refuse the use.
+    [[nodiscard]] virtual id<MTLTexture> raw_image_view(std::int32_t, id<MTLTexture>) {
+        return nil;
+    }
     [[nodiscard]] virtual bool texture_stamp_current(std::int32_t id, const DescriptorStamp& stamp) const {
         (void)id; (void)stamp;
         return false;
@@ -110,12 +138,30 @@ public:
         previous = nil;
         return nil;
     }
+    // Resources::upgrade_for_image_atomic; providers without it cannot.
+    [[nodiscard]] virtual id<MTLTexture> upgrade_for_image_atomic(std::uint64_t, bool,
+                                                                  __strong id<MTLTexture>& previous) {
+        previous = nil;
+        return nil;
+    }
+    // Resources::image_atomic_capable. Metal does not report shader-atomic usage.
+    [[nodiscard]] virtual bool image_atomic_capable(std::uint64_t) { return false; }
+    // True when upgrade_for_image_atomic would replace this storage. Signedness
+    // selects the destination format and does not change the result. Providers
+    // without storage report false.
+    [[nodiscard]] virtual bool image_atomic_needs_upgrade(std::uint64_t, bool) { return false; }
+    [[nodiscard]] virtual std::string take_sampler_failure() { return {}; }
+    [[nodiscard]] virtual std::optional<std::uint32_t> sampler_pinned_level(
+        std::int32_t, std::uint64_t) const { return {}; }
     [[nodiscard]] virtual id<MTLSamplerState> sampler_for_id(std::int32_t id) = 0;
-    // The sampler as registered when a binding was recorded after
-    // `registrations` sampler registrations.
+    // The sampler visible at the submission's registration boundary.
     [[nodiscard]] virtual id<MTLSamplerState> sampler_for_id(std::int32_t id, std::uint64_t registrations) {
         (void)registrations;
         return sampler_for_id(id);
+    }
+    [[nodiscard]] virtual CoverageSampler coverage_sampler_for_id(std::int32_t id,
+                                                                  std::uint64_t registrations) {
+        return {sampler_for_id(id, registrations), {}, false};
     }
     // The pixel format and sample count a render attachment over this texture
     // would have, when its storage already exists; invalid when creating it
@@ -130,22 +176,26 @@ public:
         (void)state; (void)view;
         return {};
     }
-    // A view of a descriptor's texture in a shader's declared type; nil keeps
-    // the texture as it is.
+    // A view in the declared type, or a zero for an incompatible floating-point
+    // typed-handle element. A nil source requests the typed zero entry; a nil
+    // result means that this resource provider cannot provide the view.
     [[nodiscard]] virtual id<MTLTexture> fitted_texture(std::int32_t texture_id, id<MTLTexture> texture,
-                                                        MTLTextureType type) {
-        (void)texture_id; (void)texture; (void)type;
+                                                        MTLTextureType type, bool typed_handle = false,
+                                              MTLPixelFormat empty_format = MTLPixelFormatRGBA8Unorm) {
+        (void)texture_id; (void)texture; (void)type; (void)typed_handle; (void)empty_format;
         return nil;
     }
     // The replay worker starts walking a submission. Buffers it resolved while
     // walking an earlier one may be released from then on.
     virtual void begin_walk() {}
-    // Commits the texture uploads made while resolving bindings and waits for
-    // them, before the replay commits work that may read those textures.
+    virtual void end_walk() {}
+    [[nodiscard]] virtual std::shared_ptr<Metal4SubmissionOwner> submission_owner() const { return {}; }
+    virtual void set_upload_publication(UploadPublication) {}
+    virtual bool publish_uploads() { return flush_uploads(); }
+    // Explicit CPU consumers wait for upload hardware completion.
     virtual bool flush_uploads() { return true; }
-    // As flush_uploads, but the uploads are not waited for on the CPU: the
-    // fence is what the replay queue waits for on the GPU before committing
-    // the work that may read them. The default completes them first.
+    // Seals upload producers into the shared publication stream. The logical
+    // range reports failures when its consuming replay segment retires.
     virtual void commit_uploads(UploadFence& fence) {
         fence = {};
         flush_uploads();
@@ -180,6 +230,43 @@ public:
         std::uint64_t lookups = 0, misses = 0;
     };
     [[nodiscard]] virtual LookupCounts texture_lookup_counts() const { return {}; }
+
+    // Descriptor registration and storage-replacement notes. Generation 1 is
+    // the epoch before the first note. A missing note was overwritten or has
+    // not been written.
+    struct RegistrationNote {
+        std::int32_t id = 0;
+        std::uint32_t kind = 0;
+    };
+    [[nodiscard]] virtual std::uint64_t registration_log_generation() const { return 1; }
+    [[nodiscard]] virtual bool read_registration_note(std::uint64_t, RegistrationNote&) const { return false; }
+    [[nodiscard]] virtual std::uint64_t storage_log_generation() const { return 1; }
+    [[nodiscard]] virtual bool read_storage_note(std::uint64_t, std::uint64_t&) const { return false; }
+    [[nodiscard]] virtual std::vector<std::int32_t> descriptor_ids_for_serial(std::uint64_t) const { return {}; }
+
+    // One past the highest registered descriptor, or 0 when none is registered.
+    // The queries do not create textures or samplers.
+    // Only reference-defined empty IDs may bypass a failed descriptor lookup.
+    [[nodiscard]] virtual bool texture_id_empty(std::int32_t) const { return false; }
+    [[nodiscard]] virtual std::int32_t registered_texture_count() const { return 0; }
+    [[nodiscard]] virtual std::int32_t sampler_count() const { return 0; }
+    [[nodiscard]] virtual bool texture_registered(std::int32_t) const { return false; }
+    [[nodiscard]] virtual bool texture_storage_made(std::int32_t) const { return false; }
+    [[nodiscard]] virtual bool texture_storage_shared(std::int32_t) const { return false; }
+    [[nodiscard]] virtual bool texture_compressible(std::int32_t) const { return false; }
+    [[nodiscard]] virtual std::uint64_t texture_storage_size(std::int32_t) const { return 1; }
+    [[nodiscard]] virtual bool texture_storage_live(std::int32_t) const { return false; }
+    [[nodiscard]] virtual std::uint64_t texture_serial(std::int32_t) const { return 0; }
+    [[nodiscard]] virtual std::uint64_t texture_descriptor_key(std::int32_t) const { return 0; }
+    // Pool-capable providers capture this identity in one lock, including
+    // historical empty transitions that registration-log gaps cannot erase.
+    [[nodiscard]] virtual bool texture_read_identity(std::int32_t, TextureReadIdentity&) const { return false; }
+    [[nodiscard]] virtual std::uint64_t texture_empty_generation() const { return 1; }
+    [[nodiscard]] virtual bool texture_is_depth(std::int32_t) const { return false; }
+    [[nodiscard]] virtual std::uint64_t texture_storage_key(std::int32_t) const { return 0; }
+    [[nodiscard]] virtual std::uint64_t texture_pool_generation() const { return 1; }
+    virtual void note_pool_depth_read(std::uint64_t, std::uint64_t) {}
+    [[nodiscard]] virtual bool pool_depth_read(std::uint64_t, std::uint64_t) const { return false; }
 };
 
 #if !defined(ARMIGO_NVN_REPLAY_HAS_RESOURCES)
@@ -195,6 +282,8 @@ enum class ReplayErrorCode : std::uint8_t {
     allocation,
     encoding,
     execution,
+    // A required resource cannot be approximated or recovered by skipping work.
+    unsupported_resource,
 };
 
 struct ReplayError {
@@ -252,9 +341,20 @@ struct ReplayStatistics {
     std::uint64_t synchronize_gpu_waits = 0;
     // Texture uses that first waited for guest-memory stores to be published.
     std::uint64_t guest_write_texture_waits = 0;
+    // Guest-memory store prediction: logs read, pools learned so far, pools
+    // found after a submission had been encoded from the learned set, and
+    // submissions encoded that way.
+    std::uint64_t guest_write_logs = 0;
+    std::uint64_t guest_write_pools_learned = 0;
+    std::uint64_t guest_write_misses = 0;
+    std::uint64_t guest_write_predicted_submissions = 0;
     std::uint64_t uniform_versions = 0;
     std::uint64_t uniform_version_bytes = 0;
     std::uint64_t compute_passes = 0;
+    std::uint64_t feedback_snapshots = 0;
+    std::uint64_t feedback_snapshot_reuses = 0;
+    std::uint64_t feedback_read_pass_splits = 0;
+    std::uint64_t feedback_mip_view_narrows = 0;
     std::uint64_t new_buffer_allocations = 0;
     std::uint64_t completion_cpu_ns = 0;
     // Time from commit to the completion callback, summed over submissions.
@@ -264,6 +364,26 @@ struct ReplayStatistics {
     std::uint64_t stage_reuses = 0;
     // Of those, binds that rewrote only a stage's uniform buffers.
     std::uint64_t stage_uniform_binds = 0;
+    // Texture and sampler pool tables published for native pool bindings.
+    std::uint64_t pool_table_builds = 0;
+    std::uint64_t pool_table_patches = 0;
+    std::uint64_t pool_table_kept = 0;
+    std::uint64_t pool_ids_read = 0;
+    std::uint64_t pool_textures_made = 0;
+    std::uint64_t pool_textures_left = 0;
+    std::uint64_t pool_walk_us = 0;
+    // Passes ended because a pool-reading fragment stage had read the pass's
+    // depth attachment. Counted whether or not pass-reason logging is enabled.
+    std::uint64_t pass_break_depth_sampled = 0;
+    // Textures whose storage moved to R32 so an image atomic could run.
+    std::uint64_t image_atomic_upgrades = 0;
+    // Storage replacements that happened while a stage was already binding.
+    // A slot written earlier in that bind can still name the old storage.
+    std::uint64_t image_atomic_late_upgrades = 0;
+    // Atomic image binds that used the stand-in texture.
+    std::uint64_t image_atomic_sinks = 0;
+    // Storage image binds whose handle named no texture and took a sink.
+    std::uint64_t image_sinks = 0;
 };
 
 // Where the driver reads and writes its pipeline warm-up state. Every path is
@@ -314,11 +434,22 @@ struct PipelineWarmupReport {
     // A capturing session failed to write one of its archive files, so the
     // archive lacks pipelines it compiled.
     bool archive_incomplete = false;
+    // Render pipelines ("<vertex> <fragment>") a capturing session compiled
+    // but could not archive, and the pipelines the warm-up missed in the
+    // loaded archives (the first 65536).
+    std::vector<std::string> unarchived, warmup_missed;
 };
 
 class MetalReplayBackend : public nvn::ReplayBackend {
 public:
     ~MetalReplayBackend() override = default;
+    // Capture frame resources in CPU submission order, after the named walk,
+    // before a later walk can publish another allocation. False cancels a
+    // pending capture during shutdown; the callback never waits for the GPU.
+    virtual bool enqueue_frame_capture(std::uint64_t after_fence,
+                                       std::function<void(bool)> capture) = 0;
+    [[nodiscard]] virtual std::shared_ptr<Metal4SubmissionOwner> submission_owner() const = 0;
+    virtual void track_native_submission(const std::shared_ptr<Metal4NativeSubmission>& submission) = 0;
 
     // After guest producers have stopped: close submission admission, drain
     // admitted work and logging tails, and join replay/encode before mappings
@@ -333,9 +464,19 @@ public:
     // captured archive, and reports.
     [[nodiscard]] virtual PipelineWarmupReport finish_pipeline_warmup() { return {}; }
     [[nodiscard]] virtual ReplayError last_error() const = 0;
+    // Native consumers call after their ordered retirement dependency, before
+    // making a frame visible. Public NVN fence semantics stay separate.
+    [[nodiscard]] virtual std::function<std::string()> retain_native_producer_result(std::uint64_t fence) = 0;
     [[nodiscard]] virtual ReplayStatistics statistics() const noexcept = 0;
+    // Test seam. Caps how many guest-memory pools stores may be predicted
+    // from. Zero restores 4096. Past the cap, stores count as a write anywhere.
+    virtual void set_learned_guest_write_cap(std::size_t) {}
     // Why draws and dispatches were left out, with a count per reason.
     [[nodiscard]] virtual std::vector<std::pair<std::string, std::uint64_t>> skip_reasons() const = 0;
+    // Test seams for pool tables. The allocation failure skips creating a table
+    // and fails the draw. The buffer is the texture table the latest lookup bound.
+    virtual void set_pool_table_allocation_failure(bool) {}
+    [[nodiscard]] virtual id<MTLBuffer> current_texture_pool_buffer() const { return nil; }
 };
 
 enum class ReplayThread { worker, encode, guest_present };
@@ -355,9 +496,19 @@ struct ReplaySchedulingPolicy {
     // They must not call back into replay; joined may be observed on retries.
     void (*observe_shutdown_workers_joined)(void*) = nullptr;
     void (*observe_retired_log)(void*, std::uint64_t fence) = nullptr;
+    // On the committing thread, after all actual residency declarations.
+    void (*observe_residency_sets)(void*, std::uint64_t fence, std::uint64_t segment, std::size_t count) = nullptr;
     // Test seam: called while a submission's unmet event waits were read and
     // its parts' holds are not registered yet (queue and hold locks held).
     void (*observe_split)(void*) = nullptr;
+    // Test observations under replay locks; they must not call back into replay.
+    // A wait is reported only at its first unmet predecessor snapshot.
+    void (*observe_event_wait)(void*, const volatile std::uint32_t* event,
+                               std::uint32_t target, std::uint64_t predecessor) = nullptr;
+    // False is after the signal store, true is after hold evaluation. Both
+    // observations precede retiring the signal's pending writer.
+    void (*observe_event_signal)(void*, const volatile std::uint32_t* event,
+                                 std::uint64_t sequence, bool evaluated) = nullptr;
 };
 
 // The queue must belong to device and both objects must outlive the backend.

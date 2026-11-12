@@ -236,6 +236,7 @@ std::optional<bool> parse_frame_stats(std::string_view text) noexcept {
 }
 
 void use_development_defaults() noexcept {
+    detail::player_quiet.store(false, std::memory_order_relaxed);
     refresh_environment();
     if (env_level_set.load(std::memory_order_relaxed) == 0)
         detail::minimum_level.store(static_cast<int>(Level::info), std::memory_order_relaxed);
@@ -243,7 +244,8 @@ void use_development_defaults() noexcept {
         detail::frame_stats.store(1, std::memory_order_relaxed);
 }
 
-void use_player_defaults() noexcept {
+void use_player_defaults(bool development_diagnostics) noexcept {
+    detail::player_quiet.store(!development_diagnostics, std::memory_order_relaxed);
     refresh_environment();
     if (env_level_set.load(std::memory_order_relaxed) == 0)
         detail::minimum_level.store(static_cast<int>(Level::warning), std::memory_order_relaxed);
@@ -252,7 +254,7 @@ void use_player_defaults() noexcept {
 }
 
 bool open_last_run_log(const char* path) noexcept {
-    if (!path || !*path) return false;
+    if (detail::player_quiet.load(std::memory_order_relaxed) || !path || !*path) return false;
     try {
         auto& state = files();
         std::lock_guard lock(state.mutex);
@@ -346,7 +348,7 @@ void frame(const char* format, ...) noexcept {
 }
 
 void opt_in(const char* format, ...) noexcept {
-    if (!format) return;
+    if (!format || detail::player_quiet.load(std::memory_order_relaxed)) return;
     va_list args;
     va_start(args, format);
     try {

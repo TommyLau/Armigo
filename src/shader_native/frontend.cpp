@@ -41,6 +41,7 @@ Builder::Builder(const Program& source, ir::Limits limits, PixelRateState rate, 
     // Task and mesh stages translate as compute: their body runs in a Metal
     // object or mesh function as a workgroup does (mesh_stage.h).
     p_.stage = source.stage == Stage::vertex ? ir::Stage::vertex : source.stage == Stage::fragment ? ir::Stage::fragment : ir::Stage::compute;
+    p_.api_mandated_early_fragment_tests = source.early_fragment_tests;
     p_.limits = limits; p_.entry = ir::FunctionId{0};
     p_.functions.push_back({0, {}, {}, {}, {}});
 }
@@ -319,9 +320,13 @@ void Builder::arithmetic(Instruction raw) {
         inputs[0] = temporary(ir::Opcode::multiply, {turns, ir::LiteralBits{0x40c90fdbu, ir::ValueType::word32}}, a.numeric);
     }
     if (a.scale) {
-        // The scale multiplies source A before the product and never saturates.
+        // Scale the rounded product, retaining its overflow and FTZ boundary.
+        // Saturation belongs to the final scaled value, not the first product.
         auto mode = a.numeric; mode.saturate = false;
-        inputs[0] = temporary(ir::Opcode::multiply, {inputs[0], ir::LiteralBits{*a.scale, ir::ValueType::word32}}, mode);
+        auto product = temporary(a.operation, std::move(inputs), mode);
+        write(a.destination, temporary(ir::Opcode::multiply,
+            {product, ir::LiteralBits{*a.scale, ir::ValueType::word32}}, a.numeric));
+        return;
     }
     // FFMA without FTZ is admitted with Metal's flushing (a documented
     // difference for subnormal operands and results, as on Switch 1).
@@ -617,6 +622,30 @@ public:
     NativeFacts(const Program& p, FrontendOptions options, const detail::TextureEvidence& textures, const std::set<ir::TextureKey>& assumed)
         : p_(p), options_(options), textures_(textures), assumed_(assumed) {}
     ir::Knowledge<ir::FactValue> lookup(ir::FactKey key) const override {
+        if (key.kind == ir::FactKind::bound_storage_descriptor && key.index == 0) {
+            const auto in_table = [&](std::uint32_t base, unsigned count) {
+                return key.byte_offset >= base && (key.byte_offset - base) % 16 == 0 &&
+                    (key.byte_offset - base) / 16 < std::min(count, 16u);
+            };
+            bool bound = false;
+            if (p_.stage == Stage::compute) {
+                const auto words = little_endian(p_.control, 0xa9, 1);
+                const auto uniforms = little_endian(p_.control, 0xb1, 1);
+                const auto storages = little_endian(p_.control, 0xb2, 1);
+                const auto uniform_base = (0x10u + 4u * words + 15u) & ~15u;
+                std::uint32_t total = uniform_base + 16u * (uniforms + storages);
+                for (unsigned at = 0xb3; at <= 0xb6; ++at) total += 8u * little_endian(p_.control, at, 1);
+                bound = total <= 0xa00 && total == little_endian(p_.control, 0xba, 2) &&
+                    (in_table(uniform_base, uniforms) || in_table(uniform_base + 16u * uniforms, storages));
+            } else {
+                const auto base = p_.stage == Stage::vertex ? 0x110u : p_.stage == Stage::fragment ? 0x510u :
+                    p_.stage == Stage::task ? 0x670u : p_.stage == Stage::mesh ? 0x770u : 0u;
+                bound = base && in_table(base, 16);
+            }
+            if (bound) return ir::Known<ir::FactValue>{true,
+                {ir::OriginKind::validated_header, "native-driver-storage-table-v1"}};
+            return ir::Unknown{"Address is not a native driver buffer descriptor"};
+        }
         if (key.kind == ir::FactKind::texture_descriptor) {
             const auto found = textures_.find(ir::TextureKey{static_cast<std::uint8_t>(key.index), key.byte_offset});
             if (found == textures_.end() || !found->second) return ir::Unknown{"Native texture instructions prove no single descriptor for this handle"};
@@ -698,6 +727,15 @@ ir::Result<ir::MslArtifact> translate_native(const Program& program, const Front
         ir::MetalProfile profile{builder.requires_disabled_rate() ? std::string(disabled_pixel_rate_profile) : "armigo-native-metal4", 3, 31, 128, 16, true, false, true, false, false, true};
         profile.texture_pools = options.texture_pools;
         auto legal = checked(ir::legalize(std::move(ssa), reader, profile));
+        if (program.stage == Stage::vertex && options.vertex_depth &&
+            std::none_of(legal.requirements.io.begin(), legal.requirements.io.end(),
+                         [](const auto& io) { return io.access == ir::Access::write; })) {
+            // An unwritten position still starts at the hardware default, so
+            // its normal entry consumes the selected clip-depth convention.
+            checked(reader.require(ir::FactQuery<ir::FactKind::depth_convention>{}, ir::Phase::legalize));
+            legal.ir.dependencies = checked(ir::merge_dependencies(legal.ir.dependencies, reader.dependencies(),
+                                                                   limits, ir::Phase::legalize));
+        }
         auto structured = checked(ir::structure(std::move(legal), limits));
         auto plan = checked(ir::plan_resources(structured, profile));
         if (options.vertex_fetch && program.stage == Stage::vertex && std::any_of(plan.io.begin(), plan.io.end(), [](const auto& io) { return io.semantic == ir::IoSemantic::generic && io.access == ir::Access::read; })) {

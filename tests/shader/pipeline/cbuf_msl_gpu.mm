@@ -12,6 +12,7 @@
 #import <Metal/Metal.h>
 
 #include "pipeline/resources.h"
+#include "proven_cbuf_fixture.h"
 
 #include <array>
 #include <cstdint>
@@ -28,6 +29,7 @@ std::string gpu_argument_buffer_source();
 namespace {
 
 using armigo::shader::pipeline::constant_buffer_window_bytes;
+using armigo::shader::pipeline::constant_buffer_zero_padding_bytes;
 
 constexpr char vertex_source[] = R"(
 #include <metal_stdlib>
@@ -48,13 +50,16 @@ struct Case {
   std::vector<std::uint32_t> backing;
   std::uint32_t dynamic_offset;
   std::array<std::uint32_t, 4> expected;
+  bool sentinel_after_backing = false;
 };
 
 struct CompiledFragment {
   id<MTLLibrary> library{};
   id<MTLRenderPipelineState> pipeline{};
+  unsigned window_bytes = 0, padding = 16, data_index = 3, support_index = 11;
+  std::optional<unsigned> offset_index = 4;
 };
-using PipelineCache = std::array<CompiledFragment, 13>;
+using PipelineCache = std::array<CompiledFragment, 33>;
 
 id<MTLLibrary> compile_library(id<MTLDevice> device, const std::string &source,
                                const char *label) {
@@ -79,8 +84,21 @@ int run_case(id<MTLDevice> device, id<MTL4Compiler> compiler,
   if (!compiled.pipeline) {
     std::string fragment_source;
     try {
-      fragment_source = armigo::shader::test::cbuf_msl::gpu_fragment_source(
-          item.source_index);
+      if (item.source_index >= 17) {
+        namespace fixture = armigo::shader::test::proven_cbuf;
+        const auto artifact = fixture::translate(fixture::cases.at(item.source_index - 17));
+        fragment_source = artifact.source; compiled.offset_index.reset();
+        for (const auto& resource : artifact.reflection.resources) {
+          const auto* use = std::get_if<armigo::shader::pipeline::BufferUse>(&resource.use);
+          if (!use) continue;
+          const auto index = std::get<armigo::shader::pipeline::MetalRange>(resource.location).first;
+          if (const auto* cb = std::get_if<armigo::shader::pipeline::ConstantBufferSource>(&use->source)) {
+            if (cb->slot == 3) { compiled.data_index = index; compiled.window_bytes = use->size.bytes;
+              compiled.padding = use->size.constant_buffer_policy == armigo::shader::pipeline::ConstantBufferPolicy::padded_zero_words_v2 ? 16 : 0; }
+            else if (cb->slot == 4) compiled.offset_index = index;
+          } else if (std::holds_alternative<armigo::shader::pipeline::SupportBufferSource>(use->source)) compiled.support_index = index;
+        }
+      } else fragment_source = armigo::shader::test::cbuf_msl::gpu_fragment_source(item.source_index);
     } catch (const std::exception &error) {
       std::fprintf(stderr, "%s: %s\n", item.name, error.what());
       return 1;
@@ -122,10 +140,16 @@ int run_case(id<MTLDevice> device, id<MTL4Compiler> compiler,
 
   // The binding contract: a bound window holds the guest's whole words below
   // the bound size and zero words past it, up to the window size.
-  std::vector<std::uint32_t> window(constant_buffer_window_bytes / sizeof(std::uint32_t), 0u);
+  const auto logical_bytes = compiled.window_bytes ? compiled.window_bytes :
+      (item.source_index == 2 || item.source_index == 7 || item.source_index == 9 || item.source_index == 13
+          ? constant_buffer_window_bytes : 64u);
+  std::vector<std::uint32_t> window((logical_bytes + compiled.padding +
+      (item.sentinel_after_backing ? 16u : 0u)) / sizeof(std::uint32_t), 0u);
   const auto words = std::min<std::size_t>({item.backing.size(), item.size_bytes / sizeof(std::uint32_t),
-                                            window.size()});
+                                          logical_bytes / sizeof(std::uint32_t)});
   std::copy_n(item.backing.begin(), words, window.begin());
+  if (item.sentinel_after_backing)
+    std::fill(window.end() - 4, window.end(), 0xdecafbadu);
   id<MTLBuffer> constants =
       [device newBufferWithBytes:window.data()
                           length:window.size() * sizeof(std::uint32_t)
@@ -133,6 +157,7 @@ int run_case(id<MTLDevice> device, id<MTL4Compiler> compiler,
   std::array<std::uint32_t, 18> sizes{};
   sizes[0] = item.size_bytes;
   sizes[1] = sizeof(item.dynamic_offset);
+  sizes[3] = item.size_bytes; sizes[4] = sizeof(item.dynamic_offset);
   id<MTLBuffer> size_table =
       [device newBufferWithBytes:sizes.data()
                           length:sizes.size() * sizeof(std::uint32_t)
@@ -169,9 +194,9 @@ int run_case(id<MTLDevice> device, id<MTL4Compiler> compiler,
     std::fprintf(stderr, "%s Metal resource creation failed.\n", item.name);
     return 1;
   }
-  [table setAddress:constants.gpuAddress atIndex:3];
-  [table setAddress:dynamic_offset.gpuAddress atIndex:4];
-  [table setAddress:size_table.gpuAddress atIndex:11];
+  [table setAddress:constants.gpuAddress atIndex:compiled.data_index];
+  if (compiled.offset_index) [table setAddress:dynamic_offset.gpuAddress atIndex:*compiled.offset_index];
+  [table setAddress:size_table.gpuAddress atIndex:compiled.support_index];
   for (id<MTLAllocation> allocation in
        @[ constants, dynamic_offset, size_table, target, readback ])
     [residency addAllocation:allocation];
@@ -253,7 +278,7 @@ std::vector<Case> make_cases() {
   std::vector<std::uint32_t> beyond_window(
       constant_buffer_window_bytes / sizeof(std::uint32_t) + 1);
   beyond_window.back() = 0xdecafbadu;
-  return {
+  std::vector<Case> cases{
       {"short_last_word",
        0,
        8,
@@ -311,13 +336,13 @@ std::vector<Case> make_cases() {
       {"runtime_dynamic_64k_last_word",
        9,
        constant_buffer_window_bytes,
-       std::move(dynamic_full_window),
+       dynamic_full_window,
        constant_buffer_window_bytes - 4,
        {0xfaceb00cu, 0xfaceb00cu, 0xfaceb00cu, 0xfaceb00cu}},
       {"runtime_dynamic_reflected_boundary",
        9,
        constant_buffer_window_bytes + 4,
-       std::move(beyond_window),
+       beyond_window,
        constant_buffer_window_bytes,
        {0u, 0u, 0u, 0u}},
       {"runtime_dynamic_uint_max",
@@ -338,6 +363,16 @@ std::vector<Case> make_cases() {
        {0x80000000u},
        0,
        {0xffff8000u, 0xffff8000u, 0xffff8000u, 0xffff8000u}},
+      {"wide_crosses_64k", 13, constant_buffer_window_bytes,
+       dynamic_full_window, constant_buffer_window_bytes - 4,
+       {0xfaceb00cu, 0u, 0xfaceb00cu, 0u}},
+      {"wide_unaligned_crosses_64k", 13, constant_buffer_window_bytes,
+       dynamic_full_window, constant_buffer_window_bytes - 1,
+       {0xfaceb00cu, 0u, 0xfaceb00cu, 0u}},
+      {"wide_at_zero_pad", 13, constant_buffer_window_bytes + 4,
+       beyond_window, constant_buffer_window_bytes, {0u, 0u, 0u, 0u}},
+      {"wide_uint_max", 13, 16, {1u, 2u, 3u, 4u}, UINT32_MAX,
+       {0u, 0u, 0u, 0u}},
       {"unaligned_half",
        12,
        4,
@@ -345,6 +380,56 @@ std::vector<Case> make_cases() {
        0,
        {0x89abu, 0x89abu, 0x89abu, 0x89abu}},
   };
+  std::vector<std::uint32_t> small_words(24, 0xdecafbadu);
+  std::fill_n(small_words.begin(), 16, 0u);
+  small_words[15] = 0xfaceb00cu;
+  for (const bool sentinel : {false, true}) {
+    for (unsigned source_index = 14; source_index <= 16; ++source_index) {
+      for (const auto offset : {63u, 64u, 65u, 80u, UINT32_MAX}) {
+        std::array<std::uint32_t, 4> expected{};
+        if (offset == 63) {
+          expected[0] = 0xfaceb00cu;
+          if (source_index == 14) expected.fill(0xfaceb00cu);
+          else if (source_index == 15) expected[2] = 0xfaceb00cu;
+        }
+        cases.push_back({"small_window_boundary", source_index, 96, small_words,
+                         offset, expected, sentinel});
+      }
+    }
+  }
+  namespace fixture = armigo::shader::test::proven_cbuf;
+  for (unsigned i = 0; i < fixture::cases.size(); ++i) {
+    const auto& spec = fixture::cases[i];
+    std::vector<std::uint32_t> words(spec.window / 4 + 4, 0xdecafbadu);
+    for (unsigned n = 0; n < spec.window / 4; ++n) words[n] = 0x89abcdefu ^ (n * 0x01010101u);
+    for (const bool sentinel : {false, true}) {
+      const unsigned runtime = UINT32_MAX;
+      std::uint64_t address = spec.address;
+      if (spec.offset == fixture::Offset::mask) address = runtime & spec.address;
+      else if (spec.offset == fixture::Offset::minimum) address = std::min(runtime, spec.address);
+      else if (spec.offset == fixture::Offset::wrap) address = 0;
+      else if (spec.offset == fixture::Offset::unknown) address = runtime;
+      else if (spec.offset == fixture::Offset::phi) address = 0;
+      else if (spec.offset == fixture::Offset::loop) address = spec.address;
+      const auto read = [&](std::uint64_t offset) {
+        const auto word_address = offset & ~std::uint64_t{3};
+        return word_address + 4 <= spec.window ? words[word_address / 4] : 0u;
+      };
+      std::vector<std::uint32_t> loaded;
+      for (unsigned n = 0; n < spec.elements; ++n) {
+        const auto offset = address + n * spec.bytes;
+        auto low = read(offset);
+        if (spec.bytes == 1) low = (low >> ((offset % 4) * 8)) & 255u;
+        if (spec.bytes == 2) low = (low >> ((offset & 2) * 8)) & 65535u;
+        loaded.push_back(low);
+        if (spec.bytes == 8) loaded.push_back(read(offset + 4));
+      }
+      std::array<std::uint32_t, 4> expected{};
+      for (unsigned n = 0; n < 4; ++n) expected[n] = loaded[n % loaded.size()];
+      cases.push_back({spec.name, 17u + i, spec.window, words, runtime, expected, sentinel});
+    }
+  }
+  return cases;
 }
 
 } // namespace

@@ -35,6 +35,23 @@ def canonical(value):
 
 
 class PackageBuildTests(unittest.TestCase):
+    def test_direct_storage_descriptor_without_gpu_constant_window(self):
+        sys.path.insert(0, str(TOOLS))
+        self.addCleanup(lambda: sys.path.remove(str(TOOLS)))
+        module = importlib.import_module("build_package")
+        binding = {"cbuf_slot": 0, "descriptor_byte_offset": 0x510,
+                   "metal_buffer_index": 0, "access": "read", "alignment": 4}
+        fact = {"kind": "bound_storage_descriptor", "index": 0,
+                "byte_offset": 0x510, "component": 0,
+                "origin": "validated_header", "value": True}
+        self.assertEqual(module.validate_storage_buffers_v3([binding], [], [fact]), {0})
+        for dependencies in ([], [dict(fact, value=False)], [dict(fact, byte_offset=0x520)]):
+            with self.subTest(dependencies=dependencies), self.assertRaises(RuntimeError):
+                module.validate_storage_buffers_v3([binding], [], dependencies)
+        module.validate_dependencies([fact], 0)
+        with self.assertRaises(RuntimeError):
+            module.validate_dependencies([dict(fact, value=1)], 0)
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="armigo-package-test-")
         self.addCleanup(temporary.cleanup)
@@ -217,6 +234,19 @@ out.write_bytes(prefix+hashlib.sha256(source.read_bytes()).digest())
                 "resource_kind": "sampled", "access": "read"}
 
     @staticmethod
+    def atomic_image(scalar, component, **changes):
+        image = {"cbuf_slot": 3, "handle_byte_offset": 0, "kind": "texture",
+                 "dimension": "d2", "array": False, "multisample": False,
+                 "scalar": scalar, "component_format": component,
+                 "normalized_coordinates": False, "comparison": False,
+                 "resource_id": 0, "array_length": 1,
+                 "location": {"kind": "direct", "namespace": "texture",
+                              "first": 0, "count": 1},
+                 "resource_kind": "storage_image", "access": "read_write"}
+        image.update(changes)
+        return image
+
+    @staticmethod
     def v3_storage(**changes):
         binding = {"cbuf_slot": 3, "descriptor_byte_offset": 8,
                    "metal_buffer_index": 2, "access": "read_write",
@@ -272,6 +302,85 @@ out.write_bytes(prefix+hashlib.sha256(source.read_bytes()).digest())
         indirect_output = self.root / "v3-indirect-order-out"
         result = self.run_tool(indirect_output, (indirect,))
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    @staticmethod
+    def texture_pool_record(first, cbuf=None):
+        record = {"kind": "texture_pool", "dimension": "d2", "array": False,
+                  "multisample": False, "scalar": "f32", "component_format": "floating",
+                  "comparison": False,
+                  "resource_kind": "sampled", "access": "read", "resource_id": 0,
+                  "array_length": 1,
+                  "location": {"kind": "direct", "namespace": "buffer",
+                               "first": first, "count": 1}}
+        if cbuf is not None:
+            record["cbuf_slot"] = cbuf
+            record["handle_byte_offset"] = 0
+        return record
+
+    @staticmethod
+    def sampler_pool_record(first, resource_id, cbuf=None, state=False):
+        record = {"kind": "sampler_pool", "resource_id": resource_id, "array_length": 1,
+                  "location": {"kind": "direct", "namespace": "buffer",
+                               "first": first, "count": 1}}
+        if cbuf is not None:
+            record["cbuf_slot"] = cbuf
+            record["handle_byte_offset"] = 4
+        if cbuf is not None or state:
+            record["comparison"] = False
+            record["normalized_coordinates"] = True
+        return record
+
+    def test_accepts_texture_and_sampler_pools(self):
+        bare = self.stage_v3(
+            "pools-bare",
+            [self.texture_pool_record(2), self.sampler_pool_record(3, 1)],
+            stage="fragment", seed=42)
+        bare_output = self.root / "pools-bare-out"
+        result = self.run_tool(bare_output, (bare,))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        bare_manifest = json.loads((bare_output / "manifest.json").read_text())
+        bare_packaged = json.loads((bare_output / bare_manifest["entries"][0]["directory"] /
+                                    "reflection.json").read_text())
+        self.assertEqual([item["kind"] for item in bare_packaged["textures"]],
+                         ["texture_pool", "sampler_pool"])
+        self.assertNotIn("cbuf_slot", bare_packaged["textures"][0])
+        self.assertNotIn("normalized_coordinates", bare_packaged["textures"][0])
+        self.assertNotIn("comparison", bare_packaged["textures"][1])
+        self.assertEqual(bare_packaged["textures"][1]["location"]["namespace"], "buffer")
+
+        keyed = self.stage_v3(
+            "pools-keyed",
+            [self.texture_pool_record(2, 30), self.sampler_pool_record(3, 1, 30)],
+            stage="fragment", seed=41)
+        self.failure(self.root / "pools-keyed-out", (keyed,),
+                     "do not carry constant-buffer keys")
+        stated = self.stage_v3(
+            "pools-sampler-state",
+            [self.texture_pool_record(2), self.sampler_pool_record(3, 1, state=True)],
+            stage="fragment", seed=43)
+        self.failure(self.root / "pools-sampler-state-out", (stated,),
+                     "do not carry sampler state")
+
+        second = self.stage_v3(
+            "pools-two-samplers",
+            [self.texture_pool_record(2), self.sampler_pool_record(3, 1),
+             self.sampler_pool_record(4, 2)],
+            stage="fragment", seed=44)
+        self.failure(self.root / "pools-two-samplers-out", (second,), "one sampler pool")
+        bad_slot = self.stage_v3(
+            "pools-bad-slot",
+            [self.texture_pool_record(2, 17), self.sampler_pool_record(3, 1, 30)],
+            stage="fragment", seed=45)
+        self.failure(self.root / "pools-bad-slot-out", (bad_slot,),
+                     "do not carry constant-buffer keys")
+        texture = self.v3_texture(0, first=0)
+        texture["cbuf_slot"] = 30
+        non_pool = self.stage_v3("pools-texture-slot-30", [texture], stage="fragment", seed=46)
+        self.failure(self.root / "pools-texture-slot-30-out", (non_pool,),
+                     "texture provenance reflection is invalid")
+        v2 = self.stage_v2("pools-v2", "fragment", mutate=lambda value: value.update(
+            textures=[{"kind": "texture_pool"}]))
+        self.failure(self.root / "pools-v2-out", (v2,), "texture kind is unsupported")
 
     def test_custom_border_capability_is_versioned_and_changes_variant(self):
         texture = self.v3_texture(0, first=0)
@@ -1172,6 +1281,40 @@ out.write_bytes(prefix+hashlib.sha256(source.read_bytes()).digest())
                          "armigo-shader-build-package")
         self.assertFalse(self.log.exists())
 
+    def test_atomic_image_flag_is_optional_and_restricted(self):
+        def packaged(name, resources, seed):
+            stage = self.stage_v3(name, resources, stage="fragment", seed=seed)
+            output = self.root / (name + "-out")
+            result = self.run_tool(output, (stage,))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            manifest = json.loads((output / "manifest.json").read_text())
+            return json.loads((output / manifest["entries"][0]["directory"] /
+                               "reflection.json").read_text())
+
+        unsigned = packaged("atomic-u32",
+                            [self.atomic_image("u32", "unsigned_integer", atomic=True)], 41)
+        self.assertIs(unsigned["textures"][0]["atomic"], True)
+        signed = packaged("atomic-s32",
+                          [self.atomic_image("s32", "signed_integer", atomic=True)], 42)
+        self.assertIs(signed["textures"][0]["atomic"], True)
+        absent = packaged("atomic-absent",
+                          [self.atomic_image("u32", "unsigned_integer")], 43)
+        self.assertNotIn("atomic", absent["textures"][0])
+
+        sampled = self.v3_texture(0, first=0)
+        sampled["atomic"] = True
+        self.failure(self.root / "atomic-sampled-out",
+                     (self.stage_v3("atomic-sampled", [sampled], stage="fragment", seed=44),),
+                     "texture atomic flag is invalid")
+        floating = self.atomic_image("f32", "floating", atomic=True)
+        self.failure(self.root / "atomic-float-out",
+                     (self.stage_v3("atomic-float", [floating], stage="fragment", seed=45),),
+                     "texture atomic flag is invalid")
+        denied = self.atomic_image("u32", "unsigned_integer", atomic=False)
+        self.failure(self.root / "atomic-false-out",
+                     (self.stage_v3("atomic-false", [denied], stage="fragment", seed=46),),
+                     "texture atomic flag is invalid")
+
     def run_tool(self, output, stages, *extra, environment=None):
         command = [sys.executable, str(SCRIPT), "--translate-tool", str(self.translate),
                    "--output", str(output), "--jobs", "2"]
@@ -1230,9 +1373,10 @@ out.write_bytes(prefix+hashlib.sha256(source.read_bytes()).digest())
         commands = [json.loads(line) for line in self.log.read_text().splitlines()]
         metal = [item for item in commands if item[2] == "metal"]
         self.assertTrue(metal)
-        self.assertEqual(metal[0][3:9], ["-std=metal4.0", "-mmacosx-version-min=26.0",
-                                         "-Werror", "-Wno-unused-variable",
-                                         "-Wno-sometimes-uninitialized", "-c"])
+        self.assertEqual(metal[0][3:11], ["-std=metal4.0", "-mmacosx-version-min=26.0", "-fwrapv",
+                                          "-Werror", "-Wno-unused-variable",
+                                          "-Wno-sometimes-uninitialized",
+                                          "-fbracket-depth=1024", "-c"])
 
     def test_optional_compile_cache_reuses_identical_sources(self):
         # With the developer cache enabled, an identical source compiled by the

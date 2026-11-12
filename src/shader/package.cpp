@@ -51,8 +51,9 @@ using detail::JsonNumber;
 using Clock = std::chrono::steady_clock;
 
 constexpr auto command_timeout = std::chrono::seconds(60);
-const std::array<std::string, 5> compile_flags{
-    "-std=metal4.0", "-mmacosx-version-min=26.0", "-Werror", "-Wno-unused-variable", "-Wno-sometimes-uninitialized"};
+const std::array<std::string, 7> compile_flags{
+    "-std=metal4.0", "-mmacosx-version-min=26.0", "-fwrapv", "-Werror", "-Wno-unused-variable",
+    "-Wno-sometimes-uninitialized", "-fbracket-depth=1024"};
 
 std::string trim(std::string value) {
     const auto first = value.find_first_not_of(" \t\r\n");
@@ -254,6 +255,7 @@ Json current_profile(const fs::path& translate_tool) {
     Json::Object profile;
     profile.emplace("compile_options", Json::Array{Json{std::string("-std=metal4.0")},
                                                    Json{std::string("-mmacosx-version-min=26.0")},
+                                                   Json{std::string("-fwrapv")},
                                                    Json{std::string("-Werror")}});
     profile.emplace("deployment_target", Json{std::string("26.0")});
     profile.emplace("identity", Json{std::string("span-prefix112-v1")});
@@ -306,13 +308,60 @@ std::uint64_t regular_size(const fs::path& path, std::string_view message) {
     return size;
 }
 
+// Libraries of earlier packages by the digest of the Metal source they were
+// compiled from, with the library digest their manifest records.
+struct ReusedLibrary {
+    fs::path library;
+    std::string digest;
+};
+using ReusedLibraries = std::map<std::string, ReusedLibrary, std::less<>>;
+
+ReusedLibraries reusable_libraries(const std::vector<fs::path>& packages, const Json& profile) {
+    ReusedLibraries libraries;
+    Json::Object compiler = profile.object();
+    compiler.erase("source_version");
+    for (const fs::path& package : packages) {
+        const auto manifest = detail::parse_json(
+            detail::read_regular(package / "manifest.json", detail::maximum_output_bytes, "reused package manifest"));
+        const auto& text = detail::member(manifest, "profile_text").string();
+        auto reused = detail::parse_json(as_bytes(text)).object();
+        reused.erase("source_version");
+        detail::require(reused == compiler, "A reused package was built with another compiler profile");
+        for (const Json& entry : detail::member(manifest, "entries").array()) {
+            const fs::path directory = package / detail::member(entry, "directory").string();
+            // The manifest binds each reflection, which names the digest of the
+            // source its library was compiled from.
+            const auto reflection_bytes = detail::read_regular(
+                directory / "reflection.json", detail::maximum_reflection_size, "reused reflection.json");
+            detail::require(detail::sha256(reflection_bytes) == detail::member(entry, "reflection_digest").string(),
+                            "A reused reflection does not match its manifest");
+            const auto reflection = detail::parse_json(reflection_bytes);
+            const auto& source_digest = detail::member(reflection, "source_digest").string();
+            libraries.try_emplace(source_digest, ReusedLibrary{directory / "shader.metallib",
+                                                               detail::member(entry, "library_digest").string()});
+        }
+    }
+    return libraries;
+}
+
 Compiled compile_stage(const detail::Stage& item, const fs::path& work_root,
-                       const std::optional<fs::path>& cache_root) {
+                       const std::optional<fs::path>& cache_root, const ReusedLibraries& reused,
+                       std::atomic<std::size_t>& reused_count) {
     const fs::path work = work_root / item.variant_id;
     fs::create_directory(work);
     const fs::path source = work / "source.metal";
     const fs::path air = work / "shader.air";
     const fs::path library = work / "shader.metallib";
+    if (const auto found = reused.find(detail::sha256(item.source)); found != reused.end()) {
+        std::error_code error;
+        fs::copy_file(found->second.library, library, fs::copy_options::none, error);
+        detail::require(!error, "Cannot copy a reused Metal library");
+        const auto size = regular_size(library, "A reused Metal library violates the size policy");
+        const auto digest = detail::sha256_file(library);
+        detail::require(digest == found->second.digest, "A reused Metal library does not match its manifest");
+        reused_count.fetch_add(1);
+        return Compiled{item.variant_id, library, size, digest};
+    }
     detail::write_file(source, item.source);
     const auto cached = compile_cache_path(item.source, cache_root);
     if (cached && fs::is_regular_file(*cached) && !fs::is_symlink(*cached)) {
@@ -353,7 +402,8 @@ Compiled compile_stage(const detail::Stage& item, const fs::path& work_root,
 
 class ThreadPool {
 public:
-    ThreadPool(unsigned count, const std::optional<fs::path>& cache_root) : cache_root_(cache_root) {
+    ThreadPool(unsigned count, const std::optional<fs::path>& cache_root, const ReusedLibraries& reused)
+        : cache_root_(cache_root), reused_(reused) {
         detail::require(count >= 1 && count <= 8, "--jobs must be between 1 and 8");
         for (unsigned index = 0; index < count; ++index) workers_.emplace_back([this] { work(); });
     }
@@ -367,7 +417,7 @@ public:
     }
     std::future<Compiled> submit(const detail::Stage& stage, const fs::path& work) {
         auto task = std::make_shared<std::packaged_task<Compiled()>>(
-            [this, &stage, work] { return compile_stage(stage, work, cache_root_); });
+            [this, &stage, work] { return compile_stage(stage, work, cache_root_, reused_, reused_count); });
         std::future<Compiled> result = task->get_future();
         {
             const std::lock_guard lock(mutex_);
@@ -395,7 +445,10 @@ private:
     std::deque<std::function<void()>> tasks_;
     std::vector<std::thread> workers_;
     std::optional<fs::path> cache_root_;
+    const ReusedLibraries& reused_;
     bool stopping_ = false;
+public:
+    std::atomic<std::size_t> reused_count{0};
 };
 
 bool within(const fs::path& path, const fs::path& root) {
@@ -473,6 +526,8 @@ std::variant<std::string, BuildReport> build_impl(const BuildOptions& options) {
         detail::require(stage.metadata.object().at("source_version").string() == source_version,
                         "stage source version differs from translator");
     }
+    const ReusedLibraries reused = reusable_libraries(options.reuse, profile);
+    std::size_t reused_libraries = 0;
     const std::string profile_text = detail::canonical_json(profile);
     Sha256 chain_hasher;
     chain_hasher.update("armigo-metal-chain-v1\n");
@@ -501,7 +556,7 @@ std::variant<std::string, BuildReport> build_impl(const BuildOptions& options) {
         destinations.emplace(stage.variant_id, std::pair{directory, destination});
     }
     {
-        ThreadPool pool(options.jobs, options.compile_cache);
+        ThreadPool pool(options.jobs, options.compile_cache, reused);
         std::size_t next = 0;
         std::deque<std::future<Compiled>> pending;
         const auto submit_next = [&] {
@@ -542,6 +597,7 @@ std::variant<std::string, BuildReport> build_impl(const BuildOptions& options) {
             for (std::size_t index = 0; index < completed && next < stages.size(); ++index) submit_next();
             if (completed == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
+        reused_libraries = pool.reused_count.load();
     }
     std::sort(entries.begin(), entries.end(), [](const Json& left, const Json& right) {
         const auto& a = left.object();
@@ -571,7 +627,7 @@ std::variant<std::string, BuildReport> build_impl(const BuildOptions& options) {
     if (fs::exists(output)) fs::remove(output);
     fs::rename(staging, output);
     cleanup.active = false;
-    return BuildReport{roots.size(), stages.size()};
+    return BuildReport{roots.size(), stages.size(), reused_libraries};
 }
 
 } // namespace

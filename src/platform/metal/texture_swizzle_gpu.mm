@@ -40,9 +40,11 @@ struct SwizzleParameters {
     std::uint32_t gob_block_height_log2 = 0;
     std::uint32_t gob_block_depth_log2 = 0;
     std::uint32_t gobs_x = 0;
+    std::uint32_t gob_order = 0;
+    std::uint32_t reserved[3]{};
 };
 
-static_assert(sizeof(SwizzleParameters) == 48);
+static_assert(sizeof(SwizzleParameters) == 64);
 
 constexpr std::uint32_t max_swizzle_log2 = 5;
 constexpr std::uint32_t max_swizzle_dimension = 1u << 26;
@@ -63,6 +65,8 @@ const char* const k_swizzle_source = R"(
         uint gob_block_height_log2;
         uint gob_block_depth_log2;
         uint gobs_x;
+        uint gob_order;
+        uint reserved[3];
     };
 
     // Byte offset of one 16-byte segment inside a level's block-linear
@@ -95,8 +99,10 @@ const char* const k_swizzle_source = R"(
         uint3 id [[thread_position_in_grid]]) {
         const uint tid = id.x & 31u;
         const uint gob_x = id.x >> 5;
-        const uint xseg = ((tid >> 4) << 1) | ((tid >> 1) & 1u);
-        const uint y = (id.y << 3) | (((tid >> 2) & 3u) << 1) | (tid & 1u);
+        const uint xseg = ((tid >> 4) << 1) | ((tid >> (p.gob_order ? 2 : 1)) & 1u);
+        const uint row_bits = p.gob_order ? (((tid >> 3) & 1u) << 2) | (((tid >> 1) & 1u) << 1)
+                                         : ((tid >> 2) & 3u) << 1;
+        const uint y = (id.y << 3) | row_bits | (tid & 1u);
         const uint x = (gob_x << 6) | (xseg << 4);
         if (x >= p.row_bytes || y >= p.rows || id.z >= p.slices) return;
         const uint n = min(16u, p.row_bytes - x);
@@ -116,8 +122,10 @@ const char* const k_swizzle_source = R"(
         uint3 id [[thread_position_in_grid]]) {
         const uint tid = id.x & 31u;
         const uint gob_x = id.x >> 5;
-        const uint xseg = ((tid >> 4) << 1) | ((tid >> 1) & 1u);
-        const uint y = (id.y << 3) | (((tid >> 2) & 3u) << 1) | (tid & 1u);
+        const uint xseg = ((tid >> 4) << 1) | ((tid >> (p.gob_order ? 2 : 1)) & 1u);
+        const uint row_bits = p.gob_order ? (((tid >> 3) & 1u) << 2) | (((tid >> 1) & 1u) << 1)
+                                         : ((tid >> 2) & 3u) << 1;
+        const uint y = (id.y << 3) | row_bits | (tid & 1u);
         const uint x = (gob_x << 6) | (xseg << 4);
         if (x >= p.row_bytes || y >= p.rows || id.z >= p.slices) return;
         const uint n = min(16u, p.row_bytes - x);
@@ -183,6 +191,7 @@ graphics::RendererStatus encode_dispatch(
     parameters_entry.gob_block_height_log2 = extent.gob_block_height_log2;
     parameters_entry.gob_block_depth_log2 = extent.gob_block_depth_log2;
     parameters_entry.gobs_x = extent.gobs_x;
+    parameters_entry.gob_order = static_cast<std::uint32_t>(extent.gob_order);
     if (to_linear) {
         parameters_entry.source_offset = extent.guest_offset;
         parameters_entry.destination_offset = extent.linear_offset;

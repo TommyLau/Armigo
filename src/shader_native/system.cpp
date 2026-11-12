@@ -170,6 +170,51 @@ bool Builder::system_value(Fields& fields) {
         write_uniform(destination, temporary(ir::Opcode::load_io, {}, unsigned_word, io));
         leave(fields); return true;
     }
+    case 0x3a1: { // MATCH.ANY / MATCH.ALL Rd, Ra
+        // Matching is bitwise over one word, or the source register pair.
+        // Only lanes executing this instruction contribute to the result.
+        if (source_.stage != Stage::fragment && !workgroup_stage())
+            fail("match requires a fragment or workgroup stage");
+        enter(fields, false);
+        const auto destination = static_cast<unsigned>(fields.take(16, 8));
+        const auto source = static_cast<unsigned>(fields.take(24, 8));
+        const bool wide = fields.flag(73), any = fields.flag(79);
+        const auto predicate_destination = static_cast<unsigned>(fields.take(81, 3));
+        if (wide && source == 255) fail("match source pair overruns the register file");
+        if (fields.unread()) fail("instruction mode or reserved bits are not admitted");
+        const auto low = reg(source);
+        const auto high = wide ? reg(source + 1) : word(0);
+        const auto active = temporary(ir::Opcode::ballot,
+            {ir::LiteralBits{1, ir::ValueType::predicate}}, word_bits, subgroup);
+        const auto from_lane = [&](ir::Operand value, unsigned lane) -> ir::Operand {
+            if (p_.values.size() + 2 > p_.limits.values)
+                fail("value limit exceeded", ir::DiagnosticCode::limit_exceeded);
+            const ir::ValueId result{static_cast<std::uint32_t>(p_.values.size())}, valid{result.value + 1};
+            p_.values.push_back({ir::ValueType::word32});
+            p_.values.push_back({ir::ValueType::predicate});
+            operation({{}, ir::Opcode::shuffle, {}, word_bits, {std::move(value), word(lane), word(0x1f)},
+                       {result, valid}, subgroup});
+            return result;
+        };
+        const auto equal = [&](ir::Operand a, ir::Operand b) {
+            return temporary(ir::Opcode::compare, {std::move(a), std::move(b)}, unsigned_word,
+                             ir::ComparisonInfo{ir::Compare::equal, false}, ir::ValueType::predicate);
+        };
+        ir::Operand same = word(0);
+        for (unsigned lane = 0; lane < 32; ++lane) {
+            auto matches = equal(from_lane(low, lane), low);
+            if (wide)
+                matches = temporary(ir::Opcode::logical_and,
+                    {matches, equal(from_lane(high, lane), high)}, boolean, {}, ir::ValueType::predicate);
+            const auto bit = bits(ir::Opcode::select, {matches, word(1u << lane), word(0)}, unsigned_word);
+            same = bits(ir::Opcode::bit_or, {same, bit});
+        }
+        same = bits(ir::Opcode::bit_and, {same, active});
+        const auto all = equal(same, active);
+        write(destination, any ? same : bits(ir::Opcode::select, {all, active, word(0)}, unsigned_word));
+        if (!any) write_predicate(predicate_destination, all);
+        leave(fields); return true;
+    }
     case 0x3c4: { // REDUX URd, Ra
         // Reduces Ra over the active lanes into a uniform register: the
         // operation is bits 78-80 (1 OR, 2 XOR, 3 SUM modulo 2^32, 4 MIN,

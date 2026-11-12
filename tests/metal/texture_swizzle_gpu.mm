@@ -97,6 +97,7 @@ struct Case {
     std::uint32_t width, height, depth, levels, layers;
     std::size_t bytes_per_block;
     std::uint32_t gob_height_log2, gob_depth_log2;
+    BlockLinearGobOrder gob_order = BlockLinearGobOrder::Maxwell;
 };
 
 void run_case(id<MTLDevice> device, id<MTL4CommandQueue> queue,
@@ -111,6 +112,7 @@ void run_case(id<MTLDevice> device, id<MTL4CommandQueue> queue,
     description.gob_block_height_log2 = item.gob_height_log2;
     description.gob_block_depth_log2 = item.gob_depth_log2;
     description.storage = TextureStorageLayout::BlockLinear;
+    description.gob_order = item.gob_order;
     const auto calculated = calculate_texture_size(description);
     if (!std::holds_alternative<TextureLayoutDescription>(calculated)) {
         CHECK(false && "layout calculation failed");
@@ -166,6 +168,7 @@ void run_case(id<MTLDevice> device, id<MTL4CommandQueue> queue,
         extent.slices = mip.depth;
         extent.gob_block_height_log2 = mip.gob_block_height_log2;
         extent.gob_block_depth_log2 = mip.gob_block_depth_log2;
+        extent.gob_order = layout.gob_order;
         // Independent GOB column count: one GOB per 64 payload bytes (the
         // sparse-tile alignment is not exercised by these layouts).
         extent.gobs_x = static_cast<std::uint32_t>((place.row_bytes + 63) >> 6);
@@ -287,6 +290,8 @@ int main() {
     auto& swizzle = std::get<std::shared_ptr<metal::GpuTextureSwizzle>>(created);
 
     const std::vector<Case> cases = {
+        {64, 8, 3, 1, 1, 1, 0, 0, BlockLinearGobOrder::Ampere},
+        {33, 17, 9, 3, 1, 4, 2, 2, BlockLinearGobOrder::Ampere},
         // bytes-per-block coverage with odd sizes, block heights 1-32 GOBs.
         {100, 7, 1, 1, 1, 1, 0, 0},
         {37, 29, 1, 3, 2, 1, 5, 0},

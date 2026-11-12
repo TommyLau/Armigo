@@ -97,6 +97,18 @@ void describe(std::ostringstream& out, const compat::PatchDescription& patch) {
     }
     out << " ignored=";
     for (auto offset : inputs.ignored_needle_offsets) out << hex(offset) << ',';
+    // Native selections are written only when set, so other descriptions keep their text.
+    if (!inputs.dictionary_member.empty()) out << " dictionary=" << inputs.dictionary_member;
+    if (!inputs.members.empty()) {
+        out << " members=";
+        for (const auto& member : inputs.members) out << member << ',';
+    }
+    if (!inputs.identities.empty()) {
+        out << " identities=";
+        for (const auto& identity : inputs.identities) out << identity << ',';
+    }
+    out << "\nplatforms=";
+    for (const auto& platform : patch.platforms) out << platform << ',';
     out << "\nwords=" << patch.words.size() << " calls=" << patch.calls.size() << "\n";
 }
 

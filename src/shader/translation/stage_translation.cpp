@@ -587,6 +587,7 @@ const char* fact_kind_name(pl::FactKind kind) {
     case pl::FactKind::local_memory_bytes: return "local_memory_bytes";
     case pl::FactKind::compute_local_size: return "compute_local_size";
     case pl::FactKind::compute_shared_memory_bytes: return "compute_shared_memory_bytes";
+    case pl::FactKind::bound_storage_descriptor: return "bound_storage_descriptor";
     case pl::FactKind::constant_buffer_bound_mask: return "constant_buffer_bound_mask";
     case pl::FactKind::constant_buffer_size: return "constant_buffer_size";
     case pl::FactKind::constant_buffer_word: return "constant_buffer_word";
@@ -658,6 +659,8 @@ std::string ported_reflection(const pl::MslArtifact& artifact, const gm::EmitOpt
     if (plan.reads_point_coord) out << ",\"point_coord\":\"attribute-v1\"";
     // A vertex stage without outputs draws only with rasterizer discard.
     if (plan.requires_rasterizer_discard) out << ",\"rasterizer_discard\":\"required-v1\"";
+    if (!plan.discard_entry_point.empty())
+        out << ",\"discard_entry_point\":" << quote(plan.discard_entry_point);
     if (plan.emulate_depth_bias) out << ",\"depth_bias_mode\":\"shader-v1\"";
     if (plan.custom_border) {
         out << ",\"custom_border\":{\"abi\":\"coverage-v1\",\"buffer_index\":"
@@ -723,8 +726,9 @@ std::string ported_reflection(const pl::MslArtifact& artifact, const gm::EmitOpt
     for (const auto& planned : plan.resources) {
         const auto* buffer = std::get_if<pl::BufferUse>(&planned.use);
         if (!buffer || !std::holds_alternative<pl::ConstantBufferSource>(buffer->source)) continue;
+        const bool proven = buffer->size.constant_buffer_policy == pl::ConstantBufferPolicy::proven_zero_words_v2;
         if (buffer->size.kind != pl::SizeKind::constant_buffer_window ||
-            buffer->size.constant_buffer_policy != pl::ConstantBufferPolicy::runtime_zero_words_v1)
+            (!proven && buffer->size.constant_buffer_policy != pl::ConstantBufferPolicy::padded_zero_words_v2))
             throw std::runtime_error("Ported reflection requires a runtime constant-buffer window");
         if (!first) out << ',';
         first = false;
@@ -733,7 +737,7 @@ std::string ported_reflection(const pl::MslArtifact& artifact, const gm::EmitOpt
             << ",\"size_kind\":\"constant_buffer_window\""
             << ",\"window_bytes\":" << buffer->size.bytes
             << ",\"alignment\":" << buffer->size.alignment
-            << ",\"policy\":\"runtime_zero_words_v1\""
+            << ",\"policy\":\"" << (proven ? "proven_zero_words_v2" : "padded_zero_words_v2") << '"'
             << ",\"metal_buffer_index\":" << std::get<pl::MetalRange>(planned.location).first << '}';
     }
     out << "],\"support_buffers\":[";
@@ -803,6 +807,8 @@ std::string ported_reflection(const pl::MslArtifact& artifact, const gm::EmitOpt
                     ? "sampled" : "storage_image")
                 << ",\"access\":" << quote(texture->access == pl::Access::read ? "read" :
                     texture->access == pl::Access::write ? "write" : "read_write");
+            if (texture->kind == pl::ResourceTextureKind::storage_image && texture->atomic)
+                out << ",\"atomic\":true";
         } else {
             out << "{\"cbuf_slot\":" << unsigned(sampler->key.cbuf_slot)
                 << ",\"handle_byte_offset\":" << sampler->key.handle_byte_offset

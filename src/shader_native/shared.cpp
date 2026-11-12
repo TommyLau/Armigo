@@ -48,8 +48,58 @@ bool Builder::shared_memory(Fields& fields) {
     const bool load = opcode_ == 0x984;
     const bool store = opcode_ == 0x388;
     const bool barrier = opcode_ == 0xb1d;
-    if (!load && !store && !barrier) return false;
+    const bool atomic = opcode_ == 0x38c || opcode_ == 0xf8c;
+    if (!load && !store && !barrier && !atomic) return false;
     if (source_.stage != Stage::compute) fail("shared memory requires a compute stage");
+
+    if (atomic) {
+        enter(fields, false);
+        const bool one = opcode_ == 0xf8c;
+        const auto destination = static_cast<unsigned>(fields.take(16, 8));
+        const auto address_register = static_cast<unsigned>(fields.take(24, 8));
+        const auto data_register = static_cast<unsigned>(fields.take(32, 8));
+        const auto displacement = static_cast<std::uint32_t>(fields.take(40, 24));
+        const auto byte_offset = (displacement ^ 0x800000u) - 0x800000u;
+        const auto type = static_cast<unsigned>(fields.take(73, 3));
+        const auto stride = static_cast<unsigned>(fields.take(78, 2));
+        const auto kind = static_cast<unsigned>(fields.take(87, 4));
+        const bool uniform_address = fields.flag(91);
+        if (type != 0) fail("shared atomic size is not admitted");
+        if (one) {
+            if (kind != 10 || !uniform_address || destination != 255)
+                fail("implicit shared increment encoding is not admitted");
+            if (fields.take(64, 6) != 63)
+                fail("uniform implicit shared increment address is not admitted");
+        } else if (kind != 0 || uniform_address) {
+            fail("shared atomic operation or uniform address is not admitted");
+        }
+        if (fields.unread()) fail("instruction mode or reserved bits are not admitted");
+        ir::MemoryInfo info;
+        info.space = ir::AddressSpace::shared;
+        info.access = ir::Access::read_write;
+        info.scope = ir::MemoryScope::workgroup;
+        info.atomic = ir::AtomicKind::add;
+        info.native_shared_atomic_policy = ir::NativeSharedAtomicPolicy::word_address_v1;
+        info.alignment = info.element_bytes = 4;
+        std::vector<ir::Operand> inputs;
+        if (address_register != 255) {
+            ir::Operand address = reg(address_register);
+            if (stride) address = bits(ir::Opcode::shift_left, {address, word(stride + 1)});
+            if (byte_offset) address = bits(ir::Opcode::add, {address, word(byte_offset)}, unsigned_word);
+            // Shared atomics select a word after wrapping the byte address.
+            address = bits(ir::Opcode::bit_and, {address, word(0xfffffffcu)});
+            info.dynamic_byte_offset = ir::InputIndex{0};
+            inputs.push_back(std::move(address));
+        } else {
+            info.byte_offset = byte_offset & ~3u;
+        }
+        info.data.push_back(ir::InputIndex{static_cast<std::uint16_t>(inputs.size())});
+        // POPC.INC adds one for each executing lane; Rb is not an operand.
+        inputs.push_back(one ? word(1) : reg(data_register));
+        const auto old = temporary(ir::Opcode::atomic, std::move(inputs), unsigned_word, info);
+        write(destination, old);
+        leave(fields); return true;
+    }
 
     if (barrier) {
         // A barrier some lanes skip deadlocks the group, so the guard is PT.

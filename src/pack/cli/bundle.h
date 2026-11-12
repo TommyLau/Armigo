@@ -24,13 +24,17 @@ namespace armigo::pack {
 struct BundleSpec {
     std::filesystem::path app_path;
     std::string display_name;
-    std::string bundle_name;
+    // The published app stem, independent of its temporary assembly path.
+    std::string file_name;
+    std::string executable_name;
     std::string bundle_identifier;
     std::string title_id;
     std::string build_id;
     std::uint32_t title_version = 0;
     std::string platform;
     std::string commit;
+    bool development = false;
+    bool development_metal_hud = false;
     std::filesystem::path player;
     std::filesystem::path title_folder;
     std::span<const std::byte> icon;
@@ -69,6 +73,10 @@ struct BundleSpec {
 // It fails, leaving both paths unchanged, when the final path already exists.
 [[nodiscard]] std::string publish_application(const std::filesystem::path& assembled,
                                               const std::filesystem::path& app_path);
+// Reads the raw CFBundleExecutable from a macOS app's Info.plist. Missing or
+// invalid metadata is an error; no executable basename is assumed.
+[[nodiscard]] std::variant<std::string, std::filesystem::path> packed_application_executable(
+    const std::filesystem::path& app_path);
 // Registers a published macOS app with LaunchServices, so the Finder shows the
 // complete app instead of any state it recorded before.
 [[nodiscard]] std::string register_application(const std::filesystem::path& app_path);

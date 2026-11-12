@@ -62,7 +62,9 @@ ProcessMemoryStatus validate_supported_range(std::uint64_t address,
                                              std::uint64_t size) noexcept {
     auto status = validate_native_range(address, size);
     if (!status.ok()) return status;
-    if (address >= query_end || size > query_end - address) {
+    const auto limits = query_host_limits();
+    if (!limits) return {ProcessMemoryError::system_failure};
+    if (!limits->contains(address, size) || address >= query_end || size > query_end - address) {
         return {ProcessMemoryError::out_of_range};
     }
     return {};
@@ -230,15 +232,6 @@ ProcessMemoryStatus make_shared_mapping(std::uint64_t destination,
 
 } // namespace
 
-std::uint64_t native_page_size() noexcept {
-#if defined(__APPLE__)
-    const std::uint64_t page = vm_page_size;
-    return page != 0 && (page & (page - 1)) == 0 ? page : 0;
-#else
-    return 0;
-#endif
-}
-
 std::optional<memory::Permission> process_memory_permissions(
     std::uint64_t address, std::uint64_t* contiguous_bytes) noexcept {
     if (contiguous_bytes) *contiguous_bytes = 0;
@@ -280,6 +273,9 @@ ProcessMemoryStatus protect_process_memory(
 
 std::string describe_guest_address_space() {
 #if defined(__APPLE__)
+    const auto limits = query_host_limits();
+    if (!limits) return "host VM limits unavailable";
+    const auto address_end = limits->guest_address_end(query_end);
     struct Mapping { std::uint64_t start, end; unsigned tag; };
     std::vector<Mapping> mappings;
     mach_vm_address_t address = 0;
@@ -289,21 +285,21 @@ std::string describe_guest_address_space() {
         vm_region_submap_info_data_64_t info{};
         mach_msg_type_number_t info_count = VM_REGION_SUBMAP_INFO_COUNT_64;
         if (::mach_vm_region_recurse(mach_task_self(), &address, &size, &depth,
-                reinterpret_cast<vm_region_recurse_info_t>(&info), &info_count) != KERN_SUCCESS || address >= query_end)
+                reinterpret_cast<vm_region_recurse_info_t>(&info), &info_count) != KERN_SUCCESS || address >= address_end)
             break;
-        mappings.push_back({address, std::min<std::uint64_t>(address + size, query_end), info.user_tag});
+        mappings.push_back({address, std::min<std::uint64_t>(address + size, address_end), info.user_tag});
         address += size;
     }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> gaps;
-    std::uint64_t cursor = std::uint64_t{1} << 32;
+    std::uint64_t cursor = std::max<std::uint64_t>(std::uint64_t{1} << 32, limits->address_begin);
     for (const auto& m : mappings) {
         if (m.start > cursor) gaps.emplace_back(m.start - cursor, cursor);
         cursor = std::max(cursor, m.end);
     }
-    if (cursor < query_end) gaps.emplace_back(query_end - cursor, cursor);
+    if (cursor < address_end) gaps.emplace_back(address_end - cursor, cursor);
     std::sort(gaps.rbegin(), gaps.rend());
     char text[96];
-    std::string out = std::to_string(mappings.size()) + " regions below 512 GiB; largest gaps";
+    std::string out = std::to_string(mappings.size()) + " regions below host guest VA end " + std::to_string(address_end) + "; largest gaps";
     for (std::size_t i = 0; i < gaps.size() && i < 3; ++i) {
         std::snprintf(text, sizeof text, " %.2f GiB at %#llx", double(gaps[i].first) / double(1ull << 30),
                       static_cast<unsigned long long>(gaps[i].second));
@@ -330,17 +326,20 @@ ProcessMemoryResult ProcessMemoryRegion::reserve_low_aligned(
     if (!bytes) return ProcessMemoryError::invalid_size;
     if (bytes % page) return ProcessMemoryError::unaligned_size;
     if (alignment < page || (alignment & (alignment - 1))) return ProcessMemoryError::unaligned_address;
-    if (bytes > query_end || alignment > query_end) return ProcessMemoryError::out_of_range;
+    const auto limits = query_host_limits();
+    if (!limits) return ProcessMemoryError::system_failure;
+    const auto address_end = limits->guest_address_end(query_end);
+    if (bytes > address_end || alignment > address_end) return ProcessMemoryError::out_of_range;
 #if defined(__APPLE__)
     // The low-address guard of a native executable need not appear as a VM
     // region. Start at its actual mapped image rather than treating that gap
     // as allocatable. This is a host placement policy, not guest geometry.
     const auto image = reinterpret_cast<std::uintptr_t>(_dyld_get_image_header(0));
     if (!image) return ProcessMemoryError::system_failure;
-    std::uint64_t cursor = image > (128ull << 20) ? image : (128ull << 20);
-    for (unsigned attempt = 0; attempt < 16384 && cursor < query_end; ++attempt) {
+    std::uint64_t cursor = std::max<std::uint64_t>(image, limits->address_begin);
+    for (unsigned attempt = 0; attempt < 16384 && cursor < address_end; ++attempt) {
         const auto candidate = (cursor + alignment - 1) & ~(alignment - 1);
-        if (candidate >= query_end || bytes > query_end - candidate)
+        if (candidate >= address_end || bytes > address_end - candidate)
             return ProcessMemoryError::allocation_failed;
         mach_vm_address_t next = candidate;
         mach_vm_size_t size = 0;
@@ -380,16 +379,19 @@ ProcessMemoryResult ProcessMemoryRegion::reserve(
     if (requested_address != 0) {
         const auto status = validate_supported_range(requested_address, bytes);
         if (!status.ok()) return status.error;
-    } else if (bytes > query_end) {
-        return ProcessMemoryError::out_of_range;
     }
+    const auto limits = query_host_limits();
+    if (!limits) return ProcessMemoryError::system_failure;
+    const auto address_end = limits->guest_address_end(query_end);
+    if (bytes > limits->guest_address_bytes(query_end))
+        return ProcessMemoryError::out_of_range;
 #if defined(__APPLE__)
     mach_vm_address_t address = requested_address;
     const bool fixed = requested_address != 0;
     const int flags = fixed ? VM_FLAGS_FIXED : VM_FLAGS_ANYWHERE;
     auto result = ::mach_vm_allocate(mach_task_self(), &address, bytes, flags);
     if (result != KERN_SUCCESS) return allocation_error(result, fixed);
-    if (address >= query_end || bytes > query_end - address) {
+    if (!limits->contains(address, bytes) || address >= address_end || bytes > address_end - address) {
         ::mach_vm_deallocate(mach_task_self(), address, bytes);
         return ProcessMemoryError::unsupported;
     }
@@ -407,45 +409,54 @@ ProcessMemoryResult ProcessMemoryRegion::reserve(
 
 ProcessMemoryResult ProcessMemoryRegion::alias_copy(
     std::uint64_t source_address, std::uint64_t size,
-    memory::Permission permission) noexcept {
-    return shared_alias(source_address, size, permission, true);
+    memory::Permission permission, ProcessMemoryStatus* diagnostic) noexcept {
+    return shared_alias(source_address, size, permission, true, diagnostic);
 }
 
 ProcessMemoryResult ProcessMemoryRegion::writable_host_alias(
-    std::uint64_t source_address, std::uint64_t size) noexcept {
+    std::uint64_t source_address, std::uint64_t size, ProcessMemoryStatus* diagnostic) noexcept {
     return shared_alias(source_address, size,
-                        memory::Permission::read | memory::Permission::write, false);
+                        memory::Permission::read | memory::Permission::write, false, diagnostic);
 }
 
 ProcessMemoryResult ProcessMemoryRegion::shared_alias(
     std::uint64_t source_address, std::uint64_t size,
-    memory::Permission permission, bool guest_address) noexcept {
+    memory::Permission permission, bool guest_address, ProcessMemoryStatus* diagnostic) noexcept {
+    if (diagnostic) *diagnostic = {};
+    const auto failed = [diagnostic](ProcessMemoryStatus status) -> ProcessMemoryResult {
+        if (diagnostic) *diagnostic = status;
+        return status.error;
+    };
     auto status = validate_permission(permission);
-    if (!status.ok()) return status.error;
+    if (!status.ok()) return failed(status);
     status = validate_native_range(source_address, size);
-    if (!status.ok()) return status.error;
+    if (!status.ok()) return failed(status);
 #if defined(__APPLE__)
     vm_prot_t current = VM_PROT_NONE;
     vm_prot_t maximum = VM_PROT_NONE;
+    const auto limits = query_host_limits();
+    if (!limits) return failed({ProcessMemoryError::system_failure});
+    if (!guest_address && !limits->contains(query_end, size))
+        return failed({ProcessMemoryError::unsupported});
     mach_vm_address_t address = guest_address ? 0 : query_end;
     const auto result = ::mach_vm_remap(
         mach_task_self(), &address, size, 0, VM_FLAGS_ANYWHERE,
         mach_task_self(), source_address, FALSE, &current, &maximum, VM_INHERIT_NONE);
-    if (result != KERN_SUCCESS) return ProcessMemoryError::remap_failed;
+    if (result != KERN_SUCCESS) return failed({ProcessMemoryError::remap_failed, static_cast<int>(result)});
     if ((guest_address && (address >= query_end || size > query_end - address)) ||
         (!guest_address && address < query_end)) {
         ::mach_vm_deallocate(mach_task_self(), address, size);
-        return ProcessMemoryError::unsupported;
+        return failed({ProcessMemoryError::unsupported});
     }
     status = apply_protection(address, size, permission);
     if (!status.ok()) {
         ::mach_vm_deallocate(mach_task_self(), address, size);
-        return status.error;
+        return failed(status);
     }
     return ProcessMemoryRegion(address, size);
 #else
     (void)guest_address;
-    return ProcessMemoryError::unsupported;
+    return failed({ProcessMemoryError::unsupported});
 #endif
 }
 

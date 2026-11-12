@@ -260,7 +260,7 @@ std::set<std::uint64_t> validate_constant_buffers_v2(const Json& items) {
                     extent % 4 == 0 && is_uint(m(item, "metal_buffer_index"), 30) && guests.insert(guest).second &&
                     metals.insert(metal).second && text(item, "size_kind") == "constant_buffer_window" &&
                     is_uint(m(item, "alignment"), 4) && number(item, "alignment") == 4 &&
-                    text(item, "policy") == "runtime_zero_words_v1",
+                    one_of(text(item, "policy"), {"runtime_zero_words_v1", "padded_zero_words_v2", "proven_zero_words_v2"}),
                 "constant-buffer reflection is invalid");
     }
     return metals;
@@ -280,9 +280,10 @@ void validate_support_buffers_v2(const Json& items, const std::set<std::uint64_t
     }
 }
 
-std::set<std::uint64_t> validate_storage_buffers_v3(const Json& items, const Json& constant_buffers) {
+std::set<std::uint64_t> validate_storage_buffers_v3(const Json& items, const Json& constant_buffers, const Json& dependencies) {
     require(items.is_array() && items.array().size() <= 31,
             "storage_buffers must be an array of at most 31 entries");
+    require(dependencies.is_array() && dependencies.array().size() <= 1024, "Storage binding dependencies are invalid");
     std::map<std::uint64_t, std::uint64_t> windows;
     for (const Json& item : constant_buffers.array()) windows[number(item, "guest_binding")] = number(item, "window_bytes");
     std::set<std::pair<std::uint64_t, std::uint64_t>> descriptors;
@@ -292,8 +293,13 @@ std::set<std::uint64_t> validate_storage_buffers_v3(const Json& items, const Jso
         const auto slot = number(item, "cbuf_slot"), offset = number(item, "descriptor_byte_offset");
         const auto metal = number(item, "metal_buffer_index");
         const auto window = windows.find(slot);
+        const bool bound = std::any_of(dependencies.array().begin(), dependencies.array().end(), [&](const Json& dependency) {
+            return dependency.is_object() && text(dependency, "kind") == "bound_storage_descriptor" && number(dependency, "index") == slot &&
+                number(dependency, "byte_offset") == offset && number(dependency, "component") == 0 &&
+                m(dependency, "value").is_bool() && m(dependency, "value").boolean();
+        });
         require(is_uint(m(item, "cbuf_slot"), 17) && is_uint(m(item, "descriptor_byte_offset"), 65524) && offset % 8 == 0 &&
-                    window != windows.end() && offset + 12 <= window->second && is_uint(m(item, "metal_buffer_index"), 30) &&
+                    (bound || (window != windows.end() && offset + 12 <= window->second)) && is_uint(m(item, "metal_buffer_index"), 30) &&
                     metals.insert(metal).second && descriptors.insert({slot, offset}).second &&
                     one_of(text(item, "access"), {"read", "write", "read_write"}) &&
                     is_uint(m(item, "alignment"), 4) && number(item, "alignment") == 4,
@@ -303,10 +309,12 @@ std::set<std::uint64_t> validate_storage_buffers_v3(const Json& items, const Jso
 }
 
 // Slot 31 names handle program (offset / 4), not a constant buffer. Slots 18
-// through 30 stay outside the constant-buffer range. `elements` is how many
+// through 30 stay outside the constant-buffer range. A pool table names slot
+// 30 itself and does not use admits_texture_slot. `elements` is how many
 // consecutive programs the binding needs (one per array element, or one for a
 // descriptor fact). The stage loader uses the same rule.
 constexpr std::uint64_t handle_program_slot = 31;
+constexpr std::uint64_t texture_pool_slot = 30;
 constexpr std::size_t handle_program_limit = 4096;
 
 std::size_t validate_handle_programs(const Json& metadata) {
@@ -395,46 +403,115 @@ void validate_textures_v3(const Json& items, const Json& argument_buffer, std::s
     std::map<std::string, std::vector<std::pair<std::uint64_t, std::uint64_t>>> direct_ranges;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> member_ranges;
     const bool indirect = !argument_buffer.is_null();
+    int sampler_pools = 0;
     for (const Json& item : items.array()) {
         const std::string& kind = text(item, "kind");
-        require(one_of(kind, {"texture", "sampler"}), "texture kind is unsupported");
-        if (kind == "texture") {
-            exact(item, "texture", "cbuf_slot", "handle_byte_offset", "kind", "resource_id", "array_length", "location",
-                  "dimension", "array", "multisample", "scalar", "component_format", "normalized_coordinates",
-                  "comparison", "resource_kind", "access");
+        const bool texture_pool = kind == "texture_pool";
+        const bool sampler_pool = kind == "sampler_pool";
+        const bool pool = texture_pool || sampler_pool;
+        require(one_of(kind, {"texture", "sampler", "texture_pool", "sampler_pool"}),
+                "texture kind is unsupported");
+        if (pool)
+            require(find_member(item, "cbuf_slot") == nullptr && find_member(item, "handle_byte_offset") == nullptr,
+                    "pool records do not carry constant-buffer keys");
+        if (sampler_pool)
+            require(find_member(item, "comparison") == nullptr &&
+                        find_member(item, "normalized_coordinates") == nullptr,
+                    "sampler pool records do not carry sampler state");
+        if (sampler_pool) {
+            require(sampler_pools == 0, "a stage admits one sampler pool");
+            ++sampler_pools;
+        }
+        if (texture_pool) {
+            exact(item, "texture pool", "kind", "resource_id", "array_length", "location", "dimension", "array",
+                  "multisample", "scalar", "component_format", "comparison", "resource_kind", "access");
+        } else if (sampler_pool) {
+            exact(item, "sampler pool", "kind", "resource_id", "array_length", "location");
+        } else if (kind == "texture") {
+            if (find_member(item, "atomic") != nullptr) {
+                exact(item, "texture", "cbuf_slot", "handle_byte_offset", "kind", "resource_id", "array_length",
+                      "location", "dimension", "array", "multisample", "scalar", "component_format",
+                      "normalized_coordinates", "comparison", "resource_kind", "access", "atomic");
+            } else {
+                exact(item, "texture", "cbuf_slot", "handle_byte_offset", "kind", "resource_id", "array_length",
+                      "location", "dimension", "array", "multisample", "scalar", "component_format",
+                      "normalized_coordinates", "comparison", "resource_kind", "access");
+            }
         } else {
             exact(item, "sampler", "cbuf_slot", "handle_byte_offset", "kind", "resource_id", "array_length", "location",
                   "comparison", "normalized_coordinates");
         }
-        const auto length = number(item, "array_length"), offset = number(item, "handle_byte_offset");
-        require(is_uint(m(item, "handle_byte_offset"), 65532) && offset % 4 == 0 &&
-                    is_uint(m(item, "array_length"), 0xffffffff) && length > 0 && length <= 16384 &&
-                    offset + length * 4 <= 65536 &&
-                    admits_texture_slot(m(item, "cbuf_slot"), offset, length, programs),
-                "texture provenance reflection is invalid");
-        require(m(item, "comparison").is_bool() && m(item, "normalized_coordinates").is_bool(),
-                kind + " reflection is invalid");
-        if (kind == "texture") {
+        const auto length = number(item, "array_length");
+        if (pool) {
+            require(is_uint(m(item, "array_length"), 0xffffffff) && length > 0 && length <= 16384,
+                    "texture provenance reflection is invalid");
+        } else {
+            const auto offset = number(item, "handle_byte_offset");
+            require(is_uint(m(item, "handle_byte_offset"), 65532) && offset % 4 == 0 &&
+                        is_uint(m(item, "array_length"), 0xffffffff) && length > 0 && length <= 16384 &&
+                        offset + length * 4 <= 65536 &&
+                        admits_texture_slot(m(item, "cbuf_slot"), offset, length, programs),
+                    "texture provenance reflection is invalid");
+        }
+        if (texture_pool) {
+            require(m(item, "comparison").is_bool(), "texture pool reflection is invalid");
+        } else if (!sampler_pool) {
+            require(m(item, "comparison").is_bool() && m(item, "normalized_coordinates").is_bool(),
+                    kind + " reflection is invalid");
+        }
+        if (kind == "texture" || texture_pool) {
             require(one_of(text(item, "dimension"), {"d1", "d2", "d3", "cube", "buffer"}) &&
                         one_of(text(item, "scalar"), {"u8", "s8", "u16", "s16", "u32", "s32", "u64", "s64",
                                                        "f16", "f32", "f64", "boolean"}) &&
                         one_of(text(item, "component_format"),
                                {"unorm", "snorm", "unsigned_integer", "signed_integer", "floating", "depth"}) &&
-                        m(item, "array").is_bool() && m(item, "multisample").is_bool() &&
-                        one_of(text(item, "resource_kind"), {"sampled", "storage_image"}) &&
-                        one_of(text(item, "access"), {"read", "write", "read_write"}) &&
-                        (text(item, "resource_kind") != "sampled" || text(item, "access") == "read"),
+                        m(item, "array").is_bool() && m(item, "multisample").is_bool(),
                     "texture reflection is invalid");
+            if (texture_pool) {
+                require(text(item, "resource_kind") == "sampled" && text(item, "access") == "read",
+                        "texture reflection is invalid");
+            } else {
+                require(one_of(text(item, "resource_kind"), {"sampled", "storage_image"}) &&
+                            one_of(text(item, "access"), {"read", "write", "read_write"}) &&
+                            (text(item, "resource_kind") != "sampled" || text(item, "access") == "read"),
+                        "texture reflection is invalid");
+            }
             Json::Object descriptor;
             for (const std::string_view name : {"dimension", "array", "multisample", "scalar", "component_format",
-                                                "normalized_coordinates", "comparison"}) {
+                                                "comparison"}) {
                 descriptor.emplace(name, m(item, name));
             }
+            if (texture_pool) {
+                Json normalized;
+                normalized.value = false;
+                descriptor.emplace("normalized_coordinates", std::move(normalized));
+            } else {
+                descriptor.emplace("normalized_coordinates", m(item, "normalized_coordinates"));
+            }
             texture_descriptor_value(Json{std::move(descriptor)}, "texture");
+            if (const Json* atomic = find_member(item, "atomic")) {
+                require(atomic->is_bool() && atomic->boolean() && text(item, "resource_kind") == "storage_image" &&
+                            one_of(text(item, "scalar"), {"u32", "s32"}) && text(item, "dimension") == "d2" &&
+                            m(item, "array").is_bool() && !m(item, "array").boolean(),
+                        "texture atomic flag is invalid");
+            }
         }
         const Json& location = m(item, "location");
         require(location.is_object() && find_member(location, "kind") != nullptr, "resource location is invalid");
-        if (!indirect) {
+        if (pool) {
+            exact(location, "resource location", "kind", "namespace", "first", "count");
+            const auto first = number(location, "first"), count = number(location, "count");
+            require(text(location, "kind") == "direct" && text(location, "namespace") == "buffer" &&
+                        is_uint(m(location, "first"), 30) && is_uint(m(location, "count"), 31) &&
+                        count == length && first + count <= 31,
+                    "direct resource location is invalid");
+            auto& ranges = direct_ranges["buffer"];
+            require(std::all_of(ranges.begin(), ranges.end(), [&](const auto& range) {
+                        return first + count <= range.first || first >= range.second;
+                    }),
+                    "direct resource locations overlap");
+            ranges.emplace_back(first, first + count);
+        } else if (!indirect) {
             exact(location, "resource location", "kind", "namespace", "first", "count");
             const std::string expected_namespace = kind;
             const auto first = number(location, "first"), count = number(location, "count");
@@ -503,7 +580,8 @@ void validate_dependencies(const Json& items, std::size_t programs) {
                                              "texture_array_length", "vertex_attribute_format", "fragment_output_type",
                                              "input_interpolation", "topology", "depth_convention", "origin_convention",
                                              "negate_y", "alpha_test", "early_z", "alpha_to_coverage", "dual_source_blend",
-                                             "draw_parameters", "compute_local_size", "compute_shared_memory_bytes"}) &&
+                                             "draw_parameters", "compute_local_size", "compute_shared_memory_bytes",
+                                             "bound_storage_descriptor"}) &&
                     one_of(text(item, "origin"), {"validated_header", "captured_state", "explicit_option", "derived"}) &&
                     is_uint(m(item, "index"), 0xffffffff) && is_uint(m(item, "byte_offset"), 0xffffffff) &&
                     is_uint(m(item, "component"), 3),
@@ -515,6 +593,11 @@ void validate_dependencies(const Json& items, std::size_t programs) {
                     "texture descriptor dependency key is invalid");
             texture_descriptor_value(m(item, "value"), "texture descriptor dependency");
         }
+        if (text(item, "kind") == "bound_storage_descriptor")
+            require(number(item, "index") < 18 && number(item, "byte_offset") <= 65536 - 12 &&
+                        number(item, "byte_offset") % 8 == 0 && number(item, "component") == 0 &&
+                        m(item, "value").is_bool(),
+                    "bound storage descriptor dependency is invalid");
         require(keys.insert({text(item, "kind"), number(item, "index"), number(item, "byte_offset"),
                              number(item, "component")}).second,
                 "dependencies must be deduplicated");
@@ -547,6 +630,9 @@ void validate_resource_dependencies_v3(const Json& dependencies, const Json& res
         if (kind != "texture_descriptor" && kind != "texture_array_length") continue;
         std::vector<const Json*> entries;
         for (const Json& resource : resources.array()) {
+            if (find_member(resource, "cbuf_slot") == nullptr ||
+                find_member(resource, "handle_byte_offset") == nullptr)
+                continue;
             if (number(resource, "cbuf_slot") == number(dependency, "index") &&
                 number(resource, "handle_byte_offset") == number(dependency, "byte_offset")) {
                 entries.push_back(&resource);
@@ -555,7 +641,8 @@ void validate_resource_dependencies_v3(const Json& dependencies, const Json& res
         require(!entries.empty() && number(dependency, "component") == 0, "resource dependency names no bound resource");
         if (kind == "texture_descriptor") {
             for (const Json* entry : entries) {
-                const std::vector<std::string_view> fields = text(*entry, "kind") == "texture"
+                const bool texture_like = text(*entry, "kind") == "texture" || text(*entry, "kind") == "texture_pool";
+                const std::vector<std::string_view> fields = texture_like
                     ? std::vector<std::string_view>{"dimension", "array", "multisample", "scalar", "component_format",
                                                     "normalized_coordinates", "comparison"}
                     : std::vector<std::string_view>{"comparison", "normalized_coordinates"};
@@ -779,7 +866,7 @@ std::string validate_reflection_v2(const Json& metadata, std::span<const std::by
     validate_support_buffers_v2(m(metadata, "support_buffers"), constant_indices);
     static const Json empty_array{Json::Array{}};
     const Json& storage_buffers = v3 && find_member(metadata, "storage_buffers") ? m(metadata, "storage_buffers") : empty_array;
-    const auto storage_indices = v3 ? validate_storage_buffers_v3(storage_buffers, m(metadata, "constant_buffers"))
+    const auto storage_indices = v3 ? validate_storage_buffers_v3(storage_buffers, m(metadata, "constant_buffers"), m(metadata, "dependencies"))
                                     : std::set<std::uint64_t>{};
     const auto argument_index = v3 ? validate_argument_buffer_v3(m(metadata, "argument_buffer")) : std::nullopt;
     const auto programs = validate_handle_programs(metadata);
@@ -797,6 +884,19 @@ std::string validate_reflection_v2(const Json& metadata, std::span<const std::by
     reserved.insert(support_indices.begin(), support_indices.end());
     reserved.insert(storage_indices.begin(), storage_indices.end());
     reserved.insert(vertex_indices.begin(), vertex_indices.end());
+    if (v3) {
+        for (const Json& item : m(metadata, "textures").array()) {
+            const std::string& kind = text(item, "kind");
+            if (kind != "texture_pool" && kind != "sampler_pool") continue;
+            const Json& location = m(item, "location");
+            const auto first = number(location, "first");
+            const auto count = number(location, "count");
+            for (std::uint64_t index = first; index < first + count; ++index) {
+                require(!reserved.contains(index), "texture pool overlaps a reflected buffer");
+                reserved.insert(index);
+            }
+        }
+    }
     if (const Json* support = find_member(metadata, "draw_support")) {
         exact(*support, "draw support", "schema", "version", "byte_extent", "alignment", "metal_buffer_index");
         const auto index = number(*support, "metal_buffer_index");

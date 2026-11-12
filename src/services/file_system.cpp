@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/file_system.h>
 
 #include <algorithm>
@@ -17,6 +18,10 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+#if defined(__APPLE__)
+#include <cerrno>
+#include <sys/clonefile.h>
+#endif
 
 namespace armigo::services::fs {
 namespace {
@@ -24,40 +29,11 @@ using horizon::IpcDisposition;
 using horizon::IpcMessage;
 using horizon::IpcReply;
 
-constexpr std::uint32_t sfci = 0x49434653;
-constexpr std::uint32_t sfco = 0x4f434653;
-constexpr std::uint32_t control_interface = 0xec6be3ff;
+using namespace horizon::cmif;
 
-std::uint32_t read(const IpcMessage& message, std::size_t offset, unsigned width = 4) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i < width; ++i)
-        value |= std::uint32_t{std::to_integer<unsigned char>(message[offset + i])} << (8 * i);
-    return value;
-}
 
-void write(IpcMessage& message, std::size_t offset, std::uint32_t value, unsigned width = 4) {
-    for (unsigned i = 0; i < width; ++i)
-        message[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
-}
 
-void cmif_header(IpcMessage& message, std::size_t offset, std::uint32_t interface_id) {
-    write(message, offset, sfco);
-    write(message, offset + 12, interface_id);
-}
 
-IpcReply control_reply(std::uint32_t value, unsigned width) {
-    IpcReply reply;
-    reply.disposition = IpcDisposition::handled;
-    reply.size = 44;
-    write(reply.bytes, 4, 9);
-    cmif_header(reply.bytes, 16, control_interface);
-    write(reply.bytes, 32, value, width);
-    return reply;
-}
-std::uint64_t read64(const IpcMessage& message, std::size_t offset) {
-    return std::uint64_t{read(message, offset)} |
-           (std::uint64_t{read(message, offset + 4)} << 32);
-}
 
 // Save files are small; this bound catches a bad size before allocating.
 constexpr std::uint64_t save_file_limit = 64ull << 20;
@@ -131,7 +107,7 @@ void recover_interrupted_commit(const std::filesystem::path& root) {
     std::filesystem::rename(previous, root, error);
 }
 
-// Reads the committed tree from the host directory, if it exists.
+// Index the committed tree without making unrelated files resident.
 void load_saves(SaveStore& store, const std::filesystem::path& root) {
     std::error_code error;
     recover_interrupted_commit(root);
@@ -140,14 +116,14 @@ void load_saves(SaveStore& store, const std::filesystem::path& root) {
          !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
         const auto relative = it->path().lexically_relative(root).generic_string();
         if (!host_safe(relative)) continue;
-        SaveNode node;
+        auto node = std::make_shared<SaveNode>();
         if (it->is_directory(error)) {
-            node.directory = true;
-        } else if (it->is_regular_file(error) && it->file_size(error) <= save_file_limit) {
-            std::ifstream file(it->path(), std::ios::binary);
-            node.bytes.resize(static_cast<std::size_t>(it->file_size(error)));
-            file.read(reinterpret_cast<char*>(node.bytes.data()), static_cast<std::streamsize>(node.bytes.size()));
-            if (!file) continue;
+            node->directory = true;
+        } else if (it->is_regular_file(error)) {
+            const auto size = it->file_size(error);
+            if (error || size > save_file_limit) continue;
+            node->backing_file = it->path();
+            node->backing_size = size;
         } else {
             continue;
         }
@@ -155,34 +131,100 @@ void load_saves(SaveStore& store, const std::filesystem::path& root) {
     }
 }
 
-// Writes the whole tree beside the host directory, then swaps it in by
-// renames, so the directory always holds one complete commit.
-bool commit_saves(const SaveStore& store, const std::filesystem::path& root) {
+// Publish bytes only after a complete read, retaining the backing on failure.
+bool load_save_file(SaveNode& node) {
+    if (node.backing_file.empty()) return true;
+    try {
+        std::ifstream file(node.backing_file, std::ios::binary);
+        if (!file) return false;
+        std::vector<std::byte> bytes(static_cast<std::size_t>(node.backing_size));
+        if (!bytes.empty())
+            file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (!file) return false;
+        node.bytes = std::move(bytes);
+        node.backing_file.clear();
+        return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+}
+
+// Snapshot untouched payloads without reading them into the commit. Only a
+// different filesystem or unavailable cloning capability permits copying;
+// storage, permission and I/O failures remain failures.
+bool copy_unopened_save(const std::filesystem::path& source,
+                        const std::filesystem::path& destination, std::error_code& error) {
+#if defined(__APPLE__)
+    if (::clonefile(source.c_str(), destination.c_str(), 0) == 0) {
+        error.clear();
+        return true;
+    }
+    const auto failure = errno;
+    if (failure != ENOTSUP && failure != EXDEV && failure != ENOSYS) {
+        error = std::error_code(failure, std::generic_category());
+        return false;
+    }
+#endif
+    return std::filesystem::copy_file(source, destination, error);
+}
+
+// Copy unopened files without materializing their payloads. The old tree is
+// retained until staging is complete, including after a failed replacement.
+bool commit_saves(SaveStore& store, const std::filesystem::path& root) {
     std::error_code error;
     const auto staged = std::filesystem::path(root).concat(".commit");
     const auto previous = std::filesystem::path(root).concat(".previous");
+    struct BackingUpdate {
+        SaveNode* node;
+        std::filesystem::path original, previous, committed;
+    };
+    std::vector<BackingUpdate> updates;
     std::filesystem::remove_all(staged, error);
+    if (error) return false;
     if (!std::filesystem::create_directories(staged, error) && error) return false;
     for (const auto& [path, node] : store.entries) {
         if (!host_safe(path)) continue;
         const auto target = staged / path;
-        if (node.directory) {
+        if (node->directory) {
             std::filesystem::create_directories(target, error);
             if (error) return false;
             continue;
         }
         std::filesystem::create_directories(target.parent_path(), error);
-        std::ofstream file(target, std::ios::binary | std::ios::trunc);
-        file.write(reinterpret_cast<const char*>(node.bytes.data()), static_cast<std::streamsize>(node.bytes.size()));
-        if (!file) return false;
+        if (error) return false;
+        if (!node->backing_file.empty()) {
+            if (!copy_unopened_save(node->backing_file, target, error) || error)
+                return false;
+            const auto relative = node->backing_file.lexically_relative(root);
+            updates.push_back({node.get(), node->backing_file,
+                               previous / relative, root / path});
+        } else {
+            std::ofstream file(target, std::ios::binary | std::ios::trunc);
+            file.write(reinterpret_cast<const char*>(node->bytes.data()),
+                       static_cast<std::streamsize>(node->bytes.size()));
+            file.close();
+            if (!file) return false;
+        }
     }
-    std::filesystem::remove_all(previous, error);
-    if (std::filesystem::exists(root, error)) {
+    const bool had_root = std::filesystem::exists(root, error);
+    if (error) return false;
+    if (had_root) {
+        std::filesystem::remove_all(previous, error);
+        if (error) return false;
         std::filesystem::rename(root, previous, error);
         if (error) return false;
+        for (auto& update : updates) update.node->backing_file = std::move(update.previous);
     }
     std::filesystem::rename(staged, root, error);
-    if (error) return false;
+    if (error) {
+        if (had_root) {
+            std::filesystem::rename(previous, root, error);
+            if (!error)
+                for (auto& update : updates) update.node->backing_file = std::move(update.original);
+        }
+        return false;
+    }
+    for (auto& update : updates) update.node->backing_file = std::move(update.committed);
     std::filesystem::remove_all(previous, error);
     return true;
 }
@@ -296,13 +338,13 @@ IpcReply FileSystemServiceSession::save_command(std::uint32_t command, std::size
         const auto size = std::min<std::uint64_t>(read64(message, cmif + 24), save_file_limit);
         const auto found = entries.find(path);
         if (found != entries.end()) {
-            if (found->second.directory || option == 0)
-                return save_result(cmif, found->second.directory ? path_not_found : path_already_exists);
+            if (found->second->directory || option == 0)
+                return save_result(cmif, found->second->directory ? path_not_found : path_already_exists);
             return save_reply(cmif);
         }
-        SaveNode node;
+        auto node = std::make_shared<SaveNode>();
         try {
-            node.bytes.assign(static_cast<std::size_t>(size), std::byte{});
+            node->bytes.assign(static_cast<std::size_t>(size), std::byte{});
         } catch (const std::bad_alloc&) {
             return unsupported("Save file allocation failed");
         }
@@ -311,7 +353,7 @@ IpcReply FileSystemServiceSession::save_command(std::uint32_t command, std::size
     }
     case 1: {  // DeleteFile
         const auto found = entries.find(path);
-        if (found == entries.end() || found->second.directory)
+        if (found == entries.end() || found->second->directory)
             return save_result(cmif, path_not_found);
         entries.erase(found);
         return save_reply(cmif);
@@ -319,7 +361,8 @@ IpcReply FileSystemServiceSession::save_command(std::uint32_t command, std::size
     case 2: {  // CreateDirectory
         if (path.empty()) return unsupported("Save directory path is empty");
         auto [entry, inserted] = entries.try_emplace(path);
-        entry->second.directory = true;
+        if (inserted) entry->second = std::make_shared<SaveNode>();
+        entry->second->directory = true;
         return save_reply(cmif);
     }
     case 3: {  // DeleteDirectory
@@ -341,29 +384,42 @@ IpcReply FileSystemServiceSession::save_command(std::uint32_t command, std::size
         const auto found = entries.find(path);
         if (found == entries.end() || second.empty())
             return save_result(cmif, path_not_found);
-        SaveNode node = std::move(found->second);
-        entries.erase(found);
-        entries[second] = std::move(node);
+        if (command == 6) {
+            std::vector<std::pair<std::string, std::shared_ptr<SaveNode>>> moved;
+            for (const auto& [name, node] : entries)
+                if (under_path(name, path)) moved.emplace_back(second + name.substr(path.size()), node);
+            for (auto it = entries.begin(); it != entries.end();) {
+                if (under_path(it->first, path)) it = entries.erase(it);
+                else ++it;
+            }
+            for (auto& [name, node] : moved) entries[name] = std::move(node);
+        } else {
+            auto node = std::move(found->second);
+            entries.erase(found);
+            entries[second] = std::move(node);
+        }
         return save_reply(cmif);
     }
     case 7: {  // GetEntryType: 0 directory, 1 file
         const auto found = entries.find(path);
         if (found == entries.end()) return save_result(cmif, path_not_found);
-        return save_u32(cmif, found->second.directory ? 0 : 1);
+        return save_u32(cmif, found->second->directory ? 0 : 1);
     }
     case 8: {  // OpenFile
         const auto found = entries.find(path);
-        if (found == entries.end() || found->second.directory)
+        if (found == entries.end() || found->second->directory)
             return save_result(cmif, path_not_found);
+        if (!load_save_file(*found->second))
+            return unsupported("Save file contents could not be read from the host backing");
         const auto id = ++state_->next_object_id;
-        state_->file_objects[id] = path;
+        state_->file_objects[id] = found->second;
         ++state_->object_count;
         return save_object(cmif, id);
     }
     case 9: {  // OpenDirectory
         const auto found = entries.find(path);
         if (!path.empty() &&
-            (found == entries.end() || !found->second.directory))
+            (found == entries.end() || !found->second->directory))
             return save_result(cmif, path_not_found);
         const auto id = ++state_->next_object_id;
         state_->directory_objects[id] = path;
@@ -411,10 +467,7 @@ IpcReply FileSystemServiceSession::file_command(std::uint32_t id, std::uint32_t 
     const auto object = state_->file_objects.find(id);
     if (object == state_->file_objects.end()) return unsupported("File object is not open");
     const std::lock_guard lock(state_->save->mutex);
-    const auto found = state_->save->entries.find(object->second);
-    if (found == state_->save->entries.end() || found->second.directory)
-        return save_result(cmif, path_not_found);
-    auto& bytes = found->second.bytes;
+    auto& bytes = object->second->bytes;
     switch (command) {
     case 0: {  // Read(option, offset, size) into the caller's buffer
         const auto offset = std::min<std::uint64_t>(read64(message, cmif + 24), bytes.size());
@@ -482,7 +535,7 @@ IpcReply FileSystemServiceSession::directory_command(std::uint32_t id, std::uint
         if (name.empty() || !under_path(name, path) || name == path) continue;
         const auto remainder = path.empty() ? name : name.substr(path.size() + 1);
         if (remainder.find('/') != std::string::npos) continue;
-        children.emplace_back(remainder, &node);
+        children.emplace_back(remainder, node.get());
     }
     if (command == 1) return save_u64(cmif, children.size());
     if (command != 0) return unsupported("Directory command is not implemented");
@@ -497,7 +550,7 @@ IpcReply FileSystemServiceSession::directory_command(std::uint32_t id, std::uint
         std::memcpy(raw.data() + index * directory_entry_size, name.data(), copy);
         raw[index * directory_entry_size + 0x304] =
             static_cast<std::byte>(children[index].second->directory ? 0 : 1);
-        const auto size = static_cast<std::uint64_t>(children[index].second->bytes.size());
+        const auto size = static_cast<std::uint64_t>(children[index].second->size());
         for (unsigned byte = 0; byte != 8; ++byte)
             raw[index * directory_entry_size + 0x308 + byte] =
                 static_cast<std::byte>((size >> (byte * 8)) & 255);
@@ -594,16 +647,16 @@ IpcReply FileSystemServiceSession::request(const IpcMessage& message, std::uint6
         // generated clients always issue these before their first command.
         if (read(message, 16) != sfci) return unsupported("File-system control magic is unsupported");
         const auto command = read(message, 24);
-        if (command == 3) return control_reply(pointer_capacity_, 2);
+        if (command == 3) return control_reply_bytes(pointer_capacity_, 2);
         if (command == 0) {
             state_->converted = true;
-            return control_reply(1, 4);
+            return control_reply_bytes(1, 4);
         }
         if (command == 2) {
             // Clone: hand the caller a session object on the same port that
             // shares this session's domain state. Firmware resolves domain ids
             // across clones, so the clone must not snapshot the tables.
-            IpcReply reply = control_reply(0, 4);
+            IpcReply reply = control_reply_bytes(0, 4);
             reply.transferred[0].reset(
                 new FileSystemServiceSession(process_id_, pointer_capacity_, romfs_, addons_, state_));
             reply.transferred_count = 1;

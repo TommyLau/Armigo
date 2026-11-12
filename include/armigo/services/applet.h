@@ -31,7 +31,10 @@ class TransferMemoryRecord;
 
 namespace armigo::services::am {
 
-// Platform policy for applet commands. Horizon 23.0.1 is the release on both.
+// The platform's applet parameters. Horizon 23.0.1 is the release on both and
+// the commands they share run one code path; the platform selects only what
+// has evidence of a difference: the commands the Switch 2 program adds (and its
+// admitted command list) and CommonStateGetter 66's mode limit (1 or 2).
 enum class AppletContract { switch1, switch2 };
 
 // Portable launch policy, separate from application metadata and permissions.

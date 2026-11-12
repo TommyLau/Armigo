@@ -263,14 +263,15 @@ Status check_requirements(const Program& p, const ResourceRequirements& requirem
         if (!charge()) return fail("Resource validation work exceeds limit", {}, DiagnosticCode::limit_exceeded);
         if (const auto* b = std::get_if<BufferUse>(&use)) {
             if (b->access > Access::read_write || b->size.kind > SizeKind::storage_descriptor ||
-                b->size.constant_buffer_policy > ConstantBufferPolicy::runtime_zero_words_v1 ||
+                b->size.constant_buffer_policy > ConstantBufferPolicy::proven_zero_words_v2 ||
                 b->size.bytes == 0 || !std::has_single_bit(b->size.alignment))
                 return fail("Invalid buffer requirement");
             if (const auto* cb = std::get_if<ConstantBufferSource>(&b->source)) {
                 if (cb->slot >= constant_buffer_slot_count || b->access != Access::read ||
                     b->size.kind != SizeKind::constant_buffer_window || b->size.alignment != 4 ||
                     b->size.bytes < 4 || b->size.bytes > constant_buffer_window_bytes || b->size.bytes % 4 != 0 ||
-                    b->size.constant_buffer_policy != ConstantBufferPolicy::runtime_zero_words_v1 ||
+                    (b->size.constant_buffer_policy != ConstantBufferPolicy::padded_zero_words_v2 &&
+                     b->size.constant_buffer_policy != ConstantBufferPolicy::proven_zero_words_v2) ||
                     !constant_buffers.insert(cb->slot).second)
                     return fail("Invalid or duplicate constant-buffer requirement");
             } else if (const auto* storage = std::get_if<StorageBufferSource>(&b->source)) {
@@ -357,6 +358,16 @@ Status check_requirements(const Program& p, const ResourceRequirements& requirem
                 !std::has_single_bit(m->alignment) || m->space > AddressSpace::guest || m->access > Access::read_write ||
                 m->order > MemoryOrder::sequential || m->scope > MemoryScope::device)
                 return fail("Memory width, alignment or access metadata is invalid", op.source);
+            if (m->native_load_policy && (*m->native_load_policy != NativeLoadPolicy::aligned_v1 ||
+                (m->space != AddressSpace::guest && m->space != AddressSpace::storage) ||
+                op.opcode != Opcode::load || m->access != Access::read || m->atomic || m->is_volatile ||
+                m->order != MemoryOrder::relaxed || (m->scope != MemoryScope::workgroup && m->scope != MemoryScope::device) ||
+                (m->element_bytes != 1 && m->element_bytes != 2 && m->element_bytes != 4) ||
+                !std::has_single_bit(unsigned(m->elements)) || m->elements > 4 ||
+                (m->element_bytes < 4 && m->elements != 1) || m->alignment != m->element_bytes * m->elements || m->array_index))
+                return fail("Native LDG policy has an invalid global-load shape", op.source);
+            if (m->native_shared_atomic_policy && !valid_native_shared_atomic(op, *m, p.stage))
+                return fail("Native shared atomic policy has an invalid operation shape", op.source);
             std::vector<bool> referenced(op.inputs.size());
             auto role = [&](InputIndex index) {
                 if (index.value >= op.inputs.size()) return false;
@@ -399,6 +410,34 @@ Status check_requirements(const Program& p, const ResourceRequirements& requirem
                 return fail("Local/shared memory has a buffer resource", op.source);
             if (m->space == AddressSpace::shared && op.opcode != Opcode::barrier && op.opcode != Opcode::memory_barrier) {
                 if (!requirements.compute) return fail("Shared access has no compute allocation", op.source);
+                if (m->native_shared_atomic_policy) {
+                    if (requirements.compute->shared_memory_bytes < 4 ||
+                        (m->dynamic_byte_offset && !shared_address_aligned(p,
+                            op.inputs[m->dynamic_byte_offset->value], 4, work)))
+                        return fail("Native shared atomic allocation or alignment is invalid", op.source);
+                    const auto* literal = m->dynamic_byte_offset
+                        ? std::get_if<LiteralBits>(&op.inputs[m->dynamic_byte_offset->value]) : nullptr;
+                    const auto address = literal ? std::optional<std::uint64_t>{literal->bits}
+                        : m->dynamic_byte_offset ? std::nullopt : std::optional<std::uint64_t>{m->byte_offset};
+                    if (address && ((*address & 3u) || *address + 4 > requirements.compute->shared_memory_bytes))
+                        return fail("Constant native shared atomic address exceeds allocation", op.source,
+                            DiagnosticCode::unsupported_capability);
+                    continue;
+                }
+                if (m->stage_buffer) {
+                    const auto& region = *m->stage_buffer;
+                    if (!region.valid_for(requirements.compute->shared_memory_bytes) || m->byte_offset ||
+                        !m->dynamic_byte_offset || m->atomic || m->is_volatile || m->elements != 1 ||
+                        (m->element_bytes != 1 && m->element_bytes != 4) ||
+                        (op.opcode != Opcode::load && op.opcode != Opcode::store))
+                        return fail("Stage-buffer access has no valid header region", op.source);
+                    if (const auto* address = std::get_if<LiteralBits>(&op.inputs[m->dynamic_byte_offset->value]); address &&
+                        (address->bits < region.region_base || address->bits + m->element_bytes >
+                         std::uint64_t(region.region_base) + region.region_bytes))
+                        return fail("Constant stage-buffer access exceeds its declared region", op.source,
+                            DiagnosticCode::unsupported_capability);
+                    continue;
+                }
                 // armigo-shared-guard-v1, re-derived independently: a nonliteral
                 // offset without a legalized bound stays runtime-checked, and
                 // emission lowers it byte-wise beside the in-range guard, so
@@ -444,6 +483,23 @@ Status check_requirements(const Program& p, const ResourceRequirements& requirem
                 const auto* cb = std::get_if<ConstantBufferSource>(&b->source);
                 if (!cb || m->constant_buffer_slot != cb->slot) return fail("Constant-buffer resource does not match its slot", op.source);
             } else if (!std::holds_alternative<StorageBufferSource>(b->source)) return fail("Storage resource has the wrong source kind", op.source);
+            if (m->direct_storage) {
+                const auto* storage = std::get_if<StorageBufferSource>(&b->source);
+                if (!storage || storage->descriptor != *m->direct_storage ||
+                    b->size.kind != SizeKind::storage_descriptor || b->size.bytes != 4 || b->size.alignment != 4 ||
+                    op.opcode != Opcode::load || m->atomic || m->is_volatile || m->element_bytes != 4 ||
+                    !std::has_single_bit(unsigned(m->elements)) || !m->dynamic_byte_offset || m->global_address_high ||
+                    m->storage_address || !m->storage_alternatives.empty())
+                    return fail("Direct storage has no matching ordinary buffer binding", op.source);
+                const auto key = *m->direct_storage;
+                const FactKey fact{FactKind::bound_storage_descriptor, key.cbuf_slot, key.handle_byte_offset};
+                const bool proven = std::any_of(p.dependencies.begin(), p.dependencies.end(), [&](const auto& d) {
+                    const auto* value = std::get_if<bool>(&d.value);
+                    return d.key == fact && value && *value;
+                });
+                if (!proven) return fail("Direct storage lacks its host-binding fact", op.source);
+                continue;
+            }
             if (b->size.kind == SizeKind::storage_descriptor) {
                 if (!storage_descriptor_inputs(p, op, std::get<StorageBufferSource>(b->source), work))
                     return fail("Runtime storage descriptor inputs do not match the binding", op.source,
@@ -477,6 +533,10 @@ Status check_requirements(const Program& p, const ResourceRequirements& requirem
                     return fail("Constant-buffer offset metadata has no sufficient re-established proof", op.source);
                 if (m->dynamic_byte_offset && !maximum && b->size.bytes != constant_buffer_window_bytes)
                     return fail("Unbounded constant-buffer offset requires the full runtime window", op.source);
+                const bool proven = b->size.constant_buffer_policy == ConstantBufferPolicy::proven_zero_words_v2;
+                if (proven && m->dynamic_byte_offset && !maximum)
+                    return fail("Proven constant-buffer window has no re-established offset bound", op.source,
+                        DiagnosticCode::missing_fact);
                 std::uint64_t extent = constant_buffer_window_bytes;
                 if (!m->dynamic_byte_offset || maximum) {
                     const std::uint64_t highest_base = std::uint64_t(m->byte_offset) +
@@ -484,7 +544,8 @@ Status check_requirements(const Program& p, const ResourceRequirements& requirem
                     const std::uint64_t last_component = highest_base + std::uint64_t(m->element_bytes) * (m->elements - 1);
                     const std::uint64_t last_word_address = m->element_bytes == 8 ?
                         ((last_component + 4) & ~std::uint64_t{3}) : (last_component & ~std::uint64_t{3});
-                    extent = std::min<std::uint64_t>(last_word_address + 4, constant_buffer_window_bytes);
+                    extent = proven ? last_word_address + 4 :
+                        std::min<std::uint64_t>(last_word_address + 4, constant_buffer_window_bytes);
                 }
                 if (extent > b->size.bytes) return fail("Memory extent exceeds reflected buffer size", op.source);
             } else {

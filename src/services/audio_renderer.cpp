@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/audio_renderer.h>
 
 #include <algorithm>
@@ -22,27 +23,7 @@ using horizon::IpcDisposition;
 using horizon::IpcMessage;
 using horizon::IpcReply;
 
-constexpr std::uint32_t sfci = 0x49434653;
-constexpr std::uint32_t sfco = 0x4f434653;
-
-std::uint32_t read(const IpcMessage& message, std::size_t offset, unsigned width = 4) {
-    std::uint32_t value = 0;
-    for (unsigned index = 0; index != width; ++index)
-        value |= std::uint32_t{std::to_integer<unsigned char>(message[offset + index])}
-                 << (8 * index);
-    return value;
-}
-
-std::uint64_t read64(const IpcMessage& message, std::size_t offset) {
-    return std::uint64_t{read(message, offset)} |
-           (std::uint64_t{read(message, offset + 4)} << 32);
-}
-
-void write(IpcMessage& message, std::size_t offset, std::uint32_t value, unsigned width = 4) {
-    for (unsigned index = 0; index != width; ++index)
-        message[offset + index] = static_cast<std::byte>((value >> (8 * index)) & 255);
-}
-
+using namespace horizon::cmif;
 
 // A CMIF reply with no output parameters. The request's CMIF offset is used so
 // the client finds the output header where its proxy expects it.

@@ -27,6 +27,7 @@
 #include "pipeline/phases.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <unistd.h>
 #include <iterator>
 #include <fstream>
@@ -208,6 +209,10 @@ void check_refused_stage_records() {
 
 int main() {
     using namespace sn::test;
+    CHECK(::setenv("ARMIGO_NVN_TEXTURE_POOLS", "0", 1) == 0);
+    CHECK(!armigo::platform::metal::native_texture_pools_enabled());
+    CHECK(::unsetenv("ARMIGO_NVN_TEXTURE_POOLS") == 0);
+    CHECK(armigo::platform::metal::native_texture_pools_enabled());
     // The ported writer on its own synthetic fragment stage.
     const auto maxwell = armigo::test::stage_fixture::fragment_stage();
     const auto ported = tr::translate_stage(maxwell.control, maxwell.code, {});
@@ -364,7 +369,7 @@ int main() {
         }
     }
 
-    // An output-less vertex stage reflects its rasterizer-discard requirement.
+    // A known-depth output-less vertex reflects both static entry points.
     {
         Fixture empty({exit_instruction()}, sn::Stage::vertex);
         empty.code[0x35] = std::byte{};
@@ -374,16 +379,38 @@ int main() {
         auto result = sn::translate_native(empty_program, vertex_options);
         CHECK(std::holds_alternative<pl::MslArtifact>(result));
         if (const auto* artifact = std::get_if<pl::MslArtifact>(&result)) {
-            const auto document = armigo::platform::metal::native_stage_reflection(*artifact, gm::EmitOptions{},
+            gm::EmitOptions emission;
+            emission.vertex_depth = gm::VertexDepthConvention::NegativeOneToOne;
+            const auto document = armigo::platform::metal::native_stage_reflection(*artifact, emission,
                                                                                      pl::Stage::vertex, empty_program.image);
-            CHECK(document.find("\"rasterizer_discard\":\"required-v1\"") != std::string::npos);
+            CHECK(document.find("\"discard_entry_point\":\"armigo_vertex_main_discard\"") != std::string::npos);
+            CHECK(document.find("\"position_output_mask\":15") != std::string::npos);
             const auto stage = armigo::platform::make_source_stage(
                 armigo::shader_input::Stage::Vertex, empty_program.image,
                 {reinterpret_cast<const std::byte*>(document.data()), document.size()}, artifact->source);
             const auto* made = std::get_if<std::shared_ptr<const armigo::platform::CompiledGraphicsStage>>(&stage);
-            CHECK(made && (*made)->requires_rasterizer_discard);
+            CHECK(made && !(*made)->requires_rasterizer_discard &&
+                  (*made)->discard_entry_point == "armigo_vertex_main_discard" && (*made)->fixed_point_size);
             if (const auto* failure = std::get_if<armigo::platform::MetalShaderPackageError>(&stage))
                 std::fprintf(stderr, "vertex stage: %s\n", failure->detail.c_str());
+            for (unsigned invalid = 0; invalid != 3; ++invalid) {
+                auto bad = document;
+                if (invalid == 0) {
+                    const auto at = bad.find("armigo_vertex_main_discard");
+                    CHECK(at != std::string::npos);
+                    if (at != std::string::npos) bad.replace(at, 26, "armigo_vertex_main_other");
+                } else if (invalid == 1) {
+                    bad.insert(1, "\"rasterizer_discard\":\"required-v1\",");
+                } else {
+                    const auto at = bad.find("\"stage\":\"vertex\"");
+                    CHECK(at != std::string::npos);
+                    if (at != std::string::npos) bad.replace(at, 16, "\"stage\":\"fragment\"");
+                }
+                const auto rejected = armigo::platform::make_source_stage(
+                    armigo::shader_input::Stage::Vertex, empty_program.image,
+                    {reinterpret_cast<const std::byte*>(bad.data()), bad.size()}, artifact->source);
+                CHECK(std::holds_alternative<armigo::platform::MetalShaderPackageError>(rejected));
+            }
         }
     }
 

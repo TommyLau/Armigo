@@ -12,9 +12,11 @@
 
 #include <armigo/shader_native/package.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -42,6 +44,15 @@ struct NativeShaderRequest {
     bool translate_only = false;
     // Write each stage's Metal source next to its library; a packed app keeps only the digest.
     bool keep_sources = true;
+    // When set, every translated stage's Metal source is also written here as
+    // <identity>-<variant>.metal, before any size limit, compile or census
+    // return, so a census can keep the sources it measures.
+    std::optional<std::filesystem::path> source_directory;
+    // Variants whose Metal source is larger than this are a source-size
+    // refusal and are not published. Unset, the limit is the package section's
+    // for the file policy (sources kept or not). A test may set a smaller
+    // value; a census and a package build use the same comparison.
+    std::optional<std::size_t> maximum_source_bytes;
 };
 
 struct NativeShaderReport {

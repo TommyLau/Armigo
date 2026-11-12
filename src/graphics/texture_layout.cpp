@@ -146,6 +146,7 @@ LevelGeometry level_geometry(const TextureLayoutDescription& layout,
 // (rob) stacked into depth slices; within a GOB, 16-byte segments interleave
 // with rows. All components add up in byte units.
 struct GobLinearLayout {
+    BlockLinearGobOrder gob_order = BlockLinearGobOrder::Maxwell;
     std::size_t rob_size = 0;
     std::size_t slice_size = 0;
     std::size_t block_height_mask = 0;
@@ -164,8 +165,14 @@ struct GobLinearLayout {
         value += ((z & block_depth_mask) * texture_gob_size)
                  << block_height_shift;
         value += ((x_bytes & 0x3f) >> 5) << 8;
-        value += ((y & 0x07) >> 1) << 6;
-        value += ((x_bytes & 0x1f) >> 4) << 5;
+        if (gob_order == BlockLinearGobOrder::Ampere) {
+            value += (y & 0x04) << 5;
+            value += (x_bytes & 0x10) << 2;
+            value += (y & 0x02) << 4;
+        } else {
+            value += ((y & 0x07) >> 1) << 6;
+            value += ((x_bytes & 0x1f) >> 4) << 5;
+        }
         value += (y & 0x01) << 4;
         value += x_bytes & 0x0f;
         return value;
@@ -180,7 +187,8 @@ bool make_gob_linear_layout(std::size_t block_columns,
                             std::uint32_t gob_block_height_log2,
                             std::uint32_t gob_block_depth_log2,
                             std::size_t bytes_per_block,
-                            GobLinearLayout& layout) noexcept {
+                            GobLinearLayout& layout, BlockLinearGobOrder order) noexcept {
+    layout.gob_order = order;
     const std::size_t block_height = std::size_t{1} << gob_block_height_log2;
     const std::size_t block_depth = std::size_t{1} << gob_block_depth_log2;
 
@@ -328,7 +336,7 @@ TextureLayoutResult<TextureLevelData> level_to_linear(
     GobLinearLayout gob;
     if (!make_gob_linear_layout(mip.block_columns, placement.column_alignment,
                                 mip.block_rows, mip.gob_block_height_log2,
-                                mip.gob_block_depth_log2, bytes, gob)) {
+                                mip.gob_block_depth_log2, bytes, gob, layout.gob_order)) {
         return failure(TextureLayoutErrorCode::ExtentOverflow);
     }
     TextureLevelData data;
@@ -371,7 +379,7 @@ TextureLayoutResult<TextureLevelData> level_to_block_linear(
     GobLinearLayout gob;
     if (!make_gob_linear_layout(mip.block_columns, placement.column_alignment,
                                 mip.block_rows, mip.gob_block_height_log2,
-                                mip.gob_block_depth_log2, bytes, gob)) {
+                                mip.gob_block_depth_log2, bytes, gob, layout.gob_order)) {
         return failure(TextureLayoutErrorCode::ExtentOverflow);
     }
     TextureLevelData data;
@@ -784,7 +792,7 @@ TextureLayoutResult<BlockLinearLevelAddressing> block_linear_level_addressing(
     if (!make_gob_linear_layout(mip.block_columns, placement.column_alignment,
                                 mip.block_rows, mip.gob_block_height_log2,
                                 mip.gob_block_depth_log2, layout.bytes_per_block,
-                                gob)) {
+                                gob, layout.gob_order)) {
         return failure(TextureLayoutErrorCode::ExtentOverflow);
     }
     // Each coordinate adds its own non-decreasing term to the address, so the
@@ -806,6 +814,7 @@ TextureLayoutResult<BlockLinearLevelAddressing> block_linear_level_addressing(
     addressing.slices = mip.block_slices;
     addressing.gob_block_height_log2 = mip.gob_block_height_log2;
     addressing.gob_block_depth_log2 = mip.gob_block_depth_log2;
+    addressing.gob_order = layout.gob_order;
     return addressing;
 }
 
@@ -856,7 +865,7 @@ TextureLayoutResult<std::monostate> write_level_from_linear(
         if (!make_gob_linear_layout(
                 mip.block_columns, placement.column_alignment, mip.block_rows,
                 mip.gob_block_height_log2, mip.gob_block_depth_log2,
-                layout.bytes_per_block, gob)) {
+                layout.bytes_per_block, gob, layout.gob_order)) {
             return failure(TextureLayoutErrorCode::ExtentOverflow);
         }
         // X addressing increases within each row, including GOB boundaries.

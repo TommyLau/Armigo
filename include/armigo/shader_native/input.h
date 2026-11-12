@@ -67,7 +67,7 @@ struct Record {
 };
 struct Inventory {
     std::uint64_t visited_bytes{}, spans{}, bnsh{}, bahs{}, records{}, duplicate_candidates{};
-    std::uint64_t rejected_markers{}, unrecognized_spans{};
+    std::uint64_t nested_candidates{}, rejected_markers{}, unrecognized_spans{};
 };
 // Record views live only during the callback. Membership is never deduplicated.
 class Enumerator {

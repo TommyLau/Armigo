@@ -75,6 +75,16 @@ struct ResolvedProgram {
     // reads them before that (command recording only keeps the program).
     std::array<std::shared_ptr<const platform::CompiledGraphicsStage>, 6> stages;
     std::array<ProgramConstants, 6> constants{};
+    // Public logical stages are distinct from the compiled artifact slots.
+    std::uint32_t logical_stages = 0;
+    bool mesh_uses_task = false;
+    // Auxiliary publication is selected by raw control word +0x68 != 0.
+    bool mesh_primitive_header = false;
+    // Immutable diagnostic linkage, populated only for an opted-in run.
+    std::uint64_t capture_call = 0;
+    bool capture_matches = false, capture_mesh_metadata = false;
+    std::uint8_t captured_mesh_route = 0;
+    std::uint16_t captured_auxiliary_word = 0;
     // API 231 compute stages only.
     std::optional<ComputeDriverLayout> compute_layout;
     // Set once before publication; command recording can retain a live

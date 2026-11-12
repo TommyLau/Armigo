@@ -11,8 +11,10 @@
 
 #include "pipeline/passes/passes.h"
 #include "pipeline/phases.h"
+#include "fragment_depth_fixture.h"
 #include <algorithm>
 #include <iostream>
+#include <functional>
 #include <string_view>
 
 namespace {
@@ -336,9 +338,146 @@ void invalid_and_limits() {
     }
     check(saw_pass_limit, "Pass work is bounded separately from structural validation");
 }
+void fragment_depth_snap() {
+    namespace fd = armigo::shader::test::fragment_depth;
+    const auto derivatives = [](const Program& p) {
+        return std::count_if(p.operations.begin(), p.operations.end(), [](const Operation& op) {
+            return op.opcode == Opcode::derivative_x;
+        });
+    };
+    for (bool scaled : {false, true}) {
+        auto p = fd::program(true, true, scaled);
+        success(passes::snap_fragment_depth(p), "Stored-depth comparison is legalized");
+        check(derivatives(p) == 1, "A uniform entry derivative serves all comparisons of one position read");
+        success(validate(p, IrForm::ssa, Phase::legalize), "Snapped comparisons preserve SSA dominance");
+    }
+    for (auto p : {fd::program(false), fd::program(true, false)}) {
+        const auto count = p.operations.size();
+        success(passes::snap_fragment_depth(p), "Unpaired position read remains unchanged");
+        check(p.operations.size() == count && derivatives(p) == 0,
+            "A later texture read or a constant comparison cannot change position Z");
+    }
+    {
+        auto p = fd::program();
+        for (auto& op : p.operations) if (auto* comparison = std::get_if<ComparisonInfo>(&op.info)) comparison->unordered = true;
+        success(passes::snap_fragment_depth(p), "Unordered depth comparisons retain their NaN behavior");
+        check(derivatives(p) == 1, "Ordered and unordered comparisons use the same surface-depth window");
+    }
+    {
+        auto p = fd::program();
+        for (auto& op : p.operations) if (op.opcode == Opcode::compare) op.inputs[1] = ConstantWord{4, 0};
+        success(passes::snap_fragment_depth(p), "Uniform depth comparison remains legal");
+        check(derivatives(p) == 0, "A uniform value is not a sampled surface depth");
+    }
+    {
+        auto p = fd::program();
+        const auto split = std::find_if(p.blocks[0].operations.begin(), p.blocks[0].operations.end(), [&](OperationId id) {
+            const auto* io = std::get_if<IoInfo>(&p.operations[id.value].info);
+            return io && io->semantic == IoSemantic::fragment_coord && io->component_mask == 4;
+        });
+        std::vector<OperationId> tail(split, p.blocks[0].operations.end());
+        p.blocks[0].operations.erase(split, p.blocks[0].operations.end());
+        p.blocks[0].terminator = Jump{BlockId{1}};
+        p.blocks.push_back({FunctionId{0}, {}, {BlockId{0}}, {}, std::move(tail), Return{}});
+        p.functions[0].blocks.push_back(BlockId{1});
+        success(passes::snap_fragment_depth(p), "An earlier dominating texture read is visible to position Z");
+        check(derivatives(p) == 1, "Depth pairing follows dominance across blocks");
+        success(validate(p, IrForm::ssa, Phase::legalize), "Cross-block snap has valid SSA");
+    }
+    {
+        auto p = fd::program();
+        const auto count = p.operations.size();
+        p.stage = Stage::vertex;
+        success(passes::snap_fragment_depth(p), "The depth pass ignores other stages");
+        check(p.operations.size() == count, "Other shader stages are unchanged");
+    }
+    {
+        auto p = fd::program();
+        auto body = std::move(p.blocks[0].operations);
+        p.blocks[0].operations.clear();
+        p.blocks.push_back({FunctionId{1}, {}, {}, {}, std::move(body), Return{}});
+        p.functions.push_back({1, BlockId{1}, {BlockId{1}}, {}, {}});
+        success(passes::snap_fragment_depth(p), "A secondary function is not rewritten");
+        check(derivatives(p) == 0, "Only the fragment entry function is paired");
+    }
+    {
+        auto p = fd::program();
+        const auto count = p.operations.size(), values = p.values.size();
+        p.limits.operations = static_cast<std::uint32_t>(count + 1);
+        rejected(passes::snap_fragment_depth(p), DiagnosticCode::limit_exceeded, "Depth rewrite respects the operation budget");
+        check(p.operations.size() == count && p.values.size() == values, "A rejected depth rewrite is transactional");
+    }
+    {
+        auto p = fd::program();
+        const auto texture = *std::find_if(p.blocks[0].operations.begin(), p.blocks[0].operations.end(), [&](OperationId id) {
+            return p.operations[id.value].opcode == Opcode::texture_sample;
+        });
+        const auto position = *std::find_if(p.blocks[0].operations.begin(), p.blocks[0].operations.end(), [&](OperationId id) {
+            const auto* io = std::get_if<IoInfo>(&p.operations[id.value].info);
+            return io && io->semantic == IoSemantic::fragment_coord && io->component_mask == 4;
+        });
+        const auto first = std::get<ValueId>(p.operations[texture.value].outputs[0]);
+        const auto z = std::get<ValueId>(p.operations[position.value].outputs[0]);
+        const auto second = value(p), maximum = value(p);
+        auto second_read = p.operations[texture.value]; second_read.outputs = {second};
+        std::get<TextureInfo>(second_read.info).texture = TextureKey{2, 24};
+        const OperationId read_id{static_cast<std::uint32_t>(p.operations.size())};
+        p.operations.push_back(std::move(second_read));
+        const OperationId max_id{static_cast<std::uint32_t>(p.operations.size())};
+        p.operations.push_back({{}, Opcode::maximum, {}, floating, {first, second}, {maximum}, {}});
+        auto& order = p.blocks[0].operations;
+        order.insert(std::find(order.begin(), order.end(), position), {read_id, max_id});
+        for (auto& op : p.operations) if (op.opcode == Opcode::compare) op.inputs[1] = maximum;
+        // The later texture has the lower value ID; definition order stays
+        // first texture, second texture, then position. Both readings matter.
+        for (auto& op : p.operations) for (auto* operands : {&op.inputs, &op.outputs}) for (auto& operand : *operands)
+            if (auto* id = std::get_if<ValueId>(&operand)) {
+                if (*id == first) *id = second;
+                else if (*id == second) *id = first;
+            }
+        success(validate(p, IrForm::ssa, Phase::legalize), "Reversed texture IDs retain valid source dominance");
+        success(passes::snap_fragment_depth(p), "Two texture roots are reconciled in source order");
+        std::vector<const Operation*> definitions(p.values.size());
+        for (const auto& op : p.operations) for (const auto& output : op.outputs)
+            definitions[std::get<ValueId>(output).value] = &op;
+        unsigned work = 0;
+        std::function<std::uint32_t(const Operand&)> evaluate = [&](const Operand& operand) -> std::uint32_t {
+            if (++work > 1000) throw std::runtime_error("Synthetic depth expression has a cycle");
+            if (const auto* bits = std::get_if<LiteralBits>(&operand)) return static_cast<std::uint32_t>(bits->bits);
+            const auto& op = *definitions[std::get<ValueId>(operand).value];
+            const auto input = [&](unsigned n) { return evaluate(op.inputs[n]); };
+            const auto fp = [&](unsigned n) { return std::bit_cast<float>(input(n)); };
+            const auto bits = [](float f) { return std::bit_cast<std::uint32_t>(f); };
+            switch (op.opcode) {
+            case Opcode::load_io: return 0x3f800000u;
+            case Opcode::texture_sample:
+                return std::get<TextureKey>(std::get<TextureInfo>(op.info).texture).handle_byte_offset == 16 ? 0x3f7fffffu : 0x3f7ffffeu;
+            case Opcode::derivative_x: case Opcode::derivative_y: return 0;
+            case Opcode::absolute: return input(0) & 0x7fffffffu;
+            case Opcode::add: return bits(fp(0) + fp(1));
+            case Opcode::multiply: return bits(fp(0) * fp(1));
+            case Opcode::subtract: return op.numeric.domain == Domain::floating ? bits(fp(0) - fp(1)) : input(0) - input(1);
+            case Opcode::logical_and: return input(0) && input(1);
+            case Opcode::select: return input(0) ? input(1) : input(2);
+            case Opcode::compare:
+                switch (std::get<ComparisonInfo>(op.info).relation) {
+                case Compare::less: return fp(0) < fp(1);
+                case Compare::greater: return fp(0) > fp(1);
+                case Compare::greater_equal: return fp(0) >= fp(1);
+                default: break;
+                }
+                break;
+            default: break;
+            }
+            throw std::runtime_error("Unsupported synthetic depth expression");
+        };
+        check(evaluate(z) == 0x3f7ffffeu, "Source-ordered depth roots reach two successive ULPs below one");
+    }
+}
 } // namespace
 int main() {
     integer_folding(); copies_and_modes(); phis_and_dead_code(); branches(); legalization(); production_bridge(); invalid_and_limits();
+    fragment_depth_snap();
     if (failures) std::cerr << failures << " pipeline pass checks failed\n";
     else std::cout << "All pipeline pass checks passed\n";
     return failures ? 1 : 0;

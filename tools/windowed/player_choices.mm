@@ -18,13 +18,14 @@ namespace armigo::tools {
 PlayerChoices read_player_choices() {
     @autoreleasepool {
         NSUserDefaults* defaults = NSUserDefaults.standardUserDefaults;
-        // The earlier layout kept language, region and fps_overlay keys and an
-        // Auto frame rate default; its stored frame rate gives way to the new
-        // default once, and its overlay toggle carries over.
+        // Remove only keys from the earlier layout. Its overlay toggle carries
+        // over unless the current setting already exists; display, frame-rate
+        // and per-title game-language choices are not migration casualties.
         if ([defaults objectForKey:@"language"] || [defaults objectForKey:@"region"] ||
             [defaults objectForKey:@"fps_overlay"]) {
-            if ([defaults boolForKey:@"fps_overlay"]) [defaults setBool:YES forKey:@"performance_overlay"];
-            for (NSString* key in @[@"language", @"region", @"fps_overlay", @"frame_rate"])
+            if ([defaults boolForKey:@"fps_overlay"] && ![defaults objectForKey:@"performance_overlay"])
+                [defaults setBool:YES forKey:@"performance_overlay"];
+            for (NSString* key in @[@"language", @"region", @"fps_overlay"])
                 [defaults removeObjectForKey:key];
         }
         NSDictionary* rate_policy = NSBundle.mainBundle.infoDictionary[@"ArmigoTitleFrameRate"];
@@ -66,6 +67,25 @@ PlayerChoices read_player_choices() {
         choices.vsync = [defaults boolForKey:@"vsync"];
         choices.performance_overlay = [defaults boolForKey:@"performance_overlay"];
         return choices;
+    }
+}
+
+std::optional<std::string> read_language_preference(const std::string& key) {
+    @autoreleasepool {
+        id value = [NSUserDefaults.standardUserDefaults objectForKey:@(key.c_str())];
+        if (![value isKindOfClass:[NSString class]]) return std::nullopt;
+        return [value UTF8String];
+    }
+}
+
+void write_language_preference(const std::string& key, std::string_view language) {
+    @autoreleasepool {
+        NSString* value = [[NSString alloc] initWithBytes:language.data() length:language.size()
+                                                 encoding:NSUTF8StringEncoding];
+        if (!value) return;
+        [NSUserDefaults.standardUserDefaults setObject:value forKey:@(key.c_str())];
+        // A restart replaces the process right after the choice; keep it.
+        [NSUserDefaults.standardUserDefaults synchronize];
     }
 }
 

@@ -734,6 +734,11 @@ public:
         std::lock_guard lock(failure_mutex_);
         if (first_failure_)
             return first_failure_;
+        if (nvn_driver_) {
+            if (auto detail = platform::metal::nvn_driver::failure_detail(); !detail.empty())
+                return make_failure(LaunchStage::graphics, LaunchError::host_failure,
+                    "service_registry.nvn_replay", std::move(detail));
+        }
         if (driver_) {
             if (auto error = driver_->gpu_failure())
                 return make_failure(LaunchStage::graphics, LaunchError::host_failure,
@@ -1082,10 +1087,7 @@ private:
                 return {services::sm::LookupKind::unsupported, 0, 0};
             }
             if (name == service_name("lm"))
-                session = std::make_shared<services::lm::LogManagerSession>(process_id_,
-                    profile_.process.platform == GuestPlatform::switch2
-                        ? services::lm::LogManagerContract::switch2
-                        : services::lm::LogManagerContract::switch1);
+                session = std::make_shared<services::lm::LogManagerSession>(process_id_);
             else if (name == service_name("acc:u0"))
                 session = std::make_shared<services::acc::AccountSession>(process_id_);
             else if (name == service_name("aoc:u"))

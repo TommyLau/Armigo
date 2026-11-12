@@ -53,10 +53,15 @@ struct TitleSettings {
 using TitleSettingsResult = std::variant<std::string, std::optional<TitleSettings>>;
 [[nodiscard]] TitleSettingsResult find_title_settings(std::uint64_t title_id);
 
-// Where a title keeps its saves and its caches: <Documents>/Armigo/<TitleID>
+// Where a title keeps its saves and its caches: <Documents>/Armigo/Saves/<TitleID>
 // and <Caches>/Armigo/<TitleID>, in the user's (or, on iOS, the app
 // container's) Documents and Caches directories.
 [[nodiscard]] std::filesystem::path title_save_directory(std::uint64_t title_id);
 [[nodiscard]] std::filesystem::path title_cache_directory(std::uint64_t title_id);
+
+// Checks only the namespace roots. Never enumerates legacy mixed-content data.
+// Existing legacy data requires an explicit import before a new save root is created.
+[[nodiscard]] std::optional<std::string> prepare_save_directory(
+    const std::filesystem::path& saves, const std::filesystem::path& legacy);
 
 } // namespace armigo::compat

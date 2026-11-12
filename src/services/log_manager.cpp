@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/log_manager.h>
 
 #include <limits>
@@ -20,23 +21,11 @@ using horizon::IpcDisposition;
 using horizon::IpcMessage;
 using horizon::IpcReply;
 
-constexpr std::uint32_t sfci = 0x49434653;
-constexpr std::uint32_t sfco = 0x4f434653;
-constexpr std::uint32_t control_interface = 0xec6be3ff;
+using namespace horizon::cmif;
 constexpr std::uint32_t log_service_interface = 0xe1d7f748;
 constexpr std::uint32_t logger_interface = 0x3e81dad2;
 
-std::uint32_t read(const IpcMessage& message, std::size_t offset, unsigned size = 4) {
-    std::uint32_t value = 0;
-    for (unsigned byte = 0; byte < size; ++byte)
-        value |= std::uint32_t{std::to_integer<unsigned char>(message[offset + byte])} << (byte * 8);
-    return value;
-}
 
-void write(IpcMessage& message, std::size_t offset, std::uint32_t value, unsigned size = 4) {
-    for (unsigned byte = 0; byte < size; ++byte)
-        message[offset + byte] = static_cast<std::byte>((value >> (byte * 8)) & 255);
-}
 
 // Supported packets have no descriptors or transferred handles. The raw
 // count includes the firmware's sixteen-byte CMIF alignment allowance.
@@ -55,33 +44,15 @@ bool packet_shape(const IpcMessage& message, std::uint32_t type, bool pid,
            words <= (message.size() - raw_start) / 4;
 }
 
-void cmif_header(IpcMessage& message, std::size_t offset, std::uint32_t interface_id) {
-    write(message, offset, sfco);
-    // Version and Result are zero from value initialization. This firmware
-    // writes an interface identifier in the fourth word, not the input token.
-    write(message, offset + 12, interface_id);
-}
 
-IpcReply control_reply(std::uint32_t value, unsigned width) {
-    IpcReply reply;
-    reply.disposition = IpcDisposition::handled;
-    reply.size = 44; // HIPC header8 + raw data36 (9 words).
-    write(reply.bytes, 4, 9);
-    cmif_header(reply.bytes, 16, control_interface);
-    write(reply.bytes, 32, value, width);
-    return reply;
-}
 } // namespace
 
-LogManagerSession::LogManagerSession(std::uint64_t process_id, LogManagerContract contract)
-    : process_id_(process_id), contract_(contract),
+LogManagerSession::LogManagerSession(std::uint64_t process_id)
+    : process_id_(process_id),
       root_(std::make_shared<DomainObject>(DomainObject{ObjectKind::root, process_id, {}})) {}
 
 horizon::IpcReply LogManagerSession::close_server() {
     const std::lock_guard lock(mutex_);
-    if (contract_ == LogManagerContract::switch1) return ClientSession::close_server();
-    if (contract_ != LogManagerContract::switch2)
-        return unsupported("Log-manager contract is unsupported");
     if (closed_) return {.disposition = IpcDisposition::handled,
                          .transport_result = horizon::session_closed_result};
     closed_ = true;
@@ -110,9 +81,6 @@ horizon::IpcReply LogManagerSession::dispatch(const horizon::IpcMessage& message
     std::uint64_t sender_pid, const horizon::GuestBuffers* buffers) {
     const std::lock_guard lock(mutex_);
     diagnostic_ = nullptr;
-    if (contract_ != LogManagerContract::switch1 &&
-        contract_ != LogManagerContract::switch2)
-        return unsupported("Log-manager contract is unsupported");
     if (closed_) return {.disposition = IpcDisposition::handled,
                          .transport_result = horizon::session_closed_result};
     if (sender_pid != process_id_)
@@ -130,8 +98,8 @@ horizon::IpcReply LogManagerSession::dispatch(const horizon::IpcMessage& message
 }
 
 horizon::IpcReply LogManagerSession::control(const horizon::IpcMessage& message) {
-    if (contract_ == LogManagerContract::switch2 && read(message, 2, 2) != 0)
-        return unsupported("Switch 2 log-manager controls cannot carry buffer descriptors");
+    if (read(message, 2, 2) != 0)
+        return unsupported("Log-manager controls cannot carry buffer descriptors");
     if (!packet_shape(message, 5, false, 8) || read(message, 16) != sfci)
         return unsupported("Log-manager control packet is outside the supported wire format");
     // The firmware parses the same CMIF header for types5/7. Type7 carries
@@ -139,10 +107,10 @@ horizon::IpcReply LogManagerSession::control(const horizon::IpcMessage& message)
     // it and the response writes the fixed interface word instead. The input
     // version does not select a different control implementation.
     const auto command = read(message, 24);
-    if (command == 3) return control_reply(0x400, 2);
+    if (command == 3) return control_reply_bytes(0x400, 2);
     if (command != 0) return unsupported("Log-manager control command is unsupported");
     if (!objects_.empty()) return unsupported("Repeated domain conversion is unsupported");
-    auto reply = control_reply(1, 4);
+    auto reply = control_reply_bytes(1, 4);
     objects_.push_back(root_);
     return reply;
 }
@@ -236,14 +204,12 @@ horizon::IpcReply LogManagerSession::log(const horizon::IpcMessage& message,
     } else if (buffers && !buffers->empty()) {
         return unsupported("Log-manager logger received an unexpected buffer");
     }
-    // The 56-byte, 12-word extent is established only for the Switch 2
-    // platform contract. The Switch 1 platform contract keeps 48 bytes and
-    // 10 words. Both replies carry the logger interface word.
-    const bool switch2 = contract_ == LogManagerContract::switch2;
+    // A domain reply: 16 CMIF, 16 domain and 16 padding bytes after the HIPC
+    // header, 56 bytes and 12 words, with the logger interface word.
     IpcReply reply;
     reply.disposition = IpcDisposition::handled;
-    reply.size = switch2 ? 56 : 48;
-    write(reply.bytes, 4, switch2 ? 12 : 10);
+    reply.size = 56;
+    write(reply.bytes, 4, 12);
     cmif_header(reply.bytes, 32, logger_interface);
     return reply;
 }

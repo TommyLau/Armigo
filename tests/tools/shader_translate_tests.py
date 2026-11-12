@@ -661,7 +661,7 @@ class PortedTranslationTests(unittest.TestCase):
         self.assertEqual(metadata['constant_buffers'], [{
             'guest_binding': 17, 'size_kind': 'constant_buffer_window',
             'window_bytes': 16, 'alignment': 4,
-            'policy': 'runtime_zero_words_v1', 'metal_buffer_index': 0}])
+            'policy': 'proven_zero_words_v2', 'metal_buffer_index': 0}])
         self.assertEqual(metadata['support_buffers'], [{
             'schema': 'armigo-cb-sizes', 'version': 1, 'byte_extent': 72,
             'alignment': 4, 'metal_buffer_index': 1}])

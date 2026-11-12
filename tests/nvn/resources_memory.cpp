@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -57,7 +58,12 @@ struct PoolRange {
 struct MockResources final : ResourceBackend {
     std::vector<const MemoryPoolState*> registered, released;
     std::vector<PoolRange> flushes, invalidates;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> addressed;
     bool accept_pools = true;
+
+    void note_addressed(std::uint64_t address, std::uint64_t size) override {
+        addressed.push_back({address, size});
+    }
 
     bool register_pool(const MemoryPoolState& pool) override {
         if (!accept_pools) return false;
@@ -73,6 +79,7 @@ struct MockResources final : ResourceBackend {
     }
     void register_texture(const TextureState&) override {}
     void release_texture(const TextureState&) override {}
+    void clear_texture_descriptor(std::int32_t) override { CHECK(false); }
     void register_texture_descriptor(std::int32_t, const TextureState&, const TextureViewState*) override {}
     void register_sampler_descriptor(std::int32_t, const SamplerParameters&) override {}
     bool read_texels(const TextureState&, const TexelTransfer&, std::byte*) override { return false; }
@@ -281,6 +288,11 @@ int main() {
     CHECK(mock.registered.size() == 1 && mock.registered[0] == pool_state);
     CHECK(pool_map(pool) == pool_memory);
     CHECK(pool_get_address(pool) == reinterpret_cast<NVNbufferAddress>(pool_memory));
+    CHECK(mock.addressed.size() == 1 &&
+          mock.addressed[0].first == reinterpret_cast<std::uint64_t>(pool_memory) &&
+          mock.addressed[0].second == 0x3000);
+    CHECK(pool_get_address(pool) == reinterpret_cast<NVNbufferAddress>(pool_memory));
+    CHECK(mock.addressed.size() == 1);
     CHECK(pool_get_size(pool) == 0x3000);
     CHECK(pool_get_flags(pool) == (NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED));
     CHECK(pool_state->flush_end == 0 && pool_state->flush_serial == 0);
@@ -330,6 +342,7 @@ int main() {
     CHECK(pool_initialize(pool, pool_builder) == 1);
     CHECK(pool_map(pool) == nullptr);
     CHECK(pool_get_address(pool) == 0);
+    CHECK(mock.addressed.size() == 1);
     CHECK(pool_get_flags(pool) == (NVN_MEMORY_POOL_FLAGS_VIRTUAL | NVN_MEMORY_POOL_FLAGS_GPU_CACHED));
     CHECK(mock.registered.size() == 2);  // no backing: nothing registered
     pool_flush(pool, 0, 0x100);
@@ -343,6 +356,7 @@ int main() {
     pool_set_flags(pool_builder, NVN_MEMORY_POOL_FLAGS_PHYSICAL | NVN_MEMORY_POOL_FLAGS_GPU_CACHED);
     CHECK(pool_initialize(pool, pool_builder) == 1);
     CHECK(pool_get_address(pool) == 0);
+    CHECK(mock.addressed.size() == 1);
     pool_finalize(pool);
     mock.accept_pools = false;
     CHECK(pool_initialize(pool, pool_builder) == 0);
@@ -416,6 +430,9 @@ int main() {
 
     CHECK(buffer_map(buffer) == static_cast<std::uint8_t*>(pool_memory) + 0x1000);
     CHECK(buffer_get_address(buffer) == reinterpret_cast<NVNbufferAddress>(static_cast<std::uint8_t*>(pool_memory) + 0x1000));
+    // Initialization and the buffer address name this pool, which the pool
+    // address above already marked on this thread.
+    CHECK(mock.addressed.size() == 1);
     CHECK(buffer_get_pool(buffer) == pool);
     CHECK(buffer_get_offset(buffer) == 0x1000);
     CHECK(buffer_get_size(buffer) == 0x800);
@@ -463,6 +480,49 @@ int main() {
     buffer_finalize(buffer);
     CHECK(buffer_map(buffer) == nullptr);  // finalized: no live buffer state
     pool_finalize(pool);
+
+    // A fresh pool is marked whole by initialization, and again by its buffer
+    // address once another pool has been marked.
+    void* left_memory = std::aligned_alloc(0x1000, 0x2000);
+    void* right_memory = std::aligned_alloc(0x1000, 0x1000);
+    CHECK(left_memory && right_memory);
+    if (left_memory && right_memory) {
+        const auto addressed = mock.addressed.size();
+        NVNmemoryPool left_pool_storage{}, right_pool_storage{};
+        pool_set_defaults(pool_builder);
+        pool_set_device(pool_builder, device);
+        pool_set_storage(pool_builder, left_memory, 0x2000);
+        pool_set_flags(pool_builder, NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED);
+        CHECK(pool_initialize(&left_pool_storage, pool_builder) == 1);
+        pool_set_storage(pool_builder, right_memory, 0x1000);
+        CHECK(pool_initialize(&right_pool_storage, pool_builder) == 1);
+        buffer_set_storage(buffer_builder, &left_pool_storage, 0x100, 0x40);
+        NVNbuffer left_buffer{};
+        CHECK(buffer_initialize(&left_buffer, buffer_builder) == 1);
+        CHECK(mock.addressed.size() == addressed + 1);
+        CHECK(mock.addressed.back().first == reinterpret_cast<std::uint64_t>(left_memory) &&
+              mock.addressed.back().second == 0x2000);
+        buffer_set_storage(buffer_builder, &right_pool_storage, 0, 0x20);
+        NVNbuffer right_buffer{};
+        CHECK(buffer_initialize(&right_buffer, buffer_builder) == 1);
+        CHECK(mock.addressed.size() == addressed + 2);
+        CHECK(mock.addressed.back().first == reinterpret_cast<std::uint64_t>(right_memory) &&
+              mock.addressed.back().second == 0x1000);
+        CHECK(buffer_get_address(&left_buffer) ==
+              reinterpret_cast<NVNbufferAddress>(static_cast<std::uint8_t*>(left_memory) + 0x100));
+        CHECK(mock.addressed.size() == addressed + 3);
+        CHECK(mock.addressed.back().first == reinterpret_cast<std::uint64_t>(left_memory) &&
+              mock.addressed.back().second == 0x2000);
+        CHECK(buffer_get_address(&left_buffer) ==
+              reinterpret_cast<NVNbufferAddress>(static_cast<std::uint8_t*>(left_memory) + 0x100));
+        CHECK(mock.addressed.size() == addressed + 3);
+        buffer_finalize(&left_buffer);
+        buffer_finalize(&right_buffer);
+        pool_finalize(&left_pool_storage);
+        pool_finalize(&right_pool_storage);
+    }
+    std::free(left_memory);
+    std::free(right_memory);
 
     std::free(pool_memory);
     std::printf("NVN device and memory resource failures: %u\n", failures);

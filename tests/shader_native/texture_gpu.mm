@@ -270,10 +270,146 @@ std::vector<Case> cases() {
         [](const Words& w) { return Pixel{bits(float(w[0])), bits(float(w[1])), 0, 0}; }});
     return c;
 }
+using OffsetQuad = std::array<std::array<int, 2>, 4>;
+std::array<std::uint32_t, 2> packed_offsets(const OffsetQuad& offsets) {
+    std::array<std::uint32_t, 2> words{};
+    for (unsigned i=0;i<4;++i) for (unsigned axis=0;axis<2;++axis)
+        words[i/2] |= (std::uint32_t(offsets[i][axis]) & 0x3fu) << ((i%2)*16+axis*8);
+    return words;
+}
+Fixture offset_program(const OffsetQuad& offsets, unsigned component, bool fixed, bool packed_half = false) {
+    const auto packed=packed_offsets(offsets);Case c;c.name="synthetic offset square";
+    if(fixed)c.body={move(12,packed[0]),move(13,packed[1])};
+    c.body.push_back(sample(0xb63,0,8,12,2,0xf,1,0,{{76,2,2},{87,3,component},{79,1,packed_half}}));
+    return program(c);
+}
+std::size_t gathers(const std::string& source) {
+    std::size_t count=0;
+    for(std::size_t at=0;(at=source.find(".gather(",at))!=std::string::npos;at+=8)++count;
+    return count;
+}
+std::string translated(const Fixture& f) {
+    const auto result=sn::translate_native(f.program());
+    if(const auto* error=std::get_if<ir::Diagnostic>(&result))throw std::runtime_error(error->message);
+    return std::get<ir::MslArtifact>(result).source;
+}
+unsigned gather_square_compute_tests(MetalHarness& gpu) {
+    const auto make = [](OffsetQuad offsets, unsigned component, bool fixed, bool packed_half) {
+        std::vector<sn::Instruction> code{move(0,0),move(1,0),move(2,0),move(3,0),load(20,0),load(21,1),load(8,2),load(9,3),load(12,4),load(13,5)};
+        const auto packed=packed_offsets(offsets);
+        if(fixed){code.push_back(move(12,packed[0]));code.push_back(move(13,packed[1]));}
+        code.push_back(sample(0xb63,0,8,12,2,0xf,1,0,{{76,2,2},{87,3,component},{79,1,packed_half}}));
+        code.push_back(op(0x386,{{24,8,20},{32,8,0},{72,1,1},{73,3,6},{77,4,5},{84,3,1}}));
+        code.push_back(exit_instruction());Fixture f(code,sn::Stage::compute);f.launch({1,1,1},0);return f;
+    };
+    const auto half_words = [](Pixel values) {
+        std::array<std::uint16_t,4> halves{};
+        for(unsigned i=0;i<4;++i)halves[i]=std::bit_cast<std::uint16_t>(static_cast<_Float16>(std::bit_cast<float>(values[i])));
+        return Pixel{std::uint32_t(halves[0])|(std::uint32_t(halves[1])<<16),0,
+                     std::uint32_t(halves[2])|(std::uint32_t(halves[3])<<16),0};
+    };
+    constexpr std::uint64_t base=0x7d00005000ull;
+    const std::array<OffsetQuad,2> sets{{OffsetQuad{{{0,0},{1,0},{0,1},{1,1}}},OffsetQuad{{{0,3},{-1,2},{0,2},{-1,3}}}}};
+    unsigned checked=0;
+    gpu.mip_levels=3;
+    for(bool packed_half:{false,true})for(unsigned component=0;component<4;++component)for(const auto offsets:sets) {
+        const auto f=make(offsets,component,true,packed_half),reference_f=make(offsets,component,false,packed_half);
+        const auto folded=gpu.compile_compute(f),reference=gpu.compile_compute(reference_f);
+        check(gathers(folded.artifact.source)==1 && gathers(reference.artifact.source)==4,"compute gathers use the same proven square contract");
+        const auto packed=packed_offsets(offsets);
+        for(auto mode:{MTLSamplerAddressModeClampToEdge,MTLSamplerAddressModeRepeat}) {
+            gpu.texture_address_mode=mode;
+            for(const auto uv:std::array<std::array<float,2>,6>{{{-0.25f,0},{0.125f,0.125f},{0.875f,0.875f},{1,1},{1.25f,0.125f},{0.125f,1.25f}}}) {
+                const Words input{std::uint32_t(base),std::uint32_t(base>>32),bits(uv[0]),bits(uv[1]),packed[0],packed[1]};
+                MetalHarness::GuestMemory a{base,Words(4,0xdeadbeefu),{}},b{base,Words(4,0xdeadbeefu),{}};
+                gpu.dispatch(folded,f,input,a);gpu.dispatch(reference,reference_f,input,b);
+                Pixel expected{};
+                for(unsigned i=0;i<4;++i) {
+                    int x=int(std::floor(uv[0]*4-0.5f))+offsets[i][0],y=int(std::floor(uv[1]*4-0.5f))+offsets[i][1];
+                    if(mode==MTLSamplerAddressModeRepeat){x=(x%4+4)%4;y=(y%4+4)%4;}
+                    else{x=std::clamp(x,0,3);y=std::clamp(y,0,3);}
+                    expected[i]=bits(MetalHarness::texel(x,y,0)[component]);
+                }
+                if(packed_half)expected=half_words(expected);
+                check(a.words==b.words && std::equal(expected.begin(),expected.end(),a.words.begin()),"compute and packed-half square outputs match independent gathers and texels");
+                check(a.table[1]==0 && b.table[1]==0,"compute gathers keep stores within their guest window");
+                ++checked;
+            }
+        }
+    }
+    gpu.mip_levels=1;gpu.texture_address_mode=MTLSamplerAddressModeClampToEdge;return checked;
+}
+unsigned gather_square_tests(MetalHarness& gpu) {
+    // Metal footprint order: x upper-left, y upper-right, z lower-right, w lower-left.
+    const OffsetQuad corners{{{0,1},{1,1},{1,0},{0,0}}};
+    const std::array<std::array<int,2>,4> bases{{{-8,-8},{0,0},{6,6},{-1,2}}};
+    unsigned checked=0;
+    for(const auto base:bases)for(unsigned component=0;component<4;++component) {
+        std::array<unsigned,4> order{0,1,2,3};
+        do {
+            OffsetQuad offsets;std::string swizzle;
+            for(unsigned i=0;i<4;++i){offsets[i]={base[0]+corners[order[i]][0],base[1]+corners[order[i]][1]};swizzle+="xyzw"[order[i]];}
+            const auto source=translated(offset_program(offsets,component,true));
+            check(gathers(source)==1,"a proven offset square emits one gather");
+            check(source.find(")."+swizzle)!=std::string::npos,"square corners retain the requested output order");
+        }while(std::next_permutation(order.begin(),order.end()));
+    }
+    for(const OffsetQuad offsets:{OffsetQuad{{{0,0},{1,0},{0,1},{0,1}}},OffsetQuad{{{0,0},{2,0},{0,1},{2,1}}},OffsetQuad{{{0,0},{1,0},{2,0},{3,0}}}})
+        check(gathers(translated(offset_program(offsets,0,true)))==4,"a non-square retains independent gathers");
+    const OffsetQuad zero{};std::array<MetalHarness::Compiled,4> reference;
+    for(unsigned component=0;component<4;++component) {
+        reference[component]=gpu.compile(offset_program(zero,component,false));
+        check(gathers(reference[component].artifact.source)==4,"runtime offsets are not guessed to form a square");
+    }
+    const std::array<std::array<unsigned,4>,4> orders{{{0,1,2,3},{3,2,1,0},{1,3,0,2},{2,0,3,1}}};
+    const std::array<std::pair<MTLSamplerAddressMode,MTLSamplerBorderColor>,5> modes{{
+        {MTLSamplerAddressModeClampToEdge,MTLSamplerBorderColorTransparentBlack},
+        {MTLSamplerAddressModeRepeat,MTLSamplerBorderColorTransparentBlack},
+        {MTLSamplerAddressModeMirrorRepeat,MTLSamplerBorderColorTransparentBlack},
+        {MTLSamplerAddressModeClampToBorderColor,MTLSamplerBorderColorTransparentBlack},
+        {MTLSamplerAddressModeClampToBorderColor,MTLSamplerBorderColorOpaqueWhite}}};
+    const std::array<std::array<float,2>,16> coordinates{{{-0.25f,-0.25f},{0,0},{0.125f,0.125f},{0.875f,0.875f},{1,1},{1.25f,1.25f},
+        {-0.25f,0.125f},{0.125f,-0.25f},{0,0.875f},{0.875f,0},{0.125f,0.875f},{0.875f,0.125f},{1,0.125f},{0.125f,1},{1.25f,0.875f},{0.875f,1.25f}}};
+    const auto wrap=[](int i,MTLSamplerAddressMode mode){
+        if(mode==MTLSamplerAddressModeRepeat)return(i%4+4)%4;
+        if(mode==MTLSamplerAddressModeMirrorRepeat){i=(i%8+8)%8;return i<4?i:7-i;}
+        return std::clamp(i,0,3);
+    };
+    gpu.mip_levels=3;
+    for(const auto base:bases)for(unsigned component=0;component<4;++component)for(const auto order:orders) {
+        OffsetQuad offsets;for(unsigned i=0;i<4;++i)offsets[i]={base[0]+corners[order[i]][0],base[1]+corners[order[i]][1]};
+        const auto packed=packed_offsets(offsets);const auto folded=gpu.compile(offset_program(offsets,component,true));
+        for(const auto [mode,border]:modes) {
+            gpu.texture_address_mode=mode;gpu.texture_border_color=border;
+            for(const auto uv:coordinates) {
+                const float u=uv[0],v=uv[1];const Words input{bits(u),bits(v),0,0,packed[0],packed[1],0,0};
+                const auto actual=gpu.run(folded,input),independent=gpu.run(reference[component],input);
+                Pixel expected{};const int x=int(std::floor(u*4-0.5f)),y=int(std::floor(v*4-0.5f));
+                for(unsigned i=0;i<4;++i) {
+                    const int px=x+offsets[i][0],py=y+offsets[i][1];const bool outside=px<0||px>=4||py<0||py>=4;
+                    expected[i]=bits(mode==MTLSamplerAddressModeClampToBorderColor&&outside
+                        ?border==MTLSamplerBorderColorOpaqueWhite?1.0f:0.0f
+                        :MetalHarness::texel(wrap(px,mode),wrap(py,mode),0)[component]);
+                }
+                if(actual!=independent||actual!=expected) {
+                    std::fprintf(stderr,"gather square base=%d,%d component=%u mode=%lu border=%lu uv=%g,%g\n",base[0],base[1],component,
+                        static_cast<unsigned long>(mode),static_cast<unsigned long>(border),u,v);
+                    throw std::runtime_error("square gather differs from four runtime gathers or texel model");
+                }
+                ++checked;
+            }
+        }
+    }
+    gpu.mip_levels=1;gpu.texture_address_mode=MTLSamplerAddressModeClampToEdge;
+    gpu.texture_border_color=MTLSamplerBorderColorTransparentBlack;return checked;
+}
+
 }
 int main() { @autoreleasepool { try {
     MetalHarness gpu;
     unsigned checked = 0;
+    checked += gather_square_tests(gpu);
+    checked += gather_square_compute_tests(gpu);
     for (const auto& test : cases()) {
         auto compiled = gpu.compile(program(test));
         for (const auto& input : test.inputs) {

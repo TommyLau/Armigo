@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/addon_content.h>
 
 #include <array>
@@ -19,16 +20,7 @@ using horizon::IpcReply;
 using horizon::IpcMessage;
 using horizon::IpcDisposition;
 
-std::uint32_t read(const IpcMessage& bytes, std::size_t offset) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i < 4; ++i)
-        value |= std::uint32_t{std::to_integer<unsigned char>(bytes[offset + i])} << (8 * i);
-    return value;
-}
-void write(IpcMessage& bytes, std::size_t offset, std::uint32_t value, unsigned count = 4) {
-    for (unsigned i = 0; i < count; ++i)
-        bytes[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
-}
+using namespace horizon::cmif;
 IpcReply control_reply(std::uint32_t value, unsigned width) {
     IpcReply reply;
     reply.disposition = IpcDisposition::handled;

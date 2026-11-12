@@ -9,6 +9,7 @@
 // ============================================================================
 
 #include "pipelines.h"
+#include "bundle.h"
 
 #include <spawn.h>
 #include <sys/wait.h>
@@ -64,7 +65,9 @@ std::variant<std::string, armigo::platform::PipelineArchiveResult> build_pack_pi
 std::string warm_pack_pipelines(const std::filesystem::path& app,
                                 const std::vector<std::filesystem::path>& manifests) {
     namespace fs = std::filesystem;
-    const fs::path player = app / "Contents" / "MacOS" / "Armigo";
+    const auto executable = packed_application_executable(app);
+    if (const auto* failure = std::get_if<std::string>(&executable)) return *failure;
+    const fs::path& player = std::get<fs::path>(executable);
     const fs::path resources = app / "Contents" / "Resources" / "Armigo";
     std::error_code error;
     if (!fs::is_regular_file(player, error)) return "The packed player is missing: " + player.string() + ".";

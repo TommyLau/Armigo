@@ -41,6 +41,12 @@ struct TitleMatch {
 // Reads titles/<TitleID>/ and matches `build_id` against its descriptions, as
 // the player does. The title root is ARMIGO_TITLES when set ("off" turns
 // settings off) and otherwise titles/ next to `executable`.
+// Empty when a pack of `title_id` may target `platform` ("macos" or "ios"):
+// some description of the title lists it, or no title settings describe the
+// title (the match reports that later). Otherwise the refusal to print.
+[[nodiscard]] std::string check_title_platform(std::uint64_t title_id, const std::string& platform,
+                                               const std::filesystem::path& executable);
+
 [[nodiscard]] std::variant<std::string, TitleMatch> match_title_build(
     std::uint64_t title_id, const std::array<std::byte, 32>& build_id,
     const std::filesystem::path& executable);

@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/sound_mixer.h>
 
 #include <algorithm>
@@ -24,7 +25,7 @@ namespace armigo::services::audsmx {
 namespace {
 using namespace horizon;
 
-constexpr std::uint32_t sfco = 0x4f434653;
+using namespace horizon::cmif;
 // Sample types of a stream: 16-bit integer and 32-bit float PCM.
 constexpr std::uint32_t sample_pcm_int16 = 2;
 constexpr std::uint32_t sample_pcm_float = 5;
@@ -35,22 +36,9 @@ constexpr auto pump_interval = std::chrono::milliseconds(5);
 
 std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) { return (value + alignment - 1) & ~(alignment - 1); }
 
-std::uint32_t read(const IpcMessage& message, std::size_t offset) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i < 4; ++i)
-        value |= std::uint32_t(std::to_integer<unsigned char>(message[offset + i])) << (8 * i);
-    return value;
-}
 
-std::uint64_t read64(const IpcMessage& message, std::size_t offset) {
-    return read(message, offset) | std::uint64_t(read(message, offset + 4)) << 32;
-}
 
-void write(IpcMessage& message, std::size_t offset, std::uint32_t value) {
-    for (unsigned i = 0; i < 4; ++i) message[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
-}
 
-constexpr std::uint32_t sfci = 0x49434653;
 // The pointer buffer size these sessions answer, the process default the
 // practical reference answers (as for hwopus).
 constexpr std::uint16_t pointer_buffer_size = 0x8000;

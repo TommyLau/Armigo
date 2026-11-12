@@ -544,7 +544,10 @@ void enumerate_gfd(const fs::path& exefs, const fs::path& romfs, const std::vect
     std::vector<std::string> present;
     present.reserve(members.size());
     for (const auto& item : members) present.push_back(item.member.name);
-    const auto missing = si::missing_shader_caches(present, input.caches, input.fallbacks);
+    std::vector<std::pair<std::string, std::vector<std::string>>> fallbacks;
+    fallbacks.reserve(input.settings.fallbacks.size());
+    for (const auto& fallback : input.settings.fallbacks) fallbacks.emplace_back(fallback.cache, fallback.alternatives);
+    const auto missing = si::missing_shader_caches(present, input.settings.caches, fallbacks);
     if (!missing.empty()) {
         enumerator.fail("Required shader cache is missing: " + missing.front());
         return;
@@ -572,7 +575,7 @@ void enumerate_gfd(const fs::path& exefs, const fs::path& romfs, const std::vect
     const auto image = read_main_image(exefs, enumerator);
     if (image.empty()) return;
     const auto packages = si::scan_hhneedle(image, "main",
-                                            input.ignored_needle_offsets);
+                                            input.settings.ignored_needle_offsets);
     if (!packages.rejected.empty()) {
         enumerator.fail(packages.rejected.front());
         return;
@@ -617,27 +620,61 @@ void enumerate_glslc(const fs::path& exefs, Enumerator& enumerator) {
     }
 }
 
-// Every stage of the title's container set, recorded into the enumerator.
-void enumerate_containers(const fs::path& exefs, const fs::path& romfs, const std::vector<fs::path>& addons,
-                          const ShaderPackInput& input, Enumerator& enumerator) {
-    if (input.containers == ShaderPackInput::Containers::Glslc) {
-        enumerator.strict_stages = true;
-        enumerate_glslc(exefs, enumerator);
-    } else if (input.containers == ShaderPackInput::Containers::GfdCache) {
-        enumerator.strict_stages = true;
-        enumerate_gfd(exefs, romfs, addons, input, enumerator);
-    } else {
-        enumerate_tree(exefs, enumerator);
-        if (!enumerator.stopped()) {
-            enumerate_tree(romfs, enumerator);
-        }
-        for (const auto& addon : addons) {
-            if (enumerator.stopped()) {
-                break;
-            }
-            enumerate_tree(addon, enumerator);
-        }
+void enumerate_bnsh_trees(const fs::path& exefs, const fs::path& romfs, const std::vector<fs::path>& addons,
+                          const ShaderPackInput&, Enumerator& enumerator) {
+    enumerate_tree(exefs, enumerator);
+    if (!enumerator.stopped()) {
+        enumerate_tree(romfs, enumerator);
     }
+    for (const auto& addon : addons) {
+        if (enumerator.stopped()) {
+            break;
+        }
+        enumerate_tree(addon, enumerator);
+    }
+}
+
+void enumerate_glslc_main(const fs::path& exefs, const fs::path&, const std::vector<fs::path>&,
+                          const ShaderPackInput&, Enumerator& enumerator) {
+    enumerate_glslc(exefs, enumerator);
+}
+
+// One reader per container set, with the policy it applies: whether a stage
+// other than vertex, fragment or compute fails the pack (otherwise it is
+// counted as unsupported), and whether any stage that does not translate
+// fails it (otherwise it is counted and left out).
+struct ShaderReader {
+    compat::ShaderContainerSet containers;
+    bool strict_stages;
+    bool translation_failures_fatal;
+    void (*enumerate)(const fs::path& exefs, const fs::path& romfs, const std::vector<fs::path>& addons,
+                      const ShaderPackInput& input, Enumerator& enumerator);
+};
+
+constexpr ShaderReader shader_readers[] = {
+    {compat::ShaderContainerSet::Bnsh, false, false, &enumerate_bnsh_trees},
+    {compat::ShaderContainerSet::GfdCache, true, true, &enumerate_gfd},
+    {compat::ShaderContainerSet::Glslc, true, false, &enumerate_glslc_main},
+};
+
+const ShaderReader* find_reader(compat::ShaderContainerSet containers) {
+    for (const auto& reader : shader_readers)
+        if (reader.containers == containers) return &reader;
+    return nullptr;
+}
+
+// Every stage of the title's container set, recorded into the enumerator.
+const ShaderReader* enumerate_containers(const fs::path& exefs, const fs::path& romfs,
+                                         const std::vector<fs::path>& addons, const ShaderPackInput& input,
+                                         Enumerator& enumerator) {
+    const ShaderReader* reader = find_reader(input.settings.containers);
+    if (!reader) {
+        enumerator.fail("Native shader inputs are read from a .nup archive, not from extracted containers.");
+        return nullptr;
+    }
+    enumerator.strict_stages = reader->strict_stages;
+    reader->enumerate(exefs, romfs, addons, input, enumerator);
+    return reader;
 }
 
 std::uint32_t word_at(std::span<const std::byte> bytes, std::size_t offset) {
@@ -768,7 +805,7 @@ unsigned worker_count(unsigned maximum) {
 std::variant<std::string, ShaderReport> build_shader_package_impl(
     const fs::path& exefs, const fs::path& romfs, const std::vector<fs::path>& addons, const fs::path& staging,
     const fs::path& package, const fs::path& compile_cache, const fs::path& translate_tool,
-    const ShaderPackInput& input) {
+    const ShaderPackInput& input, const std::vector<fs::path>& reuse) {
     std::error_code error;
     if (!fs::is_regular_file(translate_tool, error)) {
         return "The shader translator is missing next to the packer.";
@@ -782,7 +819,7 @@ std::variant<std::string, ShaderReport> build_shader_package_impl(
     fs::remove_all(package, error);
     Enumerator enumerator;
     enumerator.stages = staging / "stages";
-    enumerate_containers(exefs, romfs, addons, input, enumerator);
+    const ShaderReader* reader = enumerate_containers(exefs, romfs, addons, input, enumerator);
     if (enumerator.stopped()) {
         return enumerator.hard_error();
     }
@@ -796,7 +833,7 @@ std::variant<std::string, ShaderReport> build_shader_package_impl(
         return std::string("No shader stages were found in the extracted game.");
     }
     TranslateQueue queue;
-    queue.vertex_depth = input.vertex_depth == ShaderPackInput::VertexDepth::ZeroToOne
+    queue.vertex_depth = input.settings.vertex_depth == compat::ShaderVertexDepth::ZeroToOne
         ? gm::VertexDepthConvention::ZeroToOne
         : gm::VertexDepthConvention::NegativeOneToOne;
     queue.hoist_implicit_samples = input.hoist_implicit_samples;
@@ -834,7 +871,7 @@ std::variant<std::string, ShaderReport> build_shader_package_impl(
     if (translated == 0) {
         return std::string("No shader stages were translated.");
     }
-    if (input.containers == ShaderPackInput::Containers::GfdCache && queue.failed.load() != 0) {
+    if (reader->translation_failures_fatal && queue.failed.load() != 0) {
         return queue.errors.empty() ? std::string("A shader stage did not translate.") : queue.errors.front();
     }
     armigo::shader::package::BuildOptions options;
@@ -847,6 +884,7 @@ std::variant<std::string, ShaderReport> build_shader_package_impl(
     options.translate_tool = translate_tool;
     options.output = package;
     options.hoist_implicit_samples = input.hoist_implicit_samples;
+    options.reuse = reuse;
     if (!compile_cache.empty()) options.compile_cache = compile_cache;
     options.jobs = worker_count(8);
     auto built = armigo::shader::package::build(options);
@@ -855,6 +893,8 @@ std::variant<std::string, ShaderReport> build_shader_package_impl(
         return *failure;
     }
     ShaderReport report;
+    report.libraries = std::get<armigo::shader::package::BuildReport>(built).unique_stages;
+    report.reused = std::get<armigo::shader::package::BuildReport>(built).reused_libraries;
     report.enumerated = enumerator.unique;
     report.translated = translated;
     report.unsupported = enumerator.unsupported;
@@ -884,10 +924,10 @@ std::variant<std::string, ShaderEnumeration> enumerate_shader_stages(
 std::variant<std::string, ShaderReport> build_shader_package(
     const fs::path& exefs, const fs::path& romfs, const std::vector<fs::path>& addons, const fs::path& staging,
     const fs::path& package, const fs::path& compile_cache, const fs::path& translate_tool,
-    const ShaderPackInput& input) {
+    const ShaderPackInput& input, const std::vector<fs::path>& reuse) {
     try {
         return build_shader_package_impl(exefs, romfs, addons, staging, package, compile_cache, translate_tool,
-                                         input);
+                                         input, reuse);
     } catch (const std::bad_alloc&) {
         return std::string("Host memory for shader packing could not be allocated.");
     } catch (const std::exception& failure) {

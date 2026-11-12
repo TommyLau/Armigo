@@ -52,6 +52,19 @@ int main() {
         tail.code.back() = std::byte{1}; tail.rejects(sn::ProgramError::nonzero_padding);
         Fixture fragment(1); fragment.control[0x57] = std::byte{0xab};
         check(fragment.parse().stage == sn::Stage::fragment);
+        for (const unsigned version : {17u, 20u}) {
+            Fixture early(1); word(early.control, 8, version);
+            const auto original = early.parse();
+            check(!original.early_fragment_tests);
+            early.control[0x5b] = std::byte{0x80};
+            const auto requested = early.parse();
+            check(requested.early_fragment_tests && requested.image_digest == original.image_digest &&
+                  requested.stage_identity != original.stage_identity);
+            word(early.code, 19 * 4, 2);
+            check(!early.parse().early_fragment_tests);
+            Fixture other(0); word(other.control, 8, version); other.control[0x5b] = std::byte{1};
+            check(!other.parse().early_fragment_tests);
+        }
         Fixture compute(5); p = compute.parse(); check(p.header.empty() && p.instructions.size() == 0xa0);
         check(p.launch && p.launch->local_size == (std::array<std::uint32_t, 3>{8, 2, 1}) && p.launch->shared_memory_bytes == 0);
         word(compute.control, 0x64, 0x1380); check(compute.parse().launch->shared_memory_bytes == 0x1380);

@@ -263,6 +263,11 @@ if(BUILD_TESTING)
     target_link_libraries(armigo_shader_package_tests PRIVATE armigo_shader_package)
     add_test(NAME shader.package COMMAND armigo_shader_package_tests)
     set_tests_properties(shader.package PROPERTIES LABELS "shader;pack" TIMEOUT 60)
+    add_executable(armigo_shader_package_bracket_tests
+        "${ARMIGO_SHADER_TEST_DIR}/package/bracket_depth_tests.cpp")
+    target_link_libraries(armigo_shader_package_bracket_tests PRIVATE armigo_shader_package)
+    add_test(NAME shader.package_bracket_depth COMMAND armigo_shader_package_bracket_tests)
+    set_tests_properties(shader.package_bracket_depth PROPERTIES LABELS "shader;pack" TIMEOUT 120)
 endif()
 
 add_library(armigo_shader_package STATIC
@@ -282,6 +287,8 @@ endif()
 # libraries' own sources and build file are listed here.
 include("${ARMIGO_SHADER_REPOSITORY_ROOT}/src/loader/nso_component.cmake")
 armigo_nso_production_files(ARMIGO_NSO_VERSION_FILES)
+include("${ARMIGO_SHADER_REPOSITORY_ROOT}/src/shader_native/frontend_component.cmake")
+armigo_native_frontend_production_files(ARMIGO_NATIVE_FRONTEND_VERSION_FILES)
 set(ARMIGO_SHADER_VERSION_FILES
     "${CMAKE_CURRENT_LIST_FILE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/source_version.h.in"
@@ -293,6 +300,9 @@ set(ARMIGO_SHADER_VERSION_FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/package_validation.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/package_internal.h"
     "${ARMIGO_SHADER_INCLUDE_DIR}/armigo/shader/package.h"
+    # Native-only implementation and header changes invalidate stage-cache entries.
+    "${ARMIGO_SHADER_REPOSITORY_ROOT}/src/shader_native/frontend_component.cmake"
+    ${ARMIGO_NATIVE_FRONTEND_VERSION_FILES}
     "${ARMIGO_SHADER_REPOSITORY_ROOT}/src/shader_input/CMakeLists.txt"
     "${ARMIGO_SHADER_REPOSITORY_ROOT}/src/shader_input/tools/extract.cpp"
     "${ARMIGO_SHADER_REPOSITORY_ROOT}/src/loader/nso_component.cmake"
@@ -620,6 +630,7 @@ target_sources(armigo_shader_pipeline PRIVATE
     pipeline/passes/internal.h
     pipeline/passes/folding.cpp
     pipeline/passes/cleanup.cpp
+    pipeline/passes/fragment_depth.cpp
     pipeline/passes/nontexture.cpp
     pipeline/passes/hoist.cpp)
 if(BUILD_TESTING)

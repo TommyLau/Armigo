@@ -763,6 +763,7 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
     [schema removeObjectForKey:@"y_direction"];
     [schema removeObjectForKey:@"point_size"];
     [schema removeObjectForKey:@"rasterizer_discard"];
+    [schema removeObjectForKey:@"discard_entry_point"];
     [schema removeObjectForKey:@"point_coord"];
     // Optional, like draw_support: the writer emits it only when the stage has
     // programs, so a reflection without it stays valid. Unknown keys still fail.
@@ -880,6 +881,12 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
                               : entry.stage == Stage::TessellationEvaluation ? "armigo_mesh_main"
                                                               : "armigo_fragment_main"))
         reflection_error("Reflection entry point is unsupported");
+    if (root[@"discard_entry_point"] != nil) {
+        stage.discard_entry_point = text("discard_entry_point");
+        if (!v3 || entry.stage != Stage::Vertex || stage.requires_rasterizer_discard ||
+            stage.discard_entry_point != stage.entry_point + "_discard")
+            reflection_error("Static rasterizer-discard entry is invalid for this stage");
+    }
     const auto depth = text("vertex_depth");
     if (depth == "minus-one-to-one") stage.vertex_depth = gm::VertexDepthConvention::NegativeOneToOne;
     else if (depth == "zero-to-one") stage.vertex_depth = gm::VertexDepthConvention::ZeroToOne;
@@ -912,14 +919,17 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
         const auto guest = integer(item[@"guest_binding"], "guest_binding", 17);
         const auto extent = integer(item[@"window_bytes"], "window_bytes", 65536);
         const auto metal = integer(item[@"metal_buffer_index"], "metal_buffer_index", 30);
+        const auto policy = string(item[@"policy"], "policy");
         if (extent < 4 || (extent & 3) ||
             integer(item[@"alignment"], "alignment", 4) != 4 ||
             string(item[@"size_kind"], "size_kind") != "constant_buffer_window" ||
-            string(item[@"policy"], "policy") != "runtime_zero_words_v1" ||
+            (policy != "runtime_zero_words_v1" && policy != "padded_zero_words_v2" &&
+             policy != "proven_zero_words_v2") ||
             !guests.insert(guest).second || !metals.insert(metal).second)
             reflection_error("Constant-buffer reflection is invalid");
         stage.constant_buffer_windows.push_back({static_cast<std::uint8_t>(guest), extent,
-                                                 static_cast<std::uint8_t>(metal)});
+                                                 static_cast<std::uint8_t>(metal),
+                                                 static_cast<std::uint8_t>(policy == "padded_zero_words_v2" ? 16 : 0)});
         constant_buffer_windows.emplace(guest, extent);
     }
     NSArray* support = array(root[@"support_buffers"], "support_buffers", 1);
@@ -950,6 +960,15 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
             const auto metal = integer(item[@"metal_buffer_index"],
                                        "metal_buffer_index", 30);
             const auto window = constant_buffer_windows.find(slot);
+            bool bound = false;
+            for (id raw_fact in array(root[@"dependencies"], "dependencies", 1024)) {
+                NSDictionary* fact = object(raw_fact, "dependency");
+                if (string(fact[@"kind"], "dependency kind") != "bound_storage_descriptor") continue;
+                if (integer(fact[@"index"], "dependency index", 17) == slot &&
+                    integer(fact[@"byte_offset"], "dependency byte_offset", 65524) == offset &&
+                    integer(fact[@"component"], "dependency component", 3) == 0 &&
+                    boolean(fact[@"value"], "bound storage descriptor value")) bound = true;
+            }
             const auto access_text = string(item[@"access"], "access");
             CompiledShaderResourceAccess access;
             if (access_text == "read") access = CompiledShaderResourceAccess::Read;
@@ -957,13 +976,13 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
             else if (access_text == "read_write")
                 access = CompiledShaderResourceAccess::ReadWrite;
             else reflection_error("Storage-buffer access is unsupported");
-            if ((offset & 7u) || window == constant_buffer_windows.end() ||
-                offset + 12u > window->second ||
+            if ((offset & 7u) || (!bound && (window == constant_buffer_windows.end() ||
+                offset + 12u > window->second)) ||
                 integer(item[@"alignment"], "alignment", 4) != 4 ||
                 !descriptors.emplace(slot, offset).second || !metals.insert(metal).second)
                 reflection_error("Storage-buffer reflection is invalid");
             stage.storage_buffers.push_back({static_cast<std::uint8_t>(slot), offset,
-                static_cast<std::uint8_t>(metal), access, 4});
+                static_cast<std::uint8_t>(metal), access, 4, bound});
         }
     }
     if (stage.emulates_depth_bias && !metals.insert(30).second)
@@ -1078,7 +1097,9 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
     std::set<unsigned> texture_metal, sampler_metal;
     std::optional<unsigned> proven_slot;
     if (v3) {
-        std::array<std::vector<std::pair<std::uint32_t, std::uint32_t>>, 2> direct_ranges;
+        // Index 2 is the buffer namespace, so pool indices cannot overlap each other.
+        std::array<std::vector<std::pair<std::uint32_t, std::uint32_t>>, 3> direct_ranges;
+        bool saw_sampler_pool = false;
         std::map<std::pair<unsigned, unsigned>, std::size_t> direct_textures;
         std::map<std::pair<unsigned, unsigned>, std::size_t> direct_samplers;
         std::set<std::uint32_t> resource_ids;
@@ -1088,57 +1109,148 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
             NSDictionary* item = object(resources[ordinal], "texture");
             const auto kind_text = string(item[@"kind"], "texture kind");
             const bool is_texture = kind_text == "texture";
-            if (!is_texture && kind_text != "sampler")
+            const bool is_sampler = kind_text == "sampler";
+            const bool is_texture_pool = kind_text == "texture_pool";
+            const bool is_sampler_pool = kind_text == "sampler_pool";
+            if (!is_texture && !is_sampler && !is_texture_pool && !is_sampler_pool)
                 reflection_error("Texture kind is unsupported");
-            exact(item, is_texture
-                ? std::initializer_list<const char*>{"cbuf_slot","handle_byte_offset","kind",
-                      "dimension","array","multisample","scalar","component_format",
-                      "normalized_coordinates","comparison","resource_id","array_length",
-                      "location","resource_kind","access"}
-                : std::initializer_list<const char*>{"cbuf_slot","handle_byte_offset","kind",
-                      "comparison","normalized_coordinates","resource_id","array_length",
-                      "location"}, "texture entry");
+            const bool is_pool = is_texture_pool || is_sampler_pool;
+            // A pool record is its kind, element type and buffer location.
+            // Constant-buffer keys and sampler-state flags belong to bound
+            // textures and samplers, not to the pool table.
+            if (is_pool && (item[@"cbuf_slot"] != nil || item[@"handle_byte_offset"] != nil))
+                reflection_error("Pool records do not carry constant-buffer keys");
+            if (is_sampler_pool &&
+                (item[@"comparison"] != nil || item[@"normalized_coordinates"] != nil))
+                reflection_error("Sampler pool records do not carry sampler state");
+            if (is_sampler_pool) {
+                if (saw_sampler_pool) reflection_error("A stage admits one sampler pool");
+                saw_sampler_pool = true;
+            }
+            if (is_texture_pool) {
+                exact(item, {"kind","dimension","array","multisample","scalar","component_format",
+                             "comparison","resource_kind","access","resource_id","array_length",
+                             "location"},
+                      "texture entry");
+            } else if (is_sampler_pool) {
+                exact(item, {"kind","resource_id","array_length","location"}, "texture entry");
+            } else {
+                const bool atomic = is_texture && item[@"atomic"] != nil;
+                exact(item, !is_texture
+                    ? std::initializer_list<const char*>{"cbuf_slot","handle_byte_offset","kind",
+                          "comparison","normalized_coordinates","resource_id","array_length",
+                          "location"}
+                    : atomic
+                    ? std::initializer_list<const char*>{"cbuf_slot","handle_byte_offset","kind",
+                          "dimension","array","multisample","scalar","component_format",
+                          "normalized_coordinates","comparison","resource_id","array_length",
+                          "location","resource_kind","access","atomic"}
+                    : std::initializer_list<const char*>{"cbuf_slot","handle_byte_offset","kind",
+                          "dimension","array","multisample","scalar","component_format",
+                          "normalized_coordinates","comparison","resource_id","array_length",
+                          "location","resource_kind","access"}, "texture entry");
+            }
             const auto resource_id = integer(item[@"resource_id"], "resource_id", 0xffffffffu);
             const auto length = integer(item[@"array_length"], "array_length", 0xffffffffu);
-            const auto offset = integer(item[@"handle_byte_offset"], "handle_byte_offset", 65532);
-            const auto slot = handle_or_constant_slot(item[@"cbuf_slot"], "cbuf_slot", stage, offset, length);
-            const auto provenance_end = static_cast<std::uint64_t>(offset) +
-                                        static_cast<std::uint64_t>(length) * 4;
-            if (!resource_ids.insert(resource_id).second || !length ||
-                (offset & 3u) || provenance_end > 65536)
-                reflection_error("Texture provenance reflection is invalid");
+            std::uint32_t offset = 0;
+            std::uint32_t slot = 0;
+            if (is_pool) {
+                if (!resource_ids.insert(resource_id).second || !length)
+                    reflection_error("Texture provenance reflection is invalid");
+            } else {
+                offset = integer(item[@"handle_byte_offset"], "handle_byte_offset", 65532);
+                slot = handle_or_constant_slot(item[@"cbuf_slot"], "cbuf_slot", stage, offset, length);
+                const auto provenance_end = static_cast<std::uint64_t>(offset) +
+                                            static_cast<std::uint64_t>(length) * 4;
+                if (!resource_ids.insert(resource_id).second || !length ||
+                    (offset & 3u) || provenance_end > 65536)
+                    reflection_error("Texture provenance reflection is invalid");
+            }
 
             CompiledShaderResource resource;
             resource.resource_id = resource_id;
             resource.array_length = length;
             resource.cbuf_slot = static_cast<std::uint8_t>(slot);
             resource.handle_byte_offset = offset;
-            resource.comparison = boolean(item[@"comparison"], "comparison");
-            resource.normalized_coordinates = boolean(
-                item[@"normalized_coordinates"], "normalized_coordinates");
-            if (is_texture) {
+            if (is_texture_pool) {
+                resource.comparison = boolean(item[@"comparison"], "comparison");
+                resource.normalized_coordinates = false;
+            } else if (!is_sampler_pool) {
+                resource.comparison = boolean(item[@"comparison"], "comparison");
+                resource.normalized_coordinates = boolean(
+                    item[@"normalized_coordinates"], "normalized_coordinates");
+            }
+            if (is_texture || is_texture_pool) {
                 const auto resource_kind = string(item[@"resource_kind"], "resource_kind");
-                if (resource_kind == "sampled")
-                    resource.kind = CompiledShaderResourceKind::SampledTexture;
-                else if (resource_kind == "storage_image")
-                    resource.kind = CompiledShaderResourceKind::StorageImage;
-                else reflection_error("Texture resource kind is unsupported");
                 const auto access = string(item[@"access"], "access");
-                if (access == "read") resource.access = CompiledShaderResourceAccess::Read;
-                else if (access == "write") resource.access = CompiledShaderResourceAccess::Write;
-                else if (access == "read_write")
-                    resource.access = CompiledShaderResourceAccess::ReadWrite;
-                else reflection_error("Texture access is unsupported");
-                resource.texture_descriptor = parse_texture_descriptor_v3(item);
-                if (resource.kind == CompiledShaderResourceKind::SampledTexture &&
-                    resource.access != CompiledShaderResourceAccess::Read)
-                    reflection_error("Sampled texture resource must be read-only");
+                if (is_texture_pool) {
+                    if (resource_kind != "sampled" || access != "read")
+                        reflection_error("Texture pool resource must be a sampled read");
+                    resource.kind = CompiledShaderResourceKind::TexturePool;
+                    resource.access = CompiledShaderResourceAccess::Read;
+                } else if (resource_kind == "sampled") {
+                    resource.kind = CompiledShaderResourceKind::SampledTexture;
+                } else if (resource_kind == "storage_image") {
+                    resource.kind = CompiledShaderResourceKind::StorageImage;
+                } else reflection_error("Texture resource kind is unsupported");
+                if (!is_texture_pool) {
+                    if (access == "read") resource.access = CompiledShaderResourceAccess::Read;
+                    else if (access == "write") resource.access = CompiledShaderResourceAccess::Write;
+                    else if (access == "read_write")
+                        resource.access = CompiledShaderResourceAccess::ReadWrite;
+                    else reflection_error("Texture access is unsupported");
+                    if (resource.kind == CompiledShaderResourceKind::SampledTexture &&
+                        resource.access != CompiledShaderResourceAccess::Read)
+                        reflection_error("Sampled texture resource must be read-only");
+                }
+                NSDictionary* descriptor_source = item;
+                NSMutableDictionary* pool_descriptor = nil;
+                if (is_texture_pool) {
+                    pool_descriptor = [item mutableCopy];
+                    pool_descriptor[@"normalized_coordinates"] = @NO;
+                    descriptor_source = pool_descriptor;
+                }
+                resource.texture_descriptor = parse_texture_descriptor_v3(descriptor_source);
+                if (item[@"atomic"] != nil) {
+                    const auto& descriptor = *resource.texture_descriptor;
+                    const bool integer_scalar =
+                        descriptor.scalar == CompiledShaderTextureScalar::u32 ||
+                        descriptor.scalar == CompiledShaderTextureScalar::s32;
+                    if (!boolean(item[@"atomic"], "atomic") ||
+                        resource.kind != CompiledShaderResourceKind::StorageImage ||
+                        descriptor.dimension != CompiledShaderTextureDimension::d2 ||
+                        descriptor.array || !integer_scalar)
+                        reflection_error("Texture atomic flag is invalid");
+                    resource.atomic = true;
+                }
+            } else if (is_sampler_pool) {
+                resource.kind = CompiledShaderResourceKind::SamplerPool;
             } else {
                 resource.kind = CompiledShaderResourceKind::Sampler;
             }
 
             NSDictionary* location = object(item[@"location"], "resource location");
-            if (stage.argument_buffer) {
+            if (is_pool) {
+                exact(location, {"kind","namespace","first","count"}, "resource location");
+                const auto first = integer(location[@"first"], "first", 0xffffffffu);
+                const auto count = integer(location[@"count"], "count", 0xffffffffu);
+                const auto end = static_cast<std::uint64_t>(first) + count;
+                if (string(location[@"kind"], "location kind") != "direct" ||
+                    string(location[@"namespace"], "namespace") != "buffer" ||
+                    count != length || end > 31)
+                    reflection_error("Direct resource location is invalid");
+                auto& occupied = direct_ranges[2];
+                if (std::any_of(occupied.begin(), occupied.end(), [&](const auto& range) {
+                        return end > range.first && first < range.second;
+                    }))
+                    reflection_error("Direct resource locations overlap");
+                occupied.emplace_back(first, static_cast<std::uint32_t>(end));
+                resource.location.kind = CompiledShaderResourceLocationKind::Direct;
+                resource.location.resource_namespace = CompiledShaderResourceNamespace::Buffer;
+                resource.location.first = first;
+                resource.location.count = count;
+                stage.legacy_texture_bindings_compatible = false;
+            } else if (stage.argument_buffer) {
                 exact(location, {"kind","byte_offset","count","stride"}, "resource location");
                 const auto byte_offset = integer(location[@"byte_offset"], "byte_offset", 0xffffffffu);
                 const auto count = integer(location[@"count"], "count", 0xffffffffu);
@@ -1185,8 +1297,10 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
                         .emplace(std::make_pair(slot, offset), stage.resources.size()).second)
                     stage.legacy_texture_bindings_compatible = false;
             }
-            if (!proven_slot) proven_slot = slot;
-            else if (*proven_slot != slot) stage.legacy_texture_bindings_compatible = false;
+            if (!is_pool) {
+                if (!proven_slot) proven_slot = slot;
+                else if (*proven_slot != slot) stage.legacy_texture_bindings_compatible = false;
+            }
             stage.resources.push_back(std::move(resource));
         }
         if (stage.argument_buffer) {
@@ -1422,6 +1536,7 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
     unsigned dependencies = 0;
     std::optional<unsigned> recorded_handle_slot;
     std::set<std::pair<unsigned, unsigned>> recorded_fact_offsets, recorded_array_lengths;
+    std::set<std::pair<unsigned, unsigned>> recorded_storage_facts;
     std::map<unsigned, std::pair<std::string, unsigned>> output_type_facts;
     for (id raw in array(root[@"dependencies"], "dependencies", 1024)) {
         NSDictionary* item = object(raw, "dependency");
@@ -1432,10 +1547,18 @@ CompiledGraphicsStage parse_reflection_ported(std::span<const std::byte> bytes,
             string(item[@"origin"], "dependency origin") != "explicit_option" &&
             string(item[@"origin"], "dependency origin") != "derived")
             reflection_error("Dependency origin is unsupported");
-        if (!admitted_v2_dependency(kind) && !(v3 && kind == "texture_array_length") &&
+        if (!admitted_v2_dependency(kind) && !(v3 && (kind == "texture_array_length" || kind == "bound_storage_descriptor")) &&
             !((entry.stage == Stage::Compute || mesh_launched(entry.stage)) &&
               (kind == "compute_local_size" || kind == "compute_shared_memory_bytes")))
             reflection_error("Consumed fact " + kind + " is outside the admitted runtime subset");
+        if (kind == "bound_storage_descriptor") {
+            const auto slot = integer(item[@"index"], "dependency index", 17);
+            const auto offset = integer(item[@"byte_offset"], "dependency byte_offset", 65524);
+            (void)boolean(item[@"value"], "bound storage descriptor value");
+            if ((offset & 7u) || integer(item[@"component"], "dependency component", 3) != 0 ||
+                !recorded_storage_facts.emplace(slot, offset).second)
+                reflection_error("Bound storage descriptor dependency is invalid");
+        }
         // A task or mesh stage's body is compute code: its local size is its
         // launch's threads, and its stage memory is static in the function.
         const auto* mesh_launch = stage.task ? &*stage.task : stage.mesh ? &*stage.mesh : nullptr;

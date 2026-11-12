@@ -216,7 +216,7 @@ void test_deterministic_package(Fixture& fixture) {
     }
     const std::string variant = "1cd06a449ca44560d3f15f646a5aeb3a8c3a2d40637f57e2016291bb2043e57c";
     const std::string manifest = read(options.output / "manifest.json");
-    CHECK(manifest.find("\"chain_id\":\"239cb9f212404965aa640e5ab22406012d8777a211ccada708cac17be5afabcf\"") !=
+    CHECK(manifest.find("\"chain_id\":\"2d3cc7397abf703610a7067e9da8fe06f66b6e451a8d90908907018d045705d6\"") !=
           std::string::npos);
     CHECK(manifest.find("\"variant_id\":\"" + variant + "\"") != std::string::npos);
     CHECK(manifest.find("\"prefix_key\":\"d8d18c6edafd31857672a329c60b3c204fac4747fec24533d857614ef88df848\"") !=
@@ -231,8 +231,8 @@ void test_deterministic_package(Fixture& fixture) {
     const std::string library = read(published / "shader.metallib");
     CHECK(library.starts_with("LIBAIR#include <metal_stdlib>"));
     const std::string commands = read(fixture.log);
-    CHECK(commands.find("-std=metal4.0 -mmacosx-version-min=26.0 -Werror -Wno-unused-variable "
-                        "-Wno-sometimes-uninitialized -c") != std::string::npos);
+    CHECK(commands.find("-std=metal4.0 -mmacosx-version-min=26.0 -fwrapv -Werror -Wno-unused-variable "
+                        "-Wno-sometimes-uninitialized -fbracket-depth=1024 -c") != std::string::npos);
     CHECK(commands.find("metallib") != std::string::npos);
 
     options.output = fixture.root / "package-b";
@@ -245,6 +245,51 @@ void test_deterministic_package(Fixture& fixture) {
     CHECK(std::holds_alternative<package::BuildReport>(package::build(options)));
     CHECK(read(options.output / "manifest.json") == manifest);
     CHECK(read(fixture.log) == cold_commands);
+
+    // A restamp takes each library from an earlier package by its source
+    // digest and compiles nothing; the package is the one a build writes.
+    options.output = fixture.root / "package-d";
+    options.compile_cache.reset();
+    options.reuse = {fixture.root / "package-a"};
+    const auto restamped = package::build(options);
+    CHECK(std::holds_alternative<package::BuildReport>(restamped));
+    if (const auto* report = std::get_if<package::BuildReport>(&restamped)) CHECK(report->reused_libraries == 5);
+    CHECK(read(options.output / "manifest.json") == manifest);
+    CHECK(read(fixture.log) == cold_commands);
+    // A reflection that no longer matches its manifest is refused.
+    fs::copy(fixture.root / "package-a", fixture.root / "package-edited", fs::copy_options::recursive);
+    const fs::path edited = fixture.root / "package-edited" / "stages" / variant / "reflection.json";
+    write(edited, read(edited) + " ");
+    options.output = fixture.root / "package-f";
+    options.reuse = {fixture.root / "package-edited"};
+    const auto mismatched = package::build(options);
+    CHECK(std::holds_alternative<std::string>(mismatched) &&
+          std::get<std::string>(mismatched).find("does not match its manifest") != std::string::npos);
+    // Identical source built without signed wrapping is not a reusable library.
+    fs::copy(fixture.root / "package-a", fixture.root / "package-nonwrapping", fs::copy_options::recursive);
+    std::string nonwrapping = read(fixture.root / "package-nonwrapping" / "manifest.json");
+    const std::string old_option = "\\\"-fwrapv\\\",";
+    const auto option_at = nonwrapping.find(old_option);
+    CHECK(option_at != std::string::npos);
+    if (option_at != std::string::npos) nonwrapping.erase(option_at, old_option.size());
+    write(fixture.root / "package-nonwrapping" / "manifest.json", nonwrapping);
+    options.output = fixture.root / "package-wrapping-required";
+    options.reuse = {fixture.root / "package-nonwrapping"};
+    const auto nonwrapping_result = package::build(options);
+    CHECK(std::holds_alternative<std::string>(nonwrapping_result) &&
+          std::get<std::string>(nonwrapping_result).find("another compiler profile") != std::string::npos);
+    // A package from another compiler profile is refused, not mixed in.
+    fs::copy(fixture.root / "package-a", fixture.root / "package-other", fs::copy_options::recursive);
+    std::string other = read(fixture.root / "package-other" / "manifest.json");
+    const auto at = other.find("metal_version");
+    CHECK(at != std::string::npos);
+    if (at != std::string::npos) other.replace(at, 13, "metal_versioN");
+    write(fixture.root / "package-other" / "manifest.json", other);
+    options.output = fixture.root / "package-e";
+    options.reuse = {fixture.root / "package-other"};
+    const auto refused = package::build(options);
+    CHECK(std::holds_alternative<std::string>(refused) &&
+          std::get<std::string>(refused).find("another compiler profile") != std::string::npos);
 }
 
 // A v2 fragment whose texture, sampler and descriptor fact all name slot 31.
@@ -303,6 +348,217 @@ void expect_package_refusal(Fixture& fixture, const fs::path& stage, std::string
         ++failures;
     }
     CHECK(!fs::exists(options.output));
+}
+
+std::string texture_pool_record(bool cbuf, int slot, int buffer) {
+    std::string record = "{";
+    if (cbuf) {
+        record += "\"cbuf_slot\":" + std::to_string(slot) + ",\"handle_byte_offset\":0,";
+    }
+    record += "\"kind\":\"texture_pool\",\"dimension\":\"d2\",\"array\":false,\"multisample\":false,"
+              "\"scalar\":\"f32\",\"component_format\":\"floating\",\"comparison\":false,"
+              "\"resource_kind\":\"sampled\",\"access\":\"read\","
+              "\"resource_id\":0,\"array_length\":1,\"location\":{\"kind\":\"direct\","
+              "\"namespace\":\"buffer\",\"first\":" + std::to_string(buffer) + ",\"count\":1}}";
+    return record;
+}
+
+std::string sampler_pool_record(bool cbuf, bool state, int buffer, int resource_id) {
+    std::string record = "{";
+    if (cbuf) record += "\"cbuf_slot\":30,\"handle_byte_offset\":4,";
+    record += "\"kind\":\"sampler_pool\",";
+    if (cbuf || state) record += "\"comparison\":false,\"normalized_coordinates\":true,";
+    record += "\"resource_id\":" + std::to_string(resource_id) + ",\"array_length\":1,"
+              "\"location\":{\"kind\":\"direct\",\"namespace\":\"buffer\",\"first\":" +
+              std::to_string(buffer) + ",\"count\":1}}";
+    return record;
+}
+
+// A fragment stage whose textures are pool records. v3 carries a null argument
+// buffer; v2 is the same document without that key.
+fs::path write_pool_fragment(Fixture& fixture, std::string_view name, bool v3,
+                             std::string_view textures) {
+    const fs::path directory = fixture.inputs / name;
+    fs::create_directory(directory);
+    std::vector<std::byte> program(160);
+    for (std::size_t index = 0; index < program.size(); ++index)
+        program[index] = static_cast<std::byte>((index * 37 + name.size()) & 255);
+    const std::uint32_t sph = 5u << 10;
+    std::memcpy(program.data(), &sph, sizeof sph);
+    const std::string source = "#include <metal_stdlib>\n// " + std::string(name) + "\n";
+    const std::string version(64, 'a');
+    const std::string metadata =
+        "{\"schema\":\"" + std::string(v3 ? "armigo-shader-stage-v3" : "armigo-shader-stage-v2") +
+        "\",\"source_version\":\"" + version + "\",\"program_key\":\"" +
+        digest(std::span<const std::byte>(program)) + "\",\"program_size\":160,"
+        "\"program_file\":\"program.bin\",\"source_file\":\"source.metal\",\"source_digest\":\"" +
+        digest(source) + "\",\"stage\":\"fragment\",\"entry_point\":\"armigo_fragment_main\","
+        "\"vertex_depth\":\"unspecified\",\"fragment_position\":\"unspecified\",\"c1_digest\":null,"
+        "\"profile\":{\"identity\":\"armigo-macos-metal4\",\"version\":" + (v3 ? "3" : "1") + "},"
+        "\"constant_buffers\":[],\"support_buffers\":[]," +
+        (v3 ? "\"argument_buffer\":null," : "") + "\"textures\":[" + std::string(textures) + "],"
+        "\"vertex_streams\":[],\"vertex_inputs\":[],"
+        "\"interface\":{\"position_input_mask\":0,\"position_output_mask\":0,\"color_output_mask\":0,"
+        "\"color_outputs\":[],\"writes_fragment_depth\":false,\"writes_sample_mask\":false,"
+        "\"generic_inputs\":[],\"generic_outputs\":[]},\"dependencies\":[]}\n";
+    write(directory / "program.bin", program);
+    write(directory / "source.metal", source);
+    write(directory / "reflection.json", metadata);
+    return directory;
+}
+
+fs::path write_atomic_fragment(Fixture& fixture, std::string_view name, std::string_view textures) {
+    const fs::path directory = fixture.inputs / name;
+    fs::create_directory(directory);
+    std::vector<std::byte> program(160);
+    for (std::size_t index = 0; index < program.size(); ++index)
+        program[index] = static_cast<std::byte>((index * 31 + 19) & 255);
+    const std::uint32_t sph = 5u << 10;
+    std::memcpy(program.data(), &sph, sizeof sph);
+    const std::string source = "#include <metal_stdlib>\n// " + std::string(name) + "\n";
+    const std::string version(64, 'a');
+    const std::string metadata =
+        "{\"schema\":\"armigo-shader-stage-v3\",\"source_version\":\"" + version +
+        "\",\"program_key\":\"" + digest(std::span<const std::byte>(program)) + "\",\"program_size\":160,"
+        "\"program_file\":\"program.bin\",\"source_file\":\"source.metal\",\"source_digest\":\"" +
+        digest(source) + "\",\"stage\":\"fragment\",\"entry_point\":\"armigo_fragment_main\","
+        "\"vertex_depth\":\"unspecified\",\"fragment_position\":\"unspecified\",\"c1_digest\":null,"
+        "\"profile\":{\"identity\":\"armigo-macos-metal4\",\"version\":3},\"argument_buffer\":null,"
+        "\"constant_buffers\":[],\"support_buffers\":[],\"textures\":" + std::string(textures) +
+        ",\"vertex_streams\":[],\"vertex_inputs\":[],"
+        "\"interface\":{\"position_input_mask\":0,\"position_output_mask\":0,\"color_output_mask\":15,"
+        "\"color_outputs\":[{\"location\":0,\"component_mask\":15,\"scalar\":\"f32\",\"components\":4}],"
+        "\"writes_fragment_depth\":false,\"writes_sample_mask\":false,\"generic_inputs\":[],"
+        "\"generic_outputs\":[]},\"dependencies\":[{\"kind\":\"fragment_output_type\",\"index\":0,"
+        "\"byte_offset\":0,\"component\":0,\"origin\":\"derived\",\"value\":{\"scalar\":\"f32\","
+        "\"components\":4}}]}\n";
+    write(directory / "program.bin", program);
+    write(directory / "source.metal", source);
+    write(directory / "reflection.json", metadata);
+    return directory;
+}
+
+std::string atomic_storage_image(const char* scalar, const char* component, const char* atomic) {
+    std::string json =
+        "[{\"cbuf_slot\":3,\"handle_byte_offset\":0,\"kind\":\"texture\",\"dimension\":\"d2\","
+        "\"array\":false,\"multisample\":false,\"scalar\":\"";
+    json += scalar;
+    json += "\",\"component_format\":\"";
+    json += component;
+    json += "\",\"normalized_coordinates\":false,\"comparison\":false,\"resource_id\":0,"
+            "\"array_length\":1,\"location\":{\"kind\":\"direct\",\"namespace\":\"texture\","
+            "\"first\":0,\"count\":1},\"resource_kind\":\"storage_image\",\"access\":\"read_write\"";
+    if (atomic) {
+        json += ",\"atomic\":";
+        json += atomic;
+    }
+    json += "}]";
+    return json;
+}
+
+std::string packaged_reflection(const fs::path& output) {
+    for (const auto& entry : fs::recursive_directory_iterator(output)) {
+        if (entry.path().filename() == "reflection.json") return read(entry.path());
+    }
+    return {};
+}
+
+void test_atomic_image_packages(Fixture& fixture) {
+    const auto accept = [&](std::string_view name, std::string_view textures, bool key) {
+        const fs::path stage = write_atomic_fragment(fixture, name, textures);
+        auto options = fixture.options(std::string(name) + "-out");
+        options.stages = {stage};
+        const auto built = package::build(options);
+        if (const auto* error = std::get_if<std::string>(&built))
+            std::printf("atomic package %s: %s\n", std::string(name).c_str(), error->c_str());
+        CHECK(std::holds_alternative<package::BuildReport>(built));
+        if (!std::holds_alternative<package::BuildReport>(built)) return;
+        const std::string packaged = packaged_reflection(options.output);
+        const bool present = packaged.find("\"atomic\":true") != std::string::npos ||
+                             packaged.find("\"atomic\": true") != std::string::npos;
+        CHECK(present == key);
+        if (!key) CHECK(packaged.find("\"atomic\"") == std::string::npos);
+    };
+    accept("atomic-u32", atomic_storage_image("u32", "unsigned_integer", "true"), true);
+    accept("atomic-s32", atomic_storage_image("s32", "signed_integer", "true"), true);
+    accept("atomic-absent", atomic_storage_image("u32", "unsigned_integer", nullptr), false);
+    expect_package_refusal(fixture,
+                           write_atomic_fragment(fixture, "atomic-sampled",
+                               "[{\"cbuf_slot\":3,\"handle_byte_offset\":0,\"kind\":\"texture\","
+                               "\"dimension\":\"d2\",\"array\":false,\"multisample\":false,"
+                               "\"scalar\":\"f32\",\"component_format\":\"floating\","
+                               "\"normalized_coordinates\":true,\"comparison\":false,\"resource_id\":0,"
+                               "\"array_length\":1,\"location\":{\"kind\":\"direct\","
+                               "\"namespace\":\"texture\",\"first\":0,\"count\":1},"
+                               "\"resource_kind\":\"sampled\",\"access\":\"read\",\"atomic\":true}]"),
+                           "atomic-sampled-out", "texture atomic flag is invalid");
+    expect_package_refusal(fixture,
+                           write_atomic_fragment(fixture, "atomic-float",
+                               atomic_storage_image("f32", "floating", "true")),
+                           "atomic-float-out", "texture atomic flag is invalid");
+    expect_package_refusal(fixture,
+                           write_atomic_fragment(fixture, "atomic-false",
+                               atomic_storage_image("u32", "unsigned_integer", "false")),
+                           "atomic-false-out", "texture atomic flag is invalid");
+}
+
+
+void test_texture_pool_packages(Fixture& fixture) {
+    const auto accept = [&](std::string_view name, std::string_view textures, bool expect_cbuf) {
+        const fs::path stage = write_pool_fragment(fixture, name, true, textures);
+        auto options = fixture.options(std::string(name) + "-out");
+        options.stages = {stage};
+        const auto built = package::build(options);
+        if (const auto* error = std::get_if<std::string>(&built))
+            std::printf("pool build %s: %s\n", std::string(name).c_str(), error->c_str());
+        CHECK(std::holds_alternative<package::BuildReport>(built));
+        if (!std::holds_alternative<package::BuildReport>(built)) return;
+        std::string packaged;
+        for (const auto& entry : fs::recursive_directory_iterator(options.output)) {
+            if (entry.path().filename() == "reflection.json") packaged = read(entry.path());
+        }
+        CHECK(packaged.find("\"kind\":\"texture_pool\"") != std::string::npos);
+        CHECK(packaged.find("\"kind\":\"sampler_pool\"") != std::string::npos);
+        CHECK((packaged.find("\"cbuf_slot\"") != std::string::npos) == expect_cbuf);
+    };
+    accept("pools-bare",
+           texture_pool_record(false, 30, 2) + "," + sampler_pool_record(false, false, 3, 1), false);
+    expect_package_refusal(
+        fixture,
+        write_pool_fragment(fixture, "pools-keyed", true,
+                            texture_pool_record(true, 30, 2) + "," + sampler_pool_record(true, true, 3, 1)),
+        "pools-keyed-out", "do not carry constant-buffer keys");
+    expect_package_refusal(
+        fixture,
+        write_pool_fragment(fixture, "pools-sampler-state", true,
+                            texture_pool_record(false, 30, 2) + "," + sampler_pool_record(false, true, 3, 1)),
+        "pools-sampler-state-out", "do not carry sampler state");
+
+    const std::string bare =
+        texture_pool_record(false, 30, 2) + "," + sampler_pool_record(false, false, 3, 1);
+    expect_package_refusal(
+        fixture,
+        write_pool_fragment(fixture, "pools-two-samplers", true,
+                            bare + "," + sampler_pool_record(false, false, 4, 2)),
+        "pools-two-samplers-out", "one sampler pool");
+    expect_package_refusal(
+        fixture,
+        write_pool_fragment(fixture, "pools-bad-slot", true,
+                            texture_pool_record(true, 17, 2) + "," + sampler_pool_record(true, true, 3, 1)),
+        "pools-bad-slot-out", "do not carry constant-buffer keys");
+    expect_package_refusal(
+        fixture,
+        write_pool_fragment(fixture, "pools-texture-slot-30", true,
+                            "{\"cbuf_slot\":30,\"handle_byte_offset\":0,\"kind\":\"texture\","
+                            "\"dimension\":\"d2\",\"array\":false,\"multisample\":false,\"scalar\":\"f32\","
+                            "\"component_format\":\"floating\",\"normalized_coordinates\":true,"
+                            "\"comparison\":false,\"resource_kind\":\"sampled\",\"access\":\"read\","
+                            "\"resource_id\":0,\"array_length\":1,\"location\":{\"kind\":\"direct\","
+                            "\"namespace\":\"texture\",\"first\":0,\"count\":1}}"),
+        "pools-texture-slot-30-out", "texture provenance reflection is invalid");
+    expect_package_refusal(
+        fixture, write_pool_fragment(fixture, "pools-v2", false, "{\"kind\":\"texture_pool\"}"),
+        "pools-v2-out", "texture kind is unsupported");
 }
 
 void test_handle_program_packages(Fixture& fixture) {
@@ -440,8 +696,8 @@ void test_sample_hoisting_manifest(Fixture& fixture) {
         return start == std::string::npos ? std::string() : manifest.substr(start + marker.size(), 64);
     };
     // The field is outside the profile, so both packages keep the chain the plain profile always had.
-    CHECK(chain_of(plain_manifest) == "239cb9f212404965aa640e5ab22406012d8777a211ccada708cac17be5afabcf");
-    CHECK(chain_of(hoisted_manifest) == "239cb9f212404965aa640e5ab22406012d8777a211ccada708cac17be5afabcf");
+    CHECK(chain_of(plain_manifest) == "2d3cc7397abf703610a7067e9da8fe06f66b6e451a8d90908907018d045705d6");
+    CHECK(chain_of(hoisted_manifest) == "2d3cc7397abf703610a7067e9da8fe06f66b6e451a8d90908907018d045705d6");
 }
 
 void test_failures(Fixture& fixture) {
@@ -491,9 +747,11 @@ int main() {
     {
         Fixture fixture;
         test_handle_program_packages(fixture);
+        test_atomic_image_packages(fixture);
     }
     {
         Fixture fixture;
+        test_texture_pool_packages(fixture);
         test_sample_hoisting_manifest(fixture);
     }
     if (failures != 0) {

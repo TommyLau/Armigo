@@ -565,7 +565,8 @@ void test_ensure_save_data() {
     put(expected, 44, 0x21f9610e);
     CHECK(std::equal(expected.begin(), expected.begin() + 56, f.message.begin()));
     CHECK(f.session->diagnostic() == nullptr);
-    // The UID is required, and the zero UID names no user.
+    // The UID is required. A zero UID skips only the user save, so it also
+    // succeeds with no space required.
     f.message = proxy_getter(functions, 20);
     put(f.message, 16, 0x00100001);
     f.expect_unsupported();
@@ -573,7 +574,9 @@ void test_ensure_save_data() {
     put(f.message, 16, 0x00200001);
     put(f.message, 4, 16);
     for (const std::size_t offset : {48, 52, 56, 60}) put(f.message, offset, 0);
-    f.expect_unsupported();
+    CHECK(f.send() == IpcDisposition::handled);
+    CHECK(std::equal(expected.begin(), expected.begin() + 56, f.message.begin()));
+    CHECK(f.session->diagnostic() == nullptr);
     f.session.reset();
     CHECK(f.handles.close(f.handle));
 }
@@ -710,15 +713,18 @@ void test_preselected_user_launch_parameter() {
 
     f.message = proxy_getter(storage, 0);
     CHECK(f.send() == IpcDisposition::handled && get(f.message, 16) == 1);
+    CHECK(get(f.message, 44) == 0x8e211f3d);   // IStorage's interface word.
     const auto accessor = static_cast<std::uint32_t>(get(f.message, 48));
     f.message = proxy_getter(accessor, 0);
     CHECK(f.send() == IpcDisposition::handled && get(f.message, 48, 8) == 0x88);
+    CHECK(get(f.message, 44) == 0x919f469a);   // IStorageAccessor's interface word.
 
     StorageMemory memory;
     GuestBuffers buffers(StorageMemory::read, StorageMemory::write, &memory);
     buffers.add({0x10, 0x88, false, true});
     auto read = f.session->request_with_buffers(storage_read(accessor, 0), 71, buffers);
     CHECK(read.disposition == IpcDisposition::handled && read.size == 48);
+    CHECK(get(read.bytes, 44) == 0x919f469a);
     CHECK(get(memory.bytes, 0x10) == 0xc79497ca && memory.bytes[0x14] == std::byte{1});
     CHECK(std::equal(uid.begin(), uid.end(), memory.bytes.begin() + 0x18));
     CHECK(memory.bytes[0x10 + 0x87] == std::byte{0});
@@ -787,8 +793,8 @@ void test_network_connection_applet() {
     for (unsigned i = 0; i < 8; ++i) memory.bytes[0x20 + i] = static_cast<std::byte>(0x40 + i);
     GuestBuffers input(StorageMemory::read, StorageMemory::write, &memory);
     input.add({0x20, 8, true, false});
-    CHECK(f.session->request_with_buffers(storage_write(accessor, 4), 71, input).disposition ==
-          IpcDisposition::handled);
+    const auto written = f.session->request_with_buffers(storage_write(accessor, 4), 71, input);
+    CHECK(written.disposition == IpcDisposition::handled && get(written.bytes, 44) == 0x919f469a);
     CHECK(f.session->request_with_buffers(storage_write(accessor, 12), 71, input).disposition ==
           IpcDisposition::unsupported);
     GuestBuffers back(StorageMemory::read, StorageMemory::write, &memory);

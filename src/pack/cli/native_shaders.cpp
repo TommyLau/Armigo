@@ -17,6 +17,7 @@
 #include <armigo/platform/metal_shader_package.h>
 #include <armigo/shader/graphics_msl.h>
 #include <armigo/shader/package.h>
+#include <armigo/shader_native/package.h>
 #include <armigo/shader_input/shader_input.h>
 #include <armigo/shader_native/frontend.h>
 #include <armigo/shader_native/input.h>
@@ -62,6 +63,9 @@ namespace gm = armigo::shader::graphics_msl;
 namespace ld = armigo::loader;
 
 constexpr auto command_timeout = std::chrono::seconds(60);
+// A compile of a large stage (a mesh stage's MSL runs to megabytes) can take
+// minutes; the limit only guards against a hung compiler.
+constexpr auto compile_timeout = std::chrono::minutes(20);
 constexpr std::size_t translation_stack_bytes = 64u << 20;
 constexpr std::size_t maximum_library_size = 64u * 1024u * 1024u;
 constexpr std::uint64_t maximum_copied_bytes = 8ull << 30;
@@ -69,9 +73,10 @@ constexpr std::uint64_t maximum_copied_bytes = 8ull << 30;
 // errors. Movie stages compare a value with itself; -Werror turns that into
 // a failed library. -fpreserve-invariance matches a vertex position marked
 // invariant, and does nothing for a stage that carries no such mark.
-constexpr std::array<std::string_view, 5> compile_flags{
-    "-std=metal4.0", "-mmacosx-version-min=26.0", "-fpreserve-invariance",
-    "-Wno-unused-variable", "-Wno-sometimes-uninitialized"};
+// -fbracket-depth raises the front end's nested-bracket limit.
+constexpr std::array<std::string_view, 7> compile_flags{
+    "-std=metal4.0", "-mmacosx-version-min=26.0", "-fwrapv", "-fpreserve-invariance",
+    "-Wno-unused-variable", "-Wno-sometimes-uninitialized", "-fbracket-depth=1024"};
 
 struct Failure : std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -110,7 +115,8 @@ void read_pipe(int descriptor, std::string& output) {
     ::close(descriptor);
 }
 
-ProcessResult run_process(const std::vector<std::string>& arguments, bool c_locale) {
+ProcessResult run_process(const std::vector<std::string>& arguments, bool c_locale,
+                          std::chrono::steady_clock::duration timeout = command_timeout) {
     if (arguments.empty()) throw Failure("Cannot execute an empty shader tool command");
     int output_pipe[2] = {-1, -1};
     int error_pipe[2] = {-1, -1};
@@ -152,7 +158,7 @@ ProcessResult run_process(const std::vector<std::string>& arguments, bool c_loca
     ProcessResult result;
     std::thread output_reader(read_pipe, output_pipe[0], std::ref(result.output));
     std::thread error_reader(read_pipe, error_pipe[0], std::ref(result.error));
-    const auto deadline = std::chrono::steady_clock::now() + command_timeout;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     int status = 0;
     for (;;) {
         const pid_t waited = ::waitpid(pid, &status, WNOHANG);
@@ -182,7 +188,7 @@ std::string query(const std::vector<std::string>& arguments) {
 }
 
 void run_apple_tool(const std::vector<std::string>& arguments) {
-    const ProcessResult result = run_process(arguments, true);
+    const ProcessResult result = run_process(arguments, true, compile_timeout);
     if (result.timed_out) throw Failure("Apple shader tool timed out");
     if (result.status != 0) throw Failure("Apple shader tool failed: " + trim(result.error).substr(0, 4096));
 }
@@ -415,6 +421,13 @@ struct BuildShared {
     std::vector<std::string> compute_identities;
     // Translate and count diagnostics. Do not compile or store a library.
     bool translate_only = false;
+    // Where translated Metal sources are also written, when set.
+    std::optional<fs::path> source_directory;
+    // The largest Metal source a stage may have (the package's limit for its
+    // file policy unless a request overrides it).
+    std::size_t maximum_source_bytes = sn::maximum_native_source_bytes;
+    // Sources are written next to their libraries (bounded by the file policy).
+    bool keep_sources = true;
 
     void fail(std::string text) {
         const std::lock_guard lock(error_mutex);
@@ -454,7 +467,8 @@ const char* depth_label(sn::NativeDepth depth) {
 
 // clip_depth: a vertex or mesh stage writes clip position in one depth convention.
 bool translate_depth(const sn::Program& program, sn::NativeDepth depth, bool clip_depth, WorkerStats& stats, sn::NativeStageWrite& stage,
-                     const fs::path& work, const std::optional<fs::path>& cache, bool compile) {
+                     const fs::path& work, const std::optional<fs::path>& cache, bool compile,
+                     const std::optional<fs::path>& source_directory, std::size_t maximum_source_bytes) {
     sn::FrontendOptions options;
     options.pixel_rate = sn::PixelRateState::disabled;
     options.vertex_fetch = false;
@@ -478,8 +492,22 @@ bool translate_depth(const sn::Program& program, sn::NativeDepth depth, bool cli
                       << diagnostic->message << '\n';
         return false;
     }
-    if (!compile) return true;
     const auto& artifact = std::get<pl::MslArtifact>(translated);
+    if (source_directory) {
+        std::error_code ignored;
+        fs::create_directories(*source_directory, ignored);
+        std::ofstream(*source_directory / (program.stage_identity + '-' + depth_label(depth) + ".metal"), std::ios::binary)
+            << artifact.source;
+    }
+    // A source the package cannot record is left to run-time translation. A
+    // translation census counts it too, so its totals match a package build.
+    if (artifact.source.size() > maximum_source_bytes) {
+        ++stats.refusals["source-size"];
+        std::cerr << "Native shader source-size " << program.stage_identity << ' ' << stage_name(program.stage) << ' '
+                  << artifact.source.size() << " bytes\n";
+        return false;
+    }
+    if (!compile) return true;
     const auto launch = armigo::platform::metal::native_mesh_launch(program);
     if ((program.stage == sn::Stage::task || program.stage == sn::Stage::mesh) && !launch) {
         ++stats.refusals["stage-rejected"];
@@ -553,12 +581,14 @@ void translate_program(BuildShared& shared, std::size_t index, unsigned worker, 
     const bool compile = !shared.translate_only;
     if (clip_depth) {
         for (const sn::NativeDepth depth : {sn::NativeDepth::minus_one_to_one, sn::NativeDepth::zero_to_one}) {
-            produced = translate_depth(program, depth, true, stats, stage, work, shared.cache, compile) || produced;
+            produced = translate_depth(program, depth, true, stats, stage, work, shared.cache, compile, shared.source_directory,
+                                       shared.maximum_source_bytes) || produced;
             attempts = shared.attempts.fetch_add(1) + 1;
             note_progress(shared, attempts);
         }
     } else {
-        produced = translate_depth(program, sn::NativeDepth::stage, false, stats, stage, work, shared.cache, compile);
+        produced = translate_depth(program, sn::NativeDepth::stage, false, stats, stage, work, shared.cache, compile,
+                                   shared.source_directory, shared.maximum_source_bytes);
         attempts = shared.attempts.fetch_add(1) + 1;
         note_progress(shared, attempts);
     }
@@ -646,22 +676,11 @@ struct ArchiveSource {
 };
 
 std::string choose_dictionary(const std::map<std::string, std::uint32_t>& romfs, const std::string& requested) {
-    if (!requested.empty()) {
-        if (!romfs.contains(requested)) throw sn::InputError("Dictionary archive member was not selected");
-        return requested;
-    }
-    constexpr std::string_view preferred = "Pack/ZsDic.pack.zs";
-    if (romfs.contains(std::string(preferred))) return std::string(preferred);
-    const auto slash = preferred.rfind('/');
-    const std::string_view suffix = preferred.substr(slash == std::string_view::npos ? 0 : slash + 1);
-    std::vector<std::string> matches;
-    for (const auto& [name, id] : romfs) {
-        static_cast<void>(id);
-        if (name.size() >= suffix.size() && name.ends_with(suffix)) matches.push_back(name);
-    }
-    if (matches.size() > 1) throw sn::InputError("More than one dictionary archive member was selected");
-    if (matches.size() == 1) return matches.front();
-    return {};
+    // The title's settings (or the caller) name the dictionary member; none
+    // reads the archive without dictionaries.
+    if (requested.empty()) return {};
+    if (!romfs.contains(requested)) throw sn::InputError("Dictionary archive member was not selected");
+    return requested;
 }
 
 bool member_selected(const std::string& path, const std::vector<std::string>& members, std::vector<char>& matched) {
@@ -801,6 +820,7 @@ std::variant<std::string, NativeShaderReport> build_native_shader_package(const 
                 std::cerr << "Native shader member inventory records " << (after.records - before.records)
                           << " bnsh " << (after.bnsh - before.bnsh)
                           << " bahs " << (after.bahs - before.bahs)
+                          << " nested " << (after.nested_candidates - before.nested_candidates)
                           << " unrecognized " << (after.unrecognized_spans - before.unrecognized_spans)
                           << " bytes " << bytes.size() << '\n';
             } catch (const sn::InputError& error) {
@@ -837,6 +857,10 @@ std::variant<std::string, NativeShaderReport> build_native_shader_package(const 
         shared.work_root = request.output / "native" / ".work";
         shared.total = programs.size();
         shared.translate_only = request.translate_only;
+        shared.source_directory = request.source_directory;
+        shared.keep_sources = request.keep_sources;
+        shared.maximum_source_bytes = request.maximum_source_bytes.value_or(
+            request.keep_sources ? sn::maximum_native_source_bytes : sn::maximum_unstored_source_bytes);
         std::vector<pthread_t> threads(workers);
         std::vector<WorkerStart> starts(workers);
         pthread_attr_t attributes;

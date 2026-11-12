@@ -10,10 +10,12 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -75,6 +77,13 @@ struct NativeSection {
     std::vector<NativeEntry> entries;
 };
 
+// The largest Metal source a native variant may store as source.metal; add()
+// refuses more when it writes sources.
+inline constexpr std::size_t maximum_native_source_bytes = 4 * 1024 * 1024;
+// A variant that stores no source.metal records only the source's digest and
+// size; that size is bounded like a library.
+inline constexpr std::size_t maximum_unstored_source_bytes = 64 * 1024 * 1024;
+
 struct NativeVariantWrite {
     NativeDepth depth = NativeDepth::stage;
     std::vector<std::byte> reflection;
@@ -96,6 +105,18 @@ struct NativeLookup {
     bool vertex_depth_zero_to_one = false;
     bool fragment_position_matches = true;
 };
+
+// Run-time stage identity: `<stage number>.<program sha256>.<suffix>`.
+// 0 vertex, 1 fragment, 3 task, 4 mesh, 5 compute. A vertex or mesh suffix is
+// 1 (zero-to-one) or 2 (minus-one-to-one). Any other stage number, or any
+// other vertex or mesh suffix, is not this text.
+struct RuntimeStageIdentity {
+    NativeStageKind stage = NativeStageKind::fragment;
+    std::string program_digest;
+    bool vertex_depth_zero_to_one = false;
+};
+
+std::optional<RuntimeStageIdentity> parse_runtime_stage_identity(std::string_view text);
 
 struct NativeStageFiles {
     std::vector<std::byte> program;
@@ -136,6 +157,9 @@ class NativePackage {
 public:
     static std::variant<std::string, NativePackage> open(const std::filesystem::path& package_root);
     std::variant<NativeStageFiles, NativeMiss> find(std::string_view stage_identity, const NativeLookup& lookup) const;
+    // The packaged stage identity for a program image of this stage kind.
+    // The index is built on the first call from the opened section.
+    std::optional<std::string> identity_for_program(std::string_view program_digest_hex, NativeStageKind stage) const;
     const NativeSection& section() const;
 
     NativePackage(NativePackage&&) noexcept;

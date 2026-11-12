@@ -415,11 +415,11 @@ void test_timestamp_reports_across_heap_pages(id<MTLDevice> device,
   }
 }
 
-// Exceeding the bounded storage must report an allocation failure, preserve
-// the submitted prefix, and leave the rejected report and following work alone.
+// Exceeding bounded storage is fatal. The submitted prefix still drains while
+// the rejected report and following work remain untouched.
 void test_timestamp_report_limit(id<MTLDevice> device,
                                  id<MTL4CommandQueue> queue) {
-  constexpr std::size_t limit = 4096;
+  constexpr std::size_t limit = 24 * 1024;
   SharedResources resources(device, 64);
   std::memset(resources.memory.contents, 0, resources.memory.length);
   auto backend = replay::create_replay_backend(device, queue, resources);
@@ -438,15 +438,59 @@ void test_timestamp_report_limit(id<MTLDevice> device,
   handles.push_back(rejected);
   const auto fence = backend->submit(handles);
   CHECK(fence != 0);
-  CHECK(backend->wait_fence(fence, 10'000'000'000ull));
+  static_cast<void>(backend->wait_fence(fence, 10'000'000'000ull));
+  CHECK(backend->fatal_error_detail().find("24576") != std::string::npos);
+  CHECK(backend->stop_submission_workers(std::chrono::steady_clock::now() +
+                                         std::chrono::seconds(5)));
   const auto error = backend->last_error();
   CHECK(error.code == replay::ReplayErrorCode::allocation);
-  CHECK(error.detail.find("4096") != std::string::npos);
+  CHECK(error.detail.find("24576") != std::string::npos);
   CHECK(read_at<NVNcounterData>(resources, 0).timestamp != 0);
   CHECK(read_at<NVNcounterData>(resources, 16).timestamp == 0);
   CHECK(read_at<std::uint32_t>(resources, 32) == 0);
   recorder.release(prefix);
   recorder.release(rejected);
+  recorder.finalize();
+}
+
+// Timestamp heaps are one pool: with sixteen submission slots a submission
+// of 1,500 reports (more than one heap) completes, and sixteen gated
+// submissions of 2,048 reports each (32 heaps against a pool of 24) all
+// complete: the later ones wait for earlier ones to return their heaps
+// instead of being abandoned.
+void test_timestamp_heap_pool(id<MTLDevice> device, id<MTL4CommandQueue> queue) {
+  struct RestoreEnv {
+    ~RestoreEnv() { unsetenv("ARMIGO_NVN_SUBMISSION_SLOTS"); }
+  } restore_env;
+  setenv("ARMIGO_NVN_SUBMISSION_SLOTS", "16", 1);
+  SharedResources resources(device, 64);
+  std::memset(resources.memory.contents, 0, resources.memory.length);
+  auto backend = replay::create_replay_backend(device, queue, resources);
+  Recorder recorder;
+  load<Entry::nvnCommandBufferBeginRecording>()(&recorder.commands);
+  load<Entry::nvnCommandBufferReportCounter>()(
+      &recorder.commands, NVN_COUNTER_TYPE_TIMESTAMP, SharedResources::base);
+  const auto report = recorder.finish();
+  {
+    std::vector<NVNcommandHandle> handles(1500, report);
+    const auto fence = backend->submit(handles);
+    CHECK(fence != 0 && backend->wait_fence(fence, 10'000'000'000ull));
+    CHECK(!backend->last_error());
+    CHECK(read_at<NVNcounterData>(resources, 0).timestamp != 0);
+  }
+  id<MTLSharedEvent> gate = [device newSharedEvent];
+  [queue waitForEvent:gate value:1];
+  std::vector<NVNcommandHandle> handles(2048, report);
+  std::uint64_t last = 0;
+  for (int submission = 0; submission != 16; ++submission) {
+    last = backend->submit(handles);
+    CHECK(last != 0);
+  }
+  gate.signaledValue = 1;
+  CHECK(backend->wait_fence(last, 30'000'000'000ull));
+  CHECK(!backend->last_error());
+  CHECK(backend->statistics().skipped == 0);
+  recorder.release(report);
   recorder.finalize();
 }
 
@@ -811,6 +855,7 @@ int main() {
       test_six_inflight_submissions(device, queue);
       test_timestamp_reports_across_heap_pages(device, queue);
       test_timestamp_report_limit(device, queue);
+      test_timestamp_heap_pool(device, queue);
       test_feedback_during_encoder_split(device, queue);
       test_report_value_precedes_gpu_copy(device, queue);
       test_event_orders_gpu_work_in_one_stream(device, queue);

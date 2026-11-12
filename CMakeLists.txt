@@ -81,6 +81,8 @@ armigo_find_framework(ARMIGO_METAL_FRAMEWORK Metal)
 armigo_find_framework(ARMIGO_SECURITY_FRAMEWORK Security)
 armigo_find_framework(ARMIGO_COREFOUNDATION_FRAMEWORK CoreFoundation)
 
+include(cmake/RuntimeDependencies.cmake)
+
 add_subdirectory(src/common)
 link_libraries(armigo_diagnostics)
 
@@ -265,7 +267,8 @@ target_link_libraries(armigo_metal_engine_renderer PUBLIC armigo_metal_renderer
     armigo_metal_compute_dispatch armigo_metal_draw armigo_metal_color_clear armigo_metal_twod_blit
     PRIVATE "${ARMIGO_FOUNDATION_FRAMEWORK}" "${ARMIGO_METAL_FRAMEWORK}")
 
-add_library(armigo_host_memory STATIC src/platform/host_module.cpp src/platform/process_memory.cpp)
+add_library(armigo_host_memory STATIC src/platform/host_module.cpp src/platform/process_memory.cpp
+    src/platform/host_limits.cpp)
 
 target_include_directories(armigo_host_memory PUBLIC include)
 
@@ -374,16 +377,9 @@ target_link_libraries(armigo_services_audout PUBLIC armigo_horizon Threads::Thre
 add_library(armigo_services_hwopus STATIC src/services/hardware_opus.cpp)
 target_include_directories(armigo_services_hwopus PUBLIC include)
 target_link_libraries(armigo_services_hwopus PUBLIC armigo_horizon)
-# Opus decoding links the static libopus the way Zstandard is linked; without
-# it decoders fail to open with an explicit diagnostic.
-find_path(ARMIGO_OPUS_INCLUDE_DIR opus/opus.h)
-find_library(ARMIGO_OPUS_LIBRARY NAMES libopus.a)
-if(ARMIGO_OPUS_INCLUDE_DIR AND ARMIGO_OPUS_LIBRARY)
-    target_include_directories(armigo_services_hwopus PRIVATE "${ARMIGO_OPUS_INCLUDE_DIR}")
-    target_link_libraries(armigo_services_hwopus PRIVATE "${ARMIGO_OPUS_LIBRARY}")
+if(TARGET armigo_opus)
+    target_link_libraries(armigo_services_hwopus PRIVATE armigo_opus)
     target_compile_definitions(armigo_services_hwopus PRIVATE ARMIGO_HAS_OPUS=1)
-else()
-    message(STATUS "Opus decoding disabled: static libopus unavailable")
 endif()
 add_library(armigo_services_audio_user STATIC src/services/audio_user.cpp)
 target_include_directories(armigo_services_audio_user PUBLIC include)
@@ -558,10 +554,10 @@ add_library(armigo_runner_shell STATIC
     tools/windowed/frame_rate_controller.cpp
     tools/windowed/player_settings.cpp
     tools/windowed/player_choices.mm)
-target_include_directories(armigo_runner_shell PUBLIC tools/headless tools/windowed)
+target_include_directories(armigo_runner_shell PUBLIC tools/headless tools/windowed PRIVATE src/nvn)
 target_link_libraries(armigo_runner_shell
     PUBLIC armigo_runtime armigo_platform_presenter
-    PRIVATE armigo_platform_application armigo_services_file_system "${ARMIGO_FOUNDATION_FRAMEWORK}")
+    PRIVATE armigo_nvn armigo_platform_application armigo_services_file_system "${ARMIGO_FOUNDATION_FRAMEWORK}")
 
 # Lane I: windowed runner application on the AppKit main thread.
 # It is an application bundle so macOS classifies it as a game (Game Mode) from
@@ -584,7 +580,7 @@ if(ARMIGO_IOS)
         target_link_options(armigo-ios-player PRIVATE "LINKER:-U,_armigo_linked_embedded_bundle")
     endif()
 else()
-    add_executable(armigo MACOSX_BUNDLE tools/windowed/main.mm tools/windowed/player_frame_rate_menu.mm)
+    add_executable(armigo MACOSX_BUNDLE tools/windowed/main.mm tools/windowed/player_frame_rate_menu.mm tools/windowed/player_language_menu.mm tools/windowed/player_overlay_setting.mm)
     target_link_libraries(armigo PRIVATE armigo_runner_shell)
     set_target_properties(armigo PROPERTIES
         OUTPUT_NAME Armigo
@@ -623,6 +619,13 @@ if(BUILD_TESTING)
     target_include_directories(armigo_process_runtime_tests PRIVATE tests/loader src/loader)
     target_link_libraries(armigo_process_runtime_tests PRIVATE armigo_runtime armigo_runner_shell)
     add_test(NAME runtime.process_runtime COMMAND armigo_process_runtime_tests)
+    add_executable(armigo_frame_capture_tests tests/runtime/frame_capture_tests.cpp)
+    target_include_directories(armigo_frame_capture_tests PRIVATE src/runtime)
+    target_link_libraries(armigo_frame_capture_tests PRIVATE armigo_graphics)
+    add_test(NAME runtime.frame_capture_encoding COMMAND armigo_frame_capture_tests)
+    add_test(NAME runtime.capture_policy_default COMMAND armigo_process_runtime_tests --capture-policy)
+    add_test(NAME runtime.capture_policy_invalid COMMAND armigo_process_runtime_tests --capture-policy invalid)
+    add_test(NAME runtime.capture_policy_inverted COMMAND armigo_process_runtime_tests --capture-policy 9-2)
     add_executable(armigo_runtime_addon_content_tests tests/runtime/addon_content_tests.cpp)
     target_link_libraries(armigo_runtime_addon_content_tests PRIVATE armigo_runtime)
     add_test(NAME runtime.addon_content COMMAND armigo_runtime_addon_content_tests)
@@ -654,6 +657,7 @@ if(BUILD_TESTING)
 
     add_executable(armigo_guest_memory_failure_tests tests/runtime/guest_memory_failure_tests.cpp)
     target_link_libraries(armigo_guest_memory_failure_tests PRIVATE armigo_runtime)
+    target_include_directories(armigo_guest_memory_failure_tests PRIVATE src/platform)
     add_test(NAME runtime.guest_memory_failures COMMAND armigo_guest_memory_failure_tests)
 
     add_executable(armigo_guest_memory_concurrency_tests tests/runtime/guest_memory_concurrency_tests.cpp)
@@ -872,8 +876,8 @@ if(BUILD_TESTING)
 
     add_executable(armigo_hwopus_tests tests/services/hardware_opus_tests.cpp)
     target_link_libraries(armigo_hwopus_tests PRIVATE armigo_services_hwopus)
-    if(ARMIGO_OPUS_INCLUDE_DIR AND ARMIGO_OPUS_LIBRARY)
-        target_include_directories(armigo_hwopus_tests PRIVATE "${ARMIGO_OPUS_INCLUDE_DIR}")
+    if(TARGET armigo_opus)
+        target_link_libraries(armigo_hwopus_tests PRIVATE armigo_opus)
         target_compile_definitions(armigo_hwopus_tests PRIVATE ARMIGO_HAS_OPUS=1)
     endif()
     add_test(NAME services.hwopus COMMAND armigo_hwopus_tests)
@@ -1011,6 +1015,11 @@ if(BUILD_TESTING)
     add_test(NAME runtime.module_set COMMAND armigo_module_set_tests)
     set_tests_properties(runtime.module_set PROPERTIES LABELS "execution;arm64" TIMEOUT 30)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    if(TARGET armigo_shader_ios_package_tests)
+        target_compile_definitions(armigo_shader_ios_package_tests PRIVATE
+            ARMIGO_TEST_PYTHON="${Python3_EXECUTABLE}"
+            ARMIGO_IOS_CHAIN_PARITY_SCRIPT="${CMAKE_SOURCE_DIR}/tests/tools/ios_shader_chain_parity.py")
+    endif()
     add_test(NAME shader_input.extract
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/tools/shader_extract_tests.py"
             "$<TARGET_FILE:armigo-shader-extract>")
@@ -1020,6 +1029,11 @@ if(BUILD_TESTING)
         target_link_libraries(armigo_player_frame_rate_menu_tests PRIVATE armigo_runner_shell "${ARMIGO_UI_FRAMEWORK}")
         add_test(NAME tools.player_frame_rate_menu COMMAND armigo_player_frame_rate_menu_tests)
         set_tests_properties(tools.player_frame_rate_menu PROPERTIES LABELS "tools" TIMEOUT 30)
+        add_executable(armigo_player_overlay_setting_tests tests/tools/player_overlay_setting_tests.mm
+            tools/windowed/player_overlay_setting.mm)
+        target_link_libraries(armigo_player_overlay_setting_tests PRIVATE armigo_runner_shell "${ARMIGO_UI_FRAMEWORK}")
+        add_test(NAME tools.player_overlay_setting COMMAND armigo_player_overlay_setting_tests)
+        set_tests_properties(tools.player_overlay_setting PROPERTIES LABELS "tools" TIMEOUT 30)
         add_executable(armigo_player_choices_probe tests/tools/player_choices_probe.cpp)
         target_link_libraries(armigo_player_choices_probe PRIVATE armigo_runner_shell)
         add_test(NAME runtime.player_choices
@@ -1066,8 +1080,15 @@ if(BUILD_TESTING)
     add_test(NAME tools.timeline_summary
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/tools/timeline_summary_tests.py")
     set_tests_properties(tools.timeline_summary PROPERTIES LABELS "tools" TIMEOUT 30)
+    add_test(NAME tools.player_save_migration
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/tools/player_save_migration_tests.py")
+    set_tests_properties(tools.player_save_migration PROPERTIES LABELS "tools;saves" TIMEOUT 30)
     add_test(NAME repository.privacy_policy
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/tools/repository_policy_tests.py")
+    add_test(NAME build.native_source_identity
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/tools/native_source_identity_tests.py")
+    set_tests_properties(build.native_source_identity PROPERTIES LABELS "build;shader" TIMEOUT 240
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
     add_test(NAME build.optional_metal_tools
         COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_SOURCE_DIR}/tests/tools/optional_metal_tools_build_tests.py")
@@ -1114,6 +1135,9 @@ if(BUILD_TESTING)
             "$<TARGET_FILE:armigo-headless>" "$<TARGET_FILE:armigo>")
     set_tests_properties(tools.runtime_launch_cli PROPERTIES LABELS "tools" TIMEOUT 90)
     if(ARMIGO_ENABLE_GPU_TESTS)
+        add_test(NAME shader.signed_overflow_gpu
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/tools/shader_signed_overflow_tests.py")
+        set_tests_properties(shader.signed_overflow_gpu PROPERTIES LABELS "shader;gpu;metal4" TIMEOUT 60)
         add_executable(armigo_metal_engine_pipeline_tests tests/metal/engine_pipeline_tests.mm)
         target_include_directories(armigo_metal_engine_pipeline_tests PRIVATE src)
         target_link_libraries(armigo_metal_engine_pipeline_tests PRIVATE armigo_metal_engine_renderer)
@@ -1240,6 +1264,16 @@ if(BUILD_TESTING)
             COMMAND armigo_metal_fragment_depth_gpu_tests)
         set_tests_properties(graphics.metal4_fragment_depth
             PROPERTIES LABELS "gpu;metal4;graphics;shader" TIMEOUT 120)
+        add_executable(armigo_fragment_depth_comparison_gpu_tests tests/metal/fragment_depth_comparison.mm)
+        target_link_libraries(armigo_fragment_depth_comparison_gpu_tests PRIVATE
+            armigo_shader_pipeline "${ARMIGO_FOUNDATION_FRAMEWORK}" "${ARMIGO_METAL_FRAMEWORK}")
+        add_test(NAME shader.fragment_stored_depth COMMAND armigo_fragment_depth_comparison_gpu_tests)
+        set_tests_properties(shader.fragment_stored_depth PROPERTIES LABELS "gpu;metal4;shader" TIMEOUT 120)
+        add_executable(armigo_early_fragment_gpu_tests tests/metal/early_fragment_tests.mm)
+        target_link_libraries(armigo_early_fragment_gpu_tests PRIVATE
+            armigo_shader_pipeline "${ARMIGO_FOUNDATION_FRAMEWORK}" "${ARMIGO_METAL_FRAMEWORK}")
+        add_test(NAME shader.early_fragment_tests COMMAND armigo_early_fragment_gpu_tests)
+        set_tests_properties(shader.early_fragment_tests PROPERTIES LABELS "gpu;metal4;shader" TIMEOUT 120)
         add_executable(armigo_metal_fragment_output_conversions_gpu_tests
             tests/metal/fragment_output_conversions.mm)
         target_link_libraries(armigo_metal_fragment_output_conversions_gpu_tests PRIVATE
@@ -1568,4 +1602,15 @@ add_subdirectory(src/nvn)
 if(NOT ARMIGO_IOS)
     # The packer runs on macOS only.
     add_subdirectory(src/pack/cli)
+endif()
+
+include(cmake/PlayerFeatures.cmake)
+if(BUILD_TESTING)
+    add_test(NAME build.player_platform_parity
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/platform/player_platform_parity.py"
+            --source "${CMAKE_SOURCE_DIR}" --build "${CMAKE_BINARY_DIR}/player-parity"
+            --translator "$<TARGET_FILE:armigo-shader-translate>"
+            --dependency-cache "${ARMIGO_DEPENDENCY_CACHE}"
+            --opus-archive "${ARMIGO_OPUS_ARCHIVE}" --zstd-archive "${ARMIGO_ZSTD_ARCHIVE}")
+    set_tests_properties(build.player_platform_parity PROPERTIES LABELS build TIMEOUT 180)
 endif()

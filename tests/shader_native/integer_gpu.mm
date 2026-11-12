@@ -432,7 +432,7 @@ std::vector<Case> cases() {
             return v;
         }(),
         [](const Words& w) { const auto r = flush(bits_of(std::exp2(as_float(w[0])))); return Pixel{r, r, 0, 0}; }});
-    // Multiply scales: D8, D2, M2 and M8 on source A before the product.
+    // Multiply scales: D8, D2, M2 and M8 after the rounded, flushed product.
     auto scaled = [](unsigned d, unsigned selector) { return op(0x220, {{16, 8, d}, {24, 8, 8}, {32, 8, 9}, {80, 1, 1}, {84, 3, selector}}); };
     c.push_back({"multiply scales",
         {scaled(0, 1), scaled(1, 3), scaled(2, 5), scaled(3, 7)},
@@ -442,9 +442,33 @@ std::vector<Case> cases() {
             return v;
         }(),
         [](const Words& w) {
-            auto r = [&](float factor) { return flush(bits_of(as_float(flush(bits_of(as_float(w[0]) * factor))) * as_float(w[1]))); };
+            const auto product = flush(bits_of(as_float(w[0]) * as_float(w[1])));
+            auto r = [&](float factor) { return flush(bits_of(as_float(product) * factor)); };
             return Pixel{r(0.125f), r(0.5f), r(2.0f), r(8.0f)};
         }});
+    // Literal boundary results distinguish product scaling from input scaling
+    // and preserve the first product's overflow/FTZ before the second step.
+    c.push_back({"multiply scales range boundaries",
+        {scaled(0, 1), scaled(1, 3), scaled(2, 5), scaled(3, 7)},
+        {{0x7e800000u, 0x3e000000u, 0, 0, 0, 0, 0, 0},
+         {0x01000000u, 0x41000000u, 0, 0, 0, 0, 0, 0},
+         {0x7e800000u, 0x41000000u, 0, 0, 0, 0, 0, 0},
+         {0x01000000u, 0x3e000000u, 0, 0, 0, 0, 0, 0}},
+        [](const Words& w) {
+            if (w[0] == 0x7e800000u) return w[1] == 0x3e000000u
+                ? Pixel{0x7b800000u, 0x7c800000u, 0x7d800000u, 0x7e800000u}
+                : Pixel{0x7f800000u, 0x7f800000u, 0x7f800000u, 0x7f800000u};
+            return w[1] == 0x41000000u ? Pixel{0x01000000u, 0x02000000u, 0x03000000u, 0x04000000u}
+                : Pixel{0, 0, 0, 0};
+        }});
+    c.push_back({"multiply scale before saturation",
+        {[&] { auto i = scaled(0, 1); field(i, 77, 1, 1); return i; }()},
+        {{0x40000000u, 0x40000000u, 0, 0, 0, 0, 0, 0}},
+        [](const Words&) { return Pixel{0x3f000000u, 0, 0, 0}; }});
+    c.push_back({"scaled product final saturation",
+        {[&] { auto i = scaled(0, 7); field(i, 77, 1, 1); return i; }()},
+        {{0x3f000000u, 0x3f000000u, 0, 0, 0, 0, 0, 0}},
+        [](const Words&) { return Pixel{0x3f800000u, 0, 0, 0}; }});
     // FMUL.RZ follows the Maxwell contract: the native nearest-even product,
     // at most one ulp above the guest's toward-zero result.
     c.push_back({"toward-zero multiply contract",

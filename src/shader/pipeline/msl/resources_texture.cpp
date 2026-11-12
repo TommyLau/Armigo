@@ -10,6 +10,8 @@
 
 #include "stage_internal.h"
 #include "../dispatch.h"
+#include <algorithm>
+#include <array>
 #include <map>
 #include <set>
 
@@ -248,11 +250,10 @@ Status generate_stage_texture(MslContext& c, OperationId id) {
                 expression += ", " + std::string(gradient) + "(" + vector(c, op, t.gradients_x, ScalarType::f32, count) + ", " + vector(c, op, t.gradients_y, ScalarType::f32, count) + ")";
             }
             if (gather && !t.compare && !t.offsets.empty() && t.offsets.size() == 4 * count) {
-                // A per-texel offset set is four gathers. Texel k is the
-                // (i0, j0) texel of the footprint at offsets[k], which one
-                // gather returns as its w component. Literal offsets stay
-                // integer literals. A non-literal set passes each texel's
-                // axis pair as a run-time int2.
+                // Each offset selects the w texel of its own footprint.
+                // A complete literal 2x2 square selects one footprint; its
+                // gather components are reordered into the requested order.
+                // Other sets retain their independent footprint selections.
                 require(shape.dimension != TextureDimension::cube && count == 2,
                         "Per-texel gather offsets require a 2D texture", DiagnosticCode::unsupported_capability);
                 bool literal_offsets = true;
@@ -272,10 +273,33 @@ Status generate_stage_texture(MslContext& c, OperationId id) {
                     const auto offset_word = [&](InputIndex index) {
                         return std::to_string(static_cast<std::int32_t>(std::get<LiteralBits>(op.inputs[index.value]).bits));
                     };
+                    std::array<std::array<int, 2>, 4> offsets{};
+                    int base_x = 7, base_y = 7;
                     for (unsigned texel = 0; texel < 4; ++texel) {
-                        if (!combined.empty()) combined += ", ";
-                        combined += call + ", int2(" + offset_word(t.offsets[2 * texel]) + ", " +
-                            offset_word(t.offsets[2 * texel + 1]) + ")" + component + ").w";
+                        offsets[texel] = {static_cast<std::int32_t>(std::get<LiteralBits>(op.inputs[t.offsets[2 * texel].value]).bits),
+                                          static_cast<std::int32_t>(std::get<LiteralBits>(op.inputs[t.offsets[2 * texel + 1].value]).bits)};
+                        base_x = std::min(base_x, offsets[texel][0]);
+                        base_y = std::min(base_y, offsets[texel][1]);
+                    }
+                    unsigned corners = 0;
+                    std::string swizzle;
+                    for (const auto& offset : offsets) {
+                        const auto x = offset[0] - base_x, y = offset[1] - base_y;
+                        if (x > 1 || y > 1) break;
+                        const unsigned corner = unsigned(x + 2 * y);
+                        if (corners & (1u << corner)) break;
+                        corners |= 1u << corner;
+                        swizzle += "wzxy"[corner];
+                    }
+                    if (corners == 15) {
+                        combined = call + ", int2(" + std::to_string(base_x) + ", " + std::to_string(base_y) + ")" +
+                            component + ")." + swizzle;
+                    } else {
+                        for (unsigned texel = 0; texel < 4; ++texel) {
+                            if (!combined.empty()) combined += ", ";
+                            combined += call + ", int2(" + offset_word(t.offsets[2 * texel]) + ", " +
+                                offset_word(t.offsets[2 * texel + 1]) + ")" + component + ").w";
+                        }
                     }
                 } else {
                     for (auto index : t.offsets) {

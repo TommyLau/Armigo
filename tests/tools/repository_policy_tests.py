@@ -25,8 +25,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 from check_repository import (
     PERSONAL_PATH,
     cmake_game_name_failures,
+    duplicate_block_failures,
+    normalized_code_lines,
+    read_duplicate_allowlist,
     game_name_token,
     signing_content_failures,
+    title_id_failures,
 )
 
 _REPOSITORY = Path(__file__).resolve().parents[2]
@@ -492,6 +496,134 @@ class GameNameTests(unittest.TestCase):
         result = _run_check(_REPOSITORY)
         names = [line for line in result.stderr.splitlines() if line.endswith(": game-name")]
         self.assertEqual(names, [], result.stderr)
+
+
+_TITLE_IDS = {"01007EF00011E000"}
+
+
+class TitleIdInGenericCodeTests(unittest.TestCase):
+    def test_id_in_generic_source_reports_the_line(self):
+        text = "\n".join((
+            "int unused = 0;",
+            "const auto id = 01007EF00011E000;",
+            "add_executable(armigo_01007EF00011E000_frame_rate_tests source.cpp)",
+        )) + "\n"
+        self.assertEqual(
+            title_id_failures("src/foo.cpp", text, _TITLE_IDS),
+            [
+                "src/foo.cpp:2: title-id-in-generic-code",
+                "src/foo.cpp:3: title-id-in-generic-code",
+            ],
+        )
+
+    def test_lowercase_and_prefixed_forms(self):
+        text = "\n".join((
+            "01007ef00011e000",
+            "0x01007ef00011e000",
+            "0x01007EF00011E000ull",
+        )) + "\n"
+        self.assertEqual(
+            title_id_failures("src/foo.cpp", text, _TITLE_IDS),
+            [
+                "src/foo.cpp:1: title-id-in-generic-code",
+                "src/foo.cpp:2: title-id-in-generic-code",
+                "src/foo.cpp:3: title-id-in-generic-code",
+            ],
+        )
+
+    def test_title_owned_and_non_production_paths_are_allowed(self):
+        text = "\n".join((
+            "01007EF00011E000",
+            "01007ef00011e000",
+            "0x01007EF00011E000ull",
+            "#include <armigo/titles/01007EF00011E000/frame_rate.h>",
+        )) + "\n"
+        for name in (
+            "src/titles/x.cpp",
+            "include/armigo/titles/x.h",
+            "tests/x.cpp",
+            "titles/01007EF00011E000/profile.json",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(title_id_failures(name, text, _TITLE_IDS), [])
+
+    def test_title_include_in_generic_code_is_a_violation(self):
+        text = "#include <armigo/titles/01007EF00011E000/frame_rate.h>\n"
+        self.assertEqual(
+            title_id_failures("src/runtime/x.cpp", text, _TITLE_IDS),
+            ["src/runtime/x.cpp:1: title-id-in-generic-code"],
+        )
+
+    def test_longer_hex_run_is_not_a_match(self):
+        text = "const auto packed = 1101007EF00011E00011;\n"
+        self.assertEqual(title_id_failures("src/foo.cpp", text, _TITLE_IDS), [])
+
+    def test_index_uses_title_folders_and_skips_owned_code(self):
+        banner = _banner("//", "Armigo Tests - Synthetic")
+        generic = banner + "01007EF00011E000\n01004B10157F2000\n"
+        owned = banner + "01007EF00011E000\n"
+        files = {
+            "titles/01007EF00011E000/profile.json": "01007EF00011E000\n",
+            "src/foo.cpp": generic,
+            "src/titles/x.cpp": owned,
+            "include/armigo/titles/x.h": owned,
+            "tests/x.cpp": owned,
+        }
+        line = banner.count("\n") + 1
+        with _indexed_repository(files) as root:
+            result = _run_check(root)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr.splitlines(),
+            [f"src/foo.cpp:{line}: title-id-in-generic-code"],
+        )
+
+
+
+def _block(prefix: str) -> str:
+    return "\n".join(f"int {prefix}_{index} = compute({index});" for index in range(12)) + "\n"
+
+
+class DuplicateBlockTests(unittest.TestCase):
+    def test_comments_braces_and_includes_are_not_code(self):
+        text = "\n".join((
+            "// banner line",
+            "/* block",
+            "   comment */",
+            "#include <vector>",
+            "{",
+            "  };",
+            "int  value   = 1; // trailing",
+        )) + "\n"
+        self.assertEqual(normalized_code_lines(text), [(7, "int value = 1;")])
+
+    def test_shared_block_in_two_files_fails_once_per_pair(self):
+        shared = _block("same")
+        texts = {
+            "src/a.cpp": "// a\n" + shared,
+            "src/b.cpp": "#include <x>\n" + shared,
+            "src/c.cpp": _block("other"),
+        }
+        failures = duplicate_block_failures(texts, set())
+        self.assertEqual(len(failures), 1)
+        self.assertTrue(failures[0].startswith("src/a.cpp:2: duplicates 10+ code lines of src/b.cpp:2"))
+
+    def test_nine_shared_lines_are_not_a_block(self):
+        shared = "\n".join(f"int x_{index} = {index};" for index in range(9)) + "\n"
+        texts = {"src/a.cpp": shared + "int a = 1;\n", "src/b.cpp": shared + "int b = 2;\n"}
+        self.assertEqual(duplicate_block_failures(texts, set()), [])
+
+    def test_allowlisted_pair_passes(self):
+        shared = _block("same")
+        texts = {"src/a.cpp": shared, "src/b.cpp": shared}
+        allowed, failures = read_duplicate_allowlist("# header\nsrc/b.cpp src/a.cpp  # reviewed reason\n")
+        self.assertEqual(failures, [])
+        self.assertEqual(duplicate_block_failures(texts, allowed), [])
+
+    def test_allowlist_entries_need_two_paths_and_a_reason(self):
+        _, failures = read_duplicate_allowlist("src/a.cpp src/b.cpp\nsrc/a.cpp  # one path\n")
+        self.assertEqual(len(failures), 2)
 
 
 if __name__ == "__main__":

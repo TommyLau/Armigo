@@ -17,8 +17,8 @@
 #include <vector>
 
 #ifdef ARMIGO_HAS_OPUS
-#include <opus/opus.h>
-#include <opus/opus_multistream.h>
+#include <opus.h>
+#include <opus_multistream.h>
 #endif
 
 namespace {

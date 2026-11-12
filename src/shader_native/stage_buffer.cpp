@@ -54,22 +54,26 @@ bool Builder::stage_buffer(Fields& fields) {
     const auto vector = static_cast<unsigned>(store ? fields.take(32, 8) : fields.take(16, 8));
     if (fields.unread()) fail("instruction mode or reserved bits are not admitted");
 
-    std::uint32_t region = 0;
+    std::uint32_t region = 0, region_bytes = 0;
     std::uint8_t element_bytes = 4;
     if (!store && mode == 0x78) {
         if (ra != 255 || byte_offset != 0) fail("stage buffer workgroup read with an address is not admitted");
-        region = memory.workgroup;
+        region = memory.workgroup; region_bytes = 4;
     } else if (!store && mode == 0x38 && mesh) {
-        region = memory.input;
+        region = memory.input; region_bytes = memory.output - memory.input;
     } else if ((mode == 0xb8 && !mesh) || (store && mode == 0xf8 && mesh)) {
         region = memory.output;
+        region_bytes = (mesh ? memory.primitives : memory.bytes) - memory.output;
     } else if (store && (mode == 0x88 || mode == 0x80) && mesh) {
-        region = memory.primitives;
+        region = memory.primitives; region_bytes = memory.bytes - memory.primitives;
         element_bytes = 1;
     } else {
         fail("stage buffer access mode is not admitted");
     }
     if (store && mode == 0x88 && vector == 255) {
+        const auto address = region + byte_offset;
+        if (ra == 255 && (address < region || std::uint64_t(address) >= std::uint64_t(region) + region_bytes))
+            fail("Constant stage-buffer access exceeds its declared region", ir::DiagnosticCode::unsupported_capability);
         // The drop rests on one warp: in a larger workgroup another warp's
         // count may come first, and that zero must then win.
         if (source_.mesh_launch->threads > 32) fail("primitive count store of RZ in a mesh workgroup of more than 32 threads is not admitted");
@@ -82,13 +86,15 @@ bool Builder::stage_buffer(Fields& fields) {
     ir::Operand address = word(element_bytes == 4 ? (region + byte_offset) & ~3u : region + byte_offset);
     if (ra != 255) {
         address = temporary(ir::Opcode::add, {reg(ra), word(region + byte_offset)}, unsigned_word);
-        // Shifting the low bits out keeps the register offset unbounded (a
-        // runtime-guarded access) and proves the word alignment.
+        // Normalize only the word address; this does not wrap it to the region.
+        // The declared stage-buffer region is the access contract.
         if (element_bytes == 4)
             address = bits(ir::Opcode::shift_left, {bits(ir::Opcode::shift_right, {std::move(address), word(2)}), word(2)});
     }
     ir::MemoryInfo info;
     info.space = ir::AddressSpace::shared;
+    info.stage_buffer = ir::StageBufferAccess{ir::StageBufferPolicy::header_direct_v1,
+        region, region_bytes, memory.bytes};
     info.element_bytes = element_bytes;
     info.elements = 1;
     info.alignment = element_bytes;

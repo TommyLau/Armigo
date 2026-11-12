@@ -213,6 +213,11 @@ std::atomic<bool> policy_cpu_cached_texture_writes{false};
 std::atomic<TitlePolicy::Timestamps> policy_timestamps{TitlePolicy::Timestamps::report};
 std::atomic<TitlePolicy::Barriers> policy_barriers{TitlePolicy::Barriers::full};
 std::atomic<bool> policy_hoist_implicit_samples{false};
+std::atomic<TitlePolicy::ConditionalRender> policy_conditional_render{TitlePolicy::ConditionalRender::exact};
+std::atomic<TitlePolicy::HandleReads> policy_handle_reads{TitlePolicy::HandleReads::ordered};
+std::atomic<TitlePolicy::GuestStoreTextures> policy_guest_store_textures{TitlePolicy::GuestStoreTextures::ordered};
+std::atomic<TitlePolicy::Replay> policy_replay{TitlePolicy::Replay::standard};
+std::atomic<std::uint8_t> policy_submission_slots{0};
 } // namespace
 
 void set_title_policy(const TitlePolicy& policy) noexcept {
@@ -220,6 +225,11 @@ void set_title_policy(const TitlePolicy& policy) noexcept {
     policy_timestamps.store(policy.timestamps, std::memory_order_release);
     policy_barriers.store(policy.barriers, std::memory_order_release);
     policy_hoist_implicit_samples.store(policy.hoist_implicit_samples, std::memory_order_release);
+    policy_conditional_render.store(policy.conditional_render, std::memory_order_release);
+    policy_handle_reads.store(policy.handle_reads, std::memory_order_release);
+    policy_guest_store_textures.store(policy.guest_store_textures, std::memory_order_release);
+    policy_replay.store(policy.replay, std::memory_order_release);
+    policy_submission_slots.store(policy.submission_slots, std::memory_order_release);
 }
 
 TitlePolicy title_policy() noexcept {
@@ -228,6 +238,11 @@ TitlePolicy title_policy() noexcept {
     policy.timestamps = policy_timestamps.load(std::memory_order_acquire);
     policy.barriers = policy_barriers.load(std::memory_order_acquire);
     policy.hoist_implicit_samples = policy_hoist_implicit_samples.load(std::memory_order_acquire);
+    policy.conditional_render = policy_conditional_render.load(std::memory_order_acquire);
+    policy.handle_reads = policy_handle_reads.load(std::memory_order_acquire);
+    policy.guest_store_textures = policy_guest_store_textures.load(std::memory_order_acquire);
+    policy.replay = policy_replay.load(std::memory_order_acquire);
+    policy.submission_slots = policy_submission_slots.load(std::memory_order_acquire);
     return policy;
 }
 

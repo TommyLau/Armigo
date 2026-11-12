@@ -14,25 +14,28 @@
 
 #import <Metal/Metal.h>
 
+#include "nvn_submission_owner.h"
+#include "nvn_border_sampler.h"
+
 #include "nvn/backend.h"
+#include "nvn_descriptor_identity.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace armigo::platform::metal::nvn_driver {
 
-// What the replay queue waits for on the GPU before it runs work that may read
-// textures uploaded by committed batches: the event reaching the value means
-// those batches have completed. A null event needs no wait.
-//
-// The values (floor, value] are the upload batches this fence is responsible
-// for: a batch that failed in that range is the failure of the segment that
-// carries it (Resources::uploads_failed).
+// False under ARMIGO_NVN_IMAGE_ATOMICS=0: atomic storage images are bound as
+// any other storage image, with no R32 storage of their own.
+bool image_atomics_enabled() noexcept;
+
+// Logical upload batch range owned by a consuming replay segment. Queue
+// publication supplies readiness; the range supplies error attribution.
 struct UploadFence {
-  id<MTLEvent> event = nil;
   std::uint64_t value = 0, floor = 0;
 };
 
@@ -56,7 +59,28 @@ public:
   // complete. It returns false if completion cannot be established.
   using CompletionHook = std::function<bool()>;
 
-  explicit Resources(id<MTLDevice> device);
+  explicit Resources(id<MTLDevice> device,
+                     std::shared_ptr<Metal4SubmissionOwner> submission = {});
+  [[nodiscard]] std::shared_ptr<Metal4SubmissionOwner> submission_owner() const;
+  void set_upload_publication(UploadPublication publication);
+  struct UploadObservation {
+    enum class Kind { batch, allocator_wait } kind;
+    std::uint64_t batch = 0;
+    id<MTLBuffer> staging = nil;
+    id<MTLTexture> target = nil;
+  };
+  // Synthetic-test observations run under the resource lock and must not
+  // re-enter Resources. Batch observations expose representative allocations.
+  using UploadObserver = std::function<void(const UploadObservation&)>;
+  void set_upload_observer(UploadObserver observer);
+  struct NativeSnapshot {
+    id<MTLTexture> texture = nil;
+    std::shared_ptr<const void> allocation;
+    std::function<std::string()> producer_error;
+    std::function<void()> release_read;
+  };
+  // Resolve and pin one physical allocation under the same resource lock.
+  [[nodiscard]] NativeSnapshot capture_native(const armigo::nvn::TextureState& texture);
   ~Resources() override;
 
   Resources(const Resources &) = delete;
@@ -82,11 +106,27 @@ public:
   };
   // Leases the pools a submission's guest-memory table names until the
   // submission retires: a pool released meanwhile waits for it. Returns the
-  // pool-set generation, which moves whenever a pool is registered or starts
-  // its release; when it differs from `known`, `pools` is replaced with that
-  // set's GPU-accessible pools.
+  // pool-set generation, which moves when a pool is registered, when one
+  // starts its release, or when a handed-out address covers a range the table
+  // did not. When it differs from `known`, `pools` is replaced with the
+  // GPU-accessible pools that meet a handed-out address.
+  // ARMIGO_NVN_ADDRESSED_POOLS=0 lists every GPU-accessible pool.
   std::uint64_t claim_guest_memory_pools(std::uint64_t known, std::vector<GuestMemoryPool> &pools);
   [[nodiscard]] std::uint64_t pool_generation() const noexcept;
+  // Pools left out of the latest claimed table because no handed-out address
+  // meets them, and the bytes those pools hold. A pool the GPU cannot access
+  // is not counted. Both are zero when the addressed-pool filter is off.
+  struct GuestMemoryAdmission {
+    std::size_t omitted_pools = 0;
+    std::uint64_t omitted_bytes = 0;
+  };
+  [[nodiscard]] GuestMemoryAdmission guest_memory_admission() const;
+  // True when `address` lies in a GPU-accessible pool the table would leave
+  // out. False when the filter is off, or no such pool holds the address.
+  [[nodiscard]] bool address_in_unaddressed_pool(std::uint64_t address) const;
+  // The registered pools nearest below and above `address` (begin, end,
+  // flags, releasing), for a guest-memory miss report.
+  [[nodiscard]] std::string describe_guest_address(std::uint64_t address) const;
 
   [[nodiscard]] BufferSpan buffer_at(std::uint64_t gpu_address,
                                      std::uint64_t size);
@@ -121,6 +161,23 @@ public:
   // one; nil when the storage was writable already. Nil when no such
   // texture has storage.
   [[nodiscard]] id<MTLTexture> upgrade_for_image_write(std::uint64_t serial, __strong id<MTLTexture> &previous);
+  // Storage for an image atomic. R32Uint/R32Sint storage gains shader-write
+  // usage when it lacks it and is remembered as atomic-capable. A 32-bit
+  // colour texture the GPU has written (not one whose texels still come from
+  // guest memory) is replaced by R32 storage, signed when `is_signed` is set;
+  // its original format stays a view of that storage, every alias moves with
+  // it, and `previous` is the storage whose contents the caller copies.
+  // `previous` is nil when nothing was replaced. Nil when this storage cannot
+  // run the atomic.
+  [[nodiscard]] id<MTLTexture> upgrade_for_image_atomic(std::uint64_t serial, bool is_signed,
+                                                        __strong id<MTLTexture> &previous);
+  // Root storage was created with shader-atomic usage and is R32 integer.
+  // Metal does not report that usage on the texture.
+  [[nodiscard]] bool image_atomic_capable(std::uint64_t serial);
+  // True when upgrade_for_image_atomic would replace this storage (`previous`
+  // would be set). Signedness selects the R32 format and does not change
+  // whether the storage is replaced. False when this serial has no storage.
+  [[nodiscard]] bool image_atomic_needs_upgrade(std::uint64_t serial, bool is_signed);
   // What a descriptor lookup depended on: the registrations of its ID, the
   // descriptor pools, its texture's storage entry. A caller that kept the
   // result may use it again while texture_stamp_current holds, without the
@@ -136,6 +193,10 @@ public:
   };
   // texture_for_id, also stamping the result.
   [[nodiscard]] id<MTLTexture> texture_for_id(std::int32_t texture_id, DescriptorStamp &stamp);
+  // Resolve the image's backing before making its format-changing view.
+  [[nodiscard]] id<MTLTexture> image_base_for_id(std::int32_t texture_id, DescriptorStamp& stamp);
+  // An identity-channel image view; sRGB images use their linear twin.
+  [[nodiscard]] id<MTLTexture> raw_image_view(std::int32_t texture_id, id<MTLTexture> texture);
   [[nodiscard]] bool texture_stamp_current(std::int32_t texture_id,
                                            const DescriptorStamp &stamp) const;
   // Texture descriptor lookups since creation, and those that resolved the
@@ -146,19 +207,30 @@ public:
     std::uint64_t sampler_misses = 0;
   };
   [[nodiscard]] TextureLookupCounts texture_lookup_counts() const;
+  // Consumes the unsupported-state diagnostic from this thread's last sampler lookup.
+  [[nodiscard]] std::string take_sampler_failure();
+  // A combined mipmapped sampler whose integer min/max clamp selects one level.
+  [[nodiscard]] std::optional<std::uint32_t> sampler_pinned_level(
+      std::int32_t sampler_id, std::uint64_t registrations = UINT64_MAX) const;
   [[nodiscard]] id<MTLSamplerState> sampler_for_id(std::int32_t sampler_id);
-  // The sampler as registered when a binding recorded after `registrations`
-  // sampler registrations (nvn::sampler_registrations) was made.
+  // The sampler visible after `registrations` publications. Replay supplies
+  // its immutable submission boundary; explicit historical lookups stay strict.
   [[nodiscard]] id<MTLSamplerState> sampler_for_id(std::int32_t sampler_id,
                                                    std::uint64_t registrations);
+  // Exact primary state and color for a reflected coverage-v1 sampling pair.
+  // The binding registration selects parameters atomically with the state.
+  [[nodiscard]] CoverageSampler coverage_sampler_for_id(std::int32_t sampler_id,
+                                                        std::uint64_t registrations);
   // A view of a descriptor's sampled texture in the type a shader declares,
   // when that differs from the texture's own type: a Metal argument of another
   // texture type reads undefined values. Layered and two-dimensional types
   // convert to each other (a two-dimensional view is the first layer); the view
   // is kept in the descriptor's slot until another type or texture needs it.
-  // Nil when the types have no such view.
+  // A floating-point typed-handle element reads zero when no view fits;
+  // other unsupported pairs return nil.
   [[nodiscard]] id<MTLTexture> fitted_texture(std::int32_t texture_id, id<MTLTexture> texture,
-                                              MTLTextureType type);
+                                              MTLTextureType type, bool typed_handle = false,
+                                              MTLPixelFormat empty_format = MTLPixelFormatRGBA8Unorm);
 
   // Whether this texture shares the guest's bytes directly (a linear,
   // buffer-backed Metal texture) instead of a private tiled copy.
@@ -175,23 +247,23 @@ public:
   // next use: a texture there has storage of its own the GPU has not written,
   // or none is registered yet.
   [[nodiscard]] bool backing_feeds_texture(std::uint64_t gpu_address, std::uint64_t size);
-  // The generation of the newest GPU write noted so far, and the completion
-  // of every GPU write noted up to a generation once its work has finished.
+  // The generation of the newest GPU write or retired upload storage, and
+  // completion up to that generation once the submission has finished.
   [[nodiscard]] std::uint64_t gpu_write_generation() const;
   void complete_gpu_writes(std::uint64_t generation);
   // The replay worker starts walking a submission. buffer_address hands out
   // unretained buffers, so a released pool's buffer stays alive until the walk
   // after its release begins.
   void begin_walk();
+  void end_walk();
+  // Publishes pending producers to their reserved positions without a GPU wait.
+  bool publish_uploads();
   // Commits the batched texture uploads and waits for them (see the replay's
   // ReplayResources::flush_uploads).
   bool flush_uploads();
-  // Commits the batched texture uploads, normally without waiting for them:
-  // the fence orders the replay's next committed segment after them on the
-  // GPU. The first fence with batches still in flight waits for them on the
-  // CPU instead, once per Resources (see the definition). The
-  // staging bytes of unsettled batches stay within a fixed budget: a commit
-  // beyond it waits for the oldest batch.
+  // Seals upload producers into the replay publication stream. The logical
+  // range attributes failures to the next consuming segment; allocator reuse
+  // and the staging budget wait for actual upload hardware completion.
   void commit_uploads(UploadFence &fence);
   // Whether a batch in the fence's range failed. The replay asks when the
   // segment that carries the fence retires, and fails that segment: the
@@ -209,9 +281,13 @@ public:
     std::uint64_t gpu = 0, cpu = 0;
   };
   [[nodiscard]] UploadCounts upload_counts() const;
+  // Uploads of a texture whose storage the GPU had written and the CPU
+  // rewrote afterwards.
+  [[nodiscard]] std::uint64_t cpu_rewrites_after_gpu() const;
 
   bool register_pool(const armigo::nvn::MemoryPoolState &pool) override;
   void release_pool(const armigo::nvn::MemoryPoolState &pool) override;
+  void note_addressed(std::uint64_t gpu_address, std::uint64_t size) override;
   void prepare_pool_write(const armigo::nvn::MemoryPoolState &pool,
                           std::uint64_t offset, std::uint64_t size) override;
   void flush_pool(const armigo::nvn::MemoryPoolState &pool,
@@ -233,8 +309,44 @@ public:
   void register_texture_descriptor(
       std::int32_t id, const armigo::nvn::TextureState &texture,
       const armigo::nvn::TextureViewState *view) override;
+  void clear_texture_descriptor(std::int32_t id) override;
   void register_sampler_descriptor(
       std::int32_t id, const armigo::nvn::SamplerParameters &sampler) override;
+
+  // Descriptor registration and storage-replacement notes. Generation 1 is the
+  // epoch before the first note. A missing note was overwritten or has not
+  // been written. kind 0 is a texture ID, 1 a sampler ID, 2 a memory pool
+  // added or removed.
+  struct RegistrationNote {
+    std::int32_t id = 0;
+    std::uint32_t kind = 0;
+  };
+  [[nodiscard]] std::uint64_t registration_log_generation() const;
+  [[nodiscard]] bool read_registration_note(std::uint64_t generation, RegistrationNote &note) const;
+  [[nodiscard]] std::uint64_t storage_log_generation() const;
+  [[nodiscard]] bool read_storage_note(std::uint64_t generation, std::uint64_t &serial) const;
+  [[nodiscard]] std::vector<std::int32_t> descriptor_ids_for_serial(std::uint64_t serial) const;
+
+  // One past the highest registered descriptor, or 0 when none is registered.
+  // None of these create a texture or a sampler.
+  [[nodiscard]] bool texture_id_empty(std::int32_t id) const;
+  [[nodiscard]] std::int32_t registered_texture_count() const;
+  [[nodiscard]] std::int32_t sampler_count() const;
+  [[nodiscard]] bool texture_registered(std::int32_t id) const;
+  [[nodiscard]] bool texture_storage_made(std::int32_t id) const;
+  [[nodiscard]] bool texture_storage_shared(std::int32_t id) const;
+  [[nodiscard]] bool texture_compressible(std::int32_t id) const;
+  [[nodiscard]] std::uint64_t texture_storage_size(std::int32_t id) const;
+  [[nodiscard]] bool texture_storage_live(std::int32_t id) const;
+  [[nodiscard]] std::uint64_t texture_serial(std::int32_t id) const;
+  [[nodiscard]] std::uint64_t texture_descriptor_key(std::int32_t id) const;
+  [[nodiscard]] bool texture_is_depth(std::int32_t id) const;
+  [[nodiscard]] std::uint64_t texture_storage_key(std::int32_t id) const;
+  [[nodiscard]] bool texture_read_identity(std::int32_t id, TextureReadIdentity &identity) const;
+  [[nodiscard]] std::uint64_t texture_empty_generation() const;
+  [[nodiscard]] std::uint64_t texture_pool_generation() const;
+  void note_pool_depth_read(std::uint64_t serial, std::uint64_t storage_key);
+  [[nodiscard]] bool pool_depth_read(std::uint64_t serial, std::uint64_t storage_key) const;
 
   bool read_texels(const armigo::nvn::TextureState &texture,
                    const armigo::nvn::TexelTransfer &transfer,

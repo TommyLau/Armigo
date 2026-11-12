@@ -187,6 +187,8 @@ NVNboolean device_initialize(NVNdevice* device, const NVNdeviceBuilder* builder)
     state->depth_mode = NVN_DEPTH_MODE_NEAR_IS_MINUS_W;
     state->debug_callback = nullptr;
     state->debug_data = nullptr;
+    const auto version = selected_api_version();
+    state->gob_order = version && version->major == 231 ? 1 : 0;
     return 1;
 }
 

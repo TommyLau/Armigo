@@ -19,6 +19,7 @@
 // handle_sampler_id), which index the pools registered through
 // nvnTexturePoolRegisterTexture and nvnSamplerPoolRegisterSampler.
 
+#include "backend.h"
 #include "commands.h"
 #include "entry_table_231.h"
 #include "host_stack.h"
@@ -188,6 +189,13 @@ NVNboolean memory_pool_map_virtual(NVNmemoryPool* pool, int count, const NVNmapp
         return 0;
     }
     state->memory = physical->memory + request.physicalOffset;
+    // The aliased physical range. Marked on the call, not as a whole-pool
+    // throttle, so a later whole-pool address of that storage is still recorded.
+    if (backends().resources && request.size) {
+        const auto address = reinterpret_cast<std::uint64_t>(state->memory);
+        const auto size = request.size;
+        on_host_stack([&] { backends().resources->note_addressed(address, size); });
+    }
     return 1;
 }
 
@@ -242,22 +250,15 @@ void command_buffer_set_control_memory_callback_enabled(NVNcommandBuffer* comman
     if (command_buffer) reinterpret_cast<CommandBufferState*>(command_buffer)->control_callback_disabled = !guest_bool(enabled);
 }
 
-// NVN2 numbers the task and mesh stages 6 and 7. Their bindings take the
-// tessellation control and evaluation slots (3 and 4), which API 231 has no
-// stages for, as the program's task and mesh stages do; the API 55
-// implementation then records them like any other stage.
-constexpr NVNshaderStage stage_slot(NVNshaderStage stage) noexcept {
-    const auto value = static_cast<std::int32_t>(stage);
-    return static_cast<NVNshaderStage>(value == 6 ? 3 : value == 7 ? 4 : value);
-}
-
+// Task and mesh retain logical resource banks 6 and 7 independently of
+// ordinary graphics stages. Replay selects their physical execution slots.
 template <nvn::Entry E, typename Signature = typename nvn::EntrySignature<E>::type>
 struct StageBind;
 template <nvn::Entry E, typename... Rest>
 struct StageBind<E, void (*)(NVNcommandBuffer*, NVNshaderStage, Rest...)> {
     static void call(NVNcommandBuffer* command_buffer, NVNshaderStage stage, Rest... rest) noexcept {
         if (const auto api55 = implemented_entry(E)) {
-            reinterpret_cast<typename nvn::EntrySignature<E>::type>(api55)(command_buffer, stage_slot(stage),
+            reinterpret_cast<typename nvn::EntrySignature<E>::type>(api55)(command_buffer, stage,
                                                                          rest...);
             return;
         }
@@ -270,15 +271,12 @@ struct StageBind<E, void (*)(NVNcommandBuffer*, NVNshaderStage, Rest...)> {
     }
 };
 
-// A program binding names the stages it binds as bits; NVN2's task and mesh
-// bits (6 and 7) take the tessellation slots' bits (3 and 4), as their
-// program stages and resource bindings do.
+// Program bindings retain all logical stage bits independently of the
+// physical task/mesh execution slots.
 void command_buffer_bind_program(NVNcommandBuffer* command_buffer, const NVNprogram* program, int stages) noexcept {
-    const auto bits = static_cast<std::uint32_t>(stages);
-    const auto mapped = (bits & ~0xc0u) | ((bits >> 6) & 1u) << 3 | ((bits >> 7) & 1u) << 4;
     if (const auto api55 = implemented_entry(nvn::Entry::nvnCommandBufferBindProgram)) {
         reinterpret_cast<nvn::EntrySignature<nvn::Entry::nvnCommandBufferBindProgram>::type>(api55)(
-            command_buffer, program, static_cast<int>(mapped));
+            command_buffer, program, stages);
         return;
     }
     const auto guest_return = ARMIGO_GUEST_RETURN;
@@ -294,12 +292,12 @@ void command_buffer_push_graphics_constants(NVNcommandBuffer* command_buffer, NV
                                             const void* data) noexcept {
     const auto bytes = std::min(size, nvn::push_constant_bytes) & ~3u;
     if (!bytes) return;
-    if (stage_slot(stage) == NVN_SHADER_STAGE_COMPUTE) {
+    if (stage == NVN_SHADER_STAGE_COMPUTE) {
         nvn::command_refuse(command_buffer, "nvnCommandBufferPushGraphicsConstants",
                             "compute pushes go through nvnCommandBufferPushComputeConstants");
         return;
     }
-    nvn::command_push_constants(command_buffer, stage_slot(stage), nvn::push_constant_bank, offset & 0xffu, bytes, data,
+    nvn::command_push_constants(command_buffer, stage, nvn::push_constant_bank, offset & 0xffu, bytes, data,
                                 "nvnCommandBufferPushGraphicsConstants");
 }
 
@@ -330,7 +328,7 @@ void command_buffer_push_compute_constants(NVNcommandBuffer* command_buffer, std
 // (argument address). The replay draws them through the mesh pipeline with the
 // translated task and mesh stages.
 void command_buffer_draw_mesh_tasks(NVNcommandBuffer* command_buffer, int first, int count) noexcept {
-    nvn::command_draw_mesh_tasks(command_buffer, first, count);
+    nvn::command_draw_mesh_tasks_at(command_buffer, first, count, ARMIGO_GUEST_RETURN);
 }
 void command_buffer_draw_mesh_tasks_indirect(NVNcommandBuffer* command_buffer, NVNbufferAddress address) noexcept {
     nvn::command_draw_mesh_tasks_indirect(command_buffer, address);
@@ -338,8 +336,7 @@ void command_buffer_draw_mesh_tasks_indirect(NVNcommandBuffer* command_buffer, N
 
 // Controls with no effect on what the commands produce: color reduction and
 // stencil culling are compression and culling optimizations, and compute
-// overlap, compute workload priority and geometry processing mode schedule
-// work that the replay runs in submission order on one Metal queue. The
+// overlap and compute workload priority schedule work that the replay runs in submission order on one Metal queue. The
 // conservative rasterization mode applies only while conservative
 // rasterization is enabled, which is its own command. The title's driver
 // accepts every value (it masks or clamps each into its GPU methods), so these
@@ -365,8 +362,8 @@ void command_buffer_set_compute_overlap_mode(NVNcommandBuffer*, std::int32_t mod
 void command_buffer_set_compute_workload_priority(NVNcommandBuffer*, std::int32_t priority) noexcept {
     log_control_once<3>("nvnCommandBufferSetComputeWorkloadPriority", priority);
 }
-void command_buffer_set_geometry_processing_mode(NVNcommandBuffer*, std::int32_t mode) noexcept {
-    log_control_once<4>("nvnCommandBufferSetGeometryProcessingMode", mode);
+void command_buffer_set_geometry_processing_mode(NVNcommandBuffer* command_buffer, std::int32_t mode) noexcept {
+    nvn::command_geometry_processing_mode(command_buffer, mode);
 }
 void command_buffer_set_stencil_cull_criteria(NVNcommandBuffer*, std::int32_t function, std::int32_t,
                                               std::int32_t) noexcept {

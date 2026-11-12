@@ -130,10 +130,10 @@ void publication(const fs::path& images) {
     const auto check = [&](bool accepted) {
         std::ofstream output(root / "build/armigo-ios-player", std::ios::binary | std::ios::trunc);
         output.write(reinterpret_cast<const char*>(binary.data()), binary.size()); output.close();
-        fs::remove(root / "published");
-        const auto linked = pack::link_ios_player({root / "build", images, root / "generated", root / "published"});
+        fs::remove(root / "Synthetic-0100000000000001");
+        const auto linked = pack::link_ios_player({root / "build", images, root / "generated", root / "Synthetic-0100000000000001"});
         CHECK(std::holds_alternative<pack::IosLinkReport>(linked) == accepted);
-        CHECK(fs::exists(root / "published") == accepted);
+        CHECK(fs::exists(root / "Synthetic-0100000000000001") == accepted);
     };
     check(true);
     binary[page] ^= std::byte{1}; check(false);

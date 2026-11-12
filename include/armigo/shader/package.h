@@ -24,6 +24,11 @@ struct BuildOptions {
     std::filesystem::path translate_tool;
     std::filesystem::path output;
     std::optional<std::filesystem::path> compile_cache;
+    // Earlier packages built with the same compiler profile (every profile
+    // field but the translator's source version): a stage whose Metal source
+    // digest one of them records takes that package's library instead of
+    // being compiled. Nothing else is taken from them.
+    std::vector<std::filesystem::path> reuse;
     unsigned jobs = 0;
     // When true, the manifest records "sample_hoisting":"implicit". False omits
     // the key, so a manifest without the opt-in stays byte-identical. The field
@@ -34,6 +39,8 @@ struct BuildOptions {
 struct BuildReport {
     std::size_t input_stages = 0;
     std::size_t unique_stages = 0;
+    // Libraries taken from a reused package; the rest were compiled or cached.
+    std::size_t reused_libraries = 0;
 };
 
 // Validates and compiles translated stages, then atomically publishes the

@@ -144,7 +144,8 @@ std::string install_driver(std::shared_ptr<MetalShaderPackage> package, const st
     if (!device) return "No Metal device is available for the NVN driver.";
     id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
     if (!queue) return "The NVN driver could not create a Metal 4 command queue.";
-    auto resources = std::make_unique<Resources>(device);
+    auto submission = std::make_shared<Metal4SubmissionOwner>(device, queue);
+    auto resources = std::make_unique<Resources>(device, submission);
     auto replay = create_replay_backend(device, queue, *resources);
     if (!replay) return "The NVN driver could not create its replay backend.";
     replay->configure_pipeline_warmup(warmup_config(package, pso_manifest, title_cache));
@@ -165,9 +166,7 @@ std::string install_driver(std::shared_ptr<MetalShaderPackage> package, const st
         nvn::set_program_resolver(nullptr, nullptr);
 #endif
     }
-    Resources* lookup = resources.get();
-    nvn::set_texture_exporter(make_texture_exporter(
-        device, [lookup](const nvn::TextureState& texture) { return lookup->texture(texture, nullptr); }));
+    nvn::set_texture_exporter(make_texture_exporter(device, *resources, *replay));
     nvn::register_resource_entries();
     nvn::register_program_entries();
     nvn::register_state_entries();
@@ -185,6 +184,11 @@ std::string install_driver(std::shared_ptr<MetalShaderPackage> package, const st
 bool stop_submission_workers(std::optional<std::chrono::steady_clock::time_point> deadline) {
     auto& driver = installed();
     return !driver.replay || driver.replay->stop_submission_workers(deadline);
+}
+
+std::string failure_detail() {
+    const auto* replay = nvn::backends().replay;
+    return replay ? replay->fatal_error_detail() : std::string{};
 }
 
 void bind_native_windows(std::weak_ptr<services::vi::DisplaySession> session) {

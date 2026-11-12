@@ -206,14 +206,16 @@ private:
         std::optional<PresentationSchedule> target;
         const bool headless = dependencies_.presenter->mode() == platform::PresentationMode::headless;
         const bool has_texture = native && queued.native_texture && !queued.native_pixels;
-        // A window draws a native producer's texture directly; nothing is
-        // read back.
+        const bool wanted = dependencies_.wants_readback
+            ? dependencies_.wants_readback(queued.frame_number) : headless;
+        retained_->frame.readback = wanted;
+        // A window keeps the producer texture on the GPU. The presenter adds
+        // a completed readback only when the capture policy requests one.
         const bool direct = has_texture && !headless;
         // A headless consumer copies the texture on the GPU and reads it back
         // only when the frame's pixels are kept, so every frame is consumed
         // without a CPU copy of the ones nobody keeps.
-        const bool unread = has_texture && headless && dependencies_.wants_readback &&
-                            !dependencies_.wants_readback(queued.frame_number);
+        const bool unread = has_texture && headless && !wanted;
         if (direct) {
             // The texture is the frame; its producer already paced it.
         } else if (native) {
@@ -300,6 +302,8 @@ private:
                 return fail(LaunchError::invalid_input, "presentation.pin", "Backing provider did not pin the whole readable surface");
 
             for (std::uint32_t index = 0; index < queued.fence_count; ++index) {
+                // The consumer skips a counted entry whose syncpoint is -1; other ids wait.
+                if (queued.producer_fences[index].syncpoint == -1) continue;
                 auto waited = dependencies_.backing.wait_fence(queued.producer_fences[index],
                                                               std::nullopt, stop_.get_token());
                 if (auto* error = std::get_if<LaunchFailure>(&waited)) return *error;
@@ -338,18 +342,25 @@ private:
         auto result = dependencies_.presenter->present(retained_->frame, std::nullopt, stop_.get_token());
         if (auto* error = std::get_if<platform::PresentationFailure>(&result))
             return presenter_failure(*error, "presenter.present");
+        if (queued.native_producer_ready) {
+            bool ready = false;
+            try { ready = queued.native_producer_ready(); } catch (...) {}
+            if (!ready)
+                return fail(LaunchError::host_failure, "presenter.producer", "Native producer did not complete successfully");
+        }
         const auto& completed = std::get<platform::PresentedFrame>(result);
         if (completed.frame_number != queued.frame_number && direct)
             return fail(LaunchError::host_failure, "presenter.complete", "Consumer completion has no matching frame");
         static const graphics::Rgba8Image no_pixels{};
         const auto& pixels = retained_->frame.pixels ? *retained_->frame.pixels : no_pixels;
-        // A headless frame that asked for pixels must return them; an unread
-        // one completes on the consumer's GPU work alone.
+        // A requested capture belongs to this completed consumer frame.
+        const auto expected_width = direct ? queued.width : pixels.width;
+        const auto expected_height = direct ? queued.height : pixels.height;
         if (completed.frame_number != queued.frame_number ||
-            (headless && retained_->frame.readback &&
-             (!completed.readback || completed.readback->width != pixels.width ||
-              completed.readback->height != pixels.height ||
-              completed.readback->pixels.size() != pixels.pixels.size())))
+            (retained_->frame.readback &&
+             (!completed.readback || completed.readback->width != expected_width ||
+              completed.readback->height != expected_height ||
+              completed.readback->pixels.size() != std::uint64_t{expected_width} * expected_height * 4)))
             return fail(LaunchError::host_failure, "presenter.complete", "Consumer completion has no matching frame or owned readback");
         if (dependencies_.observe_frame) {
             auto observed = dependencies_.observe_frame(completed);

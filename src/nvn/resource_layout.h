@@ -20,6 +20,7 @@ namespace armigo::nvn {
 // Common storage interpretation for API sizing and host resource transfers.
 std::optional<graphics::TextureFormat> resource_format(std::int32_t format);
 std::optional<graphics::TextureLayoutDescription> resource_layout(const TextureDescription& description);
+std::optional<graphics::TextureLayoutDescription> resource_layout(const TextureState& texture);
 std::size_t resource_alignment(const TextureDescription& description);
 // Capture strided input before coherence operations can overwrite aliased pool bytes.
 bool snapshot_texel_input(const TextureState& texture, const TexelTransfer& transfer,

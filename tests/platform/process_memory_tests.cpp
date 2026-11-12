@@ -65,6 +65,21 @@ bool has_protection(std::uint64_t address, vm_prot_t expected) {
 }
 #endif
 
+bool host_limits_geometry(std::uint64_t page) {
+    const auto actual = armigo::platform::query_host_limits();
+    if (!check(actual && actual->native_page_bytes == page && actual->address_end > actual->address_begin,
+               "The host limits query did not describe the process VM map.")) return false;
+    const armigo::platform::HostLimits bounded{1ull << 32, 64ull << 30, page, 2ull << 30};
+    return check(bounded.guest_address_end(1ull << 39) == (64ull << 30) &&
+                     bounded.guest_address_bytes(1ull << 39) == (60ull << 30) &&
+                     bounded.contains(bounded.address_end - page, page) &&
+                     !bounded.contains(bounded.address_end, page) &&
+                     !bounded.contains(bounded.address_begin - page, page) &&
+                     !bounded.contains(bounded.address_end - page, 2 * page) &&
+                     !bounded.contains(UINT64_MAX - page, 2 * page),
+                 "A bounded host accepted addresses outside its usable VM range.");
+}
+
 bool reservation_does_not_clobber(std::uint64_t page) {
     auto first = require_region(ProcessMemoryRegion::reserve(page), "Initial reservation failed");
     const auto second = ProcessMemoryRegion::reserve(page, first.address());
@@ -263,6 +278,13 @@ bool decommit_regrow_and_failure_rollback(std::uint64_t page) {
                "Could not lower the alias source maximum protection.")) {
         return false;
     }
+    armigo::platform::ProcessMemoryStatus alias_status;
+    const auto rejected_copy = ProcessMemoryRegion::alias_copy(
+        restricted_source.address(), page, Permission::read | Permission::write, &alias_status);
+    if (!check(std::holds_alternative<ProcessMemoryError>(rejected_copy) &&
+                   alias_status.error == ProcessMemoryError::protection_failed &&
+                   alias_status.native_code == KERN_PROTECTION_FAILURE,
+               "Alias preparation lost its native protection error.")) return false;
     const auto failed_preparation = region.alias(
         0, page, restricted_source.address(), Permission::read | Permission::write);
     if (!check(failed_preparation.error == ProcessMemoryError::protection_failed,
@@ -354,7 +376,8 @@ int main() {
                "Native page size is unavailable or invalid.")) {
         return 1;
     }
-    if (!large_aligned_reservation(page) ||
+    if (!host_limits_geometry(page) ||
+        !large_aligned_reservation(page) ||
         !reservation_does_not_clobber(page) ||
         !commit_protect_and_geometry(page) ||
         !protect_middle_page(page) ||

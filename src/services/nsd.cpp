@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/nsd.h>
 
 #include <array>
@@ -18,24 +19,14 @@ namespace armigo::services::nsd {
 namespace {
 using namespace horizon;
 
-constexpr std::uint32_t sfci = 0x49434653;
-constexpr std::uint32_t sfco = 0x4f434653;
+using namespace horizon::cmif;
 constexpr std::string_view environment = "lp1";
 constexpr std::uint32_t environment_type_lp = 1;
 constexpr std::size_t fqdn_size = 0x100;
 // Result of the nsd module (141): the resolved name does not fit.
 constexpr std::uint32_t result_overflow = 141u | 2u << 9;
 
-std::uint32_t read(const IpcMessage& message, std::size_t offset) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i < 4; ++i)
-        value |= std::uint32_t(std::to_integer<unsigned char>(message[offset + i])) << (8 * i);
-    return value;
-}
 
-void write(IpcMessage& message, std::size_t offset, std::uint32_t value) {
-    for (unsigned i = 0; i < 4; ++i) message[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
-}
 
 IpcReply reply_with(std::uint32_t result, std::size_t data = 0) {
     IpcReply reply;

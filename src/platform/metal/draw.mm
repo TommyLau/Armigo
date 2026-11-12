@@ -401,6 +401,7 @@ void reflection(const CompiledGraphicsPair& pair,std::uint32_t texture_selector)
         for (const auto& cb:stage->constant_buffer_windows)
             require(cb.guest_binding < 18 && cb.metal_buffer_index < 31 &&
                     cb.window_bytes >= 4 && cb.window_bytes <= 65536 && !(cb.window_bytes & 3u) &&
+                    (cb.zero_padding_bytes == 0 || cb.zero_padding_bytes == 16) &&
                     guest.insert(cb.guest_binding).second && metal.insert(cb.metal_buffer_index).second,
                     "Metal draw constant-buffer window reflection is invalid");
         if (stage->constant_buffer_support_index)
@@ -599,7 +600,7 @@ CommandResult execute(MetalDrawContext& context,const RenderStop& stop,const Gpu
         }
         for (const auto& cb:stage.constant_buffer_windows) {
             const auto& binding=stop.constant_buffers[stage_index][cb.guest_binding];
-            std::vector<std::byte> bytes(cb.window_bytes);
+            std::vector<std::byte> bytes(cb.backing_bytes());
             // Whole words below the bound size; the rest of the window reads zero.
             const auto copied=binding.enabled ? std::min(binding.size,cb.window_bytes)&~3u : 0u;
             if (copied) read(memory,binding.address,std::span(bytes).first(copied));

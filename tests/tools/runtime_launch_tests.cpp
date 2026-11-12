@@ -15,6 +15,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <array>
+#include <cstdlib>
+#include <optional>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -255,9 +258,68 @@ struct FakeEnvironment {
     }
 };
 
+void test_development_run_options() {
+    const std::array names{"ARMIGO_DEV_INPUT_SCRIPT", "ARMIGO_DEV_SAVE_DIR", "ARMIGO_DEV_CAPTURE_DIR", "ARMIGO_DEV_FRAMES"};
+    std::array<std::optional<std::string>, names.size()> previous;
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        if (const char* value = std::getenv(names[index])) previous[index] = value;
+        ::unsetenv(names[index]);
+    }
+    auto ordinary = valid_arguments();
+    check(std::holds_alternative<std::monostate>(tools::apply_development_run_options(ordinary, false)),
+          "ordinary launch is unchanged without development options");
+    ::setenv(names[0], "input.txt", 1);
+    ::setenv(names[1], "scratch", 1);
+    ::setenv(names[2], "captures", 1);
+    ::setenv(names[3], "4200", 1);
+    ordinary.save_directory = "/saved-title";
+    const auto forbidden = tools::apply_development_run_options(ordinary, false);
+    check(std::holds_alternative<LaunchFailure>(forbidden) && !ordinary.input_script_file,
+          "ordinary packs reject scripted environment controls");
+    auto development = ordinary;
+    const auto configured = tools::apply_development_run_options(development, true);
+    check(std::holds_alternative<std::monostate>(configured) &&
+              development.input_script_file == "/Diagnostics/saved-title/input.txt" &&
+              development.save_directory == "/Diagnostics/saved-title/scratch" &&
+              development.capture_directory == "/Diagnostics/saved-title/captures" &&
+              development.completed_frame_target == 4200,
+          "development controls use a separate diagnostics namespace");
+    ::setenv(names[2], "/saved-title/capture", 1);
+    auto collision = ordinary;
+    check(std::holds_alternative<LaunchFailure>(tools::apply_development_run_options(collision, true)),
+          "development capture cannot enter the active player saves");
+    ::setenv(names[2], "/Diagnostics/saved-title/scratch/capture", 1);
+    check(std::holds_alternative<LaunchFailure>(tools::apply_development_run_options(collision, true)),
+          "development capture cannot enter scratch saves");
+    ::setenv(names[2], "captures", 1);
+    ::setenv(names[3], "0", 1);
+    auto invalid = ordinary;
+    check(std::holds_alternative<LaunchFailure>(tools::apply_development_run_options(invalid, true)) &&
+              !invalid.input_script_file && invalid.save_directory == ordinary.save_directory,
+          "invalid frame count rejects the whole configuration without partial updates");
+    for (const char* name : names) ::unsetenv(name);
+    ::setenv(names[0], "/absolute/input.txt", 1);
+    auto absolute = valid_arguments();
+    check(std::holds_alternative<LaunchFailure>(tools::apply_development_run_options(absolute, true)),
+          "absolute development paths cannot bypass validation of the default title saves");
+    absolute.save_directory = "/active-player-saves";
+    check(std::holds_alternative<std::monostate>(tools::apply_development_run_options(absolute, true)) &&
+              absolute.input_script_file == "/absolute/input.txt",
+          "absolute development paths validate against an explicit player save root");
+    ::setenv(names[0], "relative.txt", 1);
+    auto relative = valid_arguments();
+    check(std::holds_alternative<LaunchFailure>(tools::apply_development_run_options(relative, true)),
+          "relative development paths require an explicit data root");
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        if (previous[index]) ::setenv(names[index], previous[index]->c_str(), 1);
+        else ::unsetenv(names[index]);
+    }
+}
+
 } // namespace
 
 int main() {
+    test_development_run_options();
     using tools::parse_runner_arguments;
     using tools::run_headless_shell;
     const std::filesystem::path root = fixture_root();

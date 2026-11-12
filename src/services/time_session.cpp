@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/time_session.h>
 
 #include <algorithm>
@@ -23,26 +24,14 @@ using horizon::IpcDisposition;
 using horizon::IpcMessage;
 using horizon::IpcReply;
 
-constexpr std::uint32_t sfci = 0x49434653;
-constexpr std::uint32_t sfco = 0x4f434653;
-constexpr std::uint32_t control_interface = 0xec6be3ff;
+using namespace horizon::cmif;
 constexpr std::uint32_t static_time_interface = 0x0920b7a6;
 // Large enough for every pointer buffer the served commands use (the 0xd0-byte
 // clock snapshot); the firmware's own size is not established here.
 constexpr std::uint16_t pointer_buffer_size = 0x1000;
 constexpr std::size_t clock_snapshot_bytes = 0xd0;
 
-std::uint32_t read(const IpcMessage& bytes, std::size_t offset, unsigned count = 4) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i < count; ++i)
-        value |= std::uint32_t{std::to_integer<unsigned char>(bytes[offset + i])} << (8 * i);
-    return value;
-}
 
-void write(IpcMessage& bytes, std::size_t offset, std::uint32_t value, unsigned count = 4) {
-    for (unsigned i = 0; i < count; ++i)
-        bytes[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
-}
 
 bool no_descriptors(const IpcMessage& message, std::uint32_t minimum_words) {
     const auto header = read(message, 4);
@@ -50,20 +39,7 @@ bool no_descriptors(const IpcMessage& message, std::uint32_t minimum_words) {
            header <= (message.size() - 8) / 4;
 }
 
-void cmif_header(IpcMessage& message, std::size_t offset, std::uint32_t interface_id) {
-    write(message, offset, sfco);
-    write(message, offset + 12, interface_id);
-}
 
-IpcReply control_reply(std::uint32_t value, unsigned width) {
-    IpcReply reply;
-    reply.disposition = IpcDisposition::handled;
-    reply.size = 44;
-    write(reply.bytes, 4, 9);
-    cmif_header(reply.bytes, 16, control_interface);
-    write(reply.bytes, 32, value, width);
-    return reply;
-}
 
 }  // namespace
 
@@ -116,10 +92,10 @@ IpcReply TimeServiceSession::control(const IpcMessage& message) {
     // Context-bearing forms select the same methods. Their request context
     // does not alter these responses or replace the fixed interface tag.
     const auto command = read(message, 24);
-    if (command == 3) return control_reply(pointer_buffer_size, 2);
+    if (command == 3) return control_reply_bytes(pointer_buffer_size, 2);
     if (command != 0) return unsupported("Time-service control command is unsupported");
     if (!objects_.empty()) return unsupported("Repeated time-service domain conversion is unsupported");
-    auto reply = control_reply(1, 4);
+    auto reply = control_reply_bytes(1, 4);
     objects_.push_back(root_);
     return reply;
 }

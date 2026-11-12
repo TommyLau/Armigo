@@ -450,6 +450,19 @@ Status generate_absolute(MslContext& c, OperationId id) {
     return op.numeric.domain == Domain::floating ? numeric::sign(c, id, true) : integer_sign(c, id, true);
 }
 
+Status generate_derivative(MslContext& c, OperationId id) {
+    return callback(c, id, [&] {
+        const auto& op = c.operation(id);
+        require(c.program().ir.stage == Stage::fragment, "Derivatives require a fragment stage",
+                DiagnosticCode::unsupported_capability);
+        require(op.inputs.size() == 1 && op.outputs.size() == 1, "A derivative takes one input and one result");
+        require(op.numeric == NumericMode{Domain::floating, ScalarType::f32, Rounding::nearest_even},
+                "Derivative numeric modifiers are unsupported", DiagnosticCode::unsupported_modifier);
+        const auto function = op.opcode == Opcode::derivative_x ? "dfdx(" : "dfdy(";
+        take(c.assign(output_at(op, 0), function + operand_at(c, op, 0, ScalarType::f32) + ")", ScalarType::f32));
+    });
+}
+
 Status generate_negate(MslContext& c, OperationId id) {
     const auto& op = c.operation(id);
     return op.numeric.domain == Domain::floating ? numeric::sign(c, id, false) : integer_sign(c, id, false);

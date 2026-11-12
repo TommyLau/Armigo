@@ -12,16 +12,20 @@
 #include "input_script.h"
 
 #include <armigo/compat/title_settings.h>
+#include <armigo/common/diagnostics.h>
 #include <algorithm>
 #include <armigo/loader/container.h>
 #include <armigo/runtime/preparation_format.h>
 
 #include "runner_shell_internal.h"
+#include "program_capture.h"
 #include "pacing_clock.h"
 #include "input_log.h"
 
 #include <armigo/services/file_system.h>
 
+#include <fcntl.h>
+#include <spawn.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -39,6 +43,8 @@
 
 #include <sys/resource.h>
 #include <sys/syslimits.h>
+
+extern char** environ;
 
 namespace armigo::tools {
 namespace {
@@ -77,6 +83,54 @@ std::string hex_digest(std::uint64_t value) {
     return text;
 }
 
+std::mutex& owned_directory_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::filesystem::path& owned_directory() {
+    static std::filesystem::path path;
+    return path;
+}
+
+// A detached process in its own session that removes `directory` once this
+// process has exited, however it exits.
+void watch_owned_directory(const std::filesystem::path& directory) {
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attributes;
+    if (posix_spawn_file_actions_init(&actions) != 0) return;
+    if (posix_spawnattr_init(&attributes) != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        return;
+    }
+    for (const int descriptor : {0, 1, 2})
+        posix_spawn_file_actions_addopen(&actions, descriptor, "/dev/null", descriptor == 0 ? O_RDONLY : O_WRONLY, 0);
+    posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSID);
+    const std::string pid = std::to_string(::getpid());
+    const std::string path = directory.string();
+    const char* script = "while kill -0 \"$1\" 2>/dev/null; do sleep 2; done; rm -rf -- \"$2\"";
+    char* argv[] = {const_cast<char*>("/bin/sh"), const_cast<char*>("-c"), const_cast<char*>(script),
+                    const_cast<char*>("armigo-container-watch"), const_cast<char*>(pid.c_str()),
+                    const_cast<char*>(path.c_str()), nullptr};
+    pid_t watcher = 0;
+    static_cast<void>(posix_spawn(&watcher, "/bin/sh", &actions, &attributes, argv, environ));
+    posix_spawnattr_destroy(&attributes);
+    posix_spawn_file_actions_destroy(&actions);
+}
+
+void remove_owned_at_exit() { remove_owned_container_directory(); }
+
+// Records a folder the shell created for its own use.
+void own_container_directory(const std::filesystem::path& directory) {
+    {
+        const std::lock_guard lock(owned_directory_mutex());
+        owned_directory() = directory;
+    }
+    static const bool registered = std::atexit(remove_owned_at_exit) == 0;
+    static_cast<void>(registered);
+    watch_owned_directory(directory);
+}
+
 // Extracts a --container input into its cache directory with the user's
 // keys. Only a fully signature-verified extraction produces input paths.
 // With --update, the update's program NCA supplies ExeFS and a BKTR-patched
@@ -98,6 +152,14 @@ extract_container_input(const RunnerArguments& arguments) {
                             (arguments.update_container_file
                                  ? input_path_digest(*arguments.update_container_file)
                                  : 0));
+        // The shell's own folder: created and claimed before extraction, so a
+        // failed extraction is removed as well.
+        std::filesystem::create_directories(cache, error);
+        if (error) {
+            return shell_detail::failure(runtime::LaunchStage::inputs, runtime::LaunchError::host_failure,
+                                         "container input", "Cannot create the container extraction folder.");
+        }
+        own_container_directory(cache);
     }
     loader::ContainerExtractionOptions options;
     auto keys = loader::read_container_keys_file(*arguments.keys_file);
@@ -418,6 +480,72 @@ void finish_run(const std::shared_ptr<runtime::ProcessRuntime>& runtime, ShellRe
 }
 
 } // namespace shell_detail
+
+runtime::LaunchStatus apply_development_run_options(RunnerArguments& arguments, bool development_pack) {
+    const char* script = std::getenv("ARMIGO_DEV_INPUT_SCRIPT");
+    const char* saves = std::getenv("ARMIGO_DEV_SAVE_DIR");
+    const char* captures = std::getenv("ARMIGO_DEV_CAPTURE_DIR");
+    const char* frames = std::getenv("ARMIGO_DEV_FRAMES");
+    if (!script && !saves && !captures && !frames) return std::monostate{};
+    const auto rejected = [](runtime::LaunchError code, std::string detail) -> runtime::LaunchStatus {
+        return runtime::LaunchFailure{.stage = runtime::LaunchStage::inputs, .code = code,
+            .operation = "development run options", .detail = std::move(detail)};
+    };
+    if (!development_pack)
+        return rejected(runtime::LaunchError::unsupported, "Development options require a development player pack.");
+    if ((script || saves || captures) && !arguments.save_directory)
+        return rejected(runtime::LaunchError::invalid_input,
+            "Development paths require an explicit player save directory for collision checks.");
+    for (const char* value : {script, saves, captures}) {
+        if (!value) continue;
+        if (!*value) return rejected(runtime::LaunchError::invalid_input, "Development paths must not be empty.");
+        if (!std::filesystem::path(value).is_absolute() && !arguments.save_directory)
+            return rejected(runtime::LaunchError::invalid_input, "Relative development paths require a save directory.");
+    }
+    const auto path = [&](const char* value) {
+        const std::filesystem::path selected(value);
+        if (selected.is_absolute()) return selected;
+        const auto& active = *arguments.save_directory;
+        const auto base = active.parent_path().filename() == "Saves"
+            ? active.parent_path().parent_path() / "Diagnostics" / active.filename()
+            : active.parent_path() / "Diagnostics" / active.filename();
+        return base / selected;
+    };
+    auto selected = arguments;
+    if (script) selected.input_script_file = path(script);
+    if (saves) selected.save_directory = path(saves);
+    if (captures) selected.capture_directory = path(captures);
+    if (arguments.save_directory) {
+        const auto overlaps = [](const std::filesystem::path& left, const std::filesystem::path& right) {
+            const auto a = std::filesystem::weakly_canonical(left);
+            const auto b = std::filesystem::weakly_canonical(right);
+            const auto [ai, bi] = std::mismatch(a.begin(), a.end(), b.begin(), b.end());
+            return ai == a.end() || bi == b.end();
+        };
+        try {
+            for (const auto* output : {script ? &*selected.input_script_file : nullptr,
+                                      saves ? &*selected.save_directory : nullptr,
+                                      captures ? &*selected.capture_directory : nullptr}) {
+                if (output && overlaps(*output, *arguments.save_directory))
+                    return rejected(runtime::LaunchError::invalid_input,
+                        "Development files must be outside the player save folder.");
+            }
+            if (captures && selected.save_directory && overlaps(*selected.capture_directory, *selected.save_directory))
+                return rejected(runtime::LaunchError::invalid_input,
+                    "Captures must be outside the development save folder.");
+        } catch (const std::filesystem::filesystem_error&) {
+            return rejected(runtime::LaunchError::invalid_input, "Development paths could not be checked.");
+        }
+    }
+    if (frames) {
+        std::uint64_t count = 0;
+        if (!parse_integer(frames, count) || !count)
+            return rejected(runtime::LaunchError::invalid_input, "ARMIGO_DEV_FRAMES requires a positive frame count.");
+        selected.completed_frame_target = count;
+    }
+    arguments = std::move(selected);
+    return std::monostate{};
+}
 
 ParsedRunArguments parse_runner_arguments(platform::PresentationMode mode,
                                           std::span<char* const> arguments) {
@@ -826,8 +954,27 @@ std::size_t retained_runtime_count() {
     return retained_runtimes().size();
 }
 
+std::filesystem::path owned_container_directory() {
+    const std::lock_guard lock(owned_directory_mutex());
+    return owned_directory();
+}
+
+void remove_owned_container_directory() {
+    std::filesystem::path path;
+    {
+        const std::lock_guard lock(owned_directory_mutex());
+        path.swap(owned_directory());
+    }
+    if (path.empty()) return;
+    std::error_code error;
+    std::filesystem::remove_all(path, error);
+}
+
 void exit_process_if_runtime_retained(int exit_code) {
     if (retained_runtime_count() == 0) return;
+    // The retained runtime may still map extracted files, but the process
+    // ends here, so its extraction folder goes now.
+    remove_owned_container_directory();
     std::fflush(nullptr);
     std::_Exit(exit_code);
 }
@@ -908,6 +1055,13 @@ ShellReportFields report_fields(const ShellReport& report) {
 
 ShellReport run_headless_shell(const RunnerArguments& arguments,
                                const ShellEnvironment& environment) {
+    // A finished run no longer reads its extracted container; a run that
+    // retains its runtime keeps the folder until the process exits.
+    struct RemoveOwnedDirectory {
+        ~RemoveOwnedDirectory() {
+            if (retained_runtime_count() == 0) remove_owned_container_directory();
+        }
+    } remove_owned_directory;
     InputScript input_script;
     if (arguments.input_script_file) {
         std::ifstream source(*arguments.input_script_file);
@@ -1005,6 +1159,18 @@ ShellReport run_headless_shell(const RunnerArguments& arguments,
     auto runtime = std::shared_ptr<runtime::ProcessRuntime>(
         std::move(std::get<std::unique_ptr<runtime::ProcessRuntime>>(runtime_result)));
 
+    nvn::program_capture::RunBinding captured;
+    try {
+        captured = nvn::program_capture::bind_run([weak = std::weak_ptr<runtime::ProcessRuntime>(runtime)]() noexcept {
+            if (auto owner = weak.lock()) {
+                owner->request_stop(runtime::StopReason::user_request);
+                diag::opt_in("nvn_program_capture stop_requested=1\n");
+            }
+        });
+    } catch (...) {
+        diag::write(diag::Level::error, "Armigo NVN program capture: run binding failed\n");
+    }
+
     runtime::RunLimits limits;
     limits.completed_frame_target = arguments.completed_frame_target;
     limits.timeout = arguments.time_limit;
@@ -1016,6 +1182,7 @@ ShellReport run_headless_shell(const RunnerArguments& arguments,
     report.result =
         shell_detail::run_runtime_with_limits(runtime, effective, limits, destination);
     shell_detail::finish_run(runtime, report);
+    captured.finish(report.result.quiescent);
     report.exit_code = classify_run_result(report.result);
     report.metadata_signature_verified = metadata_signature_verified;
     report.update_applied = update_applied;

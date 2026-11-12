@@ -440,6 +440,8 @@ NVNboolean device_initialize(NVNdevice* device, const NVNdeviceBuilder* builder)
     *state = DeviceState{};
     state->tag = tag_device;
     state->flags = builder ? state_of<DeviceBuilderState>(builder)->flags : 0;
+    const auto version = selected_api_version();
+    state->gob_order = version && version->major == 231 ? 1 : 0;
     return 1;  // window origin and depth mode keep the API defaults
 }
 

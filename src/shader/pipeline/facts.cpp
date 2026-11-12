@@ -37,6 +37,7 @@ bool value_matches(FactKind kind, const FactValue& value) {
     ARMIGO_MATCH(alpha_to_coverage);
     ARMIGO_MATCH(dual_source_blend);
     ARMIGO_MATCH(draw_parameters);
+    ARMIGO_MATCH(bound_storage_descriptor);
 #undef ARMIGO_MATCH
     case FactKind::count: return false;
     }

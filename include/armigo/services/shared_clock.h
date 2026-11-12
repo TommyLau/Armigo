@@ -29,8 +29,9 @@ struct SystemClockContext {
 };
 
 struct Configuration {
-    // A sample of the same counter exposed to the guest, converted from its
-    // 19.2 MHz tick timeline to nanoseconds. This is not host wall time.
+    // A sample of the guest counter timeline in nanoseconds (the Switch 1
+    // 19.2 MHz and Switch 2 31.25 MHz counters share its origin). This is not
+    // host wall time.
     std::int64_t counter_nanoseconds = 0;
     std::int64_t steady_offset_nanoseconds = 0;
     // Nonzero source identity for this initialized clock timeline. Requiring

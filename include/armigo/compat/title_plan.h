@@ -12,6 +12,8 @@
 
 #include <armigo/compat/patches.h>
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -44,7 +46,7 @@ struct TitlePlan {
 };
 
 struct TitlePlanFailure {
-    enum class Kind { invalid_input, artifact_mismatch };
+    enum class Kind { invalid_input, artifact_mismatch, unsupported };
     Kind kind = Kind::invalid_input;
     // "compatibility-frame-rate" or "compatibility-resolution".
     std::string stage;
@@ -53,5 +55,15 @@ struct TitlePlanFailure {
 
 [[nodiscard]] std::variant<TitlePlan, TitlePlanFailure> plan_title_words(
     const PatchDescription& patch, const loader::NsoModuleImage& image, const TitlePlanOptions& options);
+
+// Once the launch knows whether Armigo's NVN driver replaces the game's own:
+// the title mode the words of `rate_patch` admit (zero without one or without
+// a fixed pacing target), since words meant for the driver apply only with
+// it; and the installed description's calls (module calls included), when
+// there is one, narrowed to that mode and driver choice. A GPU-work feedback
+// hook needs the driver.
+[[nodiscard]] std::variant<std::uint32_t, TitlePlanFailure> plan_title_mode(
+    const PatchDescription* rate_patch, PatchDescription* installed, std::string_view requested_rate,
+    bool nvn_driver, bool gpu_feedback);
 
 } // namespace armigo::compat

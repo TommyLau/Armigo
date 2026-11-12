@@ -44,6 +44,9 @@ namespace armigo::platform::metal::nvn_driver {
 [[nodiscard]] bool stop_submission_workers(
     std::optional<std::chrono::steady_clock::time_point> deadline);
 
+// The first fatal replay failure, independent of guest presentation progress.
+[[nodiscard]] std::string failure_detail();
+
 // Native windows the guest builds present through this display's layer.
 void bind_native_windows(std::weak_ptr<services::vi::DisplaySession> display);
 

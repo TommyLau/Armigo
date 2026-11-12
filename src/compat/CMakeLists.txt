@@ -38,10 +38,7 @@ if(BUILD_TESTING)
     target_link_libraries(armigo_title_plan_golden_tests PRIVATE armigo_compat)
     add_test(NAME title.plan_golden COMMAND armigo_title_plan_golden_tests "${PROJECT_SOURCE_DIR}/titles"
         "${PROJECT_SOURCE_DIR}/tests/titles/plan_golden.txt")
-    add_executable(armigo_01007EF00011E000_frame_rate_tests
-        "${PROJECT_SOURCE_DIR}/tests/titles/01007EF00011E000/frame_rate_tests.cpp")
-    target_link_libraries(armigo_01007EF00011E000_frame_rate_tests PRIVATE armigo_compat)
-    add_test(NAME title.01007EF00011E000.frame_rate COMMAND armigo_01007EF00011E000_frame_rate_tests)
+    include("${PROJECT_SOURCE_DIR}/tests/titles/titles.cmake")
     add_executable(armigo_title_resolution_tests "${PROJECT_SOURCE_DIR}/tests/titles/resolution_tests.cpp")
     target_link_libraries(armigo_title_resolution_tests PRIVATE armigo_compat)
     add_test(NAME title.resolution COMMAND armigo_title_resolution_tests)

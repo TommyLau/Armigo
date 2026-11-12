@@ -17,6 +17,8 @@
 #include <TargetConditionals.h>
 
 #import <Foundation/Foundation.h>
+#include "nvn_submission_owner.h"
+
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 
@@ -42,6 +44,8 @@ namespace armigo::platform {
 namespace {
 
 using graphics::Rgba8Image;
+using metal::nvn_driver::Metal4NativeSubmission;
+using metal::nvn_driver::Metal4Completion;
 
 // Each color-target dimension is at most 16384.
 constexpr std::uint32_t kMaxFrameExtent = 16384;
@@ -60,6 +64,9 @@ constexpr auto kCompletionPoll = std::chrono::milliseconds(2);
 // only after the handler reported completion under the record's mutex.
 struct InflightRecord {
     std::uint64_t frame_number = 0;
+    std::shared_ptr<Metal4NativeSubmission> native_submission;
+    std::function<bool()> producer_ready;
+    bool deferred_presentation = false;
     id<MTLResidencySet> residency = nil;
     id<MTL4CommandAllocator> allocator = nil;
     id<MTL4CommandBuffer> commands = nil;
@@ -78,6 +85,7 @@ struct InflightRecord {
     std::mutex mutex;
     std::condition_variable ready;
     bool completed = false;
+    bool cancelled = false;
     bool failed = false;
     std::string detail;
 };
@@ -101,13 +109,17 @@ MTLTextureDescriptor* frame_texture_descriptor(std::uint32_t width, std::uint32_
     return descriptor;
 }
 
-Rgba8Image take_headless_readback(InflightRecord& record) {
+Rgba8Image take_completed_readback(InflightRecord& record) {
     Rgba8Image image;
     image.width = static_cast<std::uint32_t>(record.source.width);
     image.height = static_cast<std::uint32_t>(record.source.height);
     const std::size_t bytes = std::size_t{image.width} * image.height * 4;
     image.pixels.resize(bytes);
     std::memcpy(image.pixels.data(), record.readback_buffer.contents, bytes);
+    if (record.source.pixelFormat == MTLPixelFormatBGRA8Unorm ||
+        record.source.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB)
+        for (std::size_t offset = 0; offset < bytes; offset += 4)
+            std::swap(image.pixels[offset], image.pixels[offset + 2]);
     return image;
 }
 
@@ -176,6 +188,12 @@ public:
     PresentResult present_frame(const PresentationFrame& frame,
                                 std::optional<std::chrono::steady_clock::time_point> deadline,
                                 std::stop_token stop) {
+        struct CancelReservation {
+            std::shared_ptr<Metal4NativeSubmission> submission;
+            ~CancelReservation() { if (submission) submission->cancel(); }
+        } cancel{std::static_pointer_cast<Metal4NativeSubmission>(frame.queued.native_submission)};
+        if (frame.queued.native_producer_ready && !frame.queued.native_submission)
+            return failure(PresentationError::invalid_frame, "ordered native frame has no submission context");
         if (stop.stop_requested())
             return failure(PresentationError::cancelled, "presentation was cancelled before submission");
 
@@ -261,6 +279,15 @@ public:
 
     // Test-only views of the unread headless path's reused resources. Present
     // is serialized, so callers read these between presents.
+    // A test queue proxy can observe actual submission calls before any frame
+    // is in flight. The layer stays unattached to a window in those tests.
+    bool set_test_queue(id<MTL4CommandQueue> queue) {
+        std::lock_guard lock(retire_mutex_);
+        if (!queue || queue.device != device_ || !inflight_.empty()) return false;
+        queue_ = queue;
+        if (layer_) [queue_ addResidencySet:layer_.residencySet];
+        return true;
+    }
     id<MTLTexture> native_target() const { return native_target_; }
     std::uint64_t native_target_allocations() const noexcept { return native_target_allocations_; }
     std::uint64_t native_residency_allocations() const noexcept { return native_residency_allocations_; }
@@ -322,7 +349,7 @@ private:
         [capture endEncoding];
         [record->commands endCommandBuffer];
 
-        commit_and_track(std::move(record), frame, /*with_readback=*/true);
+        commit_and_track(std::move(record), frame, /*with_readback=*/true, /*native=*/false);
         return settle(deadline, stop);
     }
 
@@ -431,7 +458,7 @@ private:
         [consumer endEncoding];
         [record->commands endCommandBuffer];
 
-        commit_and_track(std::move(record), frame, /*with_readback=*/false);
+        commit_and_track(std::move(record), frame, /*with_readback=*/false, /*native=*/true);
         return settle(deadline, stop);
     }
 
@@ -444,7 +471,7 @@ private:
             return failure(PresentationError::host_failure, "windowed presenter has no attached CAMetalLayer");
         const CGSize drawable_size = layer_.drawableSize;
         if (drawable_size.width < 1.0 || drawable_size.height < 1.0)
-            return dropped(frame);
+            return dropped(frame, deadline, stop);
         if (deadline && std::chrono::steady_clock::now() >= *deadline)
             return failure(PresentationError::deadline_expired, "deadline expired before a drawable was requested");
 
@@ -452,8 +479,8 @@ private:
         // above keeps an already-expired deadline from requesting one at all.
         id<CAMetalDrawable> drawable = [layer_ nextDrawable];
         if (!drawable)
-            return dropped(frame);
-        [queue_ waitForDrawable:drawable];
+            return dropped(frame, deadline, stop);
+        if (!native) [queue_ waitForDrawable:drawable];
 
         const std::uint32_t width = native ? std::uint32_t(native.width) : pixels->width;
         const std::uint32_t height = native ? std::uint32_t(native.height) : pixels->height;
@@ -461,6 +488,15 @@ private:
         auto record = std::make_unique<InflightRecord>();
         record->frame_number = frame.queued.frame_number;
         record->drawable = drawable;
+        if (frame.readback) {
+            if (native && native.pixelFormat != MTLPixelFormatRGBA8Unorm &&
+                native.pixelFormat != MTLPixelFormatRGBA8Unorm_sRGB &&
+                native.pixelFormat != MTLPixelFormatBGRA8Unorm && native.pixelFormat != MTLPixelFormatBGRA8Unorm_sRGB)
+                return failure(PresentationError::unsupported, "windowed readback requires an RGBA8 or BGRA8 source");
+            record->readback_buffer = [device_ newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+            if (!record->readback_buffer)
+                return failure(PresentationError::host_failure, "windowed readback allocation failed");
+        }
         if (native) {
             // The window shows the stored bytes, as the pixel path does: an
             // sRGB texture is read through its unorm view, not linearized.
@@ -475,17 +511,18 @@ private:
             }
             // The record keeps the texture alive until the draw completes.
             record->source = native;
-            record->residency = make_residency_set(native == storage ? @[native] : @[native, storage], 2);
+            record->residency = make_residency_set(native == storage ? @[native] : @[native, storage], frame.readback ? 3 : 2);
             if (!record->residency)
                 return failure(PresentationError::host_failure, "windowed presentation residency allocation failed");
         } else {
             record->source = [device_ newTextureWithDescriptor:frame_texture_descriptor(width, height)];
             record->staging = [device_ newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-            record->residency = make_residency_set(@[record->source, record->staging], 2);
+            record->residency = make_residency_set(@[record->source, record->staging], frame.readback ? 3 : 2);
             if (!record->source || !record->staging || !record->residency)
                 return failure(PresentationError::host_failure, "windowed presentation resource allocation failed");
             std::memcpy(record->staging.contents, pixels->pixels.data(), bytes);
         }
+        if (record->readback_buffer) [record->residency addAllocation:record->readback_buffer];
         [record->residency commit];
 
         const id<MTLRenderPipelineState> pipeline = pipeline_for_format(layer_.pixelFormat);
@@ -528,9 +565,20 @@ private:
         [render setArgumentTable:arguments atStages:MTLRenderStageFragment];
         [render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [render endEncoding];
+        if (frame.readback) {
+            id<MTL4ComputeCommandEncoder> capture = [record->commands computeCommandEncoder];
+            if (!capture)
+                return failure(PresentationError::host_failure, "windowed readback encoder creation failed");
+            [capture barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll
+                          visibilityOptions:MTL4VisibilityOptionDevice];
+            [capture copyFromTexture:record->source sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                          sourceSize:MTLSizeMake(width, height, 1) toBuffer:record->readback_buffer destinationOffset:0
+               destinationBytesPerRow:width * 4 destinationBytesPerImage:bytes];
+            [capture endEncoding];
+        }
         [record->commands endCommandBuffer];
 
-        commit_and_track(std::move(record), frame, /*with_readback=*/false);
+        commit_and_track(std::move(record), frame, frame.readback, native != nil);
         return settle(deadline, stop);
     }
 
@@ -538,7 +586,22 @@ private:
     // minimized or hidden long enough that the layer returns no drawable)
     // drops the frame, as a display drops a hidden layer's frame: the frame
     // still completes, so the guest's buffer queue keeps moving.
-    static PresentResult dropped(const PresentationFrame& frame) {
+    static PresentResult dropped(const PresentationFrame& frame,
+                                 std::optional<std::chrono::steady_clock::time_point> deadline,
+                                 std::stop_token stop) {
+        if (frame.queued.native_producer_ready) {
+            auto native = std::static_pointer_cast<Metal4NativeSubmission>(frame.queued.native_submission);
+            native->cancel();
+            while (!native->wait_retirement(kCompletionPoll)) {
+                if (stop.stop_requested())
+                    return failure(PresentationError::cancelled, "native frame drop was cancelled");
+                if (deadline && std::chrono::steady_clock::now() >= *deadline)
+                    return failure(PresentationError::deadline_expired, "native producer did not retire before drop deadline");
+            }
+            bool ready = false;
+            try { ready = frame.queued.native_producer_ready(); } catch (...) {}
+            if (!ready) return failure(PresentationError::host_failure, "dropped native frame has a failed producer");
+        }
         PresentedFrame result;
         result.frame_number = frame.queued.frame_number;
         result.completed_at = std::chrono::steady_clock::now();
@@ -626,26 +689,44 @@ private:
     // (never borrowed C++ state); records are destroyed solely after that
     // report, so nothing released here can still be executing.
     void commit_and_track(std::unique_ptr<InflightRecord> record, const PresentationFrame& frame,
-                          bool with_readback) {
+                          bool with_readback, bool native) {
         InflightRecord* context = record.get();
         context->frame_number = frame.queued.frame_number;
-        auto* options = [MTL4CommitOptions new];
-        [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+        context->native_submission = std::static_pointer_cast<Metal4NativeSubmission>(frame.queued.native_submission);
+        context->producer_ready = frame.queued.native_producer_ready;
+        context->deferred_presentation = context->native_submission && bool(context->producer_ready);
+        Metal4Completion completion = ^(id<MTL4CommitFeedback> feedback) {
             const std::uint64_t delay = g_test_feedback_delay_ns.load(std::memory_order_relaxed);
             if (delay) std::this_thread::sleep_for(std::chrono::nanoseconds(delay));
             std::lock_guard lock(context->mutex);
-            if (feedback.error) {
+            const auto producer_error = context->native_submission ? context->native_submission->producer_error() : std::string{};
+            bool producer_ready = true;
+            try { if (context->producer_ready) producer_ready = context->producer_ready(); }
+            catch (...) { producer_ready = false; }
+            if (!producer_ready) {
+                context->failed = true;
+                context->detail = "native producer did not complete successfully";
+            } else if (!producer_error.empty()) {
+                context->failed = true;
+                context->detail = producer_error;
+            } else if (feedback.error) {
                 context->failed = true;
                 context->detail = std::string("presentation GPU execution failed: ") +
                                   feedback.error.description.UTF8String;
+            } else if (context->native_submission && context->native_submission->cancelled()) {
+                context->cancelled = true;
             } else if (with_readback) {
                 // GPU completion above makes the shared buffer stable; copy it
                 // out on the handler thread so the waiter never reads early.
-                context->readback = take_headless_readback(*context);
+                context->readback = take_completed_readback(*context);
+            }
+            if (!context->failed && !context->cancelled && context->deferred_presentation && context->drawable &&
+                !context->native_submission->present_deferred_drawable(context->drawable)) {
+                context->cancelled = true;
             }
             context->completed = true;
             context->ready.notify_all();
-        }];
+        };
         if (record->drawable) {
             std::shared_ptr<std::atomic<bool>> observation = std::make_shared<std::atomic<bool>>(false);
             std::shared_ptr<PresentedCounter> presented = presented_;
@@ -656,13 +737,33 @@ private:
             }];
         }
         std::lock_guard lock(retire_mutex_);
-        id<MTL4CommandBuffer> submitted[] = {record->commands};
-        [queue_ commit:submitted count:1 options:options];
-        // Metal 4 shows a drawable once the queue signals it and it is
-        // presented; without present the layer never gets it back.
-        if (record->drawable) {
-            [queue_ signalDrawable:record->drawable];
-            [record->drawable present];
+        if (context->native_submission && native) {
+            const auto ticket = context->native_submission->publish(
+                record->commands, completion, record->drawable, context->deferred_presentation);
+            if (!ticket) {
+                std::lock_guard record_lock(context->mutex);
+                context->failed = true;
+                context->detail = "native presentation submission was cancelled or already consumed";
+                context->completed = true;
+                context->ready.notify_all();
+            }
+        } else if (context->native_submission && !context->native_submission->prepare_decoded_submission()) {
+            std::lock_guard record_lock(context->mutex);
+            context->failed = true;
+            context->detail = "native decoded presentation was cancelled before submission";
+            context->completed = true;
+            context->ready.notify_all();
+        } else {
+            // An owned decoded image has no GPU dependency on a later native
+            // frame. Keep its real consumer work on the presenter's queue.
+            auto* options = [MTL4CommitOptions new];
+            [options addFeedbackHandler:completion];
+            id<MTL4CommandBuffer> submitted[] = {record->commands};
+            [queue_ commit:submitted count:1 options:options];
+            if (record->drawable) {
+                [queue_ signalDrawable:record->drawable];
+                if (!context->deferred_presentation) [record->drawable present];
+            }
         }
         inflight_.push_back(std::move(record));
     }
@@ -685,10 +786,12 @@ private:
             break;
         }
         std::string detail;
+        bool cancelled = false;
         Rgba8Image readback;
         std::uint64_t frame_number = 0;
         {
             std::lock_guard record_lock(context->mutex);
+            cancelled = context->cancelled;
             if (context->failed) detail = context->detail;
             else {
                 readback = std::move(context->readback);
@@ -698,6 +801,10 @@ private:
         if (!detail.empty()) {
             retire(context);
             return failure(PresentationError::host_failure, detail);
+        }
+        if (cancelled) {
+            retire(context);
+            return failure(PresentationError::cancelled, "native presentation was cancelled before visibility");
         }
         PresentedFrame result;
         result.frame_number = frame_number;
@@ -813,6 +920,11 @@ std::shared_ptr<Presenter> create_layer_presenter(const PresenterOptions& option
 
 void presenter_test_set_feedback_delay_ns(std::uint64_t nanoseconds) noexcept {
     g_test_feedback_delay_ns.store(nanoseconds, std::memory_order_relaxed);
+}
+
+bool presenter_test_set_queue(Presenter& presenter, id<MTL4CommandQueue> queue) {
+    auto* impl = dynamic_cast<MetalPresenter*>(&presenter);
+    return impl && impl->set_test_queue(queue);
 }
 
 std::size_t presenter_test_inflight_count(const Presenter& presenter) {

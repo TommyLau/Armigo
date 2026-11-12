@@ -49,9 +49,33 @@ std::variant<LanguageManifest, std::string> read_language_manifest(
     return manifest;
 }
 
+GameLanguageChoice game_language_choice(const LanguageManifest& manifest,
+    std::optional<std::string> stored) {
+    GameLanguageChoice choice;
+    for (const auto& language : manifest.languages) {
+        const auto selected = services::set::title_language(language, manifest.supported_language_flag);
+        if (!selected || *selected != language ||
+            std::find(choice.supported_languages.begin(), choice.supported_languages.end(), language) !=
+                choice.supported_languages.end()) continue;
+        choice.supported_languages.push_back(language);
+    }
+    if (!stored || *stored == "auto") return choice;
+    if (std::find(choice.supported_languages.begin(), choice.supported_languages.end(), *stored) !=
+        choice.supported_languages.end()) {
+        choice.preference = *stored;
+    } else {
+        choice.fell_back = true;
+    }
+    return choice;
+}
+
 std::string apply_language_manifest(const LanguageManifest& manifest,
-    std::span<const std::string_view> preferred_locales) {
-    const auto language = services::set::automatic_language(preferred_locales, manifest.supported_language_flag);
+    std::span<const std::string_view> preferred_locales, std::string_view preference) {
+    const auto choice = game_language_choice(manifest, std::string(preference));
+    if (choice.fell_back) return {};
+    const auto language = choice.preference == "auto"
+        ? services::set::automatic_language(preferred_locales, manifest.supported_language_flag)
+        : std::optional<std::string>(choice.preference);
     if (!language) return {};
     if (!services::set::configure_console_language(*language) ||
         !services::set::configure_console_region(services::set::market_region(*language))) return {};
@@ -234,6 +258,10 @@ PlayerChoices title_frame_rate_choices(const TitleFrameRatePolicy& policy, std::
     return choices;
 }
 
+std::string language_preference_key(std::optional<std::uint64_t> title_id) {
+    return title_id ? "game_language." + compat::title_id_text(*title_id) : std::string("game_language");
+}
+
 std::string frame_rate_preference_key(std::optional<std::uint64_t> title_id) {
     return title_id ? "frame_rate." + compat::title_id_text(*title_id) : std::string("frame_rate");
 }
@@ -272,7 +300,8 @@ RestartCommand restart_command(std::span<const std::string> arguments,
 }
 
 void apply_performance_overlay(const PlayerChoices& choices) {
-    if (choices.performance_overlay) setenv("MTL_HUD_ENABLED", "1", 1);
+    if (!std::getenv("MTL_HUD_ENABLED"))
+        setenv("MTL_HUD_ENABLED", choices.performance_overlay ? "1" : "0", 1);
 }
 
 void apply_player_choices(const PlayerChoices& choices, std::uint32_t width, RunnerArguments& arguments) {

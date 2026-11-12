@@ -20,6 +20,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -169,6 +170,7 @@ struct CommandList {
 };
 
 struct CommandSubmission {
+    std::uint64_t sampler_registration_limit = 0;
     struct List {
         std::shared_ptr<const CommandList> commands;
         unsigned height = 0;
@@ -359,6 +361,7 @@ bool samples_textures(Op op) {
     case Op::draw: case Op::draw_indexed: case Op::draw_indirect: case Op::draw_indexed_indirect:
     case Op::multi_draw_indirect: case Op::multi_draw_indexed_indirect: case Op::draw_texture:
     case Op::transform_feedback: case Op::dispatch: case Op::dispatch_indirect:
+    case Op::draw_mesh_tasks: case Op::draw_mesh_tasks_indirect:
         return true;
     default:
         return false;
@@ -370,8 +373,8 @@ void* append_record(NVNcommandBuffer* command_buffer, Op op, std::size_t payload
     auto* list = recording_list(state, operation);
     if (!list || state->recording_failed)
         return nullptr;
-    // A draw samples with the sampler registrations made before it was
-    // recorded: stamp the count when it moved since the last stamp.
+    // Keep legacy registration stamps in the recording format. Captured
+    // replay selects descriptor contents at its immutable submission boundary.
     if (samples_textures(op)) {
         const auto registrations = sampler_registrations.load(std::memory_order_acquire);
         if (registrations != list->stamped_registrations) {
@@ -465,11 +468,63 @@ bool valid_range(int first, int count, int limit) noexcept {
     return first >= 0 && count >= 0 && first <= limit && count <= limit - first;
 }
 
+bool valid_deferred_texture_range(int first, int count) noexcept {
+    if (first < 0) {
+        char text[224];
+        std::snprintf(text, sizeof text,
+            "unsupported deferred first=%d: original driver uses 8-bit truncation, "
+            "offset = 0x20 + 8*(first & 0xff) = %#x",
+            first, 0x20u + 8u * (static_cast<unsigned>(first) & 0xffu));
+        diagnostic("nvnCommandBufferBindTexturesDeferred", text);
+        return false;
+    }
+    return valid_range(first, count, 128);
+}
+
+bool valid_binding_stage(std::int32_t stage) noexcept {
+    return static_cast<unsigned>(stage) < logical_binding_stage_count;
+}
+
 template <typename Handle>
 void bind_handles(NVNcommandBuffer* command_buffer, Op op, NVNshaderStage stage, int first, int count,
-                  const Handle* handles, int limit, Entry entry, const char* operation) {
-    if (stage < NVN_SHADER_STAGE_VERTEX || stage > NVN_SHADER_STAGE_COMPUTE || !valid_range(first, count, limit) ||
+                  const Handle* handles, int limit, Entry entry, const char* operation, int slot_base = 0) {
+    const auto api_stage = stage;
+    // The graphics combined-handle table begins at byte 0x20. Index -1
+    // updates its 0x18 prefix, rather than any nonnegative texture slot.
+    const bool combined = entry == Entry::nvnCommandBufferBindTexture || entry == Entry::nvnCommandBufferBindTextures;
+    if (combined && first == -1 && valid_binding_stage(stage) && stage != NVN_SHADER_STAGE_COMPUTE &&
+        count > 0 && handles && valid_range(0, count - 1, limit)) {
+        auto* prefix = append<BindTexturePrefix>(command_buffer, Op::bind_texture_prefix, operation);
+        if (!prefix) return;
+        prefix->stage = stage;
+        prefix->bytes = entry == Entry::nvnCommandBufferBindTexture ? 4 : 8;
+        std::memcpy(&prefix->handle, handles, 8);
+        prefix->sampler_registrations = sampler_registrations.load(std::memory_order_acquire);
+        if (const char* trace = std::getenv("ARMIGO_NVN_STAGE_DIAGNOSTICS"); trace && *trace == '1') {
+            static std::array<std::atomic_bool, logical_binding_stage_count * 2> reported{};
+            const auto key = std::size_t(stage) * 2 + (prefix->bytes == 8);
+            if (!reported[key].exchange(true, std::memory_order_relaxed)) {
+                char text[160];
+                std::snprintf(text, sizeof text,
+                    "graphics texture prefix write stage=%d index=-1 offset=0x18 bytes=%u handle=%#llx",
+                    static_cast<int>(stage), prefix->bytes, static_cast<unsigned long long>(prefix->handle));
+                diagnostic(operation, text);
+            }
+        }
+        if (auto* list = as<CommandBufferState>(command_buffer)->list)
+            list->stamped_registrations = prefix->sampler_registrations;
+        ++handles;
+        --count;
+        first = 0;
+    }
+    if (!valid_binding_stage(stage) || !valid_range(first, count, limit) ||
         (count && !handles)) {
+        char text[176];
+        std::snprintf(text, sizeof text,
+            "invalid handle binding api_stage=%d replay_stage=%d first=%d count=%d limit=%d source=%s",
+            static_cast<int>(api_stage), static_cast<int>(stage), first, count, limit,
+            handles ? "present" : "null");
+        diagnostic(operation, text);
         append_unsupported(command_buffer, entry, operation);
         return;
     }
@@ -480,7 +535,7 @@ void bind_handles(NVNcommandBuffer* command_buffer, Op op, NVNshaderStage stage,
         if (!payload)
             return;
         payload->stage = stage;
-        payload->first = first + consumed;
+        payload->first = slot_base + first + consumed;
         payload->count = batch;
         payload->sampler_registrations = sampler_registrations.load(std::memory_order_acquire);
         if (op != Op::bind_images)
@@ -493,8 +548,8 @@ void bind_handles(NVNcommandBuffer* command_buffer, Op op, NVNshaderStage stage,
 }
 
 void bind_buffer_ranges(NVNcommandBuffer* command_buffer, Op op, NVNshaderStage stage, int first, int count,
-                        const NVNbufferRange* ranges, const char* operation) {
-    if (stage < NVN_SHADER_STAGE_VERTEX || stage > NVN_SHADER_STAGE_COMPUTE || !valid_range(first, count, 16) ||
+                        const NVNbufferRange* ranges, Entry entry, const char* operation) {
+    if (!valid_binding_stage(stage) || !valid_range(first, count, 16) ||
         (count && !ranges)) {
         diagnostic(operation, "invalid stage, range, or source array");
         fail_recording(command_buffer);
@@ -564,6 +619,7 @@ constexpr std::size_t payload_minimum(Op op) noexcept {
     case Op::dispatch:
         return sizeof(Dispatch);
     case Op::barrier:
+    case Op::geometry_processing_mode:
         return sizeof(ScalarInt);
     case Op::set_texture_pool:
     case Op::set_sampler_pool:
@@ -665,6 +721,8 @@ constexpr std::size_t payload_minimum(Op op) noexcept {
         return sizeof(ClearColorInteger);
     case Op::dispatch_indirect:
         return sizeof(DispatchIndirect);
+    case Op::bind_texture_prefix:
+        return sizeof(BindTexturePrefix);
     case Op::sampler_registrations:
         return sizeof(SamplerRegistrations);
     case Op::push_constants:
@@ -701,7 +759,7 @@ constexpr auto payload_needs_check = [] {
                           Op::bind_samplers, Op::bind_images, Op::update_uniforms,
                           Op::viewport_swizzles, Op::scissors, Op::depth_ranges,
                           Op::program_subroutines, Op::debug_marker, Op::clear_texture,
-                          Op::unsupported})
+                          Op::unsupported, Op::bind_texture_prefix})
         checked[std::size_t(op)] = true;
     return checked;
 }();
@@ -752,14 +810,19 @@ bool valid_payload(Op op, const std::byte* bytes, std::size_t size) noexcept {
                std::size_t(count) <= (size - offsetof(BindVertexBuffers, ranges)) /
                                          sizeof(BindVertexBuffers::ranges[0]);
     }
+    case Op::bind_texture_prefix: {
+        const auto stage = payload_field<std::int32_t>(bytes, offsetof(BindTexturePrefix, stage));
+        const auto width = payload_field<std::uint32_t>(bytes, offsetof(BindTexturePrefix, bytes));
+        return valid_binding_stage(stage) && stage != NVN_SHADER_STAGE_COMPUTE && (width == 4 || width == 8);
+    }
     case Op::bind_textures:
     case Op::bind_samplers:
     case Op::bind_images: {
         const auto stage = payload_field<std::int32_t>(bytes, offsetof(BindHandles, stage));
         const auto first = payload_field<std::int32_t>(bytes, offsetof(BindHandles, first));
         const auto count = payload_field<std::int32_t>(bytes, offsetof(BindHandles, count));
-        const int limit = op == Op::bind_images ? 32 : 128;
-        return stage >= NVN_SHADER_STAGE_VERTEX && stage <= NVN_SHADER_STAGE_COMPUTE &&
+        const int limit = op == Op::bind_images ? 32 : op == Op::bind_textures ? 256 : 128;
+        return valid_binding_stage(stage) &&
                count <= 32 && valid_range(first, count, limit) &&
                std::size_t(count) <= (size - offsetof(BindHandles, handles)) /
                                          sizeof(BindHandles::handles[0]);
@@ -871,8 +934,8 @@ CommandWalkStatus walk_list(const std::shared_ptr<const CommandList>& list, Comm
             }
             BindTexturesDeferred deferred{};
             std::memcpy(&deferred, payload, sizeof(deferred));
-            if (deferred.stage < NVN_SHADER_STAGE_VERTEX || deferred.stage > NVN_SHADER_STAGE_COMPUTE ||
-                !valid_range(deferred.first, deferred.count, 128) || (deferred.count && !deferred.handles))
+            if (!valid_binding_stage(static_cast<NVNshaderStage>(deferred.stage)) ||
+                !valid_deferred_texture_range(deferred.first, deferred.count) || (deferred.count && !deferred.handles))
                 return CommandWalkStatus::invalid_deferred_binding;
             for (int consumed = 0; consumed < deferred.count;) {
                 BindHandles captured{};
@@ -942,8 +1005,8 @@ CommandWalkStatus prepare_list(CommandSubmission& submission, NVNcommandHandle h
         case Op::bind_textures_deferred: {
             BindTexturesDeferred value{};
             std::memcpy(&value, bytes, sizeof(value));
-            if (value.stage < NVN_SHADER_STAGE_VERTEX || value.stage > NVN_SHADER_STAGE_COMPUTE ||
-                !valid_range(value.first, value.count, 128) || (value.count && !value.handles))
+            if (!valid_binding_stage(static_cast<NVNshaderStage>(value.stage)) ||
+                !valid_deferred_texture_range(value.first, value.count) || (value.count && !value.handles))
                 return CommandWalkStatus::invalid_deferred_binding;
             const auto offset = submission.deferred_words.size();
             submission.deferred.emplace(reinterpret_cast<std::uint64_t>(record), offset);
@@ -1344,20 +1407,24 @@ void command_bind_vertex_buffer(NVNcommandBuffer* c, int index, NVNbufferAddress
 void command_bind_uniform_buffer(NVNcommandBuffer* c, NVNshaderStage stage, int index, NVNbufferAddress address,
                                  std::size_t size) {
     const NVNbufferRange range{address, size};
-    bind_buffer_ranges(c, Op::bind_uniform_buffer, stage, index, 1, &range, "nvnCommandBufferBindUniformBuffer");
+    bind_buffer_ranges(c, Op::bind_uniform_buffer, stage, index, 1, &range,
+                       Entry::nvnCommandBufferBindUniformBuffer, "nvnCommandBufferBindUniformBuffer");
 }
 void command_bind_uniform_buffers(NVNcommandBuffer* c, NVNshaderStage stage, int first, int count,
                                   const NVNbufferRange* ranges) {
-    bind_buffer_ranges(c, Op::bind_uniform_buffer, stage, first, count, ranges, "nvnCommandBufferBindUniformBuffers");
+    bind_buffer_ranges(c, Op::bind_uniform_buffer, stage, first, count, ranges,
+                       Entry::nvnCommandBufferBindUniformBuffers, "nvnCommandBufferBindUniformBuffers");
 }
 void command_bind_storage_buffer(NVNcommandBuffer* c, NVNshaderStage stage, int index, NVNbufferAddress address,
                                  std::size_t size) {
     const NVNbufferRange range{address, size};
-    bind_buffer_ranges(c, Op::bind_storage_buffer, stage, index, 1, &range, "nvnCommandBufferBindStorageBuffer");
+    bind_buffer_ranges(c, Op::bind_storage_buffer, stage, index, 1, &range,
+                       Entry::nvnCommandBufferBindStorageBuffer, "nvnCommandBufferBindStorageBuffer");
 }
 void command_bind_storage_buffers(NVNcommandBuffer* c, NVNshaderStage stage, int first, int count,
                                   const NVNbufferRange* ranges) {
-    bind_buffer_ranges(c, Op::bind_storage_buffer, stage, first, count, ranges, "nvnCommandBufferBindStorageBuffers");
+    bind_buffer_ranges(c, Op::bind_storage_buffer, stage, first, count, ranges,
+                       Entry::nvnCommandBufferBindStorageBuffers, "nvnCommandBufferBindStorageBuffers");
 }
 
 void command_bind_transform_feedback_buffer(NVNcommandBuffer* c, int index, NVNbufferAddress address,
@@ -1398,7 +1465,7 @@ void command_bind_images(NVNcommandBuffer* c, NVNshaderStage stage, int first, i
 void command_bind_separate_texture(NVNcommandBuffer* c, NVNshaderStage stage, int index,
                                    NVNseparateTextureHandle handle) {
     bind_handles(c, Op::bind_textures, stage, index, 1, &handle, 128, Entry::nvnCommandBufferBindSeparateTexture,
-                 "nvnCommandBufferBindSeparateTexture");
+                 "nvnCommandBufferBindSeparateTexture", 128);
 }
 void command_bind_separate_sampler(NVNcommandBuffer* c, NVNshaderStage stage, int index,
                                    NVNseparateSamplerHandle handle) {
@@ -1408,7 +1475,7 @@ void command_bind_separate_sampler(NVNcommandBuffer* c, NVNshaderStage stage, in
 void command_bind_separate_textures(NVNcommandBuffer* c, NVNshaderStage stage, int first, int count,
                                     const NVNseparateTextureHandle* handles) {
     bind_handles(c, Op::bind_textures, stage, first, count, handles, 128, Entry::nvnCommandBufferBindSeparateTextures,
-                 "nvnCommandBufferBindSeparateTextures");
+                 "nvnCommandBufferBindSeparateTextures", 128);
 }
 void command_bind_separate_samplers(NVNcommandBuffer* c, NVNshaderStage stage, int first, int count,
                                     const NVNseparateSamplerHandle* handles) {
@@ -2073,14 +2140,23 @@ void command_refuse(NVNcommandBuffer* c, const char* operation, const char* deta
     fail_recording(c);
 }
 
+void command_geometry_processing_mode(NVNcommandBuffer* c, int mode) noexcept {
+    if (auto* p = append<ScalarInt>(c, Op::geometry_processing_mode, "nvnCommandBufferSetGeometryProcessingMode"))
+        p->value = mode;
+}
+
 void command_draw_mesh_tasks(NVNcommandBuffer* c, int first, int count) noexcept {
+    command_draw_mesh_tasks_at(c, first, count, 0);
+}
+
+void command_draw_mesh_tasks_at(NVNcommandBuffer* c, int first, int count, std::uint64_t api_return) noexcept {
     if (first < 0 || count < 0) {
         diagnostic("nvnCommandBufferDrawMeshTasks", "negative first task or count");
         fail_recording(c);
         return;
     }
     if (auto* p = append<DrawMeshTasks>(c, Op::draw_mesh_tasks, "nvnCommandBufferDrawMeshTasks"))
-        *p = {first, count};
+        *p = {first, count, api_return};
 }
 
 void command_draw_mesh_tasks_indirect(NVNcommandBuffer* c, NVNbufferAddress address) noexcept {
@@ -2091,7 +2167,7 @@ void command_draw_mesh_tasks_indirect(NVNcommandBuffer* c, NVNbufferAddress addr
 
 void command_push_constants(NVNcommandBuffer* c, NVNshaderStage stage, std::uint32_t bank, std::uint32_t offset,
                             std::uint32_t size, const void* data, const char* operation) noexcept {
-    if (stage < NVN_SHADER_STAGE_VERTEX || stage > NVN_SHADER_STAGE_COMPUTE || offset % 4 || size % 4 ||
+    if (!valid_binding_stage(stage) || offset % 4 || size % 4 ||
         offset > push_constant_bytes || size > push_constant_bytes - offset || (size && !data)) {
         diagnostic(operation, "invalid stage, or range outside the push-constant block");
         fail_recording(c);
@@ -2124,6 +2200,7 @@ std::shared_ptr<const CommandSubmission> prepare_commands(
     std::span<const NVNcommandHandle> handles, CommandWalkStatus& status) {
     auto submission = std::make_shared<CommandSubmission>();
     submission->handles.assign(handles.begin(), handles.end());
+    submission->sampler_registration_limit = sampler_registrations.load(std::memory_order_acquire);
     // Frames repeat their shape: start from the previous submission's sizes so
     // the tables do not grow while the lists are pinned.
     static std::atomic<std::size_t> list_hint{0}, deferred_hint{0};
@@ -2137,6 +2214,10 @@ std::shared_ptr<const CommandSubmission> prepare_commands(
     list_hint.store(submission->lists.size(), std::memory_order_relaxed);
     deferred_hint.store(submission->deferred.size(), std::memory_order_relaxed);
     return submission;
+}
+
+std::uint64_t submission_sampler_registrations(const CommandSubmission& submission) noexcept {
+    return submission.sampler_registration_limit;
 }
 
 CommandWalkStatus walk_commands(const CommandSubmission& submission, CommandVisitor visitor, void* context) noexcept {

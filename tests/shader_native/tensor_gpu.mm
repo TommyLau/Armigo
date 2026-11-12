@@ -12,8 +12,9 @@
 // MOVM, and stores its result. The CPU model builds whole matrices, hands
 // each lane its fragment in the documented layout (lane L: g = L / 4,
 // t = L % 4), and computes D as an in-order binary32 fused multiply-add
-// chain over k, rounded to binary16 once. The random inputs keep every
-// partial sum exact in binary32, so any accumulation order gives those bits.
+// chain over each eight-product block, rounded to binary16 at both block
+// boundaries. Random products and binary32 partial sums remain exact; the
+// binary16 boundary conversions are modeled explicitly.
 
 #include "metal_harness.h"
 #include <bit>
@@ -120,7 +121,11 @@ Words fragments(const Matrices& m) {
     return w;
 }
 float product(const Matrices& m, unsigned row, unsigned column, float accumulator) {
-    for (unsigned k = 0; k < 16; ++k) accumulator = std::fma(from_half(m.a[row][k]), from_half(m.b[k][column]), accumulator);
+    for (unsigned first = 0; first < 16; first += 8) {
+        for (unsigned k = first; k < first + 8; ++k)
+            accumulator = std::fma(from_half(m.a[row][k]), from_half(m.b[k][column]), accumulator);
+        accumulator = from_half(to_half(accumulator));
+    }
     return accumulator;
 }
 
@@ -150,6 +155,32 @@ int main() { @autoreleasepool { try {
     auto hmma = [](unsigned d, unsigned a, unsigned b, unsigned c, bool f32) {
         return op(0x23c, {{16, 8, d}, {24, 8, a}, {32, 8, b}, {64, 8, c}, {75, 1, 1}, {76, 1, f32}});
     };
+    // Exact binary32 sums isolate the two binary16 block boundaries from
+    // within-block accumulation order. Expected words are independent constants.
+    unsigned rounding_failures = 0;
+    for (unsigned probe = 0; probe < 5; ++probe) {
+        Matrices m{};
+        const float initial = probe == 2 ? -1.0f : probe == 3 ? 1.0f + std::ldexp(1.0f, -10)
+                              : probe == 4 ? 65504.0f : 1.0f;
+        const std::uint16_t expected[] = {0x0000, 0x3c02, 0x0000, 0x1400, 0x7c00};
+        for (auto& row : m.c) for (auto& value : row) value = to_half(initial);
+        for (unsigned row = 0; row < 16; ++row) {
+            if (probe == 1) {
+                for (unsigned k = 8; k < 16; ++k) m.a[row][k] = to_half(std::ldexp(1.0f, -12));
+            } else {
+                m.a[row][0] = to_half(probe == 4 ? 32.0f : std::ldexp(probe == 2 ? -1.0f : 1.0f, -11));
+                m.a[row][8] = to_half(-initial);
+                if (probe == 4) m.a[row][8] = to_half(-32.0f);
+            }
+        }
+        for (auto& row : m.b) for (auto& value : row) value = to_half(1.0f);
+        try {
+            checked += run(gpu, program({hmma(16, 0, 4, 6, false), stg(10, 16, 48, 5)}), fragments(m),
+                [&](unsigned, const Words&) { return Words(2, pack(expected[probe], expected[probe])); },
+                "HMMA block rounding probe " + std::to_string(probe));
+        } catch (const std::exception&) { ++rounding_failures; }
+    }
+    if (rounding_failures) throw std::runtime_error("native HMMA eight-product block rounding failed: " + std::to_string(rounding_failures));
     for (unsigned trial = 0; trial < 4; ++trial) {
         const auto m = random_matrices(rng);
         const auto memory = fragments(m);

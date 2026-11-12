@@ -14,12 +14,15 @@
 #include "icon.h"
 #include "ios.h"
 #include "package_tools.h"
+#include "pack_flow.h"
+#include "run.h"
 #include "sample_jpeg.h"
 #include "settings.h"
 #include "space.h"
 
 #include <armigo/pack/naming.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -89,6 +92,14 @@ void test_arguments() {
         CHECK(command->keep_app);
         CHECK(command->firmware == "Firmware.zip");
     }
+    const auto development = parse({"armigo", "game.xci", "--keys", "keys.txt", "--platform", "ios",
+                                    "--firmware", "Firmware.zip", "--development-metal-hud"});
+    CHECK(command_of(development) && command_of(development)->development_metal_hud);
+    CHECK(failure_of(parse({"armigo", "game.xci", "--keys", "keys.txt", "--firmware", "Firmware.zip",
+                            "--development-metal-hud"})));
+    const auto development_pack = parse({"armigo", "game.xci", "--keys", "keys.txt", "--firmware", "Firmware.zip",
+                                         "--development"});
+    CHECK(command_of(development_pack) && command_of(development_pack)->development);
     const auto macos = parse({"armigo", "game.xci", "--update", "update.nsp", "--dlc=dlc.nsp", "--keys=keys.txt",
                               "--output", "out", "--firmware", "firmware"});
     CHECK(command_of(macos));
@@ -172,7 +183,8 @@ void test_names() {
     CHECK(std::holds_alternative<pack::PackedNames>(named));
     if (const auto* name = std::get_if<pack::PackedNames>(&named)) {
         CHECK(name->display_name == title);
-        CHECK(name->file_name == "Sample Chronicle - Open Country");
+        CHECK(name->file_name == "Sample Chronicle - Open Country (01007EF00011E000)");
+        CHECK(name->executable_name == "Sample-Chronicle-Open-Country-01007EF00011E000");
         CHECK(name->bundle_identifier == "com.tommylau.armigo.01007EF00011E000");
         CHECK(name->language == armigo::pack::nacp::Language::american_english);
         CHECK(name->supported_language_flag == 0x0d);
@@ -186,6 +198,48 @@ void test_names() {
     if (const auto* error = std::get_if<std::string>(&missing)) {
         CHECK(error->find("control data") != std::string::npos);
     }
+}
+
+void test_executable_names() {
+    const auto named = [](std::string_view title, std::uint64_t id = 0x0100000000000001ull) {
+        std::vector<std::byte> nacp(pack::nacp::control_file_size);
+        std::memcpy(nacp.data(), title.data(), title.size());
+        nacp[0x302c] = std::byte{1};
+        return std::get<pack::PackedNames>(pack::names_from_control(id, nacp));
+    };
+    const auto first = named("Sample Chronicle: Open Country");
+    const auto second = named("Sample Chronicle: Open Country", 0x0100000000000002ull);
+    CHECK(first.executable_name == "Sample-Chronicle-Open-Country-0100000000000001");
+    CHECK(first.executable_name != second.executable_name);
+    CHECK(first.file_name != second.file_name);
+    CHECK(first.file_name == "Sample Chronicle - Open Country (0100000000000001)");
+    CHECK(named("Sample Chronicle: Open Country").executable_name == first.executable_name);
+    CHECK(named("\xe6\xb8\xac\xe8\xa9\xa6").executable_name == "0100000000000001");
+    CHECK(named(" ... ").file_name == "0100000000000001");
+    for (const auto& title : {std::string("../../A\\B: \"C\" *?"), std::string(500, 'x'),
+                              std::string("\xe6\xb8\xac\xe8\xa9\xa6")}) {
+        const auto result = named(title);
+        CHECK(result.executable_name.find_first_not_of(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-") == std::string::npos);
+        CHECK(result.executable_name.size() <= 81);
+        CHECK(result.file_name.size() <= 221);
+        CHECK(pack::assembly_path(result.file_name + ".app", UINT64_MAX).filename().string().size() <= 255);
+        CHECK(result.file_name.find_first_of("/:") == std::string::npos);
+    }
+    std::string long_utf8;
+    for (int i = 0; i < 100; ++i) long_utf8 += "\xe6\xb8\xac";
+    const auto unicode = named(long_utf8);
+    CHECK(unicode.file_name == long_utf8.substr(0, 201) + " (0100000000000001)");
+
+    std::vector<std::byte> nacp(pack::nacp::control_file_size);
+    std::memcpy(nacp.data(), "Unsupported English", 19);
+    std::memcpy(nacp.data() + 0x600, "Supported Japanese", 18);
+    nacp[0x302c] = std::byte{4};
+    CHECK(std::get<pack::PackedNames>(pack::names_from_control(1, nacp)).display_name == "Supported Japanese");
+    nacp[0x302c] = std::byte{0};
+    CHECK(std::holds_alternative<std::string>(pack::names_from_control(1, nacp)));
+    nacp[0x302c] = std::byte{2};
+    CHECK(std::holds_alternative<std::string>(pack::names_from_control(1, nacp)));
 }
 
 void test_build_id() {
@@ -215,6 +269,19 @@ void test_build_id() {
         CHECK(text->find(absent) != std::string::npos);
         CHECK(text->find("No title settings describe build id") != std::string::npos);
     }
+    // A pack may target only the platforms a title's settings list: macOS
+    // only by default, and an iOS pack is refused before any work.
+    CHECK(pack::check_title_platform(0x0100000000000001ull, "macos", directory / "armigo").empty());
+    const auto refused = pack::check_title_platform(0x0100000000000001ull, "ios", directory / "armigo");
+    CHECK(refused.find("does not support packing for ios") != std::string::npos);
+    CHECK(refused.find("list macos") != std::string::npos);
+    {
+        std::ofstream profile(folder / "profile.json");
+        profile << "{\"version\":1,\"patches\":[{\"title_id\":\"0x0100000000000001\",\"main_build_id\":\""
+                << present << "\",\"platforms\":[\"macos\",\"ios\"]}]}";
+    }
+    CHECK(pack::check_title_platform(0x0100000000000001ull, "ios", directory / "armigo").empty());
+    CHECK(pack::check_title_platform(0x0100000000000002ull, "ios", directory / "armigo").empty());
     setenv("ARMIGO_TITLES", "off", 1);
     const auto disabled = pack::match_title_build(0x0100000000000001ull, build_id, directory / "armigo");
     CHECK(std::holds_alternative<std::string>(disabled));
@@ -253,7 +320,8 @@ void test_build_id() {
 void test_bundle_and_icon() {
     pack::BundleSpec spec;
     spec.display_name = "A&B<C>";
-    spec.bundle_name = "A:B/C";
+    spec.file_name = "A&B<C> (01007EF00011E000)";
+    spec.executable_name = "Sample-01007EF00011E000";
     spec.bundle_identifier = "com.tommylau.armigo.01007EF00011E000";
     spec.title_id = "01007EF00011E000";
     spec.build_id = std::string(64, 'c');
@@ -269,7 +337,7 @@ void test_bundle_and_icon() {
     CHECK(plist.find("GCSupportsGameMode") != std::string::npos);
     CHECK(plist.find("<string>26.0</string>") != std::string::npos);
     CHECK(plist.find("NSApplication") != std::string::npos);
-    CHECK(plist.find("<string>Armigo</string>") != std::string::npos);
+    CHECK(plist.find("<string>Sample-01007EF00011E000</string>") != std::string::npos);
     CHECK(plist.find("ArmigoTitleFrameRate") == std::string::npos);
     spec.default_frame_rate = 30;
     spec.display_refresh_rate = 60;
@@ -356,7 +424,7 @@ void test_bundle_and_icon() {
     }
     // The app is assembled under a hidden name that is not a bundle and
     // appears under its own name only when published whole.
-    const fs::path app = directory / "Sample.app";
+    const fs::path app = directory / (spec.file_name + ".app");
     const fs::path assembly = pack::assembly_path(app, 42);
     CHECK(assembly.parent_path() == directory);
     CHECK(assembly.filename().string().starts_with("."));
@@ -366,6 +434,9 @@ void test_bundle_and_icon() {
     spec.player = player;
     spec.title_folder = title;
     spec.icon = jpeg;
+    auto invalid_spec = spec;
+    invalid_spec.executable_name = "../outside";
+    CHECK(std::holds_alternative<std::string>(pack::assemble_application(invalid_spec)));
     const auto assembled = pack::assemble_application(spec);
     CHECK(std::holds_alternative<fs::path>(assembled));
     CHECK(!fs::exists(app));
@@ -375,9 +446,10 @@ void test_bundle_and_icon() {
     CHECK(fs::is_regular_file(contents / "Info.plist"));
     CHECK(fs::is_regular_file(contents / "Resources" / "AppIcon.icns"));
     CHECK(fs::is_regular_file(contents / "Resources" / "Armigo" / "pack.json"));
+    CHECK(fs::is_regular_file(contents / "Resources" / "Armigo" / "licenses" / "Opus.txt"));
     CHECK(fs::is_regular_file(contents / "Resources" / "Armigo" / "title" / "profile.json"));
     CHECK(!fs::exists(contents / "_CodeSignature"));
-    std::ifstream copied(contents / "MacOS" / "Armigo", std::ios::binary);
+    std::ifstream copied(contents / "MacOS" / spec.executable_name, std::ios::binary);
     std::string copied_bytes((std::istreambuf_iterator<char>(copied)), std::istreambuf_iterator<char>());
     CHECK(copied_bytes == player_bytes);
     // Publishing never replaces an app that is already there.
@@ -421,6 +493,7 @@ void test_bundle_and_icon() {
         CHECK(names[4].second.find("= \"Sample \\\"S\\\"\";") != std::string::npos);
     }
     const std::string ios_plist = pack::info_plist(spec);
+    CHECK(ios_plist.find("<key>CFBundleExecutable</key><string>" + spec.executable_name + "</string>") != std::string::npos);
     CHECK(ios_plist.find("MinimumOSVersion") != std::string::npos);
     CHECK(ios_plist.find("<integer>1</integer><integer>2</integer>") != std::string::npos);
     CHECK(ios_plist.find("UIInterfaceOrientationLandscapeLeft") != std::string::npos);
@@ -431,13 +504,25 @@ void test_bundle_and_icon() {
     CHECK(ios_plist.find("GCSupportedGameControllers") != std::string::npos);
     CHECK(ios_plist.find("CFBundleLocalizations</key><array><string>en</string><string>ja</string><string>fr</string><string>zh-Hant</string><string>zh-Hans</string></array>") != std::string::npos);
     CHECK(pack::language_manifest(spec).starts_with("0x0002fbff\nen-US\nja\nfr\n"));
+    CHECK(pack::info_plist(spec).find("ArmigoDevelopmentMetalHud") == std::string::npos);
+    CHECK(pack::info_plist(spec).find("ArmigoDevelopmentPack") == std::string::npos);
+    auto development_spec = spec;
+    development_spec.development = true;
+    CHECK(pack::info_plist(development_spec).find("ArmigoDevelopmentPack</key><true/>") != std::string::npos);
+    CHECK(pack::settings_bundle(spec).find("development_metal_hud") == std::string::npos);
+    spec.development_metal_hud = true;
+    CHECK(pack::info_plist(spec).find("ArmigoDevelopmentMetalHud</key><true/>") != std::string::npos);
+    CHECK(pack::info_plist(spec).find("ArmigoDevelopmentPack</key><true/>") != std::string::npos);
+    CHECK(pack::settings_bundle(spec).find("Metal Performance HUD") != std::string::npos);
     const auto ios_assembled = pack::assemble_application(spec);
     CHECK(std::holds_alternative<fs::path>(ios_assembled));
     CHECK(fs::is_regular_file(spec.app_path / "Info.plist"));
-    CHECK(fs::is_regular_file(spec.app_path / "ArmigoPlayer"));
+    CHECK(fs::is_regular_file(spec.app_path / spec.executable_name));
     CHECK(fs::is_regular_file(spec.app_path / "AppIcon.png"));
     CHECK(fs::is_regular_file(spec.app_path / "Armigo" / "pack.json"));
     CHECK(fs::is_regular_file(spec.app_path / "Armigo" / "languages.txt"));
+    CHECK(fs::file_size(spec.app_path / "Armigo" / "licenses" / "Opus.txt") > 1000);
+    CHECK(fs::file_size(spec.app_path / "Armigo" / "licenses" / "Zstandard.txt") > 1000);
     CHECK(fs::is_regular_file(spec.app_path / "Armigo" / "title" / "profile.json"));
     CHECK(fs::is_regular_file(spec.app_path / "Settings.bundle" / "Root.plist"));
     CHECK(fs::is_regular_file(spec.app_path / "zh-Hans.lproj" / "InfoPlist.strings"));
@@ -459,7 +544,7 @@ void test_bundle_and_icon() {
         ipa.string()}).empty());
     std::ifstream archive(ipa, std::ios::binary);
     const std::string archive_bytes((std::istreambuf_iterator<char>(archive)), std::istreambuf_iterator<char>());
-    CHECK(archive_bytes.find("Payload/SampleIos.app/ArmigoPlayer") != std::string::npos);
+    CHECK(archive_bytes.find("Payload/SampleIos.app/Sample-01007EF00011E000") != std::string::npos);
     CHECK(archive_bytes.find(".partial") == std::string::npos);
     CHECK(!pack::create_ios_ipa(ios_assembly, ios_app).empty());
     fs::remove_all(directory);
@@ -688,10 +773,344 @@ void test_compare_packages() {
     fs::remove_all(root);
 }
 
+const std::string* environment_value(const pack::RunPlan& plan, std::string_view name) {
+    for (const auto& entry : plan.environment) {
+        if (entry.first == name) return &entry.second;
+    }
+    return nullptr;
+}
+
+std::vector<std::string>::const_iterator flag_at(const std::vector<std::string>& arguments, std::string_view flag) {
+    return std::find(arguments.begin(), arguments.end(), std::string(flag));
+}
+
+void test_run_command() {
+    CHECK(pack::command_usage().find("armigo run <App.app|game>") != std::string::npos);
+    const auto launched = parse({"armigo", "run", "game.nup", "--frames", "30", "--rate", "60"});
+    const auto* command = command_of(launched);
+    CHECK(command && command->run && command->game == "game.nup");
+    if (command) {
+        CHECK(command->run_options.frames == 30);
+        CHECK(command->run_options.rate == "60");
+        CHECK(command->run_options.time_limit == "300");
+        CHECK(!command->run_options.audio);
+    }
+    const auto audible = parse({"armigo", "run", "game.nup", "--audio"});
+    CHECK(command_of(audible) && command_of(audible)->run_options.audio);
+    const auto missing = parse({"armigo", "run"});
+    CHECK(failure_of(missing) && failure_of(missing)->exit_code == 2);
+    CHECK(failure_of(parse({"armigo", "run", "g.xci", "--output", "x"})));
+    CHECK(failure_of(parse({"armigo", "run", "App.app", "--width", "10"})));
+    CHECK(failure_of(parse({"armigo", "run", "g.xci", "--frames", "0"})));
+    CHECK(failure_of(parse({"armigo", "run", "g.xci", "--update", "a.nsp", "--update", "b.nsp"})));
+
+    const fs::path root = fs::temp_directory_path() / "armigo_pack_cli_run";
+    fs::remove_all(root);
+    const fs::path app = (root / "App.app").lexically_normal();
+    const fs::path resources = app / "Contents" / "Resources" / "Armigo";
+    const std::string build_id(64, 'a');
+    write_text(resources / "pack.json",
+               std::string("{\"title_id\":\"0100000000000001\",\"build_id\":\"") + build_id +
+                   "\",\"platform\":\"macos\",\"title_version\":0}");
+    fs::create_directories(resources / "game" / "exefs");
+    fs::create_directories(resources / "game" / "romfs");
+    fs::create_directories(resources / "game" / "addons" / "0100000000001001");
+    fs::create_directories(resources / "shaders");
+    fs::create_directories(resources / "system");
+    fs::create_directories(resources / "pipelines");
+    write_text(resources / "pipelines" / "archive.bin", "cache");
+    write_text(resources / "title" / "profile.json", "{}\n");
+
+    pack::Command run;
+    run.run = true;
+    run.game = app;
+    const fs::path runner = root / "armigo-headless";
+    const fs::path scratch = root / "scratch";
+    const auto planned = pack::plan_run(run, runner, scratch);
+    CHECK(std::holds_alternative<pack::RunPlan>(planned));
+    if (const auto* plan = std::get_if<pack::RunPlan>(&planned)) {
+        const auto exefs = flag_at(plan->arguments, "--exefs");
+        const auto romfs = flag_at(plan->arguments, "--romfs");
+        const auto shaders = flag_at(plan->arguments, "--shaders");
+        const auto addon = flag_at(plan->arguments, "--addon");
+        CHECK(exefs != plan->arguments.end() && romfs != plan->arguments.end());
+        CHECK(shaders != plan->arguments.end() && addon != plan->arguments.end());
+        CHECK(exefs < romfs && romfs < shaders && shaders < addon);
+        CHECK(exefs != plan->arguments.end() && exefs + 1 != plan->arguments.end() &&
+              *(exefs + 1) == (resources / "game" / "exefs").string());
+        CHECK(romfs != plan->arguments.end() && romfs + 1 != plan->arguments.end() &&
+              *(romfs + 1) == (resources / "game" / "romfs").string());
+        CHECK(shaders != plan->arguments.end() && shaders + 1 != plan->arguments.end() &&
+              *(shaders + 1) == (resources / "shaders").string());
+        CHECK(addon != plan->arguments.end() && addon + 1 != plan->arguments.end() &&
+              *(addon + 1) == (resources / "game" / "addons" / "0100000000001001").string());
+        CHECK(std::count(plan->arguments.begin(), plan->arguments.end(), "--shaders") == 1);
+        const std::string* audio = environment_value(*plan, "ARMIGO_AUDIO");
+        const std::string* titles = environment_value(*plan, "ARMIGO_TITLES");
+        CHECK(audio && *audio == "0");
+        CHECK(titles && *titles == (scratch / "titles").string());
+        CHECK(plan->clones.size() == 1);
+        CHECK(plan->clones[0].first == resources / "pipelines");
+        CHECK(plan->clones[0].second == scratch / "pso");
+        std::error_code error;
+        CHECK(plan->links.size() == 1);
+        CHECK(plan->links[0].first == fs::absolute(resources / "title", error));
+        CHECK(plan->links[0].second == scratch / "titles" / "0100000000000001");
+    }
+
+    // A packed .nup app keeps its archive as game/title.nup and has no RomFS tree.
+    {
+        const fs::path nup_app = (root / "Nup.app").lexically_normal();
+        const fs::path nup_resources = nup_app / "Contents" / "Resources" / "Armigo";
+        write_text(nup_resources / "pack.json",
+                   std::string("{\"title_id\":\"0400000000000001\",\"build_id\":\"") + build_id +
+                       "\",\"platform\":\"macos\",\"title_version\":0}");
+        fs::create_directories(nup_resources / "game" / "exefs");
+        write_text(nup_resources / "game" / "title.nup", "nup");
+        fs::create_directories(nup_resources / "shaders");
+        write_text(nup_resources / "title" / "profile.json", "{}\n");
+        pack::Command nup_run;
+        nup_run.run = true;
+        nup_run.game = nup_app;
+        const auto nup_planned = pack::plan_run(nup_run, runner, scratch);
+        CHECK(std::holds_alternative<pack::RunPlan>(nup_planned));
+        if (const auto* plan = std::get_if<pack::RunPlan>(&nup_planned)) {
+            const auto archive = flag_at(plan->arguments, "--nup");
+            CHECK(archive != plan->arguments.end() && archive + 1 != plan->arguments.end() &&
+                  *(archive + 1) == (nup_resources / "game" / "title.nup").string());
+            CHECK(flag_at(plan->arguments, "--exefs") == plan->arguments.end());
+            CHECK(flag_at(plan->arguments, "--shaders") != plan->arguments.end());
+        }
+    }
+
+    write_text(root / "game.xci", "xci");
+    write_text(root / "keys.txt", "keys");
+    write_text(root / "title.keys", "title");
+    write_text(root / "update.nsp", "update");
+    pack::Command container;
+    container.run = true;
+    container.game = root / "game.xci";
+    CHECK(std::holds_alternative<std::string>(pack::plan_run(container, runner, scratch)));
+    container.run_options.keys = root / "keys.txt";
+    container.run_options.title_keys = root / "title.keys";
+    container.run_options.update = root / "update.nsp";
+    const auto container_plan = pack::plan_run(container, runner, scratch);
+    CHECK(std::holds_alternative<pack::RunPlan>(container_plan));
+    if (const auto* plan = std::get_if<pack::RunPlan>(&container_plan)) {
+        const auto file = flag_at(plan->arguments, "--container");
+        const auto keys = flag_at(plan->arguments, "--keys");
+        const auto title_keys = flag_at(plan->arguments, "--title-keys");
+        const auto update = flag_at(plan->arguments, "--update");
+        const auto cache = flag_at(plan->arguments, "--cache");
+        CHECK(file < keys && keys < title_keys && title_keys < update && update < cache);
+        CHECK(file != plan->arguments.end() && file + 1 != plan->arguments.end() &&
+              *(file + 1) == container.game.string());
+        CHECK(cache != plan->arguments.end() && cache + 1 != plan->arguments.end() &&
+              *(cache + 1) == (scratch / "extract").string());
+    }
+
+    pack::Command nup;
+    nup.run = true;
+    nup.game = root / "game.nup";
+    nup.run_options.keys = root / "keys.txt";
+    nup.run_options.update = root / "update.nsp";
+    write_text(nup.game, "nup");
+    const auto nup_plan = pack::plan_run(nup, runner, scratch);
+    CHECK(std::holds_alternative<pack::RunPlan>(nup_plan));
+    if (const auto* plan = std::get_if<pack::RunPlan>(&nup_plan)) {
+        const auto file = flag_at(plan->arguments, "--nup");
+        CHECK(file != plan->arguments.end() && file + 1 != plan->arguments.end() && *(file + 1) == nup.game.string());
+        CHECK(flag_at(plan->arguments, "--keys") == plan->arguments.end());
+        CHECK(flag_at(plan->arguments, "--update") == plan->arguments.end());
+    }
+
+    pack::Command folder;
+    folder.run = true;
+    folder.game = (root / "extracted").lexically_normal();
+    fs::create_directories(folder.game / "exefs");
+    fs::create_directories(folder.game / "romfs");
+    const auto folder_plan = pack::plan_run(folder, runner, scratch);
+    CHECK(std::holds_alternative<pack::RunPlan>(folder_plan));
+    if (const auto* plan = std::get_if<pack::RunPlan>(&folder_plan)) {
+        const auto exefs = flag_at(plan->arguments, "--exefs");
+        const auto romfs = flag_at(plan->arguments, "--romfs");
+        CHECK(exefs < romfs);
+        CHECK(exefs != plan->arguments.end() && exefs + 1 != plan->arguments.end() &&
+              *(exefs + 1) == (folder.game / "exefs").string());
+        CHECK(romfs != plan->arguments.end() && romfs + 1 != plan->arguments.end() &&
+              *(romfs + 1) == (folder.game / "romfs").string());
+    }
+
+    const auto summary = pack::summarize_report(
+        R"({"outcome":"frame-target","statistics":{"completed_frames":600,"elapsed_ns":10000000000}})");
+    CHECK(summary.find("600 frames") != std::string::npos);
+    CHECK(summary.find("60.0 fps") != std::string::npos);
+    CHECK(pack::summarize_report("not json").empty());
+    CHECK(summary.find("teardown") == std::string::npos);
+    CHECK(pack::summarize_report(R"({"outcome":"success","teardown_failure":{"detail":"x"},)"
+                                 R"("statistics":{"completed_frames":60,"elapsed_ns":1000000000}})")
+              .find("; teardown failed") != std::string::npos);
+    CHECK(pack::summarize_report(
+              R"({"outcome":"success","statistics":{"completed_frames":-1,"elapsed_ns":-1000000000}})")
+              .empty());
+    fs::remove_all(root);
+}
+
+void test_pack_flow() {
+    const char* cache_env = std::getenv("ARMIGO_SHADER_COMPILE_CACHE");
+    const char* home_env = std::getenv("HOME");
+    const std::string saved_cache = cache_env ? cache_env : std::string();
+    const std::string saved_home = home_env ? home_env : std::string();
+    const bool had_cache = cache_env != nullptr;
+    const bool had_home = home_env != nullptr;
+    const auto restore_env = [&]() {
+        if (had_cache) setenv("ARMIGO_SHADER_COMPILE_CACHE", saved_cache.c_str(), 1);
+        else unsetenv("ARMIGO_SHADER_COMPILE_CACHE");
+        if (had_home) setenv("HOME", saved_home.c_str(), 1);
+        else unsetenv("HOME");
+    };
+
+    unsetenv("ARMIGO_SHADER_COMPILE_CACHE");
+    setenv("HOME", "/pack-home", 1);
+    const fs::path cache = pack::default_shader_compile_cache("0100000000000001");
+    CHECK(cache.string() == "/pack-home/Library/Caches/Armigo/0100000000000001/compile-cache");
+    setenv("ARMIGO_SHADER_COMPILE_CACHE", "", 1);
+    CHECK(pack::default_shader_compile_cache("0100000000000001").empty());
+    unsetenv("ARMIGO_SHADER_COMPILE_CACHE");
+    unsetenv("HOME");
+    CHECK(pack::default_shader_compile_cache("0100000000000001").empty());
+    restore_env();
+
+    const pack::InputCapabilities game = pack::game_input_capabilities();
+    const pack::InputCapabilities nup = pack::nup_input_capabilities();
+    CHECK(game.updates_and_addons && game.ios && game.embeds_firmware);
+    CHECK(!game.native_shaders && game.pipeline_list_required);
+    CHECK(!nup.updates_and_addons && !nup.ios && !nup.embeds_firmware);
+    CHECK(nup.native_shaders && !nup.pipeline_list_required);
+
+    const fs::path root = fs::temp_directory_path() / "armigo_pack_flow_manifests";
+    fs::remove_all(root);
+    const fs::path shaders = root / "shaders";
+    const fs::path compute = shaders / "native" / "compute-pipelines.tsv";
+    fs::create_directories(compute.parent_path());
+    {
+        std::ofstream stream(compute);
+        stream << "C\tabc\n";
+    }
+    armigo::compat::PatchDescription description;
+    description.pso_manifest = (root / "pipelines.tsv").string();
+    const auto game_lists = pack::select_pack_manifests(description, shaders, game);
+    CHECK(game_lists.size() == 1 && game_lists[0].string() == description.pso_manifest);
+    CHECK(pack::select_pack_manifests(description, shaders, game) == game_lists);
+    description.pso_manifest.clear();
+    const auto game_empty = pack::select_pack_manifests(description, shaders, game);
+    CHECK(game_empty.size() == 1 && game_empty[0].empty());
+
+    description.pso_manifest = (root / "pipelines.tsv").string();
+    const auto nup_lists = pack::select_pack_manifests(description, shaders, nup);
+    CHECK(nup_lists.size() == 2);
+    if (nup_lists.size() == 2) {
+        CHECK(nup_lists[0].string() == description.pso_manifest);
+        CHECK(nup_lists[1].string() == compute.string());
+    }
+    CHECK(pack::select_pack_manifests(description, shaders, nup) == nup_lists);
+    description.pso_manifest.clear();
+    const auto compute_only = pack::select_pack_manifests(description, shaders, nup);
+    CHECK(compute_only.size() == 1 && compute_only[0].string() == compute.string());
+    fs::remove(compute);
+    CHECK(pack::select_pack_manifests(description, shaders, nup).empty());
+
+    // A .nup pack builds its shaders inside the hidden assembly, which is
+    // renamed when the app is published: the bundle carries the packaged
+    // compute list, and the warm-up must read it from the published app.
+    {
+        const fs::path app = root / "0400000000000001.app";
+        const fs::path assembly = pack::assembly_path(app, 7);
+        const fs::path armigo = assembly / "Contents" / "Resources" / "Armigo";
+        const fs::path packaged = armigo / "shaders" / "native" / "compute-pipelines.tsv";
+        fs::create_directories(packaged.parent_path());
+        { std::ofstream(packaged) << "C\tabc\n"; }
+        fs::create_directories(root / "title");
+        { std::ofstream(root / "title" / "profile.json") << "{\"version\":1}\n"; }
+        { std::ofstream(root / "player", std::ios::binary) << "player"; }
+        const auto assembled_lists = pack::select_pack_manifests(description, armigo / "shaders", nup);
+        pack::BundleSpec bundle;
+        bundle.app_path = assembly;
+        bundle.display_name = bundle.file_name = bundle.executable_name = bundle.title_id = "0400000000000001";
+        bundle.bundle_identifier = "com.tommylau.armigo.0400000000000001";
+        bundle.build_id = std::string(64, 'a');
+        bundle.platform = "macos";
+        bundle.player = root / "player";
+        bundle.title_folder = root / "title";
+        static const std::array<std::byte, 4> icon{std::byte{0x69}, std::byte{0x63}, std::byte{0x6e}, std::byte{0x73}};
+        bundle.icon = icon;
+        bundle.languages = {"en-US"};
+        bundle.supported_language_flag = 1;
+        CHECK(std::holds_alternative<fs::path>(pack::assemble_application(bundle)));
+        CHECK(pack::publish_application(assembly, app).empty());
+        const fs::path published = app / "Contents" / "Resources" / "Armigo" / "shaders" / "native" /
+                                   "compute-pipelines.tsv";
+        CHECK(fs::is_regular_file(published));
+        CHECK(assembled_lists.size() == 1 && !fs::exists(assembled_lists[0]));
+        const auto warm = pack::warm_up_manifests(description, app, nup);
+        CHECK(warm.size() == 1 && warm[0] == published);
+        description.pso_manifest = (root / "pipelines.tsv").string();
+        const auto warm_both = pack::warm_up_manifests(description, app, nup);
+        CHECK(warm_both.size() == 2 && warm_both[0].string() == description.pso_manifest && warm_both[1] == published);
+        CHECK(pack::warm_up_manifests(description, app, game) ==
+              std::vector<fs::path>{fs::path(description.pso_manifest)});
+    }
+    fs::remove_all(root);
+
+    armigo::compat::FrameRateSettings rates;
+    rates.default_rate = 30;
+    rates.display_refresh_rate = 120;
+    rates.supported_rates = {30, 60};
+    rates.experimental_rates = {120};
+    armigo::compat::PatchDescription rated;
+    rated.frame_rate = rates;
+    pack::BundleSpec spec;
+    spec.display_name = "keep";
+    pack::CommonBundleFields fields;
+    fields.title_id = "0100000000000001";
+    fields.build_id = "aa";
+    fields.commit = "abc";
+    fields.player = "Armigo.linker";
+    fields.title_folder = "titles/0100000000000001";
+    fields.platform = "macos";
+    fields.apply_frame_rates = false;
+    pack::fill_common_bundle_fields(spec, fields, rated);
+    CHECK(spec.display_name == "keep");
+    CHECK(spec.title_id == "0100000000000001");
+    CHECK(spec.build_id == "aa");
+    CHECK(spec.commit == "abc");
+    CHECK(spec.player == "Armigo.linker");
+    CHECK(spec.title_folder == "titles/0100000000000001");
+    CHECK(spec.platform == "macos");
+    CHECK(spec.default_frame_rate == 0);
+    CHECK(spec.display_refresh_rate == 0);
+    CHECK(spec.supported_frame_rates.empty());
+    CHECK(spec.experimental_frame_rates.empty());
+    fields.apply_frame_rates = true;
+    pack::fill_common_bundle_fields(spec, fields, rated);
+    CHECK(spec.default_frame_rate == 30);
+    CHECK(spec.display_refresh_rate == 120);
+    CHECK(spec.supported_frame_rates.size() == 2 && spec.supported_frame_rates[1] == 60);
+    CHECK(spec.experimental_frame_rates.size() == 1 && spec.experimental_frame_rates[0] == 120);
+    pack::BundleSpec ios_spec;
+    fields.platform = "ios";
+    fields.apply_frame_rates = true;
+    pack::fill_common_bundle_fields(ios_spec, fields, armigo::compat::PatchDescription{});
+    CHECK(ios_spec.platform == "ios");
+    CHECK(ios_spec.default_frame_rate == 0);
+    CHECK(ios_spec.supported_frame_rates.empty());
+}
+
 int main() {
     test_arguments();
     test_space();
     test_names();
+    test_executable_names();
     test_build_id();
     test_bundle_and_icon();
     test_ios_paths_and_selection();
@@ -701,6 +1120,8 @@ int main() {
     test_embedded_preparer_environment();
     test_git_work_tree();
     test_compare_packages();
+    test_run_command();
+    test_pack_flow();
     if (failures != 0) {
         std::printf("%d checks failed\n", failures);
         return 1;

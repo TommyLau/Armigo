@@ -17,6 +17,8 @@
 #include "native_shaders.h"
 #include "pipelines.h"
 #include "package_tools.h"
+#include "pack_flow.h"
+#include "run.h"
 #include "settings.h"
 #include "shaders.h"
 #include "space.h"
@@ -31,7 +33,6 @@
 
 #include "inputs.h"
 #include "pack_commit.h"
-#include "pso_manifest.h"
 
 #include <mach-o/dyld.h>
 #include <sys/clonefile.h>
@@ -46,6 +47,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -299,142 +301,492 @@ bool write_bytes(const fs::path& path, const std::vector<std::byte>& bytes) {
     return static_cast<bool>(output);
 }
 
+int report_free_space(const fs::path& output, std::uint64_t expected) {
+    Step step{"Check free space"};
+    const pack::SpaceCheck space = pack::check_free_space(output, expected);
+    if (!space.error.empty()) {
+        print_error(space.error);
+        return 1;
+    }
+    std::printf("Free space %s; this pack expects %s.\n", format_gib(space.available).c_str(),
+                format_gib(space.expected).c_str());
+    if (!space.enough) {
+        print_error("Not enough free space: " + format_gib(space.available) + " available, " +
+                    format_gib(space.expected) + " required.");
+        return 1;
+    }
+    return 0;
+}
+
+struct PackSession {
+    const pack::Command& command;
+    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    fs::path executable;
+    fs::path player;
+    fs::path translator;
+    fs::path preparer;
+    bool ios = false;
+    fs::path firmware_input;
+    fs::path app_path;
+    fs::path kept_app;
+    fs::path assembly;
+    fs::path armigo_root;
+    fs::path game;
+    std::string title_id;
+    std::uint64_t raw_title_id = 0;
+    std::uint32_t title_version = 0;
+    std::array<std::byte, 32> build_id{};
+    std::optional<fs::path> reuse_app;
+    std::optional<pack::PackedIdentity> reused_identity;
+    std::vector<fs::path> addon_directories;
+    std::vector<fs::path> manifests;
+    fs::path linked_player;
+    std::string executable_name;
+    pack::TitleMatch matched;
+    const armigo::compat::PatchDescription* description = nullptr;
+    // firmware_partial is declared first, so partial is destroyed before it.
+    PartialOutput firmware_partial;
+    PartialOutput partial;
+
+    explicit PackSession(const pack::Command& command_in) : command(command_in) {}
+};
+
+// The app is assembled under a hidden name that is not a bundle and moved into
+// place only when complete: LaunchServices may record an app while it is still
+// being written, and the Finder then keeps showing it as one that cannot run.
+int bind_output(PackSession& session) {
+    if (!session.command.shaders_only) {
+        std::error_code exists_error;
+        if (fs::exists(session.kept_app, exists_error)) {
+            print_error("The packed app already exists: " + session.kept_app.string());
+            return 1;
+        }
+    }
+    session.assembly = pack::assembly_path(session.app_path, static_cast<std::uint64_t>(getpid()));
+    if (!session.command.shaders_only) {
+        std::error_code exists_error;
+        if (fs::exists(session.assembly, exists_error)) {
+            print_error("The app assembly folder already exists: " + session.assembly.string());
+            return 1;
+        }
+    }
+    return 0;
+}
+
+struct PackInput {
+    virtual ~PackInput() = default;
+    virtual pack::InputCapabilities capabilities() const = 0;
+    virtual int read_keys(const pack::Command& command) = 0;
+    virtual int load_content(PackSession& session) = 0;
+    virtual int announce(PackSession& session) = 0;
+    virtual int estimate_space(PackSession& session) = 0;
+    virtual int install_game(PackSession& session) = 0;
+    virtual int collect_addons(PackSession& session) = 0;
+    virtual int build_shaders(PackSession& session, const fs::path& compile_cache) = 0;
+    virtual int extract_firmware(PackSession& session) = 0;
+    virtual int fill_bundle_identity(PackSession& session, pack::BundleSpec& spec) = 0;
+};
+
+// XCI, NSP and an extracted folder. Firmware is embedded and iOS is available.
+struct GamePackInput : PackInput {
+    loader::ContainerKeys keys;
+    loader::ContainerKeys title_keys;
+    pack::Inputs inputs;
+    pack::PackedNames names;
+    std::vector<std::byte> icon_bytes;
+
+    pack::InputCapabilities capabilities() const override { return pack::game_input_capabilities(); }
+    int read_keys(const pack::Command& command) override;
+    int load_content(PackSession& session) override;
+    int announce(PackSession& session) override;
+    int estimate_space(PackSession& session) override;
+    int install_game(PackSession& session) override;
+    int collect_addons(PackSession& session) override;
+    int build_shaders(PackSession& session, const fs::path& compile_cache) override;
+    int extract_firmware(PackSession& session) override;
+    int fill_bundle_identity(PackSession& session, pack::BundleSpec& spec) override;
+};
+
 // A .nup title is not a cartridge: the archive stays whole, its ExeFS is
 // written beside it, and admitted native programs are packaged before launch.
 // Keys are read so a bad keys file fails immediately; the archive is not
 // decrypted. Firmware fonts are not embedded.
-int pack_nup(const pack::Command& command, const fs::path& player, const fs::path& translator,
-             const fs::path& executable) {
-    const auto started = std::chrono::steady_clock::now();
-    if (!command.updates.empty() || !command.dlc.empty()) {
-        print_error("A .nup pack does not take updates or add-on content.");
+struct NupPackInput : PackInput {
+    loader::ExeFsDirectoryInput exefs;
+    std::vector<std::byte> icon_bytes;
+
+    pack::InputCapabilities capabilities() const override { return pack::nup_input_capabilities(); }
+    int read_keys(const pack::Command& command) override;
+    int load_content(PackSession& session) override;
+    int announce(PackSession& session) override;
+    int estimate_space(PackSession& session) override;
+    int install_game(PackSession& session) override;
+    int collect_addons(PackSession&) override { return 0; }
+    int build_shaders(PackSession& session, const fs::path& compile_cache) override;
+    int extract_firmware(PackSession&) override { return 0; }
+    int fill_bundle_identity(PackSession& session, pack::BundleSpec& spec) override;
+};
+
+int GamePackInput::read_keys(const pack::Command& command) {
+    Step step{"Read keys"};
+    auto read = loader::read_container_keys_file(command.keys);
+    if (auto* failure = std::get_if<loader::ContainerKeysFailure>(&read)) {
+        print_error(keys_error(*failure));
         return 1;
     }
-    if (command.shaders_only) {
-        if (const std::string failure = prepare_shaders_output(command.output); !failure.empty()) {
-            print_error(failure);
-            return 1;
-        }
-    }
-    if (const std::string low = require_space(command.output); !low.empty()) {
-        print_error(low);
-        return 1;
-    }
-    {
-        Step step{"Read keys"};
-        auto read = loader::read_container_keys_file(command.keys);
-        if (const auto* failure = std::get_if<loader::ContainerKeysFailure>(&read)) {
+    keys = std::get<loader::ContainerKeys>(std::move(read));
+    if (!command.title_keys.empty()) {
+        auto read_title = loader::read_container_keys_file(command.title_keys);
+        if (auto* failure = std::get_if<loader::ContainerKeysFailure>(&read_title)) {
             print_error(keys_error(*failure));
             return 1;
         }
-        std::printf("Keys accepted.\n");
-        std::fflush(stdout);
+        title_keys = std::get<loader::ContainerKeys>(std::move(read_title));
     }
+    return 0;
+}
+
+int GamePackInput::load_content(PackSession& session) {
+    {
+        Step step{"Classify inputs"};
+        std::vector<fs::path> paths;
+        paths.push_back(session.command.game);
+        paths.insert(paths.end(), session.command.updates.begin(), session.command.updates.end());
+        paths.insert(paths.end(), session.command.dlc.begin(), session.command.dlc.end());
+        if (!session.firmware_input.empty()) {
+            paths.push_back(session.firmware_input);
+        }
+        pack::InputsOptions options;
+        options.keys_file = session.command.keys;
+        auto classified = pack::classify_inputs(paths, options);
+        if (auto* failure = std::get_if<pack::InputsFailure>(&classified)) {
+            print_error(failure->detail);
+            return 1;
+        }
+        inputs = std::get<pack::Inputs>(std::move(classified));
+        print_inputs(inputs, session.firmware_input);
+    }
+    session.raw_title_id = inputs.application.title_id;
+    session.title_id = pack::format_title_id(session.raw_title_id);
+    session.title_version = inputs.patch ? inputs.patch->version : inputs.application.version;
+    return 0;
+}
+
+int GamePackInput::announce(PackSession& session) {
+    const pack::Command& command = session.command;
     if (!command.shaders_only) {
-        std::error_code error;
-        if (!fs::exists(command.firmware, error) || error) {
-            print_error("The firmware path does not exist: " + command.firmware.string());
+        auto named = pack::names_from_control(inputs.application.title_id, inputs.control.nacp);
+        if (auto* failure = std::get_if<std::string>(&named)) {
+            print_error(*failure);
             return 1;
         }
-        std::printf("Firmware system data is not embedded for a .nup pack.\n");
+        names = std::get<pack::PackedNames>(std::move(named));
+        std::printf("Title %s\n  %s.app\n", names.display_name.c_str(), names.file_name.c_str());
+        for (const std::string& warning : names.warnings) {
+            std::printf("Control data: %s\n", warning.c_str());
+        }
         std::fflush(stdout);
     }
+    session.executable_name = names.executable_name;
+    session.app_path = command.output / (names.file_name + ".app");
+    // A kept iOS app sits beside the macOS app of the same title, which an iOS
+    // pack reuses from the same output folder; the IPA keeps the plain name.
+    session.kept_app = session.ios ? command.output / (names.file_name + " (iOS).app") : session.app_path;
+    return 0;
+}
 
-    loader::NupSelection selection;
-    loader::ExeFsDirectoryInput exefs;
-    {
-        Step step{"Read package"};
-        auto opened = loader::NupArchive::open(command.game);
-        if (const auto* failure = std::get_if<loader::NupFailure>(&opened)) {
-            print_error(nup_error(*failure));
+int GamePackInput::estimate_space(PackSession& session) {
+    const bool ios = session.ios;
+    std::uint64_t expected_bytes = pack::kPackMarginBytes;
+    if (ios || !session.reuse_app) {
+        std::vector<pack::ContentSize> sizes;
+        sizes.push_back({inputs.application.location.file, program_and_data_bytes(inputs.application)});
+        if (inputs.patch) {
+            sizes.push_back({inputs.patch->location.file, program_and_data_bytes(*inputs.patch)});
+        }
+        for (const pack::ContentSet& addon : inputs.add_on_content) {
+            sizes.push_back({addon.location.file, program_and_data_bytes(addon)});
+        }
+        const auto content = pack::sum_content_bytes(sizes);
+        if (auto* failure = std::get_if<std::string>(&content)) {
+            print_error(*failure);
             return 1;
         }
-        const auto archive = std::get<std::shared_ptr<loader::NupArchive>>(std::move(opened));
-        auto selected = archive->select();
-        if (const auto* failure = std::get_if<loader::NupFailure>(&selected)) {
-            print_error(nup_error(*failure));
+        const std::uint64_t content_bytes = std::get<std::uint64_t>(content);
+        const std::uint64_t copies = ios && !session.reuse_app ? 2 : 1;
+        if (content_bytes > UINT64_MAX / copies) {
+            print_error("The packed input size overflows the free-space estimate.");
             return 1;
         }
-        selection = std::get<loader::NupSelection>(std::move(selected));
-        auto read = archive->read_exefs(selection);
-        if (const auto* failure = std::get_if<loader::NupFailure>(&read)) {
-            print_error(nup_error(*failure));
+        const auto expected = pack::expected_pack_bytes(content_bytes * copies);
+        if (auto* failure = std::get_if<std::string>(&expected)) {
+            print_error(*failure);
             return 1;
         }
-        exefs = std::get<loader::ExeFsDirectoryInput>(std::move(read));
-        // A member hash can already describe damaged bytes. Stop before the
-        // archive is placed when a nonempty .zs member is not a zstd frame.
-        auto mismatches = archive->zs_frame_mismatches(selection);
-        if (const auto* failure = std::get_if<loader::NupFailure>(&mismatches)) {
-            print_error(nup_error(*failure));
-            return 1;
-        }
-        const auto& damaged = std::get<std::vector<std::string>>(mismatches);
-        if (!damaged.empty()) {
-            std::string message = std::to_string(damaged.size()) +
-                " compressed member(s) do not start with a zstd frame:";
-            const std::size_t shown = damaged.size() < 20 ? damaged.size() : 20;
-            for (std::size_t i = 0; i < shown; ++i) message += "\n  " + damaged[i];
-            if (damaged.size() > shown) {
-                message += "\n  " + std::to_string(damaged.size() - shown) + " more";
-            }
-            print_error(message);
-            return 1;
-        }
+        expected_bytes = std::get<std::uint64_t>(expected);
     }
+    return report_free_space(session.command.output, expected_bytes);
+}
 
-    const std::string title_id = pack::format_title_id(selection.title_id);
-    std::printf("Title %s\n  %s\n", title_id.c_str(),
-                command.shaders_only ? command.output.c_str() : (title_id + ".app").c_str());
-    std::fflush(stdout);
-    const fs::path app_path = command.output / (title_id + ".app");
-    std::error_code exists_error;
-    if (!command.shaders_only && fs::exists(app_path, exists_error)) {
-        print_error("The packed app already exists: " + app_path.string());
+int GamePackInput::install_game(PackSession& session) {
+    if (session.reuse_app) {
+        Step step{"Clone game data"};
+        auto cloned = pack::clone_macos_game(*session.reuse_app, session.game, session.title_id);
+        if (auto* failure = std::get_if<std::string>(&cloned)) {
+            print_error(*failure);
+            return 1;
+        }
+        session.reused_identity = std::get<pack::PackedIdentity>(std::move(cloned));
+        std::printf("Reused %s\n", session.reuse_app->c_str());
+        return 0;
+    }
+    Step step{"Extract game"};
+    loader::ContainerExtractionOptions extraction;
+    extraction.keys = keys;
+    extraction.title_keys = title_keys;
+    extraction.output_directory = session.game;
+    if (inputs.patch) {
+        extraction.update_container_file = inputs.patch->location.file;
+    }
+    auto extracted = loader::extract_program_container(inputs.application.location.file, extraction);
+    if (auto* failure = std::get_if<loader::ContainerFailure>(&extracted)) {
+        print_error(container_error(*failure));
         return 1;
     }
-    const fs::path assembly = pack::assembly_path(app_path, static_cast<std::uint64_t>(getpid()));
-    if (!command.shaders_only && fs::exists(assembly, exists_error)) {
-        print_error("The app assembly folder already exists: " + assembly.string());
-        return 1;
-    }
-    {
-        std::error_code size_error;
-        const auto bytes = fs::file_size(command.game, size_error);
-        if (!size_error) {
-            const auto expected = pack::expected_pack_bytes(static_cast<std::uint64_t>(bytes));
-            if (const auto* failure = std::get_if<std::string>(&expected)) {
-                print_error(*failure);
-                return 1;
-            }
-            Step step{"Check free space"};
-            const pack::SpaceCheck space =
-                pack::check_free_space(command.output, std::get<std::uint64_t>(expected));
-            if (!space.error.empty()) {
-                print_error(space.error);
-                return 1;
-            }
-            std::printf("Free space %s; this pack expects %s.\n", format_gib(space.available).c_str(),
-                        format_gib(space.expected).c_str());
-            if (!space.enough) {
-                print_error("Not enough free space: " + format_gib(space.available) + " available, " +
-                            format_gib(space.expected) + " required.");
-                return 1;
-            }
-        }
-    }
+    return 0;
+}
 
-    PartialOutput partial;
-    // A shaders-only pack builds the same package and archive straight into
-    // the output folder, from executable files written to a work folder.
-    const fs::path armigo_root = command.shaders_only ? command.output : assembly / "Contents" / "Resources" / "Armigo";
-    const fs::path game = command.shaders_only ? command.output / ".pack-game" : armigo_root / "game";
-    const fs::path exefs_dir = game / "exefs";
-    if (command.shaders_only) {
-        partial.others = {game, armigo_root / "shaders", armigo_root / "pipelines"};
+int GamePackInput::collect_addons(PackSession& session) {
+    if (session.reused_identity) {
+        Step step{"Collect reused add-on content"};
+        auto collected = pack::reused_addon_directories(session.game);
+        if (const auto* failure = std::get_if<std::string>(&collected)) {
+            print_error(*failure);
+            return 1;
+        }
+        session.addon_directories = std::get<std::vector<fs::path>>(std::move(collected));
     } else {
-        partial.app = assembly;
+        Step step{"Extract add-on content"};
+        loader::ContainerExtractionOptions extraction;
+        extraction.keys = keys;
+        extraction.title_keys = title_keys;
+        for (const pack::ContentSet& addon : inputs.add_on_content) {
+            const std::string data_id = pack::format_title_id(addon.title_id);
+            const fs::path destination = session.game / "addons" / data_id;
+            extraction.output_directory = destination;
+            extraction.update_container_file.clear();
+            auto extracted = loader::extract_data_romfs(addon.location.file, extraction, addon.title_id);
+            if (auto* failure = std::get_if<loader::ContainerFailure>(&extracted)) {
+                print_error(data_id + ": " + container_error(*failure));
+                return 1;
+            }
+            session.addon_directories.push_back(destination);
+            std::printf("Add-on %s\n  %s\n", data_id.c_str(), destination.c_str());
+        }
     }
+    if (session.reused_identity) {
+        std::vector<std::string> selected_addons;
+        selected_addons.reserve(inputs.add_on_content.size());
+        for (const pack::ContentSet& addon : inputs.add_on_content) {
+            selected_addons.push_back(pack::format_title_id(addon.title_id));
+        }
+        const std::string mismatch = pack::validate_reused_selection(
+            *session.reused_identity, session.addon_directories, session.title_id,
+            pack::format_build_id(session.build_id), session.title_version, selected_addons);
+        if (!mismatch.empty()) {
+            print_error(mismatch);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int GamePackInput::build_shaders(PackSession& session, const fs::path& compile_cache) {
+    const bool reuse_shaders = session.ios && session.reuse_app.has_value();
+    const auto shader_paths = pack::shader_stage_paths(session.partial.staging, session.armigo_root,
+                                                        session.reuse_app.value_or(fs::path{}), session.ios);
+    const fs::path& macos_shaders = shader_paths.macos_package;
+    if (reuse_shaders) {
+        std::printf("Reusing macOS shader package %s\n", macos_shaders.c_str());
+    } else {
+        if (const std::string low = require_space(session.command.output); !low.empty()) {
+            print_error(low);
+            return 1;
+        }
+        const auto& selected = session.description->shader_inputs;
+        if (selected.containers == armigo::compat::ShaderContainerSet::Native) {
+            print_error("The matched title settings select native shader inputs, which only a .nup title has.");
+            return 1;
+        }
+        Step step{"Translate shaders"};
+        pack::ShaderPackInput shader_input;
+        shader_input.settings = selected;
+        shader_input.hoist_implicit_samples = session.description->nvn_policy.hoist_implicit_samples;
+        auto built = pack::build_shader_package(session.game / "exefs", session.game / "romfs",
+                                                 session.addon_directories, shader_paths.enumeration, macos_shaders,
+                                                 compile_cache, session.translator, shader_input,
+                                                 session.command.restamp.empty()
+                                                     ? std::vector<fs::path>{}
+                                                     : std::vector<fs::path>{session.command.restamp});
+        if (auto* failure = std::get_if<std::string>(&built)) {
+            print_error(*failure);
+            return 1;
+        }
+        const auto& shaders = std::get<pack::ShaderReport>(built);
+        std::printf("Shader stages translated: %zu (enumerated %zu, unsupported %zu, structural errors %zu).\n",
+                    shaders.translated, shaders.enumerated, shaders.unsupported, shaders.structural_errors);
+        if (!session.command.restamp.empty()) {
+            std::printf("Restamp: %zu of %zu Metal libraries reused from %s; %zu compiled or cached.\n",
+                        shaders.reused, shaders.libraries, session.command.restamp.c_str(),
+                        shaders.libraries - shaders.reused);
+        }
+    }
+    if (session.ios) {
+        Step step{"Build iOS shader package"};
+        armigo::shader::package::IosBuildOptions options;
+        options.macos_package = macos_shaders;
+        options.output = session.armigo_root / "shaders";
+        options.jobs = 8;
+        if (!compile_cache.empty()) {
+            options.compile_cache = compile_cache;
+        }
+        auto converted = armigo::shader::package::build_ios_package(options);
+        if (auto* failure = std::get_if<std::string>(&converted)) {
+            print_error(*failure);
+            return 1;
+        }
+        std::printf("iOS shader stages compiled: %zu.\n",
+                    std::get<armigo::shader::package::IosBuildReport>(converted).converted_stages);
+    }
+    return 0;
+}
+
+int GamePackInput::extract_firmware(PackSession& session) {
+    Step step{"Extract firmware resources"};
+    auto resources = pack::extract_firmware_resources(inputs, session.firmware_input, keys,
+                                                      session.armigo_root / "system");
+    if (const auto* failure = std::get_if<std::string>(&resources)) {
+        print_error(*failure);
+        return 1;
+    }
+    const auto& firmware = std::get<pack::FirmwareResources>(resources);
+    std::printf("Firmware version %s.\n", firmware.version.c_str());
+    return 0;
+}
+
+int GamePackInput::fill_bundle_identity(PackSession& session, pack::BundleSpec& spec) {
+    std::vector<pack::ControlIcon> icons;
+    icons.reserve(inputs.control.icons.size());
+    for (const pack::NamedData& icon : inputs.control.icons) {
+        icons.push_back(pack::ControlIcon{icon.name, icon.bytes});
+    }
+    const auto selected = pack::select_control_icon(icons, names.language);
+    if (auto* failure = std::get_if<std::string>(&selected)) {
+        print_error(*failure);
+        return 1;
+    }
+    const auto& jpeg = std::get<pack::ControlIcon>(selected).bytes;
+    auto icon = session.ios ? pack::jpeg_to_ios_png(jpeg) : pack::jpeg_to_icns(jpeg);
+    if (auto* failure = std::get_if<std::string>(&icon)) {
+        print_error(*failure);
+        return 1;
+    }
+    icon_bytes = std::get<std::vector<std::byte>>(std::move(icon));
+    spec.display_name = names.display_name;
+    spec.file_name = names.file_name;
+    spec.executable_name = names.executable_name;
+    spec.bundle_identifier = names.bundle_identifier;
+    spec.icon = icon_bytes;
+    spec.languages = names.languages;
+    spec.localized_titles = names.localized_titles;
+    spec.supported_language_flag = names.supported_language_flag;
+    return 0;
+}
+
+int NupPackInput::read_keys(const pack::Command& command) {
+    Step step{"Read keys"};
+    auto read = loader::read_container_keys_file(command.keys);
+    if (const auto* failure = std::get_if<loader::ContainerKeysFailure>(&read)) {
+        print_error(keys_error(*failure));
+        return 1;
+    }
+    std::printf("Keys accepted.\n");
+    std::fflush(stdout);
+    return 0;
+}
+
+int NupPackInput::load_content(PackSession& session) {
+    Step step{"Read package"};
+    auto opened = loader::NupArchive::open(session.command.game);
+    if (const auto* failure = std::get_if<loader::NupFailure>(&opened)) {
+        print_error(nup_error(*failure));
+        return 1;
+    }
+    const auto archive = std::get<std::shared_ptr<loader::NupArchive>>(std::move(opened));
+    auto selected = archive->select();
+    if (const auto* failure = std::get_if<loader::NupFailure>(&selected)) {
+        print_error(nup_error(*failure));
+        return 1;
+    }
+    const auto selection = std::get<loader::NupSelection>(std::move(selected));
+    auto read = archive->read_exefs(selection);
+    if (const auto* failure = std::get_if<loader::NupFailure>(&read)) {
+        print_error(nup_error(*failure));
+        return 1;
+    }
+    exefs = std::get<loader::ExeFsDirectoryInput>(std::move(read));
+    // A member hash can already describe damaged bytes. Stop before the
+    // archive is placed when a nonempty .zs member is not a zstd frame.
+    auto mismatches = archive->zs_frame_mismatches(selection);
+    if (const auto* failure = std::get_if<loader::NupFailure>(&mismatches)) {
+        print_error(nup_error(*failure));
+        return 1;
+    }
+    const auto& damaged = std::get<std::vector<std::string>>(mismatches);
+    if (!damaged.empty()) {
+        std::string message = std::to_string(damaged.size()) +
+            " compressed member(s) do not start with a zstd frame:";
+        const std::size_t shown = damaged.size() < 20 ? damaged.size() : 20;
+        for (std::size_t i = 0; i < shown; ++i) message += "\n  " + damaged[i];
+        if (damaged.size() > shown) {
+            message += "\n  " + std::to_string(damaged.size() - shown) + " more";
+        }
+        print_error(message);
+        return 1;
+    }
+    session.raw_title_id = selection.title_id;
+    session.title_id = pack::format_title_id(selection.title_id);
+    session.title_version = selection.version;
+    return 0;
+}
+
+int NupPackInput::announce(PackSession& session) {
+    const pack::Command& command = session.command;
+    std::printf("Title %s\n  %s\n", session.title_id.c_str(),
+                command.shaders_only ? command.output.c_str() : (session.title_id + ".app").c_str());
+    std::fflush(stdout);
+    session.executable_name = session.title_id;
+    session.app_path = command.output / (session.title_id + ".app");
+    session.kept_app = session.app_path;
+    return 0;
+}
+
+int NupPackInput::estimate_space(PackSession& session) {
+    std::error_code size_error;
+    const auto bytes = fs::file_size(session.command.game, size_error);
+    if (size_error) {
+        return 0;
+    }
+    const auto expected = pack::expected_pack_bytes(static_cast<std::uint64_t>(bytes));
+    if (const auto* failure = std::get_if<std::string>(&expected)) {
+        print_error(*failure);
+        return 1;
+    }
+    return report_free_space(session.command.output, std::get<std::uint64_t>(expected));
+}
+
+int NupPackInput::install_game(PackSession& session) {
+    const fs::path exefs_dir = session.game / "exefs";
     {
         Step step{"Write executable files"};
         std::error_code error;
@@ -458,181 +810,85 @@ int pack_nup(const pack::Command& command, const fs::path& player, const fs::pat
             return 1;
         }
     }
-    if (!command.shaders_only) {
-        Step step{"Place package"};
-        const fs::path destination = game / "title.nup";
-        std::error_code error;
-        fs::create_directories(destination.parent_path(), error);
+    if (session.command.shaders_only) {
+        return 0;
+    }
+    Step step{"Place package"};
+    const fs::path destination = session.game / "title.nup";
+    std::error_code error;
+    fs::create_directories(destination.parent_path(), error);
+    if (error) {
+        print_error("Cannot create " + destination.parent_path().string());
+        return 1;
+    }
+    if (::clonefile(session.command.game.c_str(), destination.c_str(), 0) != 0) {
+        error.clear();
+        fs::create_hard_link(session.command.game, destination, error);
         if (error) {
-            print_error("Cannot create " + destination.parent_path().string());
-            return 1;
-        }
-        if (::clonefile(command.game.c_str(), destination.c_str(), 0) != 0) {
             error.clear();
-            fs::create_hard_link(command.game, destination, error);
+            fs::copy_file(session.command.game, destination, error);
             if (error) {
-                error.clear();
-                fs::copy_file(command.game, destination, error);
-                if (error) {
-                    print_error("Cannot place the package at " + destination.string() + ": " + error.message());
-                    return 1;
-                }
+                print_error("Cannot place the package at " + destination.string() + ": " + error.message());
+                return 1;
             }
         }
     }
-
-    std::array<std::byte, 32> build_id{};
-    pack::TitleMatch matched;
-    const armigo::compat::PatchDescription* description = nullptr;
-    {
-        Step step{"Match title settings"};
-        std::string build_error;
-        const auto read_build = read_main_build(exefs_dir, build_error);
-        if (!read_build) {
-            print_error(build_error);
-            return 1;
-        }
-        build_id = *read_build;
-        auto match = pack::match_title_build(selection.title_id, build_id, executable);
-        if (auto* failure = std::get_if<std::string>(&match)) {
-            print_error(*failure);
-            return 1;
-        }
-        matched = std::get<pack::TitleMatch>(std::move(match));
-        description = &matched.description();
-        std::printf("Title settings %s\n", matched.folder.c_str());
-    }
-
-    fs::path compile_cache;
-    if (std::getenv("ARMIGO_SHADER_COMPILE_CACHE") == nullptr) {
-        if (const char* home = std::getenv("HOME")) {
-            compile_cache = fs::path(home) / "Library" / "Caches" / "Armigo" / title_id / "compile-cache";
-        }
-    }
-    {
-        if (const std::string low = require_space(command.output); !low.empty()) {
-            print_error(low);
-            return 1;
-        }
-        Step step{"Translate native shaders"};
-        pack::NativeShaderRequest request;
-        request.nup = command.game;
-        request.output = armigo_root / "shaders";
-        request.translate_tool = translator;
-        request.compile_cache = compile_cache;
-        request.jobs = 8;
-        request.keep_sources = false;
-        auto built = pack::build_native_shader_package(request);
-        if (const auto* failure = std::get_if<std::string>(&built)) {
-            print_error(*failure);
-            return 1;
-        }
-        const auto& report = std::get<pack::NativeShaderReport>(built);
-        std::printf("Native shader stages translated: %llu (enumerated %llu, unique %llu, compiled %llu).\n",
-                    static_cast<unsigned long long>(report.translated),
-                    static_cast<unsigned long long>(report.enumerated),
-                    static_cast<unsigned long long>(report.unique),
-                    static_cast<unsigned long long>(report.compiled));
-    }
-
-    std::error_code manifest_error;
-    const fs::path compute_list = armigo_root / "shaders" / "native" /
-        armigo::platform::metal::nvn_driver::compute_pipeline_manifest_file;
-    const bool compute_present = fs::is_regular_file(compute_list, manifest_error);
-    const auto selected = armigo::platform::metal::nvn_driver::select_pipeline_manifests(
-        description->pso_manifest, compute_list.string(), compute_present);
-    std::vector<fs::path> manifests;
-    manifests.reserve(selected.size());
-    for (const std::string& path : selected) manifests.emplace_back(path);
-    if (manifests.empty()) {
-        std::printf("Pipeline warm-up skipped: the title settings have no pipeline list.\n");
-        std::fflush(stdout);
-    } else {
-        if (const std::string low = require_space(command.output); !low.empty()) {
-            print_error(low);
-            return 1;
-        }
-        Step step{"Build pipeline archive"};
-        const std::string chain{armigo::runtime::expected_shader_chain_id()};
-        if (chain.empty()) {
-            print_error("This build has no shader chain, so shaders and pipelines cannot be packed.");
-            return 1;
-        }
-        auto built = pack::build_pack_pipelines(armigo_root / "shaders", manifests,
-                                                 armigo_root / "pipelines", chain);
-        if (const auto* failure = std::get_if<std::string>(&built)) {
-            print_error(*failure);
-            return 1;
-        }
-        const auto& pipelines = std::get<armigo::platform::PipelineArchiveResult>(built);
-        std::printf("Pipeline archive: %llu rows, %llu built, %llu unresolved, %llu failed, %s\n",
-                    static_cast<unsigned long long>(pipelines.rows),
-                    static_cast<unsigned long long>(pipelines.built),
-                    static_cast<unsigned long long>(pipelines.unresolved),
-                    static_cast<unsigned long long>(pipelines.failed), pipelines.archive.c_str());
-    }
-    if (command.shaders_only) {
-        return finish_shaders_only(partial, command.output, game, started);
-    }
-
-    {
-        Step step{"Assemble application"};
-        static const std::array<std::byte, 4> icon{std::byte{0x69}, std::byte{0x63}, std::byte{0x6e}, std::byte{0x73}};
-        pack::BundleSpec spec;
-        spec.app_path = assembly;
-        spec.display_name = title_id;
-        spec.bundle_name = title_id;
-        spec.bundle_identifier = "com.tommylau.armigo." + title_id;
-        spec.title_id = title_id;
-        spec.build_id = pack::format_build_id(build_id);
-        spec.title_version = selection.version;
-        spec.platform = "macos";
-        spec.commit = ARMIGO_PACK_COMMIT;
-        spec.player = player;
-        spec.title_folder = matched.folder;
-        spec.icon = icon;
-        spec.languages = {"en-US"};
-        spec.supported_language_flag = 1;
-        if (description->frame_rate) {
-            spec.default_frame_rate = description->frame_rate->default_rate;
-            spec.display_refresh_rate = description->frame_rate->display_refresh_rate;
-            spec.supported_frame_rates = description->frame_rate->supported_rates;
-            spec.experimental_frame_rates = description->frame_rate->experimental_rates;
-        }
-        auto assembled = pack::assemble_application(spec);
-        if (const auto* failure = std::get_if<std::string>(&assembled)) {
-            print_error(*failure);
-            return 1;
-        }
-    }
-
-    if (const std::string failure = pack::publish_application(assembly, app_path); !failure.empty()) {
-        print_error(failure);
-        return 1;
-    }
-    partial.app = app_path;
-    if (!manifests.empty()) {
-        Step step{"Warm player Metal caches"};
-        const std::string failure = pack::warm_pack_pipelines(app_path, manifests);
-        if (!failure.empty()) {
-            print_error(failure);
-            return 1;
-        }
-    }
-    if (const std::string failure = pack::register_application(app_path); !failure.empty()) {
-        std::printf("Warning: %s The Finder may show the app as unable to run until it is opened once.\n",
-                    failure.c_str());
-    }
-    partial.keep = true;
-    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-    const auto bytes = directory_bytes(app_path);
-    std::printf("Packed %s (%s) in %.1f s\n", app_path.c_str(), format_gib(bytes).c_str(), seconds);
-    std::fflush(stdout);
     return 0;
 }
 
-int pack_game(const pack::Command& command) {
-    const auto started = std::chrono::steady_clock::now();
+int NupPackInput::build_shaders(PackSession& session, const fs::path& compile_cache) {
+    if (const std::string low = require_space(session.command.output); !low.empty()) {
+        print_error(low);
+        return 1;
+    }
+    Step step{"Translate native shaders"};
+    pack::NativeShaderRequest request;
+    request.nup = session.command.game;
+    request.output = session.armigo_root / "shaders";
+    request.translate_tool = session.translator;
+    request.compile_cache = compile_cache;
+    request.jobs = 8;
+    request.keep_sources = false;
+    // The title's settings name the dictionary member and any member or
+    // stage selection; without them every member and program is read.
+    if (const auto& selected = session.description->shader_inputs;
+        selected.containers == armigo::compat::ShaderContainerSet::Native) {
+        request.dictionary_member = selected.dictionary_member;
+        request.members = selected.members;
+        request.identities = selected.identities;
+    }
+    auto built = pack::build_native_shader_package(request);
+    if (const auto* failure = std::get_if<std::string>(&built)) {
+        print_error(*failure);
+        return 1;
+    }
+    const auto& report = std::get<pack::NativeShaderReport>(built);
+    std::printf("Native shader stages translated: %llu (enumerated %llu, unique %llu, compiled %llu).\n",
+                static_cast<unsigned long long>(report.translated),
+                static_cast<unsigned long long>(report.enumerated),
+                static_cast<unsigned long long>(report.unique),
+                static_cast<unsigned long long>(report.compiled));
+    return 0;
+}
+
+int NupPackInput::fill_bundle_identity(PackSession& session, pack::BundleSpec& spec) {
+    icon_bytes = {std::byte{0x69}, std::byte{0x63}, std::byte{0x6e}, std::byte{0x73}};
+    spec.display_name = session.title_id;
+    spec.file_name = session.title_id;
+    spec.executable_name = session.title_id;
+    spec.bundle_identifier = "com.tommylau.armigo." + session.title_id;
+    spec.icon = icon_bytes;
+    spec.languages = {"en-US"};
+    spec.supported_language_flag = 1;
+    return 0;
+}
+
+// One pack pipeline. An input adapter supplies the kind-specific reads, the
+// game placement and the shader strategy; every other step lives here.
+int pack_flow(const pack::Command& command) {
+    // The XCI/NSP timer includes the tool check. The .nup timer starts once
+    // that check has passed, which is where its own pack began.
+    auto started = std::chrono::steady_clock::now();
     if (pack::inside_git_work_tree(command.output)) {
         print_error("Refusing to write a packed app inside a git work tree: " + command.output.string());
         return 1;
@@ -663,389 +919,224 @@ int pack_game(const pack::Command& command) {
             return 1;
         }
     }
-    if (nup_extension(command.game)) {
-        if (ios) {
-            print_error("A .nup title packs for macOS only.");
-            return 1;
-        }
-        return pack_nup(command, player, translator, executable);
+
+    const bool native = nup_extension(command.game);
+    std::unique_ptr<PackInput> input;
+    if (native) {
+        input = std::make_unique<NupPackInput>();
+    } else {
+        input = std::make_unique<GamePackInput>();
+    }
+    const pack::InputCapabilities caps = input->capabilities();
+    if (!caps.ios && ios) {
+        print_error("A .nup title packs for macOS only.");
+        return 1;
+    }
+    if (native) {
+        started = std::chrono::steady_clock::now();
+    }
+    if (caps.native_shaders && !command.restamp.empty()) {
+        print_error("--restamp reuses a Switch 1 shader package; a .nup title has none to reuse yet.");
+        return 1;
+    }
+    if (!caps.updates_and_addons && (!command.updates.empty() || !command.dlc.empty())) {
+        print_error("A .nup pack does not take updates or add-on content.");
+        return 1;
     }
 
-    loader::ContainerKeys keys;
-    loader::ContainerKeys title_keys;
-    {
-        Step step{"Read keys"};
-        auto read = loader::read_container_keys_file(command.keys);
-        if (auto* failure = std::get_if<loader::ContainerKeysFailure>(&read)) {
-            print_error(keys_error(*failure));
-            return 1;
-        }
-        keys = std::get<loader::ContainerKeys>(std::move(read));
-        if (!command.title_keys.empty()) {
-            auto read_title = loader::read_container_keys_file(command.title_keys);
-            if (auto* failure = std::get_if<loader::ContainerKeysFailure>(&read_title)) {
-                print_error(keys_error(*failure));
+    PackSession session(command);
+    session.started = started;
+    session.executable = executable;
+    session.player = player;
+    session.translator = translator;
+    session.preparer = preparer;
+    session.ios = ios;
+    session.linked_player = player;
+
+    if (caps.native_shaders) {
+        if (command.shaders_only) {
+            if (const std::string failure = prepare_shaders_output(command.output); !failure.empty()) {
+                print_error(failure);
                 return 1;
             }
-            title_keys = std::get<loader::ContainerKeys>(std::move(read_title));
         }
-    }
-
-    if (command.shaders_only) {
-        if (const std::string failure = prepare_shaders_output(command.output); !failure.empty()) {
-            print_error(failure);
+        if (const std::string low = require_space(command.output); !low.empty()) {
+            print_error(low);
             return 1;
         }
-    }
-    PartialOutput firmware_partial;
-    firmware_partial.staging = command.output / ".firmware-input";
-    fs::path firmware_input;
-    if (!command.shaders_only) {
-        Step step{"Prepare firmware"};
-        auto prepared = pack::prepare_firmware_input(command.firmware, firmware_partial.staging);
-        if (const auto* failure = std::get_if<std::string>(&prepared)) {
-            print_error(*failure);
-            return 1;
+        if (input->read_keys(command) != 0) return 1;
+        if (!command.shaders_only) {
+            std::error_code error;
+            if (!fs::exists(command.firmware, error) || error) {
+                print_error("The firmware path does not exist: " + command.firmware.string());
+                return 1;
+            }
+            std::printf("Firmware system data is not embedded for a .nup pack.\n");
+            std::fflush(stdout);
         }
-        firmware_input = std::get<fs::path>(prepared);
-    }
-
-    pack::Inputs inputs;
-    {
-        Step step{"Classify inputs"};
-        std::vector<fs::path> paths;
-        paths.push_back(command.game);
-        paths.insert(paths.end(), command.updates.begin(), command.updates.end());
-        paths.insert(paths.end(), command.dlc.begin(), command.dlc.end());
-        if (!firmware_input.empty()) {
-            paths.push_back(firmware_input);
-        }
-        pack::InputsOptions options;
-        options.keys_file = command.keys;
-        auto classified = pack::classify_inputs(paths, options);
-        if (auto* failure = std::get_if<pack::InputsFailure>(&classified)) {
-            print_error(failure->detail);
-            return 1;
-        }
-        inputs = std::get<pack::Inputs>(std::move(classified));
-        print_inputs(inputs, firmware_input);
-    }
-
-    pack::PackedNames names;
-    if (!command.shaders_only) {
-        auto named = pack::names_from_control(inputs.application.title_id, inputs.control.nacp);
-        if (auto* failure = std::get_if<std::string>(&named)) {
-            print_error(*failure);
-            return 1;
-        }
-        names = std::get<pack::PackedNames>(std::move(named));
-        std::printf("Title %s\n  %s.app\n", names.display_name.c_str(), names.file_name.c_str());
-        for (const std::string& warning : names.warnings) {
-            std::printf("Control data: %s\n", warning.c_str());
-        }
-        std::fflush(stdout);
-    }
-    const fs::path app_path = command.output / (names.file_name + ".app");
-    // A kept iOS app sits beside the macOS app of the same title, which an iOS
-    // pack reuses from the same output folder; the IPA keeps the plain name.
-    const fs::path kept_app = ios ? command.output / (names.file_name + " (iOS).app") : app_path;
-    const std::uint32_t title_version = inputs.patch ? inputs.patch->version : inputs.application.version;
-    std::error_code exists_error;
-    if (!command.shaders_only && fs::exists(kept_app, exists_error)) {
-        print_error("The packed app already exists: " + kept_app.string());
-        return 1;
-    }
-    // The app is assembled under a hidden name that is not a bundle and moved
-    // into place only when complete: LaunchServices may record an app while it
-    // is still being written, and the Finder then keeps showing it as one that
-    // cannot run.
-    const fs::path assembly = pack::assembly_path(app_path, static_cast<std::uint64_t>(getpid()));
-    if (!command.shaders_only && fs::exists(assembly, exists_error)) {
-        print_error("The app assembly folder already exists: " + assembly.string());
-        return 1;
-    }
-    const std::string title_id = pack::format_title_id(inputs.application.title_id);
-    if (command.shaders_only) {
-        std::printf("Title %s\n  %s\n", title_id.c_str(), command.output.c_str());
-        std::fflush(stdout);
-    }
-    std::optional<fs::path> reuse_app;
-    if (ios) {
-        Step step{"Find reusable game data"};
-        auto selected = pack::select_macos_reuse(command.reuse, command.output, kept_app, title_id);
-        if (auto* failure = std::get_if<std::string>(&selected)) {
-            print_error(*failure);
-            return 1;
-        }
-        reuse_app = std::get<std::optional<fs::path>>(std::move(selected));
-    }
-
-    std::uint64_t expected_bytes = pack::kPackMarginBytes;
-    if (ios || !reuse_app) {
-        std::vector<pack::ContentSize> sizes;
-        sizes.push_back({inputs.application.location.file, program_and_data_bytes(inputs.application)});
-        if (inputs.patch) {
-            sizes.push_back({inputs.patch->location.file, program_and_data_bytes(*inputs.patch)});
-        }
-        for (const pack::ContentSet& addon : inputs.add_on_content) {
-            sizes.push_back({addon.location.file, program_and_data_bytes(addon)});
-        }
-        const auto content = pack::sum_content_bytes(sizes);
-        if (auto* failure = std::get_if<std::string>(&content)) {
-            print_error(*failure);
-            return 1;
-        }
-        const std::uint64_t content_bytes = std::get<std::uint64_t>(content);
-        const std::uint64_t copies = ios && !reuse_app ? 2 : 1;
-        if (content_bytes > UINT64_MAX / copies) {
-            print_error("The packed input size overflows the free-space estimate.");
-            return 1;
-        }
-        const auto expected = pack::expected_pack_bytes(content_bytes * copies);
-        if (auto* failure = std::get_if<std::string>(&expected)) {
-            print_error(*failure);
-            return 1;
-        }
-        expected_bytes = std::get<std::uint64_t>(expected);
-    }
-    {
-        Step step{"Check free space"};
-        const pack::SpaceCheck space = pack::check_free_space(command.output, expected_bytes);
-        if (!space.error.empty()) {
-            print_error(space.error);
-            return 1;
-        }
-        std::printf("Free space %s; this pack expects %s.\n", format_gib(space.available).c_str(),
-                    format_gib(space.expected).c_str());
-        if (!space.enough) {
-            print_error("Not enough free space: " + format_gib(space.available) + " available, " +
-                        format_gib(space.expected) + " required.");
-            return 1;
-        }
-    }
-
-    PartialOutput partial;
-    if (ios) {
-        partial.sidecar = command.output / "entitlements.plist";
-    }
-    partial.staging = command.output / (ios ? ".pack-stages-ios" : ".pack-stages");
-    // A shaders-only pack builds the same package and archive straight into
-    // the output folder, from a game extracted into a work folder.
-    const fs::path armigo_root = command.shaders_only ? command.output
-        : ios ? assembly / "Armigo" : assembly / "Contents" / "Resources" / "Armigo";
-    const fs::path game = command.shaders_only ? command.output / ".pack-game" : armigo_root / "game";
-    if (command.shaders_only) {
-        partial.others = {game, armigo_root / "shaders", armigo_root / "pipelines"};
+        if (input->load_content(session) != 0) return 1;
+        if (input->announce(session) != 0) return 1;
+        if (bind_output(session) != 0) return 1;
+        if (input->estimate_space(session) != 0) return 1;
     } else {
-        partial.app = assembly;
-    }
-    std::optional<pack::PackedIdentity> reused_identity;
-    loader::ContainerExtractionOptions extraction;
-    extraction.keys = keys;
-    extraction.title_keys = title_keys;
-    extraction.output_directory = game;
-    if (inputs.patch) {
-        extraction.update_container_file = inputs.patch->location.file;
-    }
-    if (reuse_app) {
-        Step step{"Clone game data"};
-        auto cloned = pack::clone_macos_game(*reuse_app, game, title_id);
-        if (auto* failure = std::get_if<std::string>(&cloned)) {
-            print_error(*failure);
-            return 1;
+        if (input->read_keys(command) != 0) return 1;
+        if (command.shaders_only) {
+            if (const std::string failure = prepare_shaders_output(command.output); !failure.empty()) {
+                print_error(failure);
+                return 1;
+            }
         }
-        reused_identity = std::get<pack::PackedIdentity>(std::move(cloned));
-        std::printf("Reused %s\n", reuse_app->c_str());
-    } else {
-        Step step{"Extract game"};
-        auto extracted = loader::extract_program_container(inputs.application.location.file, extraction);
-        if (auto* failure = std::get_if<loader::ContainerFailure>(&extracted)) {
-            print_error(container_error(*failure));
-            return 1;
+        if (session.ios) {
+            // The title's settings decide whether it packs for iOS; that is
+            // known from its content metadata, before any firmware or game
+            // content is unpacked.
+            std::vector<fs::path> paths{command.game};
+            paths.insert(paths.end(), command.updates.begin(), command.updates.end());
+            paths.insert(paths.end(), command.dlc.begin(), command.dlc.end());
+            pack::InputsOptions options;
+            options.keys_file = command.keys;
+            auto classified = pack::classify_inputs(paths, options);
+            if (const auto* failure = std::get_if<pack::InputsFailure>(&classified)) {
+                print_error(failure->detail);
+                return 1;
+            }
+            const std::uint64_t title = std::get<pack::Inputs>(classified).application.title_id;
+            if (const std::string refused = pack::check_title_platform(title, "ios", executable); !refused.empty()) {
+                print_error(refused);
+                return 1;
+            }
         }
+        session.firmware_partial.staging = command.output / ".firmware-input";
+        if (!command.shaders_only) {
+            Step step{"Prepare firmware"};
+            auto prepared = pack::prepare_firmware_input(command.firmware, session.firmware_partial.staging);
+            if (const auto* failure = std::get_if<std::string>(&prepared)) {
+                print_error(*failure);
+                return 1;
+            }
+            session.firmware_input = std::get<fs::path>(prepared);
+        }
+        if (input->load_content(session) != 0) return 1;
+        if (input->announce(session) != 0) return 1;
+        if (bind_output(session) != 0) return 1;
+        if (command.shaders_only) {
+            std::printf("Title %s\n  %s\n", session.title_id.c_str(), command.output.c_str());
+            std::fflush(stdout);
+        }
+        if (session.ios) {
+            Step step{"Find reusable game data"};
+            auto selected = pack::select_macos_reuse(command.reuse, command.output, session.kept_app,
+                                                      session.title_id);
+            if (auto* failure = std::get_if<std::string>(&selected)) {
+                print_error(*failure);
+                return 1;
+            }
+            session.reuse_app = std::get<std::optional<fs::path>>(std::move(selected));
+        }
+        if (input->estimate_space(session) != 0) return 1;
     }
 
-    std::array<std::byte, 32> build_id{};
-    pack::TitleMatch matched;
-    const armigo::compat::PatchDescription* description = nullptr;
+    if (session.ios) {
+        session.partial.sidecar = command.output / "entitlements.plist";
+    }
+    if (!caps.native_shaders) {
+        session.partial.staging = command.output / (session.ios ? ".pack-stages-ios" : ".pack-stages");
+    }
+    // A shaders-only pack builds the same package and archive straight into the
+    // output folder. A full XCI/NSP pack extracts into the app; a full .nup pack
+    // writes executable files there and places the archive beside them.
+    session.armigo_root = command.shaders_only ? command.output
+                                              : session.ios ? session.assembly / "Armigo"
+                                                            : session.assembly / "Contents" / "Resources" / "Armigo";
+    session.game = command.shaders_only ? command.output / ".pack-game" : session.armigo_root / "game";
+    if (command.shaders_only) {
+        session.partial.others = {session.game, session.armigo_root / "shaders", session.armigo_root / "pipelines"};
+    } else {
+        session.partial.app = session.assembly;
+    }
+    if (input->install_game(session) != 0) return 1;
+
     {
         Step step{"Match title settings"};
         std::string build_error;
-        auto read_build = read_main_build(game / "exefs", build_error);
+        const auto read_build = read_main_build(session.game / "exefs", build_error);
         if (!read_build) {
             print_error(build_error);
             return 1;
         }
-        build_id = *read_build;
-        if (reused_identity && reused_identity->build_id != pack::format_build_id(build_id)) {
+        session.build_id = *read_build;
+        if (session.reused_identity &&
+            session.reused_identity->build_id != pack::format_build_id(session.build_id)) {
             print_error("The reuse app build id does not match its cloned ExeFS.");
             return 1;
         }
-        auto match = pack::match_title_build(inputs.application.title_id, build_id, executable);
+        auto match = pack::match_title_build(session.raw_title_id, session.build_id, session.executable);
         if (auto* failure = std::get_if<std::string>(&match)) {
             print_error(*failure);
             return 1;
         }
-        matched = std::get<pack::TitleMatch>(std::move(match));
-        description = &matched.description();
-        std::printf("Title settings %s\n", matched.folder.c_str());
+        session.matched = std::get<pack::TitleMatch>(std::move(match));
+        session.description = &session.matched.description();
+        std::printf("Title settings %s\n", session.matched.folder.c_str());
+        const auto& platforms = session.description->platforms;
+        if (std::find(platforms.begin(), platforms.end(), command.platform) == platforms.end()) {
+            print_error("Build " + pack::format_build_id(session.build_id) + " of title " + session.title_id +
+                        " does not support packing for " + command.platform + " in its title settings.");
+            return 1;
+        }
     }
-    if (!ios && description->pso_manifest.empty()) {
+    if (caps.pipeline_list_required && !session.ios && session.description->pso_manifest.empty()) {
         print_error("The matched title settings have no pipeline list.");
         return 1;
     }
+    if (input->collect_addons(session) != 0) return 1;
 
-    std::vector<fs::path> addon_directories;
-    if (reused_identity) {
-        Step step{"Collect reused add-on content"};
-        auto collected = pack::reused_addon_directories(game);
-        if (const auto* failure = std::get_if<std::string>(&collected)) {
-            print_error(*failure);
-            return 1;
-        }
-        addon_directories = std::get<std::vector<fs::path>>(std::move(collected));
-    } else {
-        Step step{"Extract add-on content"};
-        for (const pack::ContentSet& addon : inputs.add_on_content) {
-            const std::string data_id = pack::format_title_id(addon.title_id);
-            const fs::path destination = game / "addons" / data_id;
-            extraction.output_directory = destination;
-            extraction.update_container_file.clear();
-            auto extracted = loader::extract_data_romfs(addon.location.file, extraction, addon.title_id);
-            if (auto* failure = std::get_if<loader::ContainerFailure>(&extracted)) {
-                print_error(data_id + ": " + container_error(*failure));
+    const fs::path compile_cache = pack::default_shader_compile_cache(session.title_id);
+    if (input->build_shaders(session, compile_cache) != 0) return 1;
+
+    session.manifests = pack::select_pack_manifests(*session.description, session.armigo_root / "shaders", caps);
+    if (!session.ios) {
+        if (session.manifests.empty()) {
+            std::printf("Pipeline warm-up skipped: the title settings have no pipeline list.\n");
+            std::fflush(stdout);
+        } else {
+            if (const std::string low = require_space(command.output); !low.empty()) {
+                print_error(low);
                 return 1;
             }
-            addon_directories.push_back(destination);
-            std::printf("Add-on %s\n  %s\n", data_id.c_str(), destination.c_str());
+            Step step{"Build pipeline archive"};
+            const std::string chain{armigo::runtime::expected_shader_chain_id()};
+            if (chain.empty()) {
+                print_error("This build has no shader chain, so shaders and pipelines cannot be packed.");
+                return 1;
+            }
+            auto built = pack::build_pack_pipelines(session.armigo_root / "shaders", session.manifests,
+                                                     session.armigo_root / "pipelines", chain);
+            if (const auto* failure = std::get_if<std::string>(&built)) {
+                print_error(*failure);
+                return 1;
+            }
+            const auto& pipelines = std::get<armigo::platform::PipelineArchiveResult>(built);
+            std::printf("Pipeline archive: %llu rows, %llu built, %llu unresolved, %llu failed, %s\n",
+                        static_cast<unsigned long long>(pipelines.rows),
+                        static_cast<unsigned long long>(pipelines.built),
+                        static_cast<unsigned long long>(pipelines.unresolved),
+                        static_cast<unsigned long long>(pipelines.failed), pipelines.archive.c_str());
         }
-    }
-    if (reused_identity) {
-        std::vector<std::string> selected_addons;
-        selected_addons.reserve(inputs.add_on_content.size());
-        for (const pack::ContentSet& addon : inputs.add_on_content) {
-            selected_addons.push_back(pack::format_title_id(addon.title_id));
-        }
-        const std::string mismatch = pack::validate_reused_selection(
-            *reused_identity, addon_directories, title_id, pack::format_build_id(build_id), title_version,
-            selected_addons);
-        if (!mismatch.empty()) {
-            print_error(mismatch);
-            return 1;
-        }
-    }
-
-    fs::path compile_cache;
-    if (std::getenv("ARMIGO_SHADER_COMPILE_CACHE") == nullptr) {
-        if (const char* home = std::getenv("HOME")) {
-            compile_cache = fs::path(home) / "Library" / "Caches" / "Armigo" / title_id / "compile-cache";
-        }
-    }
-    const bool reuse_shaders = ios && reuse_app.has_value();
-    const auto shader_paths = pack::shader_stage_paths(
-        partial.staging, armigo_root, reuse_app.value_or(fs::path{}), ios);
-    const fs::path& macos_shaders = shader_paths.macos_package;
-    if (reuse_shaders) {
-        std::printf("Reusing macOS shader package %s\n", macos_shaders.c_str());
-    } else {
-        if (auto low = require_space(command.output); !low.empty()) {
-            print_error(low);
-            return 1;
-        }
-        Step step{"Translate shaders"};
-        pack::ShaderPackInput shader_input;
-        const auto& selected = description->shader_inputs;
-        if (selected.containers == armigo::compat::ShaderContainerSet::GfdCache) {
-            shader_input.containers = pack::ShaderPackInput::Containers::GfdCache;
-        } else if (selected.containers == armigo::compat::ShaderContainerSet::Glslc) {
-            shader_input.containers = pack::ShaderPackInput::Containers::Glslc;
-        }
-        if (selected.vertex_depth == armigo::compat::ShaderVertexDepth::ZeroToOne) {
-            shader_input.vertex_depth = pack::ShaderPackInput::VertexDepth::ZeroToOne;
-        }
-        shader_input.caches = selected.caches;
-        shader_input.fallbacks.reserve(selected.fallbacks.size());
-        for (const auto& fallback : selected.fallbacks) {
-            shader_input.fallbacks.emplace_back(fallback.cache, fallback.alternatives);
-        }
-        shader_input.ignored_needle_offsets = selected.ignored_needle_offsets;
-        shader_input.hoist_implicit_samples = description->nvn_policy.hoist_implicit_samples;
-        auto built = pack::build_shader_package(game / "exefs", game / "romfs", addon_directories,
-                                                 shader_paths.enumeration, macos_shaders, compile_cache, translator,
-                                                 shader_input);
-        if (auto* failure = std::get_if<std::string>(&built)) {
-            print_error(*failure);
-            return 1;
-        }
-        const auto& shaders = std::get<pack::ShaderReport>(built);
-        std::printf("Shader stages translated: %zu (enumerated %zu, unsupported %zu, structural errors %zu).\n",
-                    shaders.translated, shaders.enumerated, shaders.unsupported, shaders.structural_errors);
-    }
-    if (ios) {
-        Step step{"Build iOS shader package"};
-        armigo::shader::package::IosBuildOptions options;
-        options.macos_package = macos_shaders;
-        options.output = armigo_root / "shaders";
-        options.jobs = 8;
-        if (!compile_cache.empty()) {
-            options.compile_cache = compile_cache;
-        }
-        auto converted = armigo::shader::package::build_ios_package(options);
-        if (auto* failure = std::get_if<std::string>(&converted)) {
-            print_error(*failure);
-            return 1;
-        }
-        std::printf("iOS shader stages compiled: %zu.\n",
-                    std::get<armigo::shader::package::IosBuildReport>(converted).converted_stages);
-    }
-
-    if (!ios) {
-        if (auto low = require_space(command.output); !low.empty()) {
-            print_error(low);
-            return 1;
-        }
-        Step step{"Build pipeline archive"};
-        const std::string chain{armigo::runtime::expected_shader_chain_id()};
-        if (chain.empty()) {
-            print_error("This build has no shader chain, so shaders and pipelines cannot be packed.");
-            return 1;
-        }
-        auto built = pack::build_pack_pipelines(armigo_root / "shaders", {description->pso_manifest},
-                                                 armigo_root / "pipelines", chain);
-        if (auto* failure = std::get_if<std::string>(&built)) {
-            print_error(*failure);
-            return 1;
-        }
-        const auto& pipelines = std::get<armigo::platform::PipelineArchiveResult>(built);
-        std::printf("Pipeline archive: %llu rows, %llu built, %llu unresolved, %llu failed, %s\n",
-                    static_cast<unsigned long long>(pipelines.rows),
-                    static_cast<unsigned long long>(pipelines.built),
-                    static_cast<unsigned long long>(pipelines.unresolved),
-                    static_cast<unsigned long long>(pipelines.failed), pipelines.archive.c_str());
     }
     if (command.shaders_only) {
-        return finish_shaders_only(partial, command.output, game, started);
+        return finish_shaders_only(session.partial, command.output, session.game, session.started);
     }
+    if (caps.embeds_firmware && input->extract_firmware(session) != 0) return 1;
 
-    {
-        Step step{"Extract firmware resources"};
-        auto resources = pack::extract_firmware_resources(inputs, firmware_input, keys, armigo_root / "system");
-        if (const auto* failure = std::get_if<std::string>(&resources)) {
-            print_error(*failure);
-            return 1;
-        }
-        const auto& firmware = std::get<pack::FirmwareResources>(resources);
-        std::printf("Firmware version %s.\n", firmware.version.c_str());
-    }
-
-    fs::path linked_player = player;
-    if (ios) {
-        const fs::path embedded = partial.staging / "embedded";
+    if (session.ios) {
+        const fs::path embedded = session.partial.staging / "embedded";
         {
             Step step{"Capture embedded guest code"};
-            const std::string failure = pack::run_pack_tool({
-                preparer.string(), "--embedded", "--exefs", (game / "exefs").string(),
-                "--output", embedded.string(), "--patches", (matched.folder / "profile.json").string()}, true);
+            const std::string failure = pack::run_pack_tool(
+                {session.preparer.string(), "--embedded", "--exefs", (session.game / "exefs").string(), "--output",
+                 embedded.string(), "--patches", (session.matched.folder / "profile.json").string()},
+                true);
             if (!failure.empty()) {
                 print_error(failure);
                 return 1;
@@ -1053,26 +1144,27 @@ int pack_game(const pack::Command& command) {
         }
         {
             Step step{"Verify embedded guest code"};
-            const std::string failure = pack::run_pack_tool({
-                preparer.string(), "--embedded", "--verify", "--exefs", (game / "exefs").string(),
-                "--output", embedded.string(), "--patches", (matched.folder / "profile.json").string()}, true);
+            const std::string failure = pack::run_pack_tool(
+                {session.preparer.string(), "--embedded", "--verify", "--exefs", (session.game / "exefs").string(),
+                 "--output", embedded.string(), "--patches", (session.matched.folder / "profile.json").string()},
+                true);
             if (!failure.empty()) {
                 print_error(failure);
                 return 1;
             }
         }
         Step step{"Link iOS player"};
-        auto build = pack::prepare_ios_player_build(command.ios_build, executable, translator);
+        auto build = pack::prepare_ios_player_build(command.ios_build, session.executable, session.translator);
         if (auto* failure = std::get_if<std::string>(&build)) {
             print_error(*failure);
             return 1;
         }
-        linked_player = partial.staging / "Armigo";
+        session.linked_player = session.partial.staging / session.executable_name;
         pack::IosLinkOptions options;
         options.player_build_directory = std::get<fs::path>(build);
         options.embedded_directory = embedded;
-        options.work_directory = partial.staging / "generated";
-        options.output_executable = linked_player;
+        options.work_directory = session.partial.staging / "generated";
+        options.output_executable = session.linked_player;
         auto linked = pack::link_ios_player(options);
         if (auto* failure = std::get_if<std::string>(&linked)) {
             print_error(*failure);
@@ -1084,115 +1176,100 @@ int pack_game(const pack::Command& command) {
 
     {
         Step step{"Assemble application"};
-        std::vector<pack::ControlIcon> icons;
-        icons.reserve(inputs.control.icons.size());
-        for (const pack::NamedData& icon : inputs.control.icons) {
-            icons.push_back(pack::ControlIcon{icon.name, icon.bytes});
-        }
-        const auto selected = pack::select_control_icon(icons, names.language);
-        if (auto* failure = std::get_if<std::string>(&selected)) {
-            print_error(*failure);
-            return 1;
-        }
-        const auto& jpeg = std::get<pack::ControlIcon>(selected).bytes;
-        auto icon = ios ? pack::jpeg_to_ios_png(jpeg) : pack::jpeg_to_icns(jpeg);
-        if (auto* failure = std::get_if<std::string>(&icon)) {
-            print_error(*failure);
-            return 1;
-        }
-        const auto& icon_bytes = std::get<std::vector<std::byte>>(icon);
         pack::BundleSpec spec;
-        spec.app_path = assembly;
-        spec.display_name = names.display_name;
-        spec.bundle_name = names.file_name;
-        spec.bundle_identifier = names.bundle_identifier;
-        spec.title_id = title_id;
-        spec.build_id = pack::format_build_id(build_id);
-        spec.title_version = title_version;
-        spec.platform = command.platform;
-        spec.commit = ARMIGO_PACK_COMMIT;
-        spec.player = linked_player;
-        spec.title_folder = matched.folder;
-        spec.icon = icon_bytes;
-        spec.languages = names.languages;
-        spec.localized_titles = names.localized_titles;
-        spec.supported_language_flag = names.supported_language_flag;
-        // The current title-mode selector is a macOS launch feature. iOS
-        // embeds the profile's default preparation and keeps its existing UI.
-        if (!ios && description->frame_rate) {
-            spec.default_frame_rate = description->frame_rate->default_rate;
-            spec.display_refresh_rate = description->frame_rate->display_refresh_rate;
-            spec.supported_frame_rates = description->frame_rate->supported_rates;
-            spec.experimental_frame_rates = description->frame_rate->experimental_rates;
-        }
+        spec.app_path = session.assembly;
+        spec.title_version = session.title_version;
+        spec.development = command.development;
+        spec.development_metal_hud = command.development_metal_hud;
+        if (input->fill_bundle_identity(session, spec) != 0) return 1;
+        pack::CommonBundleFields fields;
+        fields.title_id = session.title_id;
+        fields.build_id = pack::format_build_id(session.build_id);
+        fields.commit = ARMIGO_PACK_COMMIT;
+        fields.player = session.linked_player;
+        fields.title_folder = session.matched.folder;
+        fields.platform = command.platform;
+        // The current title-mode selector is a macOS launch feature. iOS embeds
+        // the profile's default preparation and keeps its existing UI. A .nup pack
+        // is macOS only, so its frame rates are applied whenever the profile has them.
+        fields.apply_frame_rates = !session.ios;
+        pack::fill_common_bundle_fields(spec, fields, *session.description);
         auto assembled = pack::assemble_application(spec);
-        if (auto* failure = std::get_if<std::string>(&assembled)) {
+        if (const auto* failure = std::get_if<std::string>(&assembled)) {
             print_error(*failure);
             return 1;
         }
     }
 
-    if (!ios) {
-        if (const std::string failure = pack::publish_application(assembly, app_path); !failure.empty()) {
+    if (!session.ios) {
+        if (const std::string failure = pack::publish_application(session.assembly, session.app_path);
+            !failure.empty()) {
             print_error(failure);
             return 1;
         }
-        partial.app = app_path;
-        {
+        session.partial.app = session.app_path;
+        if (!session.manifests.empty()) {
             // The warm-up runs the player from its final path, so its Metal
-            // caches belong to the app's own bundle identifier.
+            // caches belong to the app's own bundle identifier. A list packaged
+            // with the shaders moved with the app, so the lists are chosen
+            // again from the published app.
             Step step{"Warm player Metal caches"};
-            const std::string failure = pack::warm_pack_pipelines(app_path, {description->pso_manifest});
+            const auto manifests = pack::warm_up_manifests(*session.description, session.app_path, caps);
+            const std::string failure = pack::warm_pack_pipelines(session.app_path, manifests);
             if (!failure.empty()) {
                 print_error(failure);
                 return 1;
             }
         }
-        if (const std::string failure = pack::register_application(app_path); !failure.empty()) {
+        if (const std::string failure = pack::register_application(session.app_path); !failure.empty()) {
             std::printf("Warning: %s The Finder may show the app as unable to run until it is opened once.\n",
                         failure.c_str());
         }
     } else if (!command.no_ipa) {
         Step step{"Create unsigned IPA"};
-        const std::string failure = pack::create_ios_ipa(assembly, app_path);
+        const std::string failure = pack::create_ios_ipa(session.assembly, session.app_path);
         if (!failure.empty()) {
             print_error(failure);
             return 1;
         }
     }
 
-    fs::path output_path = app_path;
-    if (ios) {
+    fs::path output_path = session.app_path;
+    if (session.ios) {
         std::error_code error;
-        fs::remove_all(partial.staging, error);
-        partial.staging.clear();
-        if (!command.no_ipa) output_path = app_path.parent_path() / (app_path.stem().string() + ".ipa");
+        fs::remove_all(session.partial.staging, error);
+        session.partial.staging.clear();
+        if (!command.no_ipa) {
+            output_path = session.app_path.parent_path() / (session.app_path.stem().string() + ".ipa");
+        }
         if (!command.keep_app && !command.no_ipa) {
-            fs::remove_all(assembly, error);
+            fs::remove_all(session.assembly, error);
             if (error) {
                 print_error("Cannot remove the temporary iOS app after creating the IPA.");
                 return 1;
             }
-            fs::remove(partial.sidecar, error);
+            fs::remove(session.partial.sidecar, error);
             if (error) {
                 print_error("Cannot remove the temporary iOS entitlements after creating the IPA.");
                 return 1;
             }
-            partial.app.clear();
-            partial.sidecar.clear();
+            session.partial.app.clear();
+            session.partial.sidecar.clear();
         } else {
-            if (const std::string failure = pack::publish_application(assembly, kept_app); !failure.empty()) {
+            if (const std::string failure = pack::publish_application(session.assembly, session.kept_app);
+                !failure.empty()) {
                 print_error(failure);
                 return 1;
             }
-            partial.app = kept_app;
-            if (command.no_ipa) output_path = kept_app;
+            session.partial.app = session.kept_app;
+            if (command.no_ipa) output_path = session.kept_app;
         }
     }
-    partial.keep = true;
-    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    session.partial.keep = true;
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - session.started).count();
     std::error_code size_error;
-    const auto bytes = ios && !command.no_ipa ? fs::file_size(output_path, size_error) : directory_bytes(output_path);
+    const auto bytes = session.ios && !command.no_ipa ? fs::file_size(output_path, size_error)
+                                                       : directory_bytes(output_path);
     if (size_error) {
         print_error("Cannot measure the packed output.");
         return 1;
@@ -1225,8 +1302,9 @@ int main(int argc, char** argv) {
         std::fputs(pack::format_comparison(std::get<pack::PackageComparison>(compared)).c_str(), stdout);
         return 0;
     }
+    if (command.run) return pack::run_game(command, current_executable());
     try {
-        return pack_game(command);
+        return pack_flow(command);
     } catch (const std::bad_alloc&) {
         print_error("Host memory for packing could not be allocated.");
         return 1;

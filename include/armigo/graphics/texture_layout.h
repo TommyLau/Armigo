@@ -20,6 +20,10 @@
 
 namespace armigo::graphics {
 
+// The graphics ABI selects the byte interleave inside a 64-byte by 8-row GOB.
+// Geometry and storage size are independent of this order.
+enum class BlockLinearGobOrder : std::uint8_t { Maxwell, Ampere };
+
 // A GOB is the atomic 64-byte by 8-row tile of the Tegra block-linear layout.
 inline constexpr std::size_t texture_gob_width_bytes = 64;
 inline constexpr std::size_t texture_gob_height_rows = 8;
@@ -118,6 +122,7 @@ struct TextureLayoutDescription {
     std::size_t layer_stride = 0;
     std::size_t total_size = 0;
     std::vector<TextureLevelLayout> mips;
+    BlockLinearGobOrder gob_order = BlockLinearGobOrder::Maxwell;
 };
 
 // Validates the requested geometry and computes the storage layout: per-level
@@ -191,6 +196,7 @@ struct BlockLinearLevelAddressing {
     std::uint32_t slices = 0;
     std::uint32_t gob_block_height_log2 = 0;
     std::uint32_t gob_block_depth_log2 = 0;
+    BlockLinearGobOrder gob_order = BlockLinearGobOrder::Maxwell;
 };
 
 // Validates the layout as the conversions do and returns the addressing of

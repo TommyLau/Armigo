@@ -4,6 +4,7 @@
     {
       "title_id": "0x01007EF00011E000",
       "main_build_id": "cd57b23fa4bbad65803d9788c01821ee00000000000000000000000000000000",
+      "platforms": ["macos", "ios"],
       "module": "frame-rate",
       "original_callee": "0x151d3d0",
       "calls": [

@@ -11,6 +11,7 @@
 #include "backend.h"
 #include "entry_table.h"
 #include "present.h"
+#include "present_internal.h"
 #include <armigo/services/video_interface.h>
 #include <armigo/graphics/presentation_hints.h>
 #include <atomic>
@@ -79,6 +80,13 @@ public:
   void forget_queue(std::uintptr_t queue) override { forgotten_queue = queue; }
   // A queued wait takes the next fence and leaves it incomplete.
   std::optional<std::uint64_t> queue_wait_fence(std::uintptr_t, std::uint64_t) override { return ++submitted; }
+  bool snapshot_enabled=false;
+  std::shared_ptr<std::string> native_result;
+  std::optional<NativeProducerFence> snapshot_native_producer(std::uintptr_t) override {
+    if(!snapshot_enabled)return std::nullopt;
+    auto result=native_result;
+    return NativeProducerFence{submitted.load(),[result]{return *result;}};
+  }
   void flush() override {}
   std::uint64_t completed_fence() const override { return completed; }
   bool wait_fence(std::uint64_t fence, std::uint64_t timeout) override {
@@ -152,7 +160,49 @@ void test_live_refresh_period_queries() {
 }
 } // namespace
 
+void test_window_snapshot_capture_gap(bool failed) {
+  select_api_version({55,15});register_present_entries();
+  Replay replay;replay.snapshot_enabled=true;replay.submitted=1;replay.completed=1;
+  const std::string expected=failed?"Exact producer failure":"";
+  replay.native_result=std::make_shared<std::string>(expected);
+  set_backends({nullptr,&replay});
+  armigo::horizon::HandleTable handles(16);
+  armigo::services::vi::DisplaySession display(handles);
+  display.set_vsync_source(std::make_shared<armigo::services::vi::VsyncSource>(2ms));
+  int token;CHECK(display.bind_native_window(&token));
+  std::atomic<bool> pin_live{false},captured{false};
+  std::atomic<std::uint64_t> selected{0};
+  display.set_presenter([](const auto&){return armigo::services::GraphicsPresentationResult{true,{}};});
+  alignas(8) NVNdevice device{};alignas(8) NVNqueueBuilder qb{};alignas(8) NVNqueue queue{};
+  call<Entry::nvnQueueBuilderSetDefaults>(&qb);call<Entry::nvnQueueBuilderSetDevice>(&qb,&device);
+  CHECK(call<Entry::nvnQueueInitialize>(&queue,&qb));queue_set_last_fence(&queue,1);
+  set_texture_exporter([&](const TextureState& state)->std::optional<armigo::services::vi::NativeTexture> {
+    armigo::services::vi::NativeTexture out;out.serial=state.serial;out.width=out.height=4;
+    out.read_pixels=[](auto)->armigo::graphics::Rgba8ReadbackResult{return armigo::graphics::Rgba8Image{};};
+    out.capture=[&,base=out](std::uint64_t fence)->std::optional<armigo::services::vi::NativeTexture> {
+      selected=fence;std::weak_ptr<std::string> old=replay.native_result;
+      replay.native_result=std::make_shared<std::string>("Successor result");replay.submitted=2;replay.completed=2;queue_set_last_fence(&queue,2);
+      auto pinned=old.lock();pin_live=pinned && *pinned==expected;captured=true;
+      return base;
+    };return out;
+  });
+  alignas(8) NVNtexture textures[2]{};NVNtexture* pointers[2]{&textures[0],&textures[1]};
+  for(unsigned i=0;i!=2;++i){auto& t=*reinterpret_cast<TextureState*>(pointers[i]);t.tag=object_tag('T','E','X','R');t.serial=901+i;t.description.width=t.description.height=4;}
+  alignas(8) NVNwindowBuilder builder{};alignas(8) NVNwindow window{};
+  call<Entry::nvnWindowBuilderSetDefaults>(&builder);call<Entry::nvnWindowBuilderSetDevice>(&builder,&device);
+  call<Entry::nvnWindowBuilderSetNativeWindow>(&builder,&token);call<Entry::nvnWindowBuilderSetTextures>(&builder,2,pointers);call<Entry::nvnWindowBuilderSetPresentInterval>(&builder,0);
+  CHECK(call<Entry::nvnWindowInitialize>(&window,&builder));int slot=-1;
+  CHECK(call<Entry::nvnWindowAcquireTexture>(&window,static_cast<NVNsync*>(nullptr),&slot)==NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS);
+  call<Entry::nvnQueuePresentTexture>(&queue,&window,slot);
+  call<Entry::nvnWindowFinalize>(&window);
+  std::fprintf(stderr,"window_snapshot_gap selected=%llu captured=%u pin_live=%u\n",static_cast<unsigned long long>(selected.load()),unsigned(captured.load()),unsigned(pin_live.load()));
+  CHECK(captured && selected==1 && pin_live);
+  call<Entry::nvnQueueFinalize>(&queue);armigo::services::vi::unbind_native_window(&token);set_texture_exporter({});set_backends({});
+}
+
 int main() {
+  test_window_snapshot_capture_gap(false);
+  test_window_snapshot_capture_gap(true);
   test_live_refresh_period_queries();
   select_api_version({55, 15});
   register_present_entries();

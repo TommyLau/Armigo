@@ -113,6 +113,15 @@ void generate_shared_memory(MslContext& c, OperationId id, const Operation& op, 
     require(!atomic || (op.numeric.scalar == ScalarType::u32 || op.numeric.scalar == ScalarType::s32),
             "Shared atomics require 32-bit integers", DiagnosticCode::unsupported_modifier);
     const auto extent = c.resources().compute->shared_memory_bytes;
+    const bool native_atomic = m.native_shared_atomic_policy.has_value();
+    require(!native_atomic || (valid_native_shared_atomic(op, m, c.program().ir.stage) && extent >= 4),
+            "Invalid native shared word atomic policy");
+    const bool stage_buffer = m.stage_buffer.has_value();
+    if (stage_buffer) {
+        require(m.stage_buffer->valid_for(extent), "Stage-buffer region has no matching header allocation");
+        require(!atomic && m.elements == 1 && (m.element_bytes == 1 || m.element_bytes == 4),
+            "Stage-buffer access shape is unsupported", DiagnosticCode::unsupported_capability);
+    }
     std::uint64_t maximum = 0;
     // armigo-shared-guard-v1: a nonliteral offset without a legalized bound
     // stays runtime-checked. The guard performs the whole access only
@@ -124,16 +133,21 @@ void generate_shared_memory(MslContext& c, OperationId id, const Operation& op, 
     if (m.dynamic_byte_offset) {
         if (const auto* literal = std::get_if<LiteralBits>(&op.inputs[m.dynamic_byte_offset->value])) maximum = literal->bits;
         else if (m.dynamic_byte_offset_upper_bound) maximum = *m.dynamic_byte_offset_upper_bound;
-        else guarded = true;
+        else guarded = !stage_buffer && !native_atomic;
     }
     require(!guarded || !atomic, "Guarded shared atomics require a proven offset bound",
         DiagnosticCode::unsupported_capability);
     // A guarded access whose address is proven naturally aligned keeps whole
     // element accesses inside its guard; only an unproven one goes byte-wise.
     std::uint64_t work = 0;
+    require(!native_atomic || (!(m.byte_offset & 3u) && (!m.dynamic_byte_offset ||
+        resources::shared_address_aligned(c.program().ir,
+            op.inputs[m.dynamic_byte_offset->value], 4, work))),
+        "Native shared atomic word address lacks alignment proof");
     const bool byte_wise = guarded && (m.byte_offset % m.element_bytes != 0 ||
         !resources::shared_address_aligned(c.program().ir, op.inputs[m.dynamic_byte_offset->value], m.element_bytes, work));
-    if (!guarded)
+    if (!guarded && !stage_buffer && (!native_atomic || !m.dynamic_byte_offset ||
+        std::holds_alternative<LiteralBits>(op.inputs[m.dynamic_byte_offset->value])))
         require(std::uint64_t(m.byte_offset) + maximum + std::uint64_t(m.element_bytes) * m.elements <= extent,
                 "Shared access exceeds launch allocation");
     auto base = number(m.byte_offset) + "ul";
@@ -568,13 +582,20 @@ void generate_guest_memory(MslContext& c, OperationId id, const Operation& op, c
     require(!atomic || (m.atomic && m.element_bytes == 4 && m.elements == 1 && m.access == Access::read_write &&
                         (op.numeric.scalar == ScalarType::u32 || op.numeric.scalar == ScalarType::s32)),
             "Guest atomics are single 32-bit integer words", DiagnosticCode::unsupported_capability);
-    // A load or store strong at workgroup or device scope reads and writes
+    const bool native_plain = m.native_load_policy.has_value();
+    if (native_plain)
+        require(*m.native_load_policy == NativeLoadPolicy::aligned_v1 && op.opcode == Opcode::load &&
+            m.access == Access::read && !m.atomic &&
+            (m.scope == MemoryScope::workgroup || m.scope == MemoryScope::device) &&
+            (m.element_bytes == 4 || m.elements == 1),
+            "Native LDG policy requires an aligned non-RMW load");
+    // An untagged load or a store strong at workgroup or device scope accesses
     // each word as a relaxed device atomic: coherent with every other
     // invocation's accesses and never torn. Metal has no narrower atomics: a
     // strong byte or half-word load reads its aligned containing word, which
     // lies in the same pool as pools start on word boundaries, and a strong
     // narrow store has no Metal form.
-    const bool strong = !atomic && m.scope != MemoryScope::invocation;
+    const bool strong = !atomic && m.scope != MemoryScope::invocation && !native_plain;
     require(!strong || !store || m.element_bytes == 4, "Strong guest stores narrower than a word have no Metal atomic form",
             DiagnosticCode::unsupported_capability);
     take(c.require_helper("armigo_guest_address"));
@@ -588,6 +609,18 @@ void generate_guest_memory(MslContext& c, OperationId id, const Operation& op, c
     const auto base = "guest_device" + suffix;
     take(c.statement("const ulong " + base + " = armigo_guest_address(" + windows + ", " + address + ", " +
         number(m.elements * m.element_bytes) + "u, " + tag + ", " + (store || atomic ? "true" : "false") + ");"));
+    // A plain load of two or four words is one aligned vector read: the
+    // lookup covered the whole access, which is naturally aligned, and one
+    // pointer lets Metal issue a single wide load instead of a load per word.
+    if (op.opcode == Opcode::load && !strong && m.element_bytes == 4 && (m.elements == 2 || m.elements == 4)) {
+        const auto vector = std::string("uint") + number(m.elements);
+        const auto loaded = "guest_words" + suffix;
+        take(c.statement("const " + vector + " " + loaded + " = " + base + " != 0ul ? *reinterpret_cast<device const " +
+            vector + "*>(" + base + ") : " + vector + "(0u);"));
+        for (unsigned i = 0; i < m.elements; ++i)
+            take(c.assign(output(op, i), loaded + "." + std::string(1, "xyzw"[i]), ScalarType::u32));
+        return;
+    }
     for (unsigned i = 0; i < m.elements; ++i) {
         const auto device = base + "_" + number(i);
         take(c.statement("const ulong " + device + " = " + base + " != 0ul ? " + base + " + " +
@@ -652,6 +685,29 @@ void generate_guest_memory(MslContext& c, OperationId id, const Operation& op, c
     }
 }
 
+void generate_direct_storage(MslContext& c, OperationId id, const Operation& op, const MemoryInfo& m) {
+    require(m.direct_storage && m.resource && m.dynamic_byte_offset && op.opcode == Opcode::load &&
+            m.element_bytes == 4 && !m.atomic && !m.is_volatile && !m.global_address_high &&
+            m.order == MemoryOrder::relaxed, "Direct storage load has an invalid relative address");
+    const auto& resource = planned(c.resources(), *m.resource);
+    const auto* buffer = std::get_if<BufferUse>(&resource.use);
+    const auto* source = buffer ? std::get_if<StorageBufferSource>(&buffer->source) : nullptr;
+    require(source && source->descriptor == *m.direct_storage, "Direct storage binding does not match its descriptor");
+    const auto name = take(c.resource(*m.resource));
+    const auto offset = "storage_word" + number(id.value);
+    take(c.statement("const uint " + offset + " = (" + input(c, op, *m.dynamic_byte_offset, ScalarType::u32) +
+        " + " + number(m.byte_offset) + "u) >> 2u;"));
+    if (m.elements == 1) take(c.assign(output(op, 0), name + "[" + offset + "]", ScalarType::u32));
+    else {
+        const auto vector = "uint" + number(m.elements);
+        const auto loaded = "storage_words" + number(id.value);
+        take(c.statement("const " + vector + " " + loaded + " = " + vector +
+            "(*reinterpret_cast<device const packed_" + vector + "*>(&" + name + "[" + offset + "]));"));
+        for (unsigned i = 0; i < m.elements; ++i)
+            take(c.assign(output(op, i), loaded + "." + std::string(1, "xyzw"[i]), ScalarType::u32));
+    }
+}
+
 Status generate_stage_memory(MslContext& c, OperationId id) {
     return callback(c, id, [&] {
         const auto& op = c.operation(id); const auto* info = std::get_if<MemoryInfo>(&op.info);
@@ -660,6 +716,7 @@ Status generate_stage_memory(MslContext& c, OperationId id) {
         if (m.space == AddressSpace::shared) { generate_shared_memory(c, id, op, m); return; }
         if (m.space == AddressSpace::local) { generate_local_memory(c, id, op, m); return; }
         if (m.space == AddressSpace::guest) { generate_guest_memory(c, id, op, m); return; }
+        if (m.direct_storage) { generate_direct_storage(c, id, op, m); return; }
         require(op.opcode == Opcode::load || op.opcode == Opcode::store,
                 "Buffer atomics require a proven Metal address adapter", DiagnosticCode::unsupported_capability);
         require(m.space == AddressSpace::constant_buffer || m.space == AddressSpace::storage,
@@ -689,6 +746,8 @@ Status generate_stage_memory(MslContext& c, OperationId id) {
         require(!m.global_address_high && buffer->size.kind != SizeKind::storage_descriptor,
             "Unresolved extended global address");
         const bool runtime_window = m.space == AddressSpace::constant_buffer;
+        const bool proven_window = runtime_window &&
+            buffer->size.constant_buffer_policy == ConstantBufferPolicy::proven_zero_words_v2;
         const auto bytes = std::uint64_t(m.element_bytes) * m.elements;
         if (!runtime_window)
             require(std::uint64_t(m.byte_offset) + bytes <= buffer->size.bytes, "Memory access exceeds proven extent");
@@ -708,47 +767,40 @@ Status generate_stage_memory(MslContext& c, OperationId id) {
             if (store && literal) require(literal->bits % 4 == 0, "Storage write offset is not word aligned");
         }
         if (runtime_window) {
+            require(!proven_window || !m.dynamic_byte_offset || maximum_offset.has_value(),
+                    "Proven constant-buffer window has no offset bound", DiagnosticCode::missing_fact);
             std::uint64_t extent = constant_buffer_window_bytes;
             if (!m.dynamic_byte_offset || maximum_offset) {
                 const auto last_component = std::uint64_t(m.byte_offset) + maximum_offset.value_or(0) +
                     std::uint64_t(m.element_bytes) * (m.elements - 1);
                 const auto last_word = (last_component + (m.element_bytes == 8 ? 4u : 0u)) & ~std::uint64_t{3};
-                extent = std::min<std::uint64_t>(last_word + 4, constant_buffer_window_bytes);
+                extent = proven_window ? last_word + 4 :
+                    std::min<std::uint64_t>(last_word + 4, constant_buffer_window_bytes);
             }
             require(extent <= buffer->size.bytes,
                     "Constant-buffer read window does not cover potentially valid accesses");
         }
         // Guest-width arithmetic has already been emitted into the offset IR.
         // Widen before adding host component offsets so a large address cannot
-        // wrap around into valid backing. Runtime visibility is separate from
-        // the reflected read window and from any optional analysis bound.
+        // wrap around into valid backing. Padded windows clamp once to their
+        // zero tail. Proven windows rely on the independently rechecked prefix
+        // extent and read it directly without a clamp or extra tail.
         const auto name = take(c.resource(*m.resource));
         std::string base = number(m.byte_offset) + "ul";
         if (m.dynamic_byte_offset) base = "(" + base + " + ulong(" + input(c, op, *m.dynamic_byte_offset, ScalarType::u32) + "))";
         const auto address_name = "memory_address" + number(id.value);
+        if (runtime_window && !proven_window) base = "min(" + base + ", " + number(buffer->size.bytes) + "ul)";
         take(c.statement("const ulong " + address_name + " = " + base + ";"));
         base = address_name;
         require(buffer->size.bytes % 4 == 0, "Raw-word buffer binding requires a padded word extent", DiagnosticCode::missing_fact);
         if (store) require(m.element_bytes == 4 && m.byte_offset % 4 == 0 && m.alignment >= 4,
                 "Unaligned/subword storage writes need explicit lowering", DiagnosticCode::unsupported_capability);
-        std::string runtime_size;
         if (runtime_window) {
             require(buffer->size.kind == SizeKind::constant_buffer_window &&
-                    buffer->size.constant_buffer_policy == ConstantBufferPolicy::runtime_zero_words_v1,
-                    "Constant-buffer load requires the runtime word-zero policy");
-            const PlannedResource* support = nullptr;
-            for (const auto& candidate : c.resources().resources) {
-                const auto* use = std::get_if<BufferUse>(&candidate.use);
-                const auto* source = use ? std::get_if<SupportBufferSource>(&use->source) : nullptr;
-                if (source && source->schema == constant_buffer_support_schema &&
-                    source->version == constant_buffer_support_version) {
-                    require(!support, "Duplicate constant-buffer support table");
-                    support = &candidate;
-                }
-            }
-            require(support, "Constant-buffer support table is absent", DiagnosticCode::unresolved_resource);
-            runtime_size = take(c.resource(support->resource)) + "[" + number(*m.constant_buffer_slot) + "u]";
-            take(c.require_helper("armigo_cbuf_word"));
+                    (proven_window || buffer->size.constant_buffer_policy == ConstantBufferPolicy::padded_zero_words_v2),
+                    "Constant-buffer load requires a proved or padded word-zero policy");
+            require(bytes <= constant_buffer_zero_padding_bytes,
+                    "Constant-buffer access exceeds its zero-padding extent");
         }
         for (unsigned i = 0; i < m.elements; ++i) {
             auto offset = "(" + base + " + " + number(i * m.element_bytes) + "ul)";
@@ -759,8 +811,7 @@ Status generate_stage_memory(MslContext& c, OperationId id) {
                 const auto type = m.element_bytes == 8 ? ScalarType::u64 : ScalarType::u32;
                 if (runtime_window) {
                     auto word = [&](const std::string& address) {
-                        return "armigo_cbuf_word(" + name + ", " + address + ", " + runtime_size +
-                            ", " + number(buffer->size.bytes) + "u)";
+                        return name + "[(" + address + " & ~3ul) / 4ul]";
                     };
                     expression = word(offset);
                     if (m.element_bytes == 8) {

@@ -31,19 +31,37 @@ struct LanguageManifest {
 std::variant<LanguageManifest, std::string> read_language_manifest(
     const std::filesystem::path& path);
 
-// Applies the title's supported-language mask and the system language the
-// host's languages choose: each preferred host locale in order (the app's own
-// language first) maps to a system language, and the firmware's priority
+// The languages a packed title admits, and a stored choice validated against
+// them. "auto" follows the app's and host's preferred languages. A stale or
+// unsupported stored choice falls back to Auto without becoming a launch error.
+struct GameLanguageChoice {
+    std::vector<std::string> supported_languages;
+    std::string preference = "auto";
+    bool fell_back = false;
+};
+[[nodiscard]] GameLanguageChoice game_language_choice(const LanguageManifest& manifest,
+    std::optional<std::string> stored);
+
+// Applies the title's supported-language mask and either an explicit supported
+// game language or Auto. Auto maps each preferred host locale in order (the
+// app's own language first) to a system language, and the firmware's priority
 // order maps that to one of the title's languages. The region is that
 // language's market, never China. Returns the system language set, or empty
-// when the title admits none.
+// when the title admits none or an explicit choice is unsupported.
 std::string apply_language_manifest(const LanguageManifest& manifest,
-    std::span<const std::string_view> preferred_locales);
+    std::span<const std::string_view> preferred_locales, std::string_view preference = "auto");
 
-// The settings both players keep under the same keys, on iOS in its Settings
-// page and on macOS in the Settings window. They take effect when the game
-// starts. The game's language has no setting: it follows the app's language
-// in the system's settings.
+// The defaults key that keeps the game language: "game_language" in a packed
+// app, which plays one title, and "game_language.<TitleID>" in the repository's
+// app, which plays any. The new key is independent of the removed legacy
+// "language" setting.
+[[nodiscard]] std::string language_preference_key(std::optional<std::uint64_t> title_id);
+std::optional<std::string> read_language_preference(const std::string& key);
+void write_language_preference(const std::string& key, std::string_view language);
+
+// The display settings both players keep under the same keys, on iOS in its
+// Settings page and on macOS in the Settings window. They take effect when the
+// game starts. macOS keeps its game-language choice separately per title.
 struct PlayerChoices {
     bool handheld = false;             // console_mode: "docked" or "handheld"
     std::string resolution = "auto";   // auto, 720p, 900p, 1080p, 1440p, 2160p or native
@@ -57,10 +75,10 @@ struct PlayerChoices {
     bool performance_overlay = false;  // Apple's Metal performance HUD
 };
 
-// Reads the choices from the app's defaults, first moving the settings of the
-// earlier layout: its language and region choices and its frame rate (Auto
-// by default then) are removed, and its frame-rate overlay toggle becomes the
-// performance overlay.
+// Reads the display choices from the app's defaults, first removing the earlier
+// layout's language, region and frame-rate-overlay keys. Its overlay toggle
+// becomes the performance overlay only when that setting does not exist yet;
+// current frame-rate and per-title game-language preferences stay untouched.
 PlayerChoices read_player_choices();
 
 // The frame-rate policy a title's settings declare for the running build: its
@@ -133,9 +151,10 @@ using MacPlayerLaunchObserver =
 std::uint32_t resolution_width(std::string_view choice, bool ios,
     std::uint32_t display_width, std::uint32_t display_height);
 
-// Turns on Apple's Metal performance HUD when the choices ask for it. Metal
+// Applies On or Off unless an explicit launch environment value wins. Metal
 // reads MTL_HUD_ENABLED when the process first uses it, so the players call
-// this before anything creates a Metal device.
+// this before anything creates a Metal device. Restarts use the original launch
+// environment, excluding any HUD value this function adds.
 void apply_performance_overlay(const PlayerChoices& choices);
 
 // Applies the choices to the launch of a packed game: the operation mode, the

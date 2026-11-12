@@ -38,6 +38,7 @@ int main() {
         ARMIGO_CHECK(std::holds_alternative<NupSelection>(selected));
         auto selection = std::get<NupSelection>(selected);
         ARMIGO_CHECK(selection.update_applied && selection.version == 0x20000);
+        ARMIGO_CHECK(selection.display_version.empty());   // The update carries none.
         ARMIGO_CHECK(selection.exefs.at("main") == 3);
         ARMIGO_CHECK(selection.romfs.at("old") == 4 && selection.romfs.at("keep") == 2);
         std::array<std::byte, 8> output{};
@@ -49,6 +50,24 @@ int main() {
         ARMIGO_CHECK(std::get<ExeFsDirectoryInput>(exefs).modules[0].bytes[0] == std::byte{0x44});
         ARMIGO_CHECK(std::holds_alternative<NupFailure>(archive->read_exefs(selection, {3, 10})));
         ARMIGO_CHECK(std::holds_alternative<NupFailure>(archive->select(0x1234)));
+    }
+    {
+        // Metadata type 4 is the package's display version; it follows the
+        // selected package. The update here is made an add-on, so the base is used.
+        auto bytes = fixture();
+        put(bytes, toc_end, 4, 2);
+        std::memcpy(bytes.data() + toc_end + 8, "1.02", 4);
+        put(bytes, package + 0x40 + 24, 2, 1);
+        rehash(bytes);
+        Temporary temp;
+        auto opened = temp.open(bytes);
+        ARMIGO_CHECK(std::holds_alternative<std::shared_ptr<NupArchive>>(opened));
+        if (std::holds_alternative<std::shared_ptr<NupArchive>>(opened)) {
+            const auto selected = std::get<std::shared_ptr<NupArchive>>(opened)->select();
+            ARMIGO_CHECK(std::holds_alternative<NupSelection>(selected));
+            if (const auto* selection = std::get_if<NupSelection>(&selected))
+                ARMIGO_CHECK(!selection->update_applied && selection->display_version == "1.02");
+        }
     }
     auto bytes = fixture(); bytes[pool] ^= std::byte{1}; rejects(bytes, "nup.toc_hash", false);
     bytes = fixture(); put(bytes, toc + 8, UINT64_MAX, 8); rejects(bytes, "nup.counts");

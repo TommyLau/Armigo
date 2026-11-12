@@ -15,6 +15,7 @@
 
 #include "nvn_deswizzle.h"
 
+#include <cstring>
 #include <limits>
 
 namespace armigo::platform::metal::nvn_driver {
@@ -33,14 +34,14 @@ struct DeswizzleParameters {
   std::uint32_t slices = 0;
   std::uint32_t height_log2 = 0;
   std::uint32_t depth_log2 = 0;
+  std::uint32_t gob_order = 0;
 };
-static_assert(sizeof(DeswizzleParameters) == 64);
+static_assert(sizeof(DeswizzleParameters) == deswizzle_parameter_bytes);
 
 constexpr std::uint32_t max_block_log2 = 5;
 
-// Inside a GOB, bit 0 of the thread index selects row bit 0, bit 1 the
-// 16-byte column bit, bits 2-3 row bits 1-2 and bit 4 the 32-byte column
-// bit: thread t's segment starts t * 16 bytes into the GOB.
+// Thread t starts at byte t * 16 inside a GOB. The selected interleave
+// determines which thread bits name the row and 16-byte column.
 const char *const deswizzle_source = R"(
 #include <metal_stdlib>
 using namespace metal;
@@ -56,6 +57,7 @@ struct DeswizzleLevel {
   uint slices;
   uint height_log2;
   uint depth_log2;
+  uint gob_order;
 };
 
 kernel void armigo_nvn_deswizzle(device const uchar *source [[buffer(0)]],
@@ -66,8 +68,10 @@ kernel void armigo_nvn_deswizzle(device const uchar *source [[buffer(0)]],
   const uint gob_x = id.x >> 5;
   const uint gob_y = id.y;
   const uint z = id.z;
-  const uint segment = ((tid >> 4) << 1) | ((tid >> 1) & 1u);
-  const uint y = (gob_y << 3) | (((tid >> 2) & 3u) << 1) | (tid & 1u);
+  const uint segment = ((tid >> 4) << 1) | ((tid >> (p.gob_order ? 2 : 1)) & 1u);
+  const uint row_bits = p.gob_order ? (((tid >> 3) & 1u) << 2) | (((tid >> 1) & 1u) << 1)
+                                    : ((tid >> 2) & 3u) << 1;
+  const uint y = (gob_y << 3) | row_bits | (tid & 1u);
   const uint x = (gob_x << 6) | (segment << 4);
   if (x >= p.row_bytes || y >= p.rows || z >= p.slices) return;
   const uint n = min(16u, p.row_bytes - x);
@@ -131,11 +135,18 @@ bool deswizzle_supported(const graphics::BlockLinearLevelAddressing &level,
          level.gob_block_depth_log2 <= max_block_log2;
 }
 
-void encode_deswizzle(id<MTLComputeCommandEncoder> encoder,
-                      id<MTLComputePipelineState> pipeline, id<MTLBuffer> source,
-                      std::uint64_t source_offset, id<MTLBuffer> destination,
-                      std::uint64_t destination_offset, std::uint64_t pitch,
-                      const graphics::BlockLinearLevelAddressing &level) {
+bool encode_deswizzle_metal4(id<MTL4ComputeCommandEncoder> encoder,
+                            id<MTLComputePipelineState> pipeline,
+                            id<MTL4ArgumentTable> table,
+                            id<MTLBuffer> parameter_buffer, std::uint64_t parameter_offset,
+                            id<MTLBuffer> source, std::uint64_t source_offset,
+                            id<MTLBuffer> destination, std::uint64_t destination_offset,
+                            std::uint64_t pitch,
+                            const graphics::BlockLinearLevelAddressing& level) {
+  if (!encoder || !pipeline || !table || !source || !destination ||
+      !parameter_buffer.contents || parameter_offset > parameter_buffer.length ||
+      sizeof(DeswizzleParameters) > parameter_buffer.length - parameter_offset ||
+      !deswizzle_supported(level, pitch)) return false;
   DeswizzleParameters parameters;
   parameters.source = source_offset + level.guest_base;
   parameters.destination = destination_offset;
@@ -147,14 +158,19 @@ void encode_deswizzle(id<MTLComputeCommandEncoder> encoder,
   parameters.slices = level.slices;
   parameters.height_log2 = level.gob_block_height_log2;
   parameters.depth_log2 = level.gob_block_depth_log2;
+  parameters.gob_order = static_cast<std::uint32_t>(level.gob_order);
+  std::memcpy(static_cast<std::byte*>(parameter_buffer.contents) + parameter_offset,
+              &parameters, sizeof parameters);
+  [table setAddress:source.gpuAddress atIndex:0];
+  [table setAddress:destination.gpuAddress atIndex:1];
+  [table setAddress:parameter_buffer.gpuAddress + parameter_offset atIndex:2];
   [encoder setComputePipelineState:pipeline];
-  [encoder setBuffer:source offset:0 atIndex:0];
-  [encoder setBuffer:destination offset:0 atIndex:1];
-  [encoder setBytes:&parameters length:sizeof(parameters) atIndex:2];
+  [encoder setArgumentTable:table];
   const NSUInteger gob_columns = (level.row_bytes + 63) / 64;
   const NSUInteger gob_rows = (std::uint64_t{level.rows} + 7) / 8;
   [encoder dispatchThreadgroups:MTLSizeMake(gob_columns, gob_rows, level.slices)
           threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+  return true;
 }
 
 } // namespace armigo::platform::metal::nvn_driver

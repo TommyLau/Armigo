@@ -103,4 +103,25 @@ std::variant<TitlePlan, TitlePlanFailure> plan_title_words(
     return plan;
 }
 
+std::variant<std::uint32_t, TitlePlanFailure> plan_title_mode(
+    const PatchDescription* rate_patch, PatchDescription* installed, std::string_view requested_rate,
+    bool nvn_driver, bool gpu_feedback) {
+    std::uint32_t admitted = 0;
+    if (rate_patch) {
+        const auto effective = select_patch_words(*rate_patch, requested_rate, nvn_driver, &admitted);
+        if (const auto* failure = std::get_if<std::string>(&effective))
+            return Failure{Failure::Kind::invalid_input, "compatibility-frame-rate", *failure};
+    }
+    if (installed) {
+        if (gpu_feedback && !nvn_driver)
+            return Failure{Failure::Kind::unsupported, "compatibility-resolution",
+                           "GPU-work feedback requires the NVN driver."};
+        auto selected = select_patch_calls(*installed, requested_rate, nvn_driver);
+        if (const auto* failure = std::get_if<std::string>(&selected))
+            return Failure{Failure::Kind::invalid_input, "compatibility-frame-rate", *failure};
+        installed->calls = std::get<std::vector<CallPatch>>(std::move(selected));
+    }
+    return admitted;
+}
+
 } // namespace armigo::compat

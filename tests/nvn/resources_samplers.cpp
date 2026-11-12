@@ -28,6 +28,7 @@ template <Entry E> auto entry() {
 
 struct Backend final : ResourceBackend {
     int textures = 0, samplers = 0, last_id = -1, released_texture_pools = 0;
+    int cleared_textures = 0;
     bool descriptor_pools_allowed = true;
     std::uint64_t serial = 0;
     SamplerParameters sampler{};
@@ -44,6 +45,7 @@ struct Backend final : ResourceBackend {
     void register_texture_descriptor(std::int32_t id, const TextureState& texture, const TextureViewState* v) override {
         ++textures; last_id = id; serial = texture.serial; if (v) view = *v;
     }
+    void clear_texture_descriptor(std::int32_t id) override { ++cleared_textures; last_id = id; }
     void register_sampler_descriptor(std::int32_t id, const SamplerParameters& p) override {
         ++samplers; last_id = id; sampler = p;
     }
@@ -139,6 +141,13 @@ int main() {
     CHECK(backend.textures == 1 && backend.serial == 123 && backend.view.base_level == 2);
     entry<Entry::nvnTexturePoolRegisterImage>()(&textures, 257, &texture, nullptr);
     CHECK(backend.textures == 2 && backend.last_id == 257);
+    entry<Entry::nvnTexturePoolRegisterTexture>()(&textures, 256, nullptr, &view);
+    CHECK(backend.cleared_textures == 1 && backend.last_id == 256);
+    entry<Entry::nvnTexturePoolRegisterImage>()(&textures, 257, nullptr, nullptr);
+    CHECK(backend.cleared_textures == 2 && backend.last_id == 257);
+    entry<Entry::nvnTexturePoolRegisterTexture>()(&textures, 255, nullptr, nullptr);
+    entry<Entry::nvnTexturePoolRegisterImage>()(&textures, 300, nullptr, nullptr);
+    CHECK(backend.cleared_textures == 2 && backend.textures == 2);
     entry<Entry::nvnTexturePoolFinalize>()(&textures);
     CHECK(backend.released_texture_pools == 1);
     entry<Entry::nvnTexturePoolRegisterImage>()(&textures, 257, &texture, nullptr);

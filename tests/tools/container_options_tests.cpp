@@ -14,6 +14,8 @@
 #include "runner_shell.h"
 
 #include <filesystem>
+#include <fstream>
+#include <unistd.h>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -144,6 +146,38 @@ int main() {
         report.metadata_signature_verified = true;
         fields = armigo::tools::report_fields(report);
         CHECK(fields.metadata_signature_verified);
+    }
+
+    // A container run without --cache extracts into a folder of its own,
+    // which is gone when the run returns, even when the launch fails.
+    {
+        const std::filesystem::path junk = directory / "junk.nsp";
+        { std::ofstream(junk) << "not a container"; }
+        { std::ofstream(directory / "junk.keys") << "header_key = 00\n"; }
+        const auto parsed = parse_runner_arguments(PresentationMode::headless,
+            as_arguments({"--container", junk.string(), "--keys", (directory / "junk.keys").string()}));
+        CHECK(parsed.ok);
+        if (parsed.ok) {
+            const auto report = armigo::tools::run_headless_shell(parsed.arguments, {});
+            CHECK(report.exit_code != armigo::tools::RunnerExitCode::success);
+            CHECK(armigo::tools::owned_container_directory().empty());
+            const std::string prefix = "armigo-container-" + std::to_string(::getpid()) + "-";
+            bool left = false;
+            for (const auto& entry : std::filesystem::directory_iterator(std::filesystem::temp_directory_path()))
+                left = left || entry.path().filename().string().starts_with(prefix);
+            CHECK(!left);
+        }
+        // A --cache directory is the caller's and stays.
+        const auto cached = parse_runner_arguments(PresentationMode::headless,
+            as_arguments({"--container", junk.string(), "--keys", (directory / "junk.keys").string(), "--cache",
+                          cache.string()}));
+        CHECK(cached.ok);
+        if (cached.ok) {
+            std::filesystem::create_directories(cache);
+            static_cast<void>(armigo::tools::run_headless_shell(cached.arguments, {}));
+            CHECK(std::filesystem::is_directory(cache));
+            CHECK(armigo::tools::owned_container_directory().empty());
+        }
     }
 
     std::filesystem::remove_all(directory);

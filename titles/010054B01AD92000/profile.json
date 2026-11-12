@@ -4,6 +4,7 @@
     {
       "title_id": "0x010054B01AD92000",
       "main_build_id": "9c3116f0333ea157526612d17354b3755737c4f2000000000000000000000000",
+      "platforms": ["macos", "ios"],
       "nvn_driver": true,
       "pipelines": "pipelines.tsv",
       "nvn_policy": {

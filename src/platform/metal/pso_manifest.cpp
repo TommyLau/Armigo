@@ -15,6 +15,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <algorithm>
 #include <iterator>
 
 namespace armigo::platform::metal::nvn_driver {
@@ -24,6 +25,7 @@ std::size_t field_count(char kind) {
     switch (kind) {
         case 'S': case 'C': return 1;
         case 'R': case 'O': return 3;
+        case 'M': return 4;
         case 'K': return 7;
         default: return 0;
     }
@@ -179,6 +181,31 @@ void PsoRecorder::note(const PsoRow& row) {
     const std::lock_guard lock(mutex_);
     append(record_, line);
     append(user_, line);
+}
+
+bool write_unarchived_pipelines(const std::filesystem::path& directory, std::vector<std::string> keys) {
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    std::ofstream out(directory / unarchived_pipelines_file, std::ios::binary | std::ios::trunc);
+    for (const auto& key : keys) out << key << '\n';
+    return static_cast<bool>(out);
+}
+
+std::unordered_set<std::string> read_unarchived_pipelines(const std::filesystem::path& cache_root) {
+    std::unordered_set<std::string> keys;
+    std::error_code error;
+    for (const auto& entry : std::filesystem::directory_iterator(cache_root, error)) {
+        std::ifstream in(entry.path() / unarchived_pipelines_file, std::ios::binary);
+        for (std::string line; std::getline(in, line);)
+            if (!line.empty()) keys.insert(line);
+    }
+    return keys;
+}
+
+std::uint64_t explained_archive_misses(const std::vector<std::string>& missed,
+                                       const std::unordered_set<std::string>& unarchived) {
+    return static_cast<std::uint64_t>(
+        std::count_if(missed.begin(), missed.end(), [&](const auto& key) { return unarchived.contains(key); }));
 }
 
 } // namespace armigo::platform::metal::nvn_driver

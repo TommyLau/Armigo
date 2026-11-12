@@ -49,15 +49,21 @@ void parsing() {
         "K\tclear_vertex\tclear_color_frag\t70\t15\t0\t0\t4\n"
         "K\tclear_vertex\tclear_color_frag\t70\n"
         "O\t0.bb.2\t1.ee.0\tv1:0100\n"
-        "O\tonly\ttwo\n";
+        "O\tonly\ttwo\n"
+        "M\t-\t4.ff.2\t1.ee.0\tv1:0100\n"
+        "M\t3.aa.0\t4.bb.2\t-\tv1:0100\n"
+        "M\t4.ff.2\t1.ee.0\tv1:0100\n"
+        "M\t-\t\t1.ee.0\tv1:0100\n";
     const auto rows = parse_pso_manifest(text);
-    CHECK(rows.size() == 6);
+    CHECK(rows.size() == 8);
     CHECK(rows[0] == row('S', {"1.aa.0"}));
     CHECK(rows[1] == row('R', {"0.bb.2", "-", "v1:00ff"}));
     CHECK(rows[2] == row('C', {"5.cc.1x1x1s0"}));
     CHECK(rows[3] == row('R', {"0.bb.2", "1.dd.0", "v1:0100"}));
     CHECK(rows[4] == row('K', {"clear_vertex", "clear_color_frag", "70", "15", "0", "0", "4"}));
     CHECK(rows[5] == row('O', {"0.bb.2", "1.ee.0", "v1:0100"}));
+    CHECK(rows[6] == row('M', {"-", "4.ff.2", "1.ee.0", "v1:0100"}));
+    CHECK(rows[7] == row('M', {"3.aa.0", "4.bb.2", "-", "v1:0100"}));
     CHECK(rows[1].text() == "R\t0.bb.2\t-\tv1:00ff");
     // Text round trip.
     for (const auto& value : rows) CHECK(parse_pso_row(value.text()) == value);
@@ -153,6 +159,25 @@ void recording() {
     std::filesystem::remove_all(dir);
 }
 
+// An archive build records the pipelines it compiled but could not archive;
+// a warm-up's misses of exactly those are explained, any other is not.
+void unarchived_pipelines() {
+    const auto root = std::filesystem::temp_directory_path() / "armigo_pso_unarchived";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root / "archive-a");
+    CHECK(write_unarchived_pipelines(root / "archive-a", {"v2 f2", "v1 f1", "v2 f2"}));
+    CHECK(read_all(root / "archive-a" / unarchived_pipelines_file) == "v1 f1\nv2 f2\n");
+    std::filesystem::create_directories(root / "archive-b");
+    CHECK(write_unarchived_pipelines(root / "archive-b", {}));
+    const auto keys = read_unarchived_pipelines(root);
+    CHECK(keys.size() == 2 && keys.contains("v1 f1") && keys.contains("v2 f2"));
+    CHECK(explained_archive_misses({"v1 f1", "v2 f2"}, keys) == 2);
+    CHECK(explained_archive_misses({"v1 f1", "v3 f3", "c1 -"}, keys) == 1);
+    CHECK(explained_archive_misses({}, keys) == 0);
+    CHECK(read_unarchived_pipelines(root / "missing").empty());
+    std::filesystem::remove_all(root);
+}
+
 } // namespace
 
 int main() {
@@ -161,6 +186,7 @@ int main() {
     hex();
     compute_manifest();
     recording();
+    unarchived_pipelines();
     std::printf("pso manifest failures: %d\n", failures);
     return failures ? 1 : 0;
 }

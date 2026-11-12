@@ -25,7 +25,7 @@ def current_profile(translate_tool):
     profile = chain.current_profile(translate_tool)
     profile.update({
         "platform": "ios-metal4",
-        "compile_options": ["-std=metal4.0", "-mios-version-min=26.0", "-Werror"],
+        "compile_options": ["-std=metal4.0", "-mios-version-min=26.0", "-fwrapv", "-Werror"],
         "metal_binary_sha256": chain._sha256_file(chain._run(["xcrun", "--sdk", "iphoneos", "--find", "metal"])),
         "metallib_binary_sha256": chain._sha256_file(chain._run(["xcrun", "--sdk", "iphoneos", "--find", "metallib"])),
         "metal_version": chain._first_line(chain._run(["xcrun", "--sdk", "iphoneos", "metal", "--version"]), "metal"),

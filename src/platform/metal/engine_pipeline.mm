@@ -141,6 +141,7 @@ std::string reflection_record(const CompiledGraphicsStage& stage) {
         append_scalar(out, item.guest_binding);
         append_scalar(out, item.window_bytes);
         append_scalar(out, item.metal_buffer_index);
+        append_scalar(out, item.zero_padding_bytes);
     }
     append_scalar(out, stage.constant_buffer_support_index.has_value());
     if (stage.constant_buffer_support_index)
@@ -215,6 +216,7 @@ void validate_stage_resources(const CompiledGraphicsStage& stage,
         require(binding.guest_binding < 18 && binding.metal_buffer_index < 31 &&
                     binding.window_bytes >= 4 && binding.window_bytes <= 65536 &&
                     !(binding.window_bytes & 3u) &&
+                    (binding.zero_padding_bytes == 0 || binding.zero_padding_bytes == 16) &&
                     guest.insert(binding.guest_binding).second &&
                     buffers.insert(binding.metal_buffer_index).second,
                 "Engine pipeline constant-buffer window is invalid");

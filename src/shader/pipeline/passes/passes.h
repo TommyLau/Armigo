@@ -13,9 +13,12 @@
 #include "../resources.h"
 
 namespace armigo::shader::pipeline::passes {
-// Both passes require valid SSA and publish changes only after validation succeeds.
+// These passes require valid SSA and publish changes only after validation succeeds.
 // Cleanup preserves all effects and never evaluates floating arithmetic on the host.
 [[nodiscard]] Status cleanup(Program&);
+// Reconciles a fragment's depth with the same surface's stored texture value
+// only for comparisons pairing those two data origins.
+[[nodiscard]] Status snap_fragment_depth(Program&);
 [[nodiscard]] Status legalize_nontexture(Program&, FactReader&, const MetalProfile&);
 // Moves filtered texture samples out of the blocks their instruction
 // predicate guards when their inputs are available before the guard;

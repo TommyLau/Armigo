@@ -9,6 +9,7 @@
 // ============================================================================
 
 #include "pipeline/phases.h"
+#include "proven_cbuf_fixture.h"
 
 #include <cstdlib>
 #include <filesystem>
@@ -23,6 +24,7 @@ namespace armigo::shader::test::cbuf_msl {
 std::string gpu_argument_buffer_source();
 
 std::string gpu_fragment_source(unsigned case_index);
+std::string gpu_small_window_source(unsigned words);
 }
 
 namespace {
@@ -91,7 +93,7 @@ struct Fixture {
     constant.source = ConstantBufferSource{slot};
     constant.access = Access::read;
     constant.size = {SizeKind::constant_buffer_window, window_bytes, 4,
-                     ConstantBufferPolicy::runtime_zero_words_v1};
+                     ConstantBufferPolicy::padded_zero_words_v2};
     buffer = add_resource(constant, 3);
 
     BufferUse sizes;
@@ -128,7 +130,7 @@ struct Fixture {
     constant.source = ConstantBufferSource{slot};
     constant.access = Access::read;
     constant.size = {SizeKind::constant_buffer_window, window_bytes, 4,
-                     ConstantBufferPolicy::runtime_zero_words_v1};
+                     ConstantBufferPolicy::padded_zero_words_v2};
     return add_resource(constant, index);
   }
 
@@ -290,7 +292,43 @@ void compile_generated_source(const std::string &source,
   check(std::system(command.c_str()) == 0, label + " Metal 4 compilation");
 }
 
+void proven_window(Fixture& fixture, ResourceId resource = ResourceId{0}) {
+  auto& use = std::get<BufferUse>(fixture.program.requirements.uses[resource.value]);
+  use.size.constant_buffer_policy = ConstantBufferPolicy::proven_zero_words_v2;
+  fixture.plan.resources[resource.value].use = use;
+}
+
 void source_tests() {
+  for (const auto& item : armigo::shader::test::proven_cbuf::cases) {
+    try {
+      const auto artifact = armigo::shader::test::proven_cbuf::translate(item);
+      const BufferUse* data = nullptr;
+      for (const auto& resource : artifact.reflection.resources)
+        if (const auto* use = std::get_if<BufferUse>(&resource.use))
+          if (const auto* slot = std::get_if<ConstantBufferSource>(&use->source); slot && slot->slot == 3) data = use;
+      check(data && data->size.constant_buffer_policy == item.policy && data->size.bytes == item.window,
+            std::string(item.name) + " legalization selects the independently checked complete-word contract");
+      const bool clamp = artifact.source.find(", " + std::to_string(item.window) + "ul)") != std::string::npos;
+      check(clamp == (item.policy == ConstantBufferPolicy::padded_zero_words_v2),
+            std::string(item.name) + " emission matches its proven/padded policy");
+      check(artifact.source.find("armigo_cbuf_word") == std::string::npos,
+            std::string(item.name) + " has no per-word range helper");
+      compile_generated_source(artifact.source, std::string("proven_shape_") + item.name);
+    } catch (const std::exception& error) { check(false, std::string(item.name) + ": " + error.what()); }
+  }
+  Fixture proven(5, 64);
+  proven_window(proven);
+  proven.load(4);
+  const auto proved_source = accepted(proven, "cbuf_proven_word");
+  check(proved_source.find("min(") == std::string::npos &&
+            proved_source.find("armigo_cbuf_word") == std::string::npos &&
+            proved_source.find("resource0[((memory_address0 + 0ul) & ~3ul) / 4ul]") != std::string::npos,
+        "Proved windows use direct loads with no clamp or per-word guard");
+  Fixture proven_end(0, constant_buffer_window_bytes);
+  proven_window(proven_end);
+  proven_end.load(constant_buffer_window_bytes - 4);
+  check(accepted(proven_end, "cbuf_proven_last_word").find("min(") == std::string::npos,
+        "The last complete word can use an unpadded proven window");
   Fixture direct(5, 64);
   direct.load(4);
   auto source = accepted(direct, "cbuf_direct_word");
@@ -299,33 +337,27 @@ void source_tests() {
             source.find("constant uint* resource1 [[buffer(11)]]") !=
                 std::string::npos,
         "Constant buffer and support table use planned Metal arguments");
-  check(source.find("inline uint armigo_cbuf_word(constant uint* cb, ulong "
-                    "address, uint size_bytes, uint window_bytes)") !=
-                std::string::npos &&
-            source.find("const ulong word_address = address & ~3ul;") !=
-                std::string::npos &&
-            source.find("word_address <= ulong(window_bytes - 4u) ? "
-                        "cb[word_address / 4ul] : 0u") != std::string::npos,
-        "Generated helper normalizes the address and reads only inside the window");
-  check(source.find("resource1[5u]") != std::string::npos &&
-            source.find("armigo_cbuf_word(resource0") != std::string::npos &&
-            source.find(", 64u)") != std::string::npos,
-        "Direct load uses its slot size and reflected window");
+  check(source.find("armigo_cbuf_word") == std::string::npos &&
+            source.find("min(4ul, 64ul)") != std::string::npos &&
+            source.find("resource0[((memory_address0 + 0ul) & ~3ul) / 4ul]") != std::string::npos,
+        "Padded loads use one address clamp and direct word indexing");
+  check(source.find("resource1[5u]") == std::string::npos &&
+            source.find(" ? ") == std::string::npos,
+        "Constant loads have no size-table read or per-word zero branch");
 
   Fixture dynamic(2, constant_buffer_window_bytes);
   const auto offset = dynamic.copied_word(UINT32_MAX);
   dynamic.load(12, 4, 1, offset);
   source = accepted(dynamic, "cbuf_dynamic_word");
   check(source.find("4294967295u") != std::string::npos &&
-            source.find("resource1[2u]") != std::string::npos &&
-            source.find(", 65536u)") != std::string::npos,
-        "Unknown dynamic offset remains runtime guarded through the 64 KiB "
-        "window");
+            source.find("resource1[2u]") == std::string::npos &&
+            source.find(", 65536ul)") != std::string::npos,
+        "Dynamic offsets clamp to the zero pad after the 64 KiB window");
 
   Fixture unaligned(0, 16);
   unaligned.load(6);
   source = accepted(unaligned, "cbuf_unaligned_word");
-  check(source.find("armigo_cbuf_word(resource0") != std::string::npos &&
+  check(source.find("resource0[((memory_address0 + 0ul) & ~3ul) / 4ul]") != std::string::npos &&
             source.find("memory_address0 + 0ul") != std::string::npos &&
             source.find("255u") == std::string::npos,
         "Unaligned U32 uses one normalized word load rather than byte "
@@ -341,26 +373,31 @@ void source_tests() {
             source.find("65535u") != std::string::npos &&
             source.find("as_type<short>") != std::string::npos,
         "Narrow extraction follows byte and aligned-halfword rules after the "
-        "word guard");
+        "padded word load");
 
   Fixture wide(1, 16);
   wide.load(4, 8);
   source = accepted(wide, "cbuf_word64");
-  check(occurrences(source, "armigo_cbuf_word(resource0") == 2 &&
+  check(occurrences(source, "resource0[") == 2 &&
+            occurrences(source, "min(") == 1 &&
             source.find("+ 4ul") != std::string::npos,
-        "B64 performs two independently guarded word reads");
+        "B64 uses one clamp followed by two direct word reads");
 
   const auto first_dynamic =
       armigo::shader::test::cbuf_msl::gpu_fragment_source(9);
   const auto second_dynamic =
       armigo::shader::test::cbuf_msl::gpu_fragment_source(9);
   check(first_dynamic == second_dynamic &&
-            first_dynamic.find("resource1[1u]") != std::string::npos &&
-            first_dynamic.find("resource1[0u]") != std::string::npos &&
+            first_dynamic.find("resource1[1u]") == std::string::npos &&
+            first_dynamic.find("resource1[0u]") == std::string::npos &&
             first_dynamic.find("ulong(value0)") != std::string::npos,
-        "One generated variant reads a draw-time offset and both draw-time "
-        "sizes");
+        "One generated variant reads a draw-time offset without runtime size reads");
   compile_generated_source(first_dynamic, "cbuf_runtime_dynamic_gpu_fragment");
+  const auto dynamic_wide = armigo::shader::test::cbuf_msl::gpu_fragment_source(13);
+  check(occurrences(dynamic_wide, "min(") == 2 &&
+            dynamic_wide.find("armigo_cbuf_word") == std::string::npos,
+        "Dynamic B64 clamps once; its offset-buffer load has its own static clamp");
+  compile_generated_source(dynamic_wide, "cbuf_runtime_wide_gpu_fragment");
   compile_generated_source(
       armigo::shader::test::cbuf_msl::gpu_fragment_source(10),
       "cbuf_signed_byte_gpu_fragment");
@@ -373,6 +410,20 @@ void source_tests() {
 }
 
 void validation_tests() {
+  Fixture unknown_proven(0, constant_buffer_window_bytes);
+  proven_window(unknown_proven);
+  const auto offset_buffer = unknown_proven.add_constant_buffer(1, 4, 4);
+  const auto unknown = unknown_proven.load_from(offset_buffer, 0).front();
+  unknown_proven.load(0, 4, 1, unknown);
+  rejected(unknown_proven, "An unbounded offset cannot claim an unpadded proven window",
+           DiagnosticCode::missing_fact);
+  auto forged_bound = unknown_proven;
+  std::get<MemoryInfo>(forged_bound.program.ir.operations.back().info).dynamic_byte_offset_upper_bound = 60;
+  rejected(std::move(forged_bound), "A forged offset bound must be independently rejected");
+  Fixture crosses_end(0, constant_buffer_window_bytes);
+  proven_window(crosses_end);
+  crosses_end.load(constant_buffer_window_bytes - 4, 8);
+  rejected(std::move(crosses_end), "B64 cannot claim an unpadded window when its high word needs the pad");
   Fixture static_extent(0, 4);
   static_extent.load(12);
   rejected(std::move(static_extent),
@@ -467,17 +518,58 @@ std::string gpu_argument_buffer_source() {
   return source;
 }
 
+std::string gpu_small_window_source(unsigned words) {
+  if (words < 1 || words > 4 || words == 3)
+    throw std::runtime_error("Small-window fixture width is invalid");
+  Fixture fixture(0, 64, true);
+  fixture.add_constant_buffer(1, 4, 4);
+  const auto proven_offset = 64u - words * 4u;
+  const auto dynamic = fixture.copied_word(proven_offset);
+  std::vector<Operand> color;
+  if (words == 2) {
+    const auto halves = fixture.unpack(fixture.load(0, 8, 1, dynamic).front());
+    color = {halves[0], halves[1], halves[0], halves[1]};
+  } else {
+    const auto loaded = fixture.load(0, 4, static_cast<std::uint8_t>(words), dynamic);
+    color.assign(loaded.begin(), loaded.end());
+  }
+  fixture.store_color(std::move(color));
+  for (auto& operation : fixture.program.ir.operations)
+    if (auto* memory = std::get_if<MemoryInfo>(&operation.info);
+        memory && memory->dynamic_byte_offset)
+      memory->dynamic_byte_offset_upper_bound = proven_offset;
+  auto emitted = fixture.emit();
+  if (const auto* error = std::get_if<Diagnostic>(&emitted))
+    throw std::runtime_error(error->message);
+  auto source = std::get<MslArtifact>(std::move(emitted)).source;
+  // Legalization requires a small window's register offset to be bounded.
+  // Replace only this synthetic offset producer with test data after emission
+  // to exercise the real clamp beyond that proven range, without rewriting
+  // its extent or load expressions. Production admission remains unchanged.
+  const auto producer = "value0 = " + std::to_string(proven_offset) + "u;";
+  const auto at = source.find(producer);
+  if (at == std::string::npos || source.find(producer, at + 1) != std::string::npos)
+    throw std::runtime_error("Small-window offset producer is not unique");
+  source.replace(at, producer.size(), "value0 = resource2[0];");
+  return source;
+}
+
 std::string gpu_fragment_source(unsigned case_index) {
+  if (case_index >= 14 && case_index <= 16)
+    return gpu_small_window_source(1u << (case_index - 14));
   Fixture fixture(0,
-                  case_index == 2 || case_index == 7 || case_index == 9
+                  case_index == 2 || case_index == 7 || case_index == 9 || case_index == 13
                       ? constant_buffer_window_bytes
                       : 64,
                   true);
   std::vector<Operand> color;
-  if (case_index == 9) {
+  if (case_index == 9 || case_index == 13) {
     const auto offset_buffer = fixture.add_constant_buffer(1, 4, 4);
     const auto dynamic = fixture.load_from(offset_buffer, 0).front();
-    color.push_back(fixture.load(0, 4, 1, dynamic).front());
+    if (case_index == 13) {
+      const auto halves = fixture.unpack(fixture.load(0, 8, 1, dynamic).front());
+      color = {halves[0], halves[1], halves[0], halves[1]};
+    } else color.push_back(fixture.load(0, 4, 1, dynamic).front());
   } else if (case_index == 2) {
     const auto dynamic = fixture.copied_word(UINT32_MAX);
     color.push_back(fixture.load(0, 4, 1, dynamic).front());
@@ -517,6 +609,7 @@ int run_gpu_cases();
 
 } // namespace armigo::shader::test::cbuf_msl
 
+#if !defined(ARMIGO_CBUF_MSL_FIXTURE_ONLY)
 int main(int argc, char **argv) {
   bool run_gpu = false;
   for (int i = 1; i < argc; ++i) {
@@ -557,3 +650,5 @@ int main(int argc, char **argv) {
     std::cout << "Constant-buffer MSL tests passed\n";
   return failures ? 1 : 0;
 }
+
+#endif

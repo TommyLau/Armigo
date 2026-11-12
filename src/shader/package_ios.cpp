@@ -58,8 +58,9 @@ using Clock = std::chrono::steady_clock;
 
 constexpr auto command_timeout = std::chrono::seconds(60);
 constexpr std::size_t maximum_manifest_size = 64u << 20;
-const std::array<std::string, 5> compile_flags{
-    "-std=metal4.0", "-mios-version-min=26.0", "-Werror", "-Wno-unused-variable", "-Wno-sometimes-uninitialized"};
+const std::array<std::string, 7> compile_flags{
+    "-std=metal4.0", "-mios-version-min=26.0", "-fwrapv", "-Werror", "-Wno-unused-variable", "-Wno-sometimes-uninitialized",
+    "-fbracket-depth=1024"};
 
 std::string trim(std::string value) {
     const auto first = value.find_first_not_of(" \t\r\n");
@@ -255,6 +256,7 @@ Json current_profile(std::string_view source_version) {
     Json::Object profile;
     profile.emplace("compile_options", Json::Array{Json{std::string("-std=metal4.0")},
                                                    Json{std::string("-mios-version-min=26.0")},
+                                                   Json{std::string("-fwrapv")},
                                                    Json{std::string("-Werror")}});
     profile.emplace("deployment_target", Json{std::string("26.0")});
     profile.emplace("identity", Json{std::string("span-prefix112-v1")});

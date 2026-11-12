@@ -18,7 +18,6 @@
 namespace {
 using namespace armigo::horizon;
 using armigo::services::lm::LogManagerSession;
-using armigo::services::lm::LogManagerContract;
 unsigned failures = 0;
 #define CHECK(condition) do { if (!(condition)) { ++failures; \
     std::fprintf(stderr, "FAIL %d: %s\n", __LINE__, #condition); } } while (false)
@@ -92,8 +91,8 @@ struct Fixture {
     QueryRegisters registers{};
     IpcCallContext caller{71, message, nullptr, nullptr};
 
-    explicit Fixture(LogManagerContract contract = LogManagerContract::switch1)
-        : session(std::make_shared<LogManagerSession>(71, contract)) {}
+    Fixture()
+        : session(std::make_shared<LogManagerSession>(71)) {}
 
     IpcDisposition send() {
         registers.fill(0x123456789abcdef0);
@@ -176,10 +175,10 @@ void test_startup() {
 
 void check_log_reply(const IpcMessage& actual) {
     IpcMessage expected{};
-    put(expected, 4, 10);
+    put(expected, 4, 12);
     put(expected, 32, 0x4f434653);
     put(expected, 44, 0x3e81dad2);
-    CHECK(std::equal(expected.begin(), expected.begin() + 48, actual.begin()));
+    CHECK(std::equal(expected.begin(), expected.begin() + 56, actual.begin()));
     // The request still holds SFCI at byte48; only the admitted reply extent
     // is overwritten, so the untouched tail begins after the request payload.
     CHECK(std::all_of(actual.begin() + 64, actual.end(), [](std::byte b) { return b == std::byte{0xa5}; }));
@@ -195,8 +194,8 @@ void test_logger_log_command() {
     f.message = log_request(logger);
     CHECK(f.send() == IpcDisposition::handled);
     check_log_reply(f.message);
-    // Switch 1 keeps the 48-byte, 10-word reply and uses the shared logger word.
-    CHECK(get(f.message, 4) == 10 && get(f.message, 44) == 0x3e81dad2);
+    // One 56-byte, 12-word reply with the logger word on both platforms.
+    CHECK(get(f.message, 4) == 12 && get(f.message, 44) == 0x3e81dad2);
     CHECK(std::all_of(f.registers.begin(), f.registers.end(), [](auto v) { return v == 0; }));
     CHECK(f.session->domain_object_count() == 2 && f.session->diagnostic() == nullptr);
     // The upper halfword counts descriptors on both platforms; it is not a
@@ -207,11 +206,10 @@ void test_logger_log_command() {
     f.message = log_request(logger);
     put(f.message, 8, std::uint64_t{0x10} << 16); // Nonzero X size with a zero address.
     f.expect_unsupported();
-    // Descriptor-count rejection stays on the Switch 2 platform contract.
+    // Controls carry no buffer descriptors.
     f.message = control(3);
     put(f.message, 0, 5u | (1u << 16));
-    CHECK(f.send() == IpcDisposition::handled);
-    check_control_reply(f.message, 0x400, 2);
+    f.expect_unsupported();
     // Validation still applies: no oversized payload, foreign sender, input
     // objects, unknown command or missing magic reaches a success reply.
     f.message = log_request(logger, 24);
@@ -263,7 +261,7 @@ IpcMessage switch2_log_request(std::uint32_t logger, std::uint64_t address,
 }
 
 void test_switch2_logger_contract() {
-    Fixture f(LogManagerContract::switch2);
+    Fixture f;
     f.message = control(3);
     CHECK(f.send() == IpcDisposition::handled);
     check_control_reply(f.message, 0x400, 2);
@@ -327,13 +325,13 @@ void test_switch2_logger_contract() {
 
 void test_switch2_control_counts_and_close() {
     for (unsigned command : {0u, 3u}) {
-        Fixture f(LogManagerContract::switch2);
+        Fixture f;
         f.message = control(command);
         put(f.message, 0, 7u | (2u << 16));
         f.expect_unsupported();
         CHECK(f.session->domain_object_count() == 0);
     }
-    Fixture f(LogManagerContract::switch2);
+    Fixture f;
     const auto root = f.convert();
     f.message = open_logger(root);
     CHECK(f.send() == IpcDisposition::handled);
@@ -355,7 +353,7 @@ void test_switch2_control_counts_and_close() {
     f.message = control(3);
     CHECK(f.send() == IpcDisposition::handled && f.registers[0] == 0xe401);
 
-    // A close is a close on both contracts: later requests are session-closed.
+    // A close before any logger exists is also session-closed afterwards.
     Fixture legacy;
     const auto legacy_root = legacy.convert();
     legacy.message = close_message;

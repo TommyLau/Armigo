@@ -25,8 +25,11 @@
 // flushed operands rounded to nearest, for RED and ATOMG's add), the memory
 // order bits 77-80
 // and the eviction priority, a cache hint, bits 84-86. Weak and constant
-// loads and stores are plain device accesses of the invocation; strong ones
-// keep their scope, and the back end makes each word a relaxed device atomic.
+// loads and all non-RMW LDG loads use ordinary aligned device accesses. LDG
+// orders 5/7 retain their decoded scope with the native aligned-load policy;
+// strong stores remain relaxed device atomic words. Resource legalization
+// rewrites proven driver-buffer loads
+// to ordinary storage accesses before the guest-memory path is emitted.
 // Atomics are strong at GPU scope, which relaxed device atomics provide.
 // INC and DEC of a 32-bit word (type 0 or 1) are a compare-and-swap loop.
 // 64-bit INC and DEC, and every other size, stay refused.
@@ -111,10 +114,11 @@ bool Builder::global_memory(Fields& fields) {
     if (load || store) {
         // Weak, constant, strong at SM scope and strong at GPU scope.
         if (order != 0 && order != 4 && order != 5 && order != 7) fail("global memory order is not admitted");
-        // Strong accesses keep their scope; the back end makes each word a
-        // relaxed device atomic.
+        // Preserve the decoded scope. The native LDG policy selects ordinary
+        // aligned loads; strong stores retain their atomic-word lowering.
         if (order == 5) info.scope = ir::MemoryScope::workgroup;
         if (order == 7) info.scope = ir::MemoryScope::device;
+        if (load && (order == 5 || order == 7)) info.native_load_policy = ir::NativeLoadPolicy::aligned_v1;
         static constexpr std::array<ir::ScalarType, 4> narrow{ir::ScalarType::u8, ir::ScalarType::s8, ir::ScalarType::u16, ir::ScalarType::s16};
         if (type > 6 || (store && type < 4)) fail("global memory access type is not admitted");
         const unsigned words = type < 5 ? 1u : type == 5 ? 2u : 4u;

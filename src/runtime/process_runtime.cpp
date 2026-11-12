@@ -21,6 +21,7 @@
 #include <armigo/nvn/driver.h>
 #include <armigo/services/file_system.h>
 #include "service_registry.h"
+#include "frame_capture.h"
 #ifdef ARMIGO_RUNTIME_TESTING
 #include "process_runtime_test_access.h"
 #endif
@@ -34,6 +35,7 @@
 #include <cstdio>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <condition_variable>
 #include <cstring>
 #include <cstdlib>
@@ -867,11 +869,26 @@ LaunchStatus NativeProcessRuntime::observe_frame(const platform::PresentedFrame&
     // Captures are external output. The PPM stores RGB from actual completed
     // pixels and does not manufacture a frame when readback is unavailable.
     const auto& pixels = *frame.readback;
+    static const auto maximum_width = [] {
+        std::pair<std::uint32_t, bool> result{0, true};
+        if (const char* value = std::getenv("ARMIGO_CAPTURE_WIDTH")) {
+            const char* end = value + std::strlen(value);
+            const auto parsed = std::from_chars(value, end, result.first);
+            result.second = parsed.ec == std::errc{} && parsed.ptr == end && result.first != 0;
+        }
+        return result;
+    }();
+    if (!maximum_width.second)
+        return fail(LaunchStage::inputs, LaunchError::invalid_input, "capture-frame",
+                    "ARMIGO_CAPTURE_WIDTH requires a positive width.");
+    std::string bytes;
+    try { bytes = encode_capture_ppm(pixels, maximum_width.first); }
+    catch (const std::exception& error) {
+        return fail(LaunchStage::presentation, LaunchError::host_failure, "capture-frame", error.what());
+    }
     const auto path = *output_.capture_directory / ("frame-" + std::to_string(frame.frame_number) + ".ppm");
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    file << "P6\n" << pixels.width << ' ' << pixels.height << "\n255\n";
-    for (std::size_t offset = 0; offset + 3 < pixels.pixels.size(); offset += 4)
-        file.write(reinterpret_cast<const char*>(pixels.pixels.data() + offset), 3);
+    file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     file.close();
     if (!file) return fail(LaunchStage::presentation, LaunchError::host_failure, "capture-frame",
                            "Completed frame capture could not be written.");
@@ -1089,12 +1106,31 @@ LaunchStatus NativeProcessRuntime::shutdown(std::optional<ClockInstant> deadline
 
 bool captures_frame(const ReportDestination& output, std::uint64_t frame_number) {
     if (!output.capture_directory) return false;
-    // ARMIGO_CAPTURE_EVERY=N keeps every Nth frame instead of all of them.
-    static const std::uint64_t every = [] {
-        const char* value = std::getenv("ARMIGO_CAPTURE_EVERY");
-        return value ? std::max<std::uint64_t>(1, std::strtoull(value, nullptr, 10)) : 1;
-    }();
-    return frame_number % every == 0;
+    struct Selection {
+        std::uint64_t first = 0, last = std::numeric_limits<std::uint64_t>::max(), every = 1;
+        bool valid = true;
+        Selection() {
+            if (const char* value = std::getenv("ARMIGO_CAPTURE_EVERY"))
+                every = std::max<std::uint64_t>(1, std::strtoull(value, nullptr, 10));
+            const char* range = std::getenv("ARMIGO_CAPTURE_RANGE");
+            if (!range || !*range) return;
+            const char* end = range + std::strlen(range);
+            const char* dash = std::find(range, end, '-');
+            if (dash == end) valid = false;
+            else {
+                const auto begin_result = std::from_chars(range, dash, first);
+                const auto end_result = std::from_chars(dash + 1, end, last);
+                valid = begin_result.ec == std::errc{} && begin_result.ptr == dash &&
+                    end_result.ec == std::errc{} && end_result.ptr == end && first <= last;
+            }
+            if (!valid)
+                armigo::diag::warning("Armigo capture: ARMIGO_CAPTURE_RANGE must be FIRST-LAST; frame capture disabled.\n");
+        }
+    };
+    // Both the writer and readback observe one immutable selection.
+    static const Selection selection;
+    return selection.valid && frame_number >= selection.first && frame_number <= selection.last &&
+        frame_number % selection.every == 0;
 }
 
 #ifdef ARMIGO_RUNTIME_TESTING
@@ -1275,10 +1311,9 @@ LaunchResult<std::unique_ptr<ProcessRuntime>> ProcessRuntime::create(
         }
         if (description.title_saves) {
             const auto saves = compat::title_save_directory(profile.title_id);
-            std::error_code error;
-            if (saves.empty() || (std::filesystem::create_directories(saves, error), error))
-                return fail(LaunchStage::inputs, LaunchError::host_failure, "title-saves",
-                            "The title's save directory " + saves.string() + " could not be created.");
+            const auto legacy = saves.parent_path().parent_path() / compat::title_id_text(profile.title_id);
+            if (const auto error = compat::prepare_save_directory(saves, legacy))
+                return fail(LaunchStage::inputs, LaunchError::host_failure, "title-saves", *error);
             services::fs::set_host_save_directory(saves);
         }
         // A guest fault ends its thread with a report instead of the process.
@@ -1349,11 +1384,13 @@ LaunchResult<std::unique_ptr<ProcessRuntime>> ProcessRuntime::create(
         auto& runtime = owner->runtime;
         LaunchStatus initialized;
         try {
-            // A NUP carries no control data; like the practical reference,
-            // its display version reads the package version as
-            // major.minor.micro from bits 16, 8 and 0.
+            // A NUP carries no control data. The selected package's display
+            // version metadata stands in for the control-data field; without it
+            // the package version reads as major.minor.micro from bits 16, 8, 0.
             std::optional<std::string> display_version;
-            if (nup_selection) {
+            if (nup_selection && !nup_selection->display_version.empty()) {
+                display_version = nup_selection->display_version;
+            } else if (nup_selection) {
                 const auto version = nup_selection->version;
                 display_version = std::to_string(version >> 16) + "." + std::to_string((version >> 8) & 0xff) + "." +
                                   std::to_string(version & 0xff);

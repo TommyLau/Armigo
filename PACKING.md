@@ -30,7 +30,7 @@ All inputs are your own dumps.
 | `--update FILE` | An update `.nsp`; repeat for several, the newest applies |
 | `--dlc FILE` | An add-on content `.nsp`; repeat for each |
 | `--keys FILE` | Your console's `prod.keys`; it must contain every key your game's content uses (the packer names any missing key) |
-| `--firmware PATH` | Your console's firmware: a folder of its `.nca` files, or a `.zip` of them. Armigo's baseline is 20.5.0; other versions pack with a warning |
+| `--firmware PATH` | Your console's firmware: a folder of its `.nca` files, or a `.zip` of them. Armigo's baseline is 23.0.1; other versions pack with a warning |
 | `--title-keys FILE` | Optional `title.keys`. Without it, title keys come from the tickets inside the NSPs |
 | `--output DIR` | Where the app is written (default: the current directory); never inside a git checkout |
 
@@ -53,15 +53,20 @@ the game's English title, then its Simplified Chinese title, then the first one
 available; the Home Screen, Dock and Finder show the title in your language
 when the game has it.
 
-Saves live in `~/Documents/Armigo/<TitleID>/` and caches in
+Saves live in `~/Documents/Armigo/Saves/<TitleID>/` and caches in
 `~/Library/Caches/Armigo/<TitleID>/` (on iOS, inside the app's container).
-Packing a newer version of the same game keeps your saves.
+Packing a newer version of the same game keeps your saves. Legacy mixed-content
+folders remain intact. If existing data needs importing, the player asks before
+starting; it never silently creates an empty replacement. Import only explicitly
+selected saved files with `tools/migrate_player_saves.py`, whose manifest records
+relative paths, byte sizes, and SHA-256 digests. It preserves all original files
+and refuses to replace an existing destination.
 
 ## macOS
 
 ```sh
 build/macos-release/armigo "My Game.xci" --keys prod.keys \
-  --firmware Firmware.20.5.0.zip --output "$HOME/Games"
+  --firmware Firmware.23.0.1.zip --output "$HOME/Games"
 ```
 
 The app keeps only the ad-hoc signature its player gets when it is built, and
@@ -73,7 +78,7 @@ time, or you can sign it with your own identity.
 
 ```sh
 build/macos-release/armigo "My Game.xci" --keys prod.keys \
-  --firmware Firmware.20.5.0.zip --platform ios --output "$HOME/Games"
+  --firmware Firmware.23.0.1.zip --platform ios --output "$HOME/Games"
 ```
 
 This writes one unsigned `<Name>.ipa` that contains the game. It needs iOS 26 or
@@ -92,6 +97,8 @@ Apple Configurator or your usual tool.
 ## Problems
 
 The packer stops with a message that names the missing or invalid input. A
-packed app writes its warnings and errors to `last-run.log` in its cache
-folder; attach it when you report a problem, together with the title ID and
-version, but never your keys, firmware or game files.
+normal packed app creates no diagnostic log, report, or capture files.
+Actionable failures appear on screen. Report that message together with the
+title ID and version, but never share your keys, firmware, saves, or game files.
+Explicit development runs can opt into diagnostics outside the active save
+folder; ordinary release packs reject development run controls.

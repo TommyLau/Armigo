@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include <armigo/compat/patches.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -21,35 +23,31 @@
 namespace armigo::pack {
 
 struct ShaderReport {
+    // Package libraries, and those taken from a reused package.
+    std::size_t libraries = 0;
+    std::size_t reused = 0;
     std::size_t enumerated = 0;
     std::size_t translated = 0;
     std::size_t unsupported = 0;
     std::size_t structural_errors = 0;
 };
 
-// Which containers hold the title's stages, and the vertex depth recorded in
-// the package. The defaults select BNSH enumeration and a minus-one-to-one
-// vertex depth. gfd-cache reads .gsc members of CPK archives under the RomFS
-// and add-on trees, then the packages embedded in the main module. `caches`
-// names members that must be present; an empty list accepts every .gsc member.
-// A fallback satisfies one required name when an alternative member is present.
-// `ignored_needle_offsets` are main-module image offsets whose failed packages
-// are not errors. A successful package at an ignored offset is still kept.
-// glslc reads the GLSLC compiler outputs compiled into the main module; every
-// shader control in that image must belong to one of them.
+// The title's shader input settings, as its profile states them (see
+// compat::ShaderInputSettings), and the NVN policy translation follows. Each
+// container set has one reader: bnsh scans every file of the ExeFS, RomFS and
+// add-on trees for BNSH and BAHS containers, also inside Yaz0 and SARC;
+// gfd-cache reads the .gsc members of CPK archives under the RomFS and add-on
+// trees, then the packages embedded in the main module (`caches` must be
+// present, a fallback stands in for one, and failed packages at
+// `ignored_needle_offsets` are not errors); glslc reads the GLSLC outputs
+// compiled into the main module, every shader control of which must belong to
+// one. Native inputs belong to a .nup archive and are refused here.
 // `hoist_implicit_samples` follows the title's nvn_policy and, when set, is
 // applied to every translated stage and recorded in the package manifest.
 // That record is outside the profile and does not change the chain id.
 struct ShaderPackInput {
-    enum class Containers { Bnsh, GfdCache, Glslc };
-    enum class VertexDepth { NegativeOneToOne, ZeroToOne };
-
-    Containers containers = Containers::Bnsh;
-    VertexDepth vertex_depth = VertexDepth::NegativeOneToOne;
+    compat::ShaderInputSettings settings;
     bool hoist_implicit_samples = false;
-    std::vector<std::string> caches;
-    std::vector<std::pair<std::string, std::vector<std::string>>> fallbacks;
-    std::vector<std::uint64_t> ignored_needle_offsets;
 };
 
 // The distinct vertex, fragment and compute stages the input's containers
@@ -76,6 +74,7 @@ struct ShaderEnumeration {
     const std::filesystem::path& exefs, const std::filesystem::path& romfs,
     const std::vector<std::filesystem::path>& addons, const std::filesystem::path& staging,
     const std::filesystem::path& package, const std::filesystem::path& compile_cache,
-    const std::filesystem::path& translate_tool, const ShaderPackInput& input = {});
+    const std::filesystem::path& translate_tool, const ShaderPackInput& input = {},
+    const std::vector<std::filesystem::path>& reuse = {});
 
 } // namespace armigo::pack

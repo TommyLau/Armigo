@@ -69,7 +69,8 @@ public:
 // so the two cannot disagree: output captures a completed frame when it names
 // a capture directory and the frame number is a multiple of
 // ARMIGO_CAPTURE_EVERY (default 1, read once per process). Presentation reads
-// back only these frames; the GPU still consumes every frame.
+// back only these frames; the GPU still consumes every frame. Optional
+// ARMIGO_CAPTURE_RANGE=FIRST-LAST limits capture to an inclusive frame window.
 [[nodiscard]] bool captures_frame(const ReportDestination& output, std::uint64_t frame_number);
 // Never destroy a nonquiescent runtime. Shells retain it after a timed-out run;
 // a hard watchdog belongs to an external spawn/exec supervisor, never guest fork.

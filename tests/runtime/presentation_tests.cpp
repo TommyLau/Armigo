@@ -93,10 +93,12 @@ struct Consumer final : platform::Presenter {
     bool fail_present = false;
     bool fail_drain = false;
     bool omit_readback = false;
+    platform::PresentationMode presentation_mode = platform::PresentationMode::headless;
+    std::optional<graphics::Rgba8Image> native_readback;
     bool throw_present = false;
     unsigned drains = 0;
     std::function<void()> during_present;
-    platform::PresentationMode mode() const noexcept override { return platform::PresentationMode::headless; }
+    platform::PresentationMode mode() const noexcept override { return presentation_mode; }
     platform::PresentResult present(const platform::PresentationFrame& frame,
         std::optional<ClockInstant> deadline, std::stop_token) override {
         CHECK(!deadline);
@@ -114,7 +116,10 @@ struct Consumer final : platform::Presenter {
         platform::PresentedFrame result;
         result.frame_number = frame.queued.frame_number;
         // Like a real consumer, only a frame that asked for pixels gets them.
-        if (!omit_readback && frame.readback && frame.pixels) result.readback = *frame.pixels;
+        if (!omit_readback && frame.readback) {
+            if (frame.pixels) result.readback = *frame.pixels;
+            else if (native_readback) result.readback = *native_readback;
+        }
         return result;
     }
     platform::PresenterStatus drain(std::optional<ClockInstant>) override {
@@ -225,9 +230,10 @@ struct Fixture {
 void crop_fences_worker_and_owned_pixels() {
     Fixture f;
     f.frame.crop = {2, 1, 6, 4};
-    f.frame.fence_count = 2;
+    f.frame.fence_count = 3;
     f.frame.producer_fences[0] = {3, 10};
-    f.frame.producer_fences[1] = {4, 20};
+    f.frame.producer_fences[1] = {-1, 15};    // a counted -1 entry is skipped, not waited
+    f.frame.producer_fences[2] = {4, 20};
     f.bind();
     const auto caller = std::this_thread::get_id();
     CHECK(f.binding->callback()(f.frame).completed);
@@ -326,6 +332,7 @@ void producer_completion_precedes_decode() {
     bool waiting = false;
     bool completed = false;
     f.frame.fence_count = 1;
+    f.frame.producer_fences[0] = {5, 1};
     f.dependencies.backing.wait_fence = [&](const auto&, auto, std::stop_token stop) -> LaunchStatus {
         std::unique_lock lock(fence_mutex);
         waiting = true;
@@ -362,6 +369,8 @@ void pin_and_fence_failures_never_decode_or_present() {
         };
         else {
             f.frame.fence_count = 2;
+            f.frame.producer_fences[0] = {5, 1};
+            f.frame.producer_fences[1] = {6, 1};
             f.dependencies.backing.wait_fence = [](const auto&, auto, auto) -> LaunchStatus {
                 return error("fence failed");
             };
@@ -692,9 +701,56 @@ void native_frames_read_back_only_when_wanted() {
     }
 }
 
+void windowed_native_capture_obeys_selection() {
+    Fixture f;
+    const NativeFrame native;
+    native.apply(f.frame);
+    f.frame.crop = {};
+    f.consumer->presentation_mode = platform::PresentationMode::windowed;
+    graphics::Rgba8Image authored;
+    authored.width = 8; authored.height = 6;
+    authored.pixels.assign(8 * 6 * 4, std::byte{0x37});
+    f.consumer->native_readback = authored;
+    f.dependencies.wants_readback = [](std::uint64_t number) { return number % 2 == 0; };
+    std::vector<std::uint64_t> captured;
+    f.dependencies.observe_frame = [&](const platform::PresentedFrame& frame) -> LaunchStatus {
+        if (frame.readback) captured.push_back(frame.frame_number);
+        return std::monostate{};
+    };
+    f.bind();
+    for (std::uint64_t number = 1; number <= 4; ++number) {
+        f.frame.frame_number = number;
+        CHECK(f.binding->callback()(f.frame).completed);
+    }
+    CHECK(!f.binding->failure() && *native.reads == 0);
+    CHECK(captured == (std::vector<std::uint64_t>{2, 4}));
+    for (const auto& frame : f.consumer->frames) CHECK(!frame.pixels);
+}
+
+void ordered_producer_failure_never_reaches_observer() {
+    for (bool valid : {false, true}) {
+        Fixture f;
+        NativeFrame native;
+        native.apply(f.frame);
+        unsigned checks = 0, observed = 0;
+        f.frame.native_producer_ready = [&] { ++checks; return valid; };
+        f.dependencies.wants_readback = [](std::uint64_t) { return false; };
+        f.dependencies.observe_frame = [&](const platform::PresentedFrame&) -> LaunchStatus {
+            ++observed; return std::monostate{};
+        };
+        f.bind();
+        const auto result = f.binding->callback()(f.frame);
+        CHECK(result.completed == valid);
+        CHECK(checks == 1 && observed == unsigned(valid));
+        CHECK(f.consumer->frames.size() == 1);
+    }
+}
+
 } // namespace
 
 int main() {
+    ordered_producer_failure_never_reaches_observer();
+    windowed_native_capture_obeys_selection();
     crop_fences_worker_and_owned_pixels();
     padded_surfaces_preserve_pitch_and_pin_extent();
     authored_gobs_preserve_padded_stride_and_block_height();

@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/mm.h>
 
 #include <algorithm>
@@ -16,26 +17,7 @@
 namespace armigo::services::mm {
 namespace {
 using namespace horizon;
-constexpr std::uint32_t sfci = 0x49434653;
-constexpr std::uint32_t sfco = 0x4f434653;
-std::uint32_t read(const IpcMessage& bytes, std::size_t offset) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i != 4; ++i)
-        value |= std::uint32_t(std::to_integer<unsigned char>(bytes[offset + i])) << (8 * i);
-    return value;
-}
-void write(IpcMessage& bytes, std::size_t offset, std::uint32_t value) {
-    for (unsigned i = 0; i != 4; ++i)
-        bytes[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
-}
-// A non-domain reply with `output_words` of output after the CMIF header.
-IpcReply reply_with(unsigned output_words) {
-    IpcReply reply{IpcDisposition::handled};
-    reply.size = 8 + 4 * (8 + output_words);
-    write(reply.bytes, 4, 8 + output_words);
-    write(reply.bytes, 16, sfco);
-    return reply;
-}
+using namespace horizon::cmif;
 } // namespace
 
 Session::Session(std::uint64_t process_id) : process_id_(process_id) {}

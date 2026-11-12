@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/nifm.h>
 
 #include <array>
@@ -18,8 +19,7 @@
 namespace armigo::services::nifm {
 namespace {
 using namespace horizon;
-constexpr std::uint32_t sfci = 0x49434653;
-constexpr std::uint32_t sfco = 0x4f434653;
+using namespace horizon::cmif;
 // The pointer-buffer capacity each nifm session reports.
 constexpr std::uint32_t pointer_capacity = 0x1000;
 // A request's state: free, or on hold while it is evaluated.
@@ -33,16 +33,6 @@ constexpr std::size_t switch2_profile_bytes = 436;
 constexpr std::uint32_t network_connection_applet = 15;
 constexpr std::uint32_t applet_mode_all_foreground = 0;
 
-std::uint32_t read(const IpcMessage& bytes, std::size_t offset) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i != 4; ++i)
-        value |= std::uint32_t(std::to_integer<unsigned char>(bytes[offset + i])) << (8 * i);
-    return value;
-}
-void write(IpcMessage& bytes, std::size_t offset, std::uint32_t value) {
-    for (unsigned i = 0; i != 4; ++i)
-        bytes[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
-}
 
 // What one method produced: a result, output words, a new object, copied objects.
 struct Outcome {

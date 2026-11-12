@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/common/diagnostics.h>
 #include <armigo/services/graphics_system.h>
 #include <armigo/horizon/startup_queries.h>
@@ -27,16 +28,7 @@
 
 namespace armigo::services::gsv {
 namespace {
-std::uint32_t read(const horizon::IpcMessage& message, unsigned offset) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i < 4; ++i)
-        value |= std::uint32_t(std::to_integer<unsigned char>(message[offset + i])) << (i * 8);
-    return value;
-}
-void write(horizon::IpcMessage& message, unsigned offset, std::uint32_t value) {
-    for (unsigned i = 0; i < 4; ++i)
-        message[offset + i] = static_cast<std::byte>((value >> (i * 8)) & 255);
-}
+using namespace horizon::cmif;
 
 // A TIPC reply without handles: the request type, the raw word count, the
 // result, then the data words.

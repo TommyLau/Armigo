@@ -349,19 +349,20 @@ void mutex_and_condition_abi() {
     };
 
     // The mutex range check precedes alignment and handle lookup for all three SVCs.
+    // The kernel's word envelope ends at 0x40000000000, beyond the mapped 39-bit space.
     for (const auto svc : {0x1a, 0x1b, 0x1c}) {
-        for (const auto bad : {0ull, 1ull, 0x1fffffull, 0x8000000000ull,
-                               0x8000000001ull, ~0ull}) {
+        for (const auto bad : {0ull, 1ull, 0x1fffffull, 0x40000000000ull,
+                               0x40000000001ull, ~0ull}) {
             QueryRegisters registers{};
             registers[svc == 0x1a ? 1 : 0] = bad;
             CHECK(call(svc, registers) == 0xd401);
         }
-        for (const auto bad : {0x200001ull, address + 1, 0x7fffffffffull}) {
+        for (const auto bad : {0x200001ull, address + 1, 0x7fffffffffull, 0x8000000001ull}) {
             QueryRegisters registers{};
             registers[svc == 0x1a ? 1 : 0] = bad;
             CHECK(call(svc, registers) == 0xcc01);
         }
-        for (const auto unmapped : {0x200000ull, address + 8, 0x7ffffffffcull}) {
+        for (const auto unmapped : {0x200000ull, address + 8, 0x7ffffffffcull, 0x8000000000ull}) {
             QueryRegisters registers{};
             registers[svc == 0x1a ? 1 : 0] = unmapped;
             CHECK(call(svc, registers) == 0xd401);

@@ -53,7 +53,8 @@ enum class Op : std::uint32_t {
     rasterizer_discard, conservative_raster, conservative_raster_dilate, subpixel_precision_bias,
     shader_scratch_memory, zcull_data, copy_image_stride, draw_texture, program_subroutines,
     coverage_modulation_table, resolve_depth_buffer, debug_marker, clear_color_integer, dispatch_indirect,
-    sampler_registrations, push_constants, draw_mesh_tasks, draw_mesh_tasks_indirect,
+    sampler_registrations, push_constants, draw_mesh_tasks, draw_mesh_tasks_indirect, bind_texture_prefix,
+    geometry_processing_mode,
     count
 };
 
@@ -134,6 +135,8 @@ struct PushConstants {
 // the indirect arguments in GPU memory.
 struct DrawMeshTasks {
     std::int32_t first, count;
+    // API 231 entry return address; zero for internal recordings without it.
+    std::uint64_t api_return;
 };
 struct DrawMeshTasksIndirect {
     std::uint64_t address;
@@ -144,6 +147,12 @@ struct BindHandles {
     // deferred binding, whose draw carries them).
     std::uint64_t sampler_registrations;
     std::uint64_t handles[32];
+};
+struct BindTexturePrefix {
+    std::int32_t stage;
+    std::uint32_t bytes;
+    std::uint64_t handle;
+    std::uint64_t sampler_registrations;
 };
 // which: 0 value mask, 1 write mask, 2 reference value.
 struct Stencil {
@@ -415,6 +424,7 @@ struct CommandSubmission;
 [[nodiscard]] CommandWalkStatus walk_commands(
     const CommandSubmission& submission, CommandVisitor visitor, void* context) noexcept;
 void fence_commands(const CommandSubmission& submission, std::uint64_t fence) noexcept;
+[[nodiscard]] std::uint64_t submission_sampler_registrations(const CommandSubmission& submission) noexcept;
 // Whether a list of the submission records an event wait.
 [[nodiscard]] bool submission_has_event_waits(const CommandSubmission& submission) noexcept;
 
@@ -424,7 +434,11 @@ void register_command_entries() noexcept;
 
 // Reports `detail` for `operation` and fails the recording.
 void command_refuse(NVNcommandBuffer* command_buffer, const char* operation, const char* detail) noexcept;
+inline constexpr std::size_t logical_binding_stage_count = static_cast<std::size_t>(api::NVN_SHADER_STAGE_MESH) + 1;
+void command_geometry_processing_mode(NVNcommandBuffer* command_buffer, int mode) noexcept;
 void command_draw_mesh_tasks(NVNcommandBuffer* command_buffer, int first, int count) noexcept;
+void command_draw_mesh_tasks_at(NVNcommandBuffer* command_buffer, int first, int count,
+                                std::uint64_t api_return) noexcept;
 void command_draw_mesh_tasks_indirect(NVNcommandBuffer* command_buffer, NVNbufferAddress address) noexcept;
 
 // Records `size` bytes of push constants for a graphics stage (vertex through

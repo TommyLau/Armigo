@@ -13,6 +13,8 @@
 #include "armigo/compat/title_settings.h"
 #include "player_settings.h"
 #include "player_frame_rate_menu.h"
+#include "player_language_menu.h"
+#include "player_overlay_setting.h"
 #include "report_json.h"
 #include "runner_shell.h"
 #include <armigo/services/settings.h>
@@ -30,17 +32,21 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 extern char** environ;
 
 // The Settings window (the app menu's Settings..., Command-,). A packed app
-// keeps its choices under the same keys as iOS, with declared 120 fps modes
-// admitted on capable Mac displays; they take effect on the next launch. A
-// run started from the command line offers the title's frame rate alone. A
-// new frame rate goes through the Frame Rate menu, which offers to restart.
+// keeps its display choices under the same keys as iOS and its game language
+// separately; declared 120 fps modes require capable Mac displays. Choices take
+// effect on the next launch. A command-line run offers the title's frame rate
+// alone. New frame-rate, language and overlay choices offer a cooperative restart.
 @interface ArmigoSettingsWindow : NSObject <NSWindowDelegate>
-- (instancetype)initWithFrameRates:(ArmigoFrameRateMenu*)frameRates frameRateOnly:(BOOL)frameRateOnly;
+- (instancetype)initWithFrameRates:(ArmigoFrameRateMenu*)frameRates
+                         languages:(ArmigoLanguageMenu*)languages
+                           overlay:(ArmigoOverlaySetting*)overlay
+                     frameRateOnly:(BOOL)frameRateOnly;
 - (void)install;
 - (void)show:(id)sender;
 - (BOOL)writeSnapshot:(NSString*)path;
@@ -49,18 +55,31 @@ extern char** environ;
 @implementation ArmigoSettingsWindow {
     NSWindow* _window;
     ArmigoFrameRateMenu* _frameRates;
+    ArmigoLanguageMenu* _languages;
+    ArmigoOverlaySetting* _overlay;
+    NSPopUpButton* _overlayChoice;
+    NSTextField* _overlayStatus;
     BOOL _frameRateOnly;
     NSPopUpButton* _rate;
     NSTextField* _rateStatus;
+    NSPopUpButton* _language;
+    NSTextField* _languageStatus;
 }
 
-- (instancetype)initWithFrameRates:(ArmigoFrameRateMenu*)frameRates frameRateOnly:(BOOL)frameRateOnly {
+- (instancetype)initWithFrameRates:(ArmigoFrameRateMenu*)frameRates
+                         languages:(ArmigoLanguageMenu*)languages
+                           overlay:(ArmigoOverlaySetting*)overlay
+                     frameRateOnly:(BOOL)frameRateOnly {
     self = [super init];
     if (!self) return nil;
     _frameRates = frameRates;
+    _languages = languages;
+    _overlay = overlay;
     _frameRateOnly = frameRateOnly;
     __weak ArmigoSettingsWindow* weak = self;
     frameRates.changed = ^{ [weak refreshFrameRate]; };
+    languages.changed = ^{ [weak refreshLanguage]; };
+    overlay.changed = ^{ [weak refreshOverlay]; };
     return self;
 }
 
@@ -105,6 +124,18 @@ extern char** environ;
     _rateStatus.stringValue = _frameRates.status;
 }
 
+- (void)refreshLanguage {
+    if (!_language) return;
+    [_languages populate:_language];
+    _languageStatus.stringValue = _languages.status;
+}
+
+- (void)refreshOverlay {
+    if (!_overlayChoice) return;
+    [_overlay populate:_overlayChoice];
+    _overlayStatus.stringValue = _overlay.status;
+}
+
 - (void)build {
     _rate = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
     _rate.target = self;
@@ -114,6 +145,16 @@ extern char** environ;
     _rateStatus.textColor = NSColor.secondaryLabelColor;
     _rateStatus.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
     [self refreshFrameRate];
+    if (_languages) {
+        _language = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+        _language.target = self;
+        _language.action = @selector(chooseLanguage:);
+        [_language.widthAnchor constraintEqualToConstant:240].active = YES;
+        _languageStatus = [NSTextField labelWithString:@""];
+        _languageStatus.textColor = NSColor.secondaryLabelColor;
+        _languageStatus.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+        [self refreshLanguage];
+    }
     NSArray<NSArray<NSView*>*>* rows;
     NSString* note;
     if (_frameRateOnly) {
@@ -131,9 +172,17 @@ extern char** environ;
             titles:@[@"Auto (Native)", @"720p", @"900p", @"1080p", @"1440p", @"4K", @"Native"]
             values:@[@"auto", @"720p", @"900p", @"1080p", @"1440p", @"2160p", @"native"]];
         NSPopUpButton* vsync = [self popUpForKey:@"vsync" titles:@[@"On", @"Off"] values:@[@YES, @NO]];
-        NSPopUpButton* overlay = [self popUpForKey:@"performance_overlay" titles:@[@"Off", @"On"]
-                                            values:@[@NO, @YES]];
+        _overlayChoice = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+        [_overlayChoice.widthAnchor constraintEqualToConstant:240].active = YES;
+        _overlayStatus = [NSTextField wrappingLabelWithString:@""];
+        [_overlayStatus.widthAnchor constraintEqualToConstant:240].active = YES;
+        _overlayStatus.textColor = NSColor.secondaryLabelColor;
+        _overlayStatus.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+        [self refreshOverlay];
         rows = @[
+            @[[self heading:@"Game"], NSGridCell.emptyContentView],
+            @[[NSTextField labelWithString:@"Language:"], _language],
+            @[NSGridCell.emptyContentView, _languageStatus],
             @[[self heading:@"Display"], NSGridCell.emptyContentView],
             @[[NSTextField labelWithString:@"Console Mode:"], mode],
             @[[NSTextField labelWithString:@"Resolution:"], resolution],
@@ -141,10 +190,11 @@ extern char** environ;
             @[NSGridCell.emptyContentView, _rateStatus],
             @[[NSTextField labelWithString:@"V-Sync:"], vsync],
             @[[self heading:@"Overlay"], NSGridCell.emptyContentView],
-            @[[NSTextField labelWithString:@"Performance Overlay:"], overlay],
+            @[[NSTextField labelWithString:@"Performance Overlay:"], _overlayChoice],
+            @[NSGridCell.emptyContentView, _overlayStatus],
         ];
-        note = @"Game language follows this app's language in system Settings.\n"
-               @"A new frame rate restarts the game; other changes take effect the next time the game starts.";
+        note = @"Auto follows this app's language, then the system's preferred languages.\n"
+               @"A new language, frame rate or performance overlay offers to restart; other changes take effect next launch.";
     }
     NSGridView* grid = [NSGridView gridViewWithViews:rows];
     [grid columnAtIndex:0].xPlacement = NSGridCellPlacementTrailing;
@@ -164,7 +214,7 @@ extern char** environ;
     stack.spacing = 16;
     stack.edgeInsets = NSEdgeInsetsMake(20, 20, 20, 20);
     [label.widthAnchor constraintEqualToConstant:380].active = YES;
-    _window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 420, _frameRateOnly ? 180 : 360)
+    _window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 420, _frameRateOnly ? 180 : 480)
                                           styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
                                             backing:NSBackingStoreBuffered
                                               defer:NO];
@@ -181,6 +231,8 @@ extern char** environ;
     (void)sender;
     if (!_window) [self build];
     [self refreshFrameRate];
+    [self refreshLanguage];
+    [self refreshOverlay];
     [_window makeKeyAndOrderFront:nil];
 }
 
@@ -203,12 +255,16 @@ extern char** environ;
     NSArray* choice = sender.selectedItem.representedObject;
     [_frameRates chooseRate:[choice[1] intValue]];
 }
+
+- (void)chooseLanguage:(NSPopUpButton*)sender {
+    [_languages chooseLanguage:((NSString*)sender.selectedItem.representedObject).UTF8String];
+}
 @end
 
 namespace {
 
 // The command line and environment the game started with, kept for a restart
-// from the Frame Rate menu, and whether one was asked for.
+// from the settings menus, and whether one was asked for.
 struct Restart {
     std::vector<std::string> arguments;
     std::vector<std::string> environment;
@@ -235,22 +291,36 @@ bool press_button(NSView* view, NSString* title) {
     return false;
 }
 
-// Installs the Frame Rate menu and the Settings window for the running game.
-// Restarting closes the game the way Quit does and starts it again once the
-// runtime has shut down.
-void install_frame_rate_controls(const armigo::tools::MacFrameRateSelection& selection,
-                                 const std::string& key, bool frame_rate_only) {
+// Installs the settings menus and window for the running game. Restarting
+// closes the game the way Quit does and starts it again once the runtime has
+// shut down.
+void install_player_controls(const armigo::tools::MacFrameRateSelection& selection,
+                             const std::string& key, bool frame_rate_only,
+                             const armigo::tools::LanguageManifest* language_manifest = nullptr,
+                             const std::string& language_key = {}, const std::string& running_language = {},
+                             bool running_overlay = false, bool overlay_override = false) {
     static ArmigoFrameRateMenu* frame_rates;
+    static ArmigoLanguageMenu* languages;
     static ArmigoSettingsWindow* settings;
+    static ArmigoOverlaySetting* overlay;
     frame_rates = [[ArmigoFrameRateMenu alloc] initWithSelection:selection key:key];
     frame_rates.restart = ^{
         NSWindow* window = game_window();
         restart.fullscreen = window && (window.styleMask & NSWindowStyleMaskFullScreen);
         restart.requested = true;
-        armigo::diag::write(armigo::diag::Level::info, "Armigo: restarting the game for its new frame rate.\n");
+        armigo::diag::write(armigo::diag::Level::info, "Armigo: restarting the game for its new settings.\n");
         [NSApp terminate:nil];
     };
-    settings = [[ArmigoSettingsWindow alloc] initWithFrameRates:frame_rates frameRateOnly:frame_rate_only];
+    languages = language_manifest
+        ? [[ArmigoLanguageMenu alloc] initWithManifest:*language_manifest key:language_key runningLanguage:running_language]
+        : nil;
+    languages.restart = frame_rates.restart;
+    overlay = frame_rate_only ? nil : [[ArmigoOverlaySetting alloc]
+        initWithDefaults:NSUserDefaults.standardUserDefaults key:@"performance_overlay"
+        runningEnabled:running_overlay environmentOverride:overlay_override];
+    overlay.restart = frame_rates.restart;
+    settings = [[ArmigoSettingsWindow alloc] initWithFrameRates:frame_rates languages:languages overlay:overlay
+                                                 frameRateOnly:frame_rate_only];
     if (const char* snapshot = std::getenv("ARMIGO_SETTINGS_SNAPSHOT"); snapshot && *snapshot) {
         // Verification aid: write the Settings window's contents as a PNG.
         if (![settings writeSnapshot:@(snapshot)])
@@ -290,6 +360,7 @@ void install_frame_rate_controls(const armigo::tools::MacFrameRateSelection& sel
     }
     dispatch_async(dispatch_get_main_queue(), ^{
         [frame_rates install];
+        [languages install];
         [settings install];
     });
 }
@@ -352,6 +423,7 @@ int main(int argc, char* argv[]) {
     // A packed app opened from the Finder gets no arguments and runs the game
     // it carries in its own bundle.
     const bool packed_launch = argc == 1 && !armigo::compat::packed_resources().empty();
+    armigo::diag::use_player_defaults(!packed_launch);
     if (!packed_launch && (argc < 2 || std::string_view(argv[1]) != "run")) {
         armigo::diag::error("%s", "Expected --help, run, or pso-archive.\n");
         return 2;
@@ -375,16 +447,26 @@ int main(int argc, char* argv[]) {
                 armigo::diag::write(armigo::diag::Level::error,  "%s\n", error->c_str());
                 return 1;
             }
+            const auto language_manifest = std::get<armigo::tools::LanguageManifest>(std::move(manifest));
+            const auto language_key = armigo::tools::language_preference_key(std::nullopt);
+            const auto language_choice = armigo::tools::game_language_choice(language_manifest,
+                armigo::tools::read_language_preference(language_key));
+            if (language_choice.fell_back) {
+                armigo::diag::write(armigo::diag::Level::warning,
+                    "Armigo settings: the stored game language is not supported by this title; using Auto.\n");
+                armigo::tools::write_language_preference(language_key, "auto");
+            }
             const auto locales = armigo::tools::preferred_host_locales();
             std::vector<std::string_view> preferred(locales.begin(), locales.end());
             const std::string language = armigo::tools::apply_language_manifest(
-                std::get<armigo::tools::LanguageManifest>(manifest), preferred);
+                language_manifest, preferred, language_choice.preference);
             if (language.empty()) {
                 armigo::diag::error("%s", "This game supports none of your preferred languages.\n");
                 return 1;
             }
             const auto choices = armigo::tools::read_player_choices();
             // Before anything here creates a Metal device.
+            const bool overlay_override = std::getenv("MTL_HUD_ENABLED") != nullptr;
             armigo::tools::apply_performance_overlay(choices);
             // Native is the main display's pixels; flags given on the command
             // line keep their own operation mode and window.
@@ -406,9 +488,10 @@ int main(int argc, char* argv[]) {
                 parsed.arguments.operation_mode = choices.handheld ? armigo::services::OperationMode::Handheld
                                                                   : armigo::services::OperationMode::Console;
             configure_launch = armigo::tools::mac_player_launch_configuration(choices, width,
-                [language, width](const armigo::tools::PlayerChoices& effective,
+                [language_manifest, language_key, language, width, overlay_override](const armigo::tools::PlayerChoices& effective,
                                   const armigo::tools::MacFrameRateSelection& selection) {
-                install_frame_rate_controls(selection, armigo::tools::frame_rate_preference_key(std::nullopt), false);
+                install_player_controls(selection, armigo::tools::frame_rate_preference_key(std::nullopt), false,
+                    &language_manifest, language_key, language, effective.performance_overlay, overlay_override);
                 armigo::diag::write(armigo::diag::Level::info,
                     "Armigo settings: language=%s region=%u mode=%s resolution=%s/%u frame_rate=%s "
                     "vsync=%s overlay=%s\n", language.c_str(), armigo::services::set::console_region_code(),
@@ -425,7 +508,7 @@ int main(int argc, char* argv[]) {
                     armigo::tools::title_frame_rate_choices(*policy, armigo::tools::read_frame_rate_preference(key)),
                     [key](const armigo::tools::PlayerChoices& effective,
                           const armigo::tools::MacFrameRateSelection& selection) {
-                    install_frame_rate_controls(selection, key, true);
+                    install_player_controls(selection, key, true);
                     armigo::diag::write(armigo::diag::Level::info, "Armigo settings: frame_rate=%s\n",
                         effective.frame_rate ? std::to_string(effective.frame_rate).c_str() : "auto");
                 });
@@ -441,19 +524,33 @@ int main(int argc, char* argv[]) {
             armigo::diag::write(armigo::diag::Level::error,  "armigo run: %s\n", parsed.error.c_str());
             return 2;
         }
+        const auto configured = armigo::tools::apply_development_run_options(parsed.arguments,
+            [NSBundle.mainBundle.infoDictionary[@"ArmigoDevelopmentPack"] boolValue]);
+        if (const auto* error = std::get_if<armigo::runtime::LaunchFailure>(&configured)) {
+            armigo::diag::error("Armigo development run: %s\n", error->detail.c_str());
+            return 2;
+        }
         const auto environment = armigo::tools::default_shell_environment();
         const auto report = armigo::tools::run_windowed_shell(
             parsed.arguments, environment, armigo::tools::create_application_host, configure_launch);
         const auto fields = armigo::tools::report_fields(report);
-        const bool reported = armigo::tools::emit_shell_report(@"run-windowed", fields,
+        const bool reported = packed_launch ? true : armigo::tools::emit_shell_report(@"run-windowed", fields,
                                                                parsed.arguments.report_file);
+        if (packed_launch) {
+            if (const auto* error = std::get_if<armigo::runtime::LaunchFailure>(&report.result.outcome)) {
+                NSAlert* alert = [NSAlert new];
+                alert.messageText = @"The game could not continue";
+                alert.informativeText = [NSString stringWithUTF8String:error->detail.c_str()];
+                [alert runModal];
+            }
+        }
         // A runtime that did not stop within its bound still has live threads
         // (possibly writing saves); it ends with the process, never restarts.
         if (restart.requested && !report.runtime_retained && report.result.quiescent)
             restart_game();
         else if (restart.requested)
             armigo::diag::error("%s", "Armigo: the game did not shut down cleanly, so it was not restarted; "
-                                      "start it again to use the new frame rate.\n");
+                                      "start it again to use the new settings.\n");
         if (!reported) {
             armigo::tools::exit_process_if_runtime_retained(1);
             return 1;

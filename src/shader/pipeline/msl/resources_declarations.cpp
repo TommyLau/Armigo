@@ -66,7 +66,11 @@ std::string interpolation(Interpolation i, ScalarType scalar_type) {
 }
 void validate_plan(const StructuredProgram& p, const ResourcePlan& plan, const EmitOptions& options) {
     require(p.ir.stage <= Stage::compute, "Unsupported shader stage", DiagnosticCode::unsupported_capability);
-    if (p.ir.stage == Stage::compute)
+    const bool proven_windows = std::any_of(p.requirements.uses.begin(), p.requirements.uses.end(), [](const auto& use) {
+        const auto* buffer = std::get_if<BufferUse>(&use);
+        return buffer && buffer->size.constant_buffer_policy == ConstantBufferPolicy::proven_zero_words_v2;
+    });
+    if (p.ir.stage == Stage::compute || proven_windows)
         take(resources::check_requirements(p.ir, p.requirements, p.profile, Phase::emit_msl));
     require(plan.compute == p.requirements.compute, "Binding plan compute launch differs from requirements");
     require(plan.stage == p.ir.stage && plan.profile == p.profile, "Binding plan stage/profile disagrees with structured program");
@@ -144,7 +148,8 @@ void validate_plan(const StructuredProgram& p, const ResourcePlan& plan, const E
                 ++constant_buffers;
                 require(cb->slot < constant_buffer_slot_count && constant_slots.insert(cb->slot).second &&
                         buffer.access == Access::read && buffer.size.kind == SizeKind::constant_buffer_window &&
-                        buffer.size.constant_buffer_policy == ConstantBufferPolicy::runtime_zero_words_v1 &&
+                        (buffer.size.constant_buffer_policy == ConstantBufferPolicy::padded_zero_words_v2 ||
+                         buffer.size.constant_buffer_policy == ConstantBufferPolicy::proven_zero_words_v2) &&
                         buffer.size.bytes >= 4 && buffer.size.bytes <= constant_buffer_window_bytes &&
                         buffer.size.bytes % 4 == 0 && buffer.size.alignment == 4,
                         "Invalid runtime constant-buffer read window");
@@ -320,15 +325,15 @@ std::string pool_declarations(const ResourcePlan& plan) {
             (t ? texture_type(*t) : std::string("sampler")) + ", 1> e;\n};\n";
     }
     // Marks texture ID id read in the bitmap at seen, when there is one and
-    // the ID is inside the table. The word is loaded first: a bit is set
-    // once, so nearly every read costs a load rather than an atomic.
+    // the ID is inside the table. A published bitmap only gains set bits;
+    // epoch changes allocate a new buffer. A stale zero only repeats an OR.
     if (marks) text +=
         "static inline __attribute__((always_inline)) uint armigo_pool_read(ulong seen, uint id, uint n) {\n"
         "    if (seen != 0 && id < n) {\n"
-        "        device atomic_uint* word = reinterpret_cast<device atomic_uint*>(seen) + (id >> 5);\n"
+        "        device uint* word = reinterpret_cast<device uint*>(seen) + (id >> 5);\n"
         "        const uint bit = 1u << (id & 31u);\n"
-        "        if ((atomic_load_explicit(word, memory_order_relaxed) & bit) == 0u)\n"
-        "            atomic_fetch_or_explicit(word, bit, memory_order_relaxed);\n"
+        "        if ((*word & bit) == 0u)\n"
+        "            atomic_fetch_or_explicit(reinterpret_cast<device atomic_uint*>(word), bit, memory_order_relaxed);\n"
         "    }\n"
         "    return min(id, n);\n"
         "}\n";

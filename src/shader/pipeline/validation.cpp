@@ -162,6 +162,31 @@ bool Validator::metadata(const Operation& op) {
         for (const auto& target : m->storage_alternatives)
             if (!index(target.address.base_low) || !index(target.address.base_high) ||
                 !index(target.address.byte_size)) return false;
+        if (m->native_load_policy && (*m->native_load_policy != NativeLoadPolicy::aligned_v1 ||
+            (m->space != AddressSpace::guest && m->space != AddressSpace::storage) ||
+            op.opcode != Opcode::load || m->access != Access::read || m->atomic || m->is_volatile ||
+            m->order != MemoryOrder::relaxed || (m->scope != MemoryScope::workgroup && m->scope != MemoryScope::device) ||
+            (m->element_bytes != 1 && m->element_bytes != 2 && m->element_bytes != 4) ||
+            !std::has_single_bit(unsigned(m->elements)) || m->elements > 4 ||
+            (m->element_bytes < 4 && m->elements != 1) || m->alignment != m->element_bytes * m->elements || m->array_index))
+            return fail("Native LDG policy requires an aligned non-RMW global load", op.source);
+        if (m->native_shared_atomic_policy && !valid_native_shared_atomic(op, *m, p.stage))
+            return fail("Native shared atomic policy requires a relaxed workgroup U32 addition", op.source);
+        if (m->stage_buffer && (m->space != AddressSpace::shared ||
+            !m->stage_buffer->valid_for(m->stage_buffer->allocation_bytes) ||
+            (op.opcode != Opcode::load && op.opcode != Opcode::store) ||
+            (m->element_bytes != 1 && m->element_bytes != 4) || m->elements != 1 ||
+            m->byte_offset || !m->dynamic_byte_offset || m->atomic || m->is_volatile ||
+            m->resource || m->constant_buffer_slot || m->array_index || m->global_address_high ||
+            m->storage_address || !m->storage_alternatives.empty()))
+            return fail("Stage-buffer policy requires a header-sized shared load or store", op.source);
+        if (m->direct_storage && (m->space != AddressSpace::storage ||
+            op.opcode != Opcode::load || m->atomic || m->is_volatile || m->element_bytes != 4 ||
+            !std::has_single_bit(unsigned(m->elements)) || !m->dynamic_byte_offset ||
+            m->global_address_high || m->storage_address || !m->storage_alternatives.empty() || m->array_index ||
+            !valid_fact_key(FactQuery<FactKind::bound_storage_descriptor>{m->direct_storage->cbuf_slot,
+                m->direct_storage->handle_byte_offset}.key())))
+            return fail("Direct storage requires an ordinary descriptor-relative word load", op.source);
         if (!m->storage_alternatives.empty() && !m->storage_address)
             return fail("Storage alternatives require a primary storage address", op.source);
         if ((m->storage_address && m->space != AddressSpace::storage) ||
@@ -499,6 +524,8 @@ bool Validator::dominance(const Function& function) {
 }
 
 Status Validator::run() {
+    if (p.api_mandated_early_fragment_tests && p.stage != Stage::fragment)
+        return diagnose(phase, DiagnosticCode::invalid_ir, {}, "API early fragment tests require a fragment stage");
     if (p.functions.empty() || p.entry.value >= p.functions.size()) return diagnose(phase, DiagnosticCode::invalid_ir, {}, "Program entry function is invalid");
     for (const auto& value : p.values) {
         if (value.type > ValueType::predicate || (form != IrForm::registers && value.kind != ValueKind::temporary))

@@ -33,20 +33,24 @@ namespace armigo::services::fs {
 // store is read on demand; the service never holds the image's data region.
 using RomFsStorage = std::shared_ptr<romfs::Storage>;
 
-// One save-data file. The store keeps whole file contents because save files
-// are small; the limit bounds an accidental huge allocation.
+// Host-backed file contents are loaded only when the guest opens the file.
+// Directory enumeration and mounting retain metadata without reading payloads.
 struct SaveNode {
     bool directory = false;
     std::vector<std::byte> bytes;
+    std::filesystem::path backing_file;
+    std::uint64_t backing_size = 0;
+    std::uint64_t size() const noexcept { return backing_file.empty() ? bytes.size() : backing_size; }
 };
 
 // The save-data tree mounted by fsp-srv command 51. A session clone and the
 // file objects opened from it share one store, so the game's final commit sees
 // every write. With a host save directory the tree is read from it at the
-// first mount and each commit replaces it whole.
+// first mount as metadata and each commit replaces it whole. Open files keep
+// their node alive across rename, deletion and committed tree replacement.
 struct SaveStore {
     std::mutex mutex;
-    std::map<std::string, SaveNode> entries;
+    std::map<std::string, std::shared_ptr<SaveNode>> entries;
     bool loaded = false;
     std::map<std::uint32_t, std::string> files;
     std::map<std::uint32_t, std::string> directories;
@@ -100,7 +104,7 @@ private:
         // Opened data storages: the application's RomFS or an add-on's.
         std::map<std::uint32_t, RomFsStorage> stores;
         std::vector<std::uint32_t> save_objects;
-        std::map<std::uint32_t, std::string> file_objects;
+        std::map<std::uint32_t, std::shared_ptr<SaveNode>> file_objects;
         std::map<std::uint32_t, std::string> directory_objects;
         std::shared_ptr<SaveStore> save = std::make_shared<SaveStore>();
         std::uint64_t application_program_id = 0;

@@ -8,28 +8,19 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/ssl.h>
 
 namespace armigo::services::ssl {
 namespace {
 using namespace horizon;
 
-constexpr std::uint32_t sfci = 0x49434653;
-constexpr std::uint32_t sfco = 0x4f434653;
+using namespace horizon::cmif;
 // The pointer buffer size the service answers, the process default the
 // practical reference answers (as for hwopus and the sound mixer).
 constexpr std::uint16_t pointer_buffer_size = 0x8000;
 
-std::uint32_t read(const IpcMessage& message, std::size_t offset) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i < 4; ++i)
-        value |= std::uint32_t(std::to_integer<unsigned char>(message[offset + i])) << (8 * i);
-    return value;
-}
 
-void write(IpcMessage& message, std::size_t offset, std::uint32_t value) {
-    for (unsigned i = 0; i < 4; ++i) message[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
-}
 
 // A reply whose CMIF header is at `out` (16, or 32 after a domain header)
 // with `data` bytes after it.

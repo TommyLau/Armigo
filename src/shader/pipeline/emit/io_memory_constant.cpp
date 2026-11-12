@@ -9,7 +9,7 @@
 // ============================================================================
 // LDC: constant buffer load with direct and slot-indexed addressing. Indexed
 // slots select among shader-addressable buffers independently of draw bindings.
-// Each candidate is guarded by the runtime constant-buffer read-window policy.
+// Each candidate reads the statically selected padded constant-buffer window.
 
 #include "io_memory_shared.h"
 
@@ -79,7 +79,7 @@ Status emit_constant_load(EmitterContext& context) {
             address_mode, ValueType::word32);
         if (const auto* error = std::get_if<Diagnostic>(&masked)) return *error;
 
-        // Every addressable candidate has a guarded load and valid backing,
+        // Every addressable candidate has a padded load and valid backing,
         // including unbound draw slots. The selected value is zero for a
         // selector outside the supported slot range.
         std::vector<Operand> selected(shape.elements, word_literal(0));

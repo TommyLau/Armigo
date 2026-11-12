@@ -1,0 +1,33 @@
+# Reviewed file pairs that may share a block of 10 or more normalized code lines
+# (tools/check_repository.py). One "left right  # reason" per line. An entry whose
+# pair no longer duplicates fails the check, so this list only shrinks.
+src/audio/renderer/command/data_source/adpcm.h src/audio/renderer/command/data_source/pcm_float.h  # audio renderer: per-format data sources and per-effect state mirror one another; audio lane to fold
+src/audio/renderer/command/data_source/adpcm.h src/audio/renderer/command/data_source/pcm_int16.h  # audio renderer: per-format data sources and per-effect state mirror one another; audio lane to fold
+src/audio/renderer/command/data_source/pcm_float.cpp src/audio/renderer/command/data_source/pcm_int16.cpp  # audio renderer: per-format data sources and per-effect state mirror one another; audio lane to fold
+src/audio/renderer/command/data_source/pcm_float.h src/audio/renderer/command/data_source/pcm_int16.h  # audio renderer: per-format data sources and per-effect state mirror one another; audio lane to fold
+src/audio/renderer/command/effect/i3dl2_reverb.cpp src/audio/renderer/command/effect/reverb.cpp  # audio renderer: per-format data sources and per-effect state mirror one another; audio lane to fold
+src/audio/renderer/effect/delay.cpp src/audio/renderer/effect/i3dl2.cpp  # audio renderer: per-format data sources and per-effect state mirror one another; audio lane to fold
+src/audio/renderer/effect/delay.cpp src/audio/renderer/effect/reverb.cpp  # audio renderer: per-format data sources and per-effect state mirror one another; audio lane to fold
+src/audio/renderer/effect/i3dl2.cpp src/audio/renderer/effect/reverb.cpp  # audio renderer: per-format data sources and per-effect state mirror one another; audio lane to fold
+src/audio/renderer/effect/i3dl2.h src/audio/renderer/effect/reverb.h  # audio renderer: per-format data sources and per-effect state mirror one another; audio lane to fold
+src/graphics/render_state.cpp src/graphics/render_target.cpp  # renderer: render-target, blit and state setup repeat format handling; renderer lane to fold
+src/graphics/render_target.cpp src/graphics/twod_blit.cpp  # renderer: render-target, blit and state setup repeat format handling; renderer lane to fold
+src/nvn/device.cpp src/nvn/null_device.cpp  # NVN: the null device mirrors the driver device and queues; NVN lane to fold
+src/nvn/null_device.cpp src/nvn/queues.cpp  # NVN: the null device mirrors the driver device and queues; NVN lane to fold
+src/pack/cli/native_shaders.cpp src/shader/package_ios.cpp  # compile cache and Apple tool helpers; the native identity hashes tool digests, so sharing changes its cache keys
+src/pack/cli/native_shaders.cpp src/shader/package.cpp  # compile cache and Apple tool helpers; the native identity hashes tool digests, so sharing changes its cache keys
+src/platform/metal/bindings.mm src/platform/metal/draw.mm  # Metal draw, binding and pipeline state setup repeat; renderer lane to fold
+src/platform/metal/draw.mm src/platform/metal/pipeline_state.mm  # Metal draw, binding and pipeline state setup repeat; renderer lane to fold
+src/platform/metal/nvn_native_stages.mm src/shader/tools/translate.cpp  # stage translation option setup per front end (runtime, tool, library); shader lane to fold
+src/platform/metal/nvn_native_stages.mm src/shader/translation/stage_translation.cpp  # stage translation option setup per front end (runtime, tool, library); shader lane to fold
+src/platform/video/videotoolbox_av1.mm src/platform/video/videotoolbox_vp9.mm  # AV1 and VP9 VideoToolbox sessions share setup; video lane to fold
+src/runtime/launch_plan.cpp src/runtime/native_launch.cpp  # both launchers call compat::plan_title_mode and reset an empty call set the same way; the planning is shared
+src/services/csrng.cpp src/services/mm.cpp  # the same CMIF control branch in two small services with different reply contents
+src/shader_native/local.cpp src/shader_native/shared.cpp  # shader lowering and emission helpers repeat per memory space or family; shader lane to fold
+src/shader/families/select_by_predicate_lower.cpp src/shader/families/word_logic_lower.cpp  # shader lowering and emission helpers repeat per memory space or family; shader lane to fold
+src/shader/forward_lower.cpp src/shader/forward_program.cpp  # shader lowering and emission helpers repeat per memory space or family; shader lane to fold
+src/shader/package.cpp src/shader/package_ios.cpp  # macOS and iOS package builders share manifest and Apple tool helpers; packaging lane to fold
+src/shader/pipeline/emit/io_memory_constant.cpp src/shader/pipeline/emit/io_memory_global.cpp  # shader lowering and emission helpers repeat per memory space or family; shader lane to fold
+src/shader/pipeline/emit/io_memory_constant.cpp src/shader/pipeline/emit/io_memory_local.cpp  # shader lowering and emission helpers repeat per memory space or family; shader lane to fold
+src/shader/pipeline/emit/io_memory_global.cpp src/shader/pipeline/emit/io_memory_local.cpp  # shader lowering and emission helpers repeat per memory space or family; shader lane to fold
+src/shader/tools/translate.cpp src/shader/translation/stage_translation.cpp  # stage translation option setup per front end (runtime, tool, library); shader lane to fold

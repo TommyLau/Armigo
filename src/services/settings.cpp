@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/settings.h>
 
 #include <algorithm>
@@ -23,16 +24,7 @@
 namespace armigo::services::set {
 namespace {
 using namespace horizon;
-std::uint32_t read(const IpcMessage& bytes, unsigned offset) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i != 4; ++i)
-        value |= std::uint32_t(std::to_integer<unsigned char>(bytes[offset + i])) << (8 * i);
-    return value;
-}
-void write(IpcMessage& bytes, unsigned offset, std::uint32_t value) {
-    for (unsigned i = 0; i != 4; ++i)
-        bytes[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
-}
+using namespace horizon::cmif;
 
 // A language code is its name in at most eight bytes, zero padded.
 constexpr std::uint64_t code(std::string_view name) {

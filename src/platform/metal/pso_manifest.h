@@ -12,7 +12,9 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -26,6 +28,11 @@ namespace armigo::platform::metal::nvn_driver {
 // driver created, in the order it was first used. Fields are tab separated:
 //   S <stage identity>                          a shader stage's Metal library
 //   R <vertex identity> <fragment identity|-> <v1:state hex>   a render pipeline
+//   M <task identity|-> <mesh identity> <fragment identity|-> <v1:state hex>
+//     a native mesh render pipeline, with the same attachment/raster state
+//     encoding as R and no vertex input layout
+//     Mesh stage references append @<source digest> and #<native input id>
+//     when known, identifying exact emitted and control/payload variants.
 //   C <stage identity>                          a compute pipeline.
 //     A packaged compute list is these rows, one per packaged compute stage.
 //   K <vertex> <fragment> <color> <mask> <depth> <stencil> <samples>   a clear
@@ -104,5 +111,21 @@ private:
     std::mutex mutex_;
     Sink record_, user_;
 };
+
+// Render pipelines ("<vertex identity> <fragment identity>") an archive build
+// compiled but could not archive, because Metal refused their open form. The
+// build keeps them in this file of its archive directory, so a later warm-up
+// that reads the archive can tell those misses from pipelines the archive
+// should have held.
+inline constexpr char unarchived_pipelines_file[] = "unarchived.tsv";
+// Writes the keys (sorted, once each) into `directory`; false when the file
+// cannot be written.
+[[nodiscard]] bool write_unarchived_pipelines(const std::filesystem::path& directory,
+                                              std::vector<std::string> keys);
+// The keys of every archive directory under `cache_root`.
+[[nodiscard]] std::unordered_set<std::string> read_unarchived_pipelines(const std::filesystem::path& cache_root);
+// How many of a warm-up's missed keys the archive build recorded as unarchived.
+[[nodiscard]] std::uint64_t explained_archive_misses(const std::vector<std::string>& missed,
+                                                     const std::unordered_set<std::string>& unarchived);
 
 } // namespace armigo::platform::metal::nvn_driver

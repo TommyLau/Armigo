@@ -90,7 +90,10 @@ enum class SizeKind : std::uint8_t {
     // with at least four bytes backing even when the runtime descriptor is empty.
     storage_descriptor = 3,
 };
-enum class ConstantBufferPolicy : std::uint8_t { none = 0, runtime_zero_words_v1 = 1 };
+enum class ConstantBufferPolicy : std::uint8_t {
+    none = 0, runtime_zero_words_v1 = 1, padded_zero_words_v2 = 2, proven_zero_words_v2 = 3
+};
+inline constexpr std::uint32_t constant_buffer_zero_padding_bytes = 16;
 struct SizeRequirement {
     SizeKind kind{SizeKind::accessed_extent};
     std::uint64_t bytes{}; // Proven extent, binding size, or explicit bounded CB window.
@@ -222,6 +225,9 @@ struct ResourcePlan {
     // Metal admits only with rasterization disabled, so draws must discard
     // primitives before rasterization.
     bool requires_rasterizer_discard{};
+    // Optional static void entry for the same guest body, selected only when
+    // draw state explicitly disables rasterization.
+    std::string discard_entry_point;
     // A fragment stage reading the guest point coordinate (attribute 0x2e0,
     // [[point_coord]]); function constant 11 selects a lower-left origin.
     bool reads_point_coord{};

@@ -840,6 +840,8 @@ NVNboolean texture_initialize(NVNtexture* texture, const NVNtextureBuilder* buil
     TextureState initialized{};
     initialized.tag = texture_tag;
     initialized.description = source->description;
+    if (source->device)
+        initialized.gob_order = state<DeviceState>(source->device)->gob_order;
     initialized.size = layout->total_size;
     initialized.layer_size = layout->layer_stride;
     initialized.pool = source->pool;
@@ -922,7 +924,15 @@ ptrdiff_t texture_get_stride(const NVNtexture* texture) {
     return state<TextureState>(texture)->description.stride;
 }
 NVNtextureAddress texture_get_texture_address(const NVNtexture* texture) {
-    return reinterpret_cast<NVNtextureAddress>(state<TextureState>(texture)->memory);
+    const auto* current = state<TextureState>(texture);
+    // The texture's own range, every call: a subrange must not count as the
+    // pool's last whole-pool mark.
+    if (current->memory && backends().resources) {
+        const auto address = reinterpret_cast<std::uint64_t>(current->memory);
+        const auto bytes = current->size ? current->size : 1;
+        on_host_stack([&] { backends().resources->note_addressed(address, bytes); });
+    }
+    return reinterpret_cast<NVNtextureAddress>(current->memory);
 }
 void texture_get_sparse_tile_layout(const NVNtexture*, NVNtextureSparseTileLayout* layout) {
     if (layout) std::memset(layout, 0, sizeof(*layout));
@@ -1349,6 +1359,12 @@ std::optional<graphics::TextureLayoutDescription> resource_layout(
     return std::nullopt;
 }
 
+std::optional<graphics::TextureLayoutDescription> resource_layout(const TextureState& texture) {
+    auto layout = resource_layout(texture.description);
+    if (layout) layout->gob_order = static_cast<graphics::BlockLinearGobOrder>(texture.gob_order);
+    return layout;
+}
+
 std::size_t resource_alignment(const TextureDescription& description) {
     const FormatGeometry format = format_geometry(description.format);
     if (format.bytes_per_block == 0) return 0;
@@ -1362,7 +1378,7 @@ std::size_t resource_alignment(const TextureDescription& description) {
 bool snapshot_texel_input(const TextureState& texture, const TexelTransfer& transfer,
                           const std::byte* input, std::vector<std::byte>& bytes,
                           TexelTransfer& packed) {
-    const auto layout = resource_layout(texture.description);
+    const auto layout = resource_layout(texture);
     TransferGeometry geometry;
     if (!input || !layout || !transfer_geometry(texture, *layout, transfer, geometry)) return false;
     packed = transfer;
@@ -1390,7 +1406,7 @@ bool snapshot_texel_input(const TextureState& texture, const TexelTransfer& tran
 bool transfer_pool_texels(const TextureState& texture, const TexelTransfer& transfer,
                           std::byte* bytes, bool write) {
     if (!bytes || !texture.memory || texture.size == 0) return false;
-    const auto layout = resource_layout(texture.description);
+    const auto layout = resource_layout(texture);
     if (!layout || texture.size < layout->total_size) return false;
     TransferGeometry geometry;
     if (!transfer_geometry(texture, *layout, transfer, geometry)) return false;
@@ -1452,7 +1468,7 @@ bool pool_texture_addressing(const TextureState& texture,
                              std::vector<graphics::BlockLinearLevelAddressing>& levels) {
     levels.clear();
     if (!texture.memory || texture.size == 0) return false;
-    const auto layout = resource_layout(texture.description);
+    const auto layout = resource_layout(texture);
     if (!layout || layout->storage != graphics::TextureStorageLayout::BlockLinear ||
         texture.size < layout->total_size) return false;
     const bool is_3d = texture.description.target == NVN_TEXTURE_TARGET_3D;

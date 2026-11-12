@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/parental_control.h>
 
 #include <limits>
@@ -17,16 +18,7 @@
 namespace armigo::services::pctl {
 namespace {
 using namespace horizon;
-std::uint32_t read(const IpcMessage& bytes, unsigned offset, unsigned width = 4) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i != width; ++i)
-        value |= std::uint32_t(std::to_integer<unsigned char>(bytes[offset + i])) << (8 * i);
-    return value;
-}
-void write(IpcMessage& bytes, unsigned offset, std::uint32_t value) {
-    for (unsigned i = 0; i != 4; ++i)
-        bytes[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
-}
+using namespace horizon::cmif;
 void response_header(IpcMessage& bytes, unsigned offset, std::uint32_t interface_id) {
     write(bytes, offset, 0x4f434653);
     write(bytes, offset + 12, interface_id);

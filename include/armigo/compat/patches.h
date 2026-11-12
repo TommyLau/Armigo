@@ -115,8 +115,11 @@ struct ResolutionSites {
 // keep the historical choice: BNSH containers and a minus-one-to-one vertex
 // depth. A gfd-cache description reads .gsc members of CPK archives plus the
 // packages embedded in the main module. A glslc description reads the GLSLC
-// compiler outputs compiled into the main module.
-enum class ShaderContainerSet { Bnsh, GfdCache, Glslc };
+// compiler outputs compiled into the main module. A native description is for
+// a .nup title: the packer reads the archive's native programs, and the
+// description may name the RomFS member holding the Zstandard dictionaries,
+// the members to read and the stage identities to admit.
+enum class ShaderContainerSet { Bnsh, GfdCache, Glslc, Native };
 enum class ShaderVertexDepth { NegativeOneToOne, ZeroToOne };
 struct ShaderCacheFallback {
     std::string cache;
@@ -128,6 +131,10 @@ struct ShaderInputSettings {
     std::vector<std::string> caches;
     std::vector<ShaderCacheFallback> fallbacks;
     std::vector<std::uint64_t> ignored_needle_offsets;
+    // Native only. Empty member lists select every member or identity.
+    std::string dictionary_member;
+    std::vector<std::string> members;
+    std::vector<std::string> identities;
 };
 struct PatchDescription {
     TitleIdentity identity;
@@ -151,6 +158,16 @@ struct PatchDescription {
         bool game_barriers = false;
         // "hoist_implicit_samples": a boolean, false by default.
         bool hoist_implicit_samples = false;
+        // "conditional_render": "exact" (default) or "replay".
+        bool replay_conditional_render = false;
+        // "handle_reads": "ordered" (default) or "current".
+        bool current_handle_reads = false;
+        // "guest_store_textures": "ordered" (default) or "retired".
+        bool retired_guest_store_textures = false;
+        // "replay": "standard" (default) or "core".
+        bool core_replay = false;
+        // "submission_slots": 1 to 16 submissions encoded and in flight at once; 0 = the replay's default.
+        std::uint32_t submission_slots = 0;
     } nvn_policy;
     // The title's pipeline list (the profile's "pipelines" file, resolved to
     // its path in the title folder); empty for none. Only the NVN driver
@@ -168,6 +185,9 @@ struct PatchDescription {
     // Optional plain English on the description itself, 1 to 200 characters
     // when the profile includes it.
     std::string note;
+    // The platforms a pack of this build may target ("macos", "ios"), from
+    // the profile's "platforms" list; macOS only when the profile has none.
+    std::vector<std::string> platforms{"macos"};
 };
 struct GpuBudgetContext;
 struct FrameRatioContext;

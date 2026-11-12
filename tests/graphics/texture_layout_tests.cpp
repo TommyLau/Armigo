@@ -996,7 +996,37 @@ void test_block_linear_level_addressing() {
     }
 }
 
+void test_ampere_gob_addresses() {
+    auto description = block_linear(64, 8, 1, 1, 1, 1, 1, 1, 0);
+    description.gob_order = BlockLinearGobOrder::Ampere;
+    auto sized = calculate_texture_size(description);
+    CHECK(is_data(sized));
+    if (!is_data(sized)) return;
+    const auto& layout = std::get<TextureLayoutDescription>(sized);
+    std::vector<std::byte> guest(layout.total_size), expected(512);
+    // Independent byte-address contract for all 32 pieces of one GOB.
+    const std::array<std::size_t, 8> rows{0, 16, 32, 48, 128, 144, 160, 176};
+    const std::array<std::size_t, 4> columns{0, 64, 256, 320};
+    for (std::size_t y = 0; y < 8; ++y)
+        for (std::size_t x = 0; x < 64; ++x) {
+            const auto value = std::byte((x * 17 + y * 31) & 255);
+            expected[y * 64 + x] = value;
+            guest[rows[y] + columns[x / 16] + x % 16] = value;
+        }
+    auto decoded = convert_texture_to_linear(layout, guest);
+    CHECK(is_data(decoded));
+    if (is_data(decoded)) CHECK(std::get<std::vector<std::byte>>(decoded) == expected);
+    auto encoded = convert_texture_to_block_linear(layout, expected);
+    CHECK(is_data(encoded));
+    if (is_data(encoded)) CHECK(std::get<std::vector<std::byte>>(encoded) == guest);
+    auto addressing = block_linear_level_addressing(layout, 0, 0);
+    CHECK(is_data(addressing));
+    if (is_data(addressing))
+        CHECK(std::get<BlockLinearLevelAddressing>(addressing).gob_order == BlockLinearGobOrder::Ampere);
+}
+
 int main() {
+    test_ampere_gob_addresses();
     test_hand_computed_mip_sizes();
     test_array_layer_alignment();
     test_bcn_block_sizes();

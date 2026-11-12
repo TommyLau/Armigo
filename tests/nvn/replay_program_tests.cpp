@@ -116,6 +116,44 @@ int main() {
         CHECK(empty && empty->constants[1].size == 0);
         finalize(&program);
     }
+    // Native task/mesh selectors retain their logical identity while their
+    // constants occupy the six-slot compiled artifact layout.
+    {
+        select_api_version({231, 40});
+        for (const unsigned logical : {6u, 7u}) {
+            alignas(16) std::array<std::byte, 0xe0> control{};
+            const std::uint32_t size = 0x20, offset = 0x180;
+            std::memcpy(control.data() + 0x3c, &size, 4);
+            std::memcpy(control.data() + 0x40, &offset, 4);
+            control[0x56] = std::byte(logical);
+            control[0x5e] = std::byte{1};
+            control[0x69] = std::byte{1};
+            NVNshaderData descriptor{0x20000, control.data()};
+            struct Failed final : PendingStage {
+                std::shared_ptr<const armigo::platform::CompiledGraphicsStage> wait() override { return {}; }
+            };
+            set_deferred_program_resolver([](void*, const DeviceState*, std::span<const NVNshaderData> input,
+                std::array<std::shared_ptr<const armigo::platform::CompiledGraphicsStage>, 6>&,
+                std::array<std::shared_ptr<PendingStage>, 6>& pending, std::string&) {
+                const auto* control = static_cast<const std::byte*>(input[0].control);
+                pending[std::to_integer<unsigned>(control[0x56]) - 3] = std::make_shared<Failed>();
+                return true;
+            }, nullptr);
+            CHECK(initialize(&program, nullptr));
+            CHECK(set(&program, 1, &descriptor));
+            const auto snapshot = retain_program_snapshot(live);
+            CHECK(snapshot && snapshot->logical_stages == (1u << logical));
+            CHECK(snapshot && snapshot->constants[logical - 3].address == 0x20180 &&
+                snapshot->constants[logical - 3].size == size);
+            const auto failed = retain_program(live);
+            CHECK(failed == snapshot && failed->logical_stages == (1u << logical));
+            CHECK(failed && failed->failed_stages == (1u << (logical - 3)));
+            if (logical == 7) CHECK(failed && failed->mesh_uses_task && failed->mesh_primitive_header);
+            finalize(&program);
+        }
+        select_api_version({55, 15});
+        set_program_resolver(resolve, &resolver_state);
+    }
     // Resolution runs outside the program lock: while one thread's resolver
     // is still loading a program, another thread retains an existing program
     // and sets shaders on a second one without waiting for it.

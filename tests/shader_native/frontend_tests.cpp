@@ -297,6 +297,21 @@ void global_memory_tests(const std::filesystem::path& directory) {
         return op;
     };
     auto program = [](sn::Instruction op) { return Fixture({move(2, 0x1000), move(3, 0x7d), op, exit_instruction()}); };
+    for (const unsigned order : {0u, 4u, 5u, 7u}) {
+        const auto p = lowered(program(ldg({{77, 4, order}}))).ir;
+        bool found = false;
+        for (const auto& operation : p.operations) {
+            const auto* memory = std::get_if<ir::MemoryInfo>(&operation.info);
+            if (!memory || memory->space != ir::AddressSpace::guest || operation.opcode != ir::Opcode::load) continue;
+            found = true;
+            const auto scope = order == 5 ? ir::MemoryScope::workgroup : order == 7 ? ir::MemoryScope::device : ir::MemoryScope::invocation;
+            check(memory->scope == scope, "native LDG retains its decoded scope metadata");
+            check(memory->native_load_policy == ((order == 5 || order == 7)
+                ? std::optional{ir::NativeLoadPolicy::aligned_v1} : std::nullopt),
+                "only native LDG orders 5/7 select the versioned aligned-load policy");
+        }
+        check(found, "native LDG policy fixture has a global load");
+    }
     // The address adds a uniform when a mutable local (a uniform register)
     // reaches either address word. A descriptor's uniform is not an address term.
     auto adds_uniform = [](const Fixture& fixture) {
@@ -578,6 +593,17 @@ void arithmetic_tests(const std::filesystem::path& directory) {
     Fixture denormal({move(1, 1), move(2, 0x40000000), mul, exit_instruction()}); refused(denormal);
     field(mul, 80, 1, 1); Fixture flushed({move(1, 1), move(2, 0x40000000), mul, exit_instruction()}); check(result_bits(flushed) == 0, "native FTZ mapping");
     compile_fixture(flushed, directory, "ftz_multiply");
+    // Scales apply to the rounded, flushed product, before saturation.
+    // These exact boundary words separate that order from scaling source A.
+    for (auto [a, b, selector, expected] : {
+             std::tuple{0x7e800000u, 0x3e000000u, 7u, 0x7e800000u},
+             std::tuple{0x01000000u, 0x41000000u, 1u, 0x01000000u},
+             std::tuple{0x7e800000u, 0x41000000u, 1u, 0x7f800000u},
+             std::tuple{0x01000000u, 0x3e000000u, 7u, 0u}}) {
+        auto scaled = mul; field(scaled, 84, 3, selector);
+        Fixture boundary({move(1, a), move(2, b), scaled, exit_instruction()});
+        check(result_bits(boundary) == expected, "native multiply product precedes scale");
+    }
     auto add = raw(0x221); field(add, 24, 8, 1); field(add, 32, 8, 2); field(add, 77, 1, 1);
     field(add, 80, 1, 1);
     Fixture saturated({move(1, 0x3fc00000), move(2, 0x40000000), add, exit_instruction()}); check(result_bits(saturated) == 0x3f800000, "native saturation mapping");
@@ -656,6 +682,9 @@ std::vector<std::pair<std::uint32_t, unsigned>> shared_accesses(const ir::Progra
         if (op.opcode != ir::Opcode::load && op.opcode != ir::Opcode::store) continue;
         const auto& m = std::get<ir::MemoryInfo>(op.info);
         check(m.space == ir::AddressSpace::shared && m.dynamic_byte_offset, "stage buffer access is a shared access");
+        check(m.stage_buffer && m.stage_buffer->policy == ir::StageBufferPolicy::header_direct_v1 &&
+              m.stage_buffer->valid_for(m.stage_buffer->allocation_bytes),
+              "stage-buffer instructions carry the versioned header-region contract");
         const auto* literal = std::get_if<ir::LiteralBits>(&op.inputs.at(m.dynamic_byte_offset->value));
         out.push_back({literal ? std::uint32_t(literal->bits) : ~0u, m.element_bytes});
     }
@@ -689,12 +718,47 @@ void stage_buffer_tests() {
     const auto mesh_msl = sn::translate_native(mesh.program(), clip);
     check(std::holds_alternative<ir::MslArtifact>(mesh_msl) && std::get<ir::MslArtifact>(mesh_msl).entry_point == "armigo_mesh_main",
           "mesh stage translates to a mesh function");
+    if (const auto* artifact = std::get_if<ir::MslArtifact>(&mesh_msl)) {
+        check(artifact->source.find("stage_buffer_header_direct_v1") != std::string::npos &&
+              artifact->source.find("shared_inside") == std::string::npos,
+              "stage-buffer accesses index their header-sized regions without runtime tests");
+    }
+    for (const auto& bad : {
+            workgroup({isbe(0x923, 1, 255, 64, 0x38), isbe(0x927, 1, 255, 0, 0xf8), exit_instruction()}, sn::Stage::mesh),
+            workgroup({isbe(0x923, 1, 255, 0xfffffcu, 0x38), isbe(0x927, 1, 255, 0, 0xf8), exit_instruction()}, sn::Stage::mesh),
+            workgroup({move(1, 1), isbe(0x927, 1, 255, 512, 0xf8), exit_instruction()}, sn::Stage::mesh),
+            workgroup({move(1, 1), isbe(0x927, 1, 255, 100, 0x80), exit_instruction()}, sn::Stage::mesh),
+            workgroup({isbe(0x927, 255, 255, 100, 0x88), exit_instruction()}, sn::Stage::mesh)}) {
+        const auto result = sn::translate_native(bad.program(), clip);
+        check(std::holds_alternative<ir::Diagnostic>(result),
+              "a constant stage-buffer index outside its region is diagnosed");
+    }
+    const auto last = workgroup({isbe(0x923, 1, 255, 60, 0x38), isbe(0x927, 1, 255, 508, 0xf8),
+        isbe(0x927, 1, 255, 99, 0x80), exit_instruction()}, sn::Stage::mesh);
+    check(std::holds_alternative<ir::MslArtifact>(sn::translate_native(last.program(), clip)),
+          "last complete words and primitive bytes stay inside their physical header regions");
     const Fixture task = workgroup({isbe(0x923, 1, 255, 0, 0x78), isbe(0x927, 1, 255, 4, 0xb8), isbe(0x923, 2, 255, 4, 0xb8), exit_instruction()},
                                    sn::Stage::task);
     check(shared_accesses(lowered(task).ir) == Accesses{{0, 4}, {0x54, 4}, {0x54, 4}}, "task stage buffer accesses");
     const auto task_msl = sn::translate_native(task.program());
     check(std::holds_alternative<ir::MslArtifact>(task_msl) && std::get<ir::MslArtifact>(task_msl).entry_point == "armigo_object_main",
           "task stage translates to an object function");
+    for (const auto offset : {60u, 64u, 0xfffffcu}) {
+        const auto boundary = workgroup({isbe(0x923, 1, 255, offset, 0xb8),
+            isbe(0x927, 1, 255, offset, 0xb8), exit_instruction()}, sn::Stage::task);
+        check(std::holds_alternative<ir::MslArtifact>(sn::translate_native(boundary.program())) == (offset == 60),
+              "Task payload accepts its last complete word and diagnoses either outside boundary");
+    }
+    const auto dynamic_task = workgroup({isbe(0x923, 1, 255, 0, 0x78), isbe(0x927, 1, 1, 0, 0xb8),
+        isbe(0x923, 2, 1, 0, 0xb8), isbe(0x927, 2, 1, 4, 0xb8), exit_instruction()}, sn::Stage::task);
+    const auto dynamic_task_msl = sn::translate_native(dynamic_task.program());
+    const auto* dynamic_task_artifact = std::get_if<ir::MslArtifact>(&dynamic_task_msl);
+    check(dynamic_task_artifact && dynamic_task_artifact->source.find("stage_buffer_header_direct_v1") != std::string::npos &&
+          dynamic_task_artifact->source.find("shared_inside") == std::string::npos,
+          "Task workgroup-derived payload reads and writes index their header region directly");
+    const auto dropped_count = workgroup({isbe(0x927, 255, 255, 3, 0x88), exit_instruction()}, sn::Stage::mesh);
+    check(std::holds_alternative<ir::MslArtifact>(sn::translate_native(dropped_count.program(), clip)),
+          "An in-range zero primitive count remains a valid dropped store");
     refused(workgroup({isbe(0x923, 1, 255, 0, 0x38), exit_instruction()}, sn::Stage::task));   // a task stage has no input
     refused(workgroup({isbe(0x927, 1, 255, 0, 0xf8), exit_instruction()}, sn::Stage::task));   // nor attributes
     refused(workgroup({isbe(0x927, 1, 255, 0, 0xb8), exit_instruction()}, sn::Stage::mesh));   // a mesh stage has no payload
@@ -833,6 +897,23 @@ void handle_program_tests() {
         if (const auto* error = std::get_if<ir::Diagnostic>(&translated)) throw std::runtime_error(error->message);
         check(std::get<ir::MslArtifact>(translated).source.find("early_fragment_tests") == std::string::npos,
               "a guest store keeps the late depth test");
+        for (const unsigned version : {17u, 20u}) {
+            auto required = stored;
+            put(required.control, 8, version); required.control[0x5b] = std::byte{1};
+            auto early = sn::translate_native(required.program(), pooled);
+            if (const auto* error = std::get_if<ir::Diagnostic>(&early)) throw std::runtime_error(error->message);
+            check(std::get<ir::MslArtifact>(early).source.find("[[early_fragment_tests]] fragment ") != std::string::npos,
+                  "native API flag requires early tests even with a guest store");
+            auto registers = sn::emit_native_ir(required.program());
+            check(std::holds_alternative<ir::RegisterProgram>(registers) &&
+                  std::get<ir::RegisterProgram>(registers).ir.api_mandated_early_fragment_tests,
+                  "native early-test contract survives the public register IR path");
+        }
+        auto required_discard = discarding; required_discard.control[0x5b] = std::byte{1};
+        auto early_discard = sn::translate_native(required_discard.program(), pooled);
+        if (const auto* error = std::get_if<ir::Diagnostic>(&early_discard)) throw std::runtime_error(error->message);
+        check(std::get<ir::MslArtifact>(early_discard).source.find("[[early_fragment_tests]] fragment ") != std::string::npos,
+              "native API early tests retain discard ordering");
         Fixture masked({lane, move(3, 0x7d), ldg(12, 2, 0x20), move(8, 0x3f000000), move(9, 0x3f000000), move(4, 1), tex, exit_instruction()});
         put(masked.code, 0x48, 0x3);
         masked.code[0x4c] = std::byte{1};
@@ -841,6 +922,18 @@ void handle_program_tests() {
         const auto& masked_source = std::get<ir::MslArtifact>(translated).source;
         check(masked_source.find("sample_mask") != std::string::npos && masked_source.find("early_fragment_tests") == std::string::npos,
               "a sample-mask write keeps the late depth test");
+        auto required_mask = masked; required_mask.control[0x5b] = std::byte{1};
+        auto early_mask = sn::translate_native(required_mask.program(), pooled);
+        if (const auto* error = std::get_if<ir::Diagnostic>(&early_mask)) throw std::runtime_error(error->message);
+        check(std::get<ir::MslArtifact>(early_mask).source.find("[[early_fragment_tests]] fragment ") != std::string::npos,
+              "native API early tests retain sample-mask ordering");
+        Fixture compute_only({exit_instruction()}, sn::Stage::compute);
+        auto compute_ir = sn::emit_native_ir(compute_only.program());
+        check(std::holds_alternative<ir::RegisterProgram>(compute_ir), "compute control emits register IR");
+        auto wrong_stage = std::get<ir::RegisterProgram>(compute_ir).ir;
+        wrong_stage.api_mandated_early_fragment_tests = true;
+        check(std::holds_alternative<ir::Diagnostic>(ir::validate(wrong_stage, ir::IrForm::registers, ir::Phase::emit_ir)),
+              "API early-test metadata is rejected outside fragment stages");
         auto bad = tex; field(bad, 61, 3, 6);
         Fixture selector({move(8, 0x3f000000), move(9, 0x3f000000), move(12, 1), bad, exit_instruction()});
         put(selector.code, 0x48, 0x3);
@@ -1404,18 +1497,25 @@ int main(int argc, char** argv) {
         sn::FrontendOptions disabled_unused; disabled_unused.vertex_depth=ir::DepthConvention::negative_one_to_one;disabled_unused.pixel_rate=sn::PixelRateState::disabled;
         auto unchanged=sn::translate_native(system.program(),disabled_unused);
         check(std::holds_alternative<ir::MslArtifact>(unchanged) && std::get<ir::MslArtifact>(unchanged).reflection.profile.identity=="armigo-native-metal4","unused specialization does not add a false state requirement");
-        // A vertex that writes nothing is a void vertex for rasterizer-discard
-        // draws, with or without a clip-depth option: it records no depth fact.
+        // Unknown-depth output-less vertices retain the void contract; a
+        // known convention permits normal and explicit-discard entries.
         Fixture empty_vertex({exit_instruction()}, sn::Stage::vertex);
         for (const bool depth : {false, true}) {
             sn::FrontendOptions options; if (depth) options.vertex_depth = ir::DepthConvention::negative_one_to_one;
             auto translated = sn::translate_native(empty_vertex.program(), options);
             if (auto e = std::get_if<ir::Diagnostic>(&translated)) throw std::runtime_error("empty vertex: " + e->message);
             const auto& artifact = std::get<ir::MslArtifact>(translated);
-            check(artifact.reflection.requires_rasterizer_discard && artifact.source.find("vertex void ") != std::string::npos &&
-                  std::none_of(artifact.reflection.dependencies.begin(), artifact.reflection.dependencies.end(),
-                               [](const auto& d) { return d.key.kind == ir::FactKind::depth_convention; }),
-                  "an empty vertex is a void vertex without a depth fact");
+            if (!depth) {
+                check(artifact.reflection.requires_rasterizer_discard && artifact.source.find("vertex void ") != std::string::npos &&
+                      std::none_of(artifact.reflection.dependencies.begin(), artifact.reflection.dependencies.end(),
+                                   [](const auto& d) { return d.key.kind == ir::FactKind::depth_convention; }),
+                      "an unknown-depth empty vertex retains the void discard-only contract");
+            } else {
+                check(!artifact.reflection.requires_rasterizer_discard && artifact.reflection.fixed_point_size &&
+                      artifact.source.find("vertex ArmigoOutput armigo_vertex_main(") != std::string::npos &&
+                      artifact.source.find("vertex void armigo_vertex_main_discard(") != std::string::npos,
+                      "a known-depth empty vertex supports normal and explicit-discard entries");
+            }
         }
         std::cout << "Native frontend contracts passed\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

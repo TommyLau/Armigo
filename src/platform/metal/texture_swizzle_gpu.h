@@ -15,6 +15,7 @@
 #import <Metal/Metal.h>
 
 #include <armigo/graphics/renderer_types.h>
+#include <armigo/graphics/texture_layout.h>
 
 #include <memory>
 #include <cstdint>
@@ -39,6 +40,7 @@ struct TextureSwizzleExtent {
     std::uint32_t gob_block_height_log2 = 0;
     std::uint32_t gob_block_depth_log2 = 0;
     std::uint32_t gobs_x = 0;
+    graphics::BlockLinearGobOrder gob_order = graphics::BlockLinearGobOrder::Maxwell;
 };
 
 // Metal 4 compute deswizzle/swizzle pipelines built once per device. One

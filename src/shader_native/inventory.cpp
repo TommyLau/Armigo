@@ -158,7 +158,8 @@ int main(int argc, char** argv) {
                 << "\nextents\t" << extents.size() << "\nbnsh\t" << i.bnsh << "\nbahs\t" << i.bahs
                 << "\nrecords\t" << i.records << "\ncontrol_code_pairs\t" << pairs.size()
                 << "\naccepted_stage_images\t" << program_images.size() << "\nrefused_stage_pairs\t" << refused_stage_pairs.size()
-                << "\nduplicate_candidates\t" << i.duplicate_candidates << "\nrejected_markers\t" << i.rejected_markers
+                << "\nduplicate_candidates\t" << i.duplicate_candidates
+                << "\nnested_candidates\t" << i.nested_candidates << "\nrejected_markers\t" << i.rejected_markers
                 << "\nunrecognized_spans\t" << i.unrecognized_spans << "\nvisited_bytes\t" << i.visited_bytes << '\n';
         summary << "decoded_slots\t" << decoded_slots << "\nrefused_slots\t" << refused_slots
                 << "\nfully_decoded_images\t" << fully_decoded_images << '\n';

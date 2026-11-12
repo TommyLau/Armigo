@@ -98,7 +98,12 @@ struct NoFacts final : FactSource {
     }
 };
 
-MslArtifact translate(Program program, std::uint32_t tag = 0) {
+struct Prepared {
+    StructuredProgram program;
+    ResourcePlan plan;
+};
+
+Prepared prepare(Program program) {
     auto take = []<class T>(Result<T> r) { if (auto* e = std::get_if<Diagnostic>(&r)) throw std::runtime_error(e->message); return std::get<T>(std::move(r)); };
     Limits limits; NoFacts source; FactReader facts(source, limits);
     const MetalProfile profile{"guest-memory-test", 1, 31, 128, 16, true, false, true, false, false, false};
@@ -106,8 +111,15 @@ MslArtifact translate(Program program, std::uint32_t tag = 0) {
     auto legal = take(legalize(std::move(ssa), facts, profile));
     auto structured = take(structure(std::move(legal), limits));
     auto plan = take(plan_resources(structured, profile));
+    return {std::move(structured), std::move(plan)};
+}
+
+MslArtifact translate(Program program, std::uint32_t tag = 0) {
+    auto prepared = prepare(std::move(program));
     EmitOptions options; options.guest_memory_tag = tag;
-    return take(emit_msl(structured, plan, options));
+    auto result = emit_msl(prepared.program, prepared.plan, options);
+    if (const auto* error = std::get_if<Diagnostic>(&result)) throw std::runtime_error(error->message);
+    return std::get<MslArtifact>(std::move(result));
 }
 
 struct Gpu {
@@ -197,12 +209,94 @@ vertex V guest_test_vertex(uint i [[vertex_id]]) {
     }
 };
 
+std::size_t occurrences(const std::string& text, std::string_view needle) {
+    std::size_t count = 0;
+    for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + needle.size())) ++count;
+    return count;
+}
+
+void native_load_policy_tests() {
+    const auto fixture = [](bool policy) {
+        Builder b;
+        const auto loaded = b.guest(Opcode::load, 0x1000, 0, 4, ScalarType::u32).front();
+        auto& memory = std::get<MemoryInfo>(b.p.operations.back().info);
+        memory.scope = MemoryScope::device;
+        if (policy) memory.native_load_policy = NativeLoadPolicy::aligned_v1;
+        b.export_color({loaded, word(0), word(0), word(0)});
+        return b.p;
+    };
+    const auto untagged = translate(fixture(false)).source;
+    check(occurrences(untagged, "atomic_load_explicit(reinterpret_cast<device atomic_uint*>(guest_device") == 1 &&
+          untagged.find("native_ldg_aligned_v1") == std::string::npos,
+          "Untagged generic device-scope loads retain their atomic-word representation");
+    const auto tagged = translate(fixture(true)).source;
+    check(tagged.find("atomic_load_explicit(reinterpret_cast<device atomic_uint*>(guest_device") == std::string::npos &&
+          tagged.find("native_ldg_aligned_v1") != std::string::npos,
+          "The native aligned-load policy selects the ordinary scalar path");
+
+    const auto rejects = [](Program p) {
+        try { (void)translate(std::move(p)); }
+        catch (const std::runtime_error& error) {
+            check(std::string(error.what()).find("Native LDG policy") != std::string::npos,
+                  "Malformed native policy fails at its contract diagnostic");
+            return;
+        }
+        check(false, "Malformed native policy was accepted");
+    };
+    for (unsigned variant = 0; variant < 12; ++variant) {
+        auto p = fixture(true);
+        auto& memory = std::get<MemoryInfo>(p.operations.front().info);
+        switch (variant) {
+        case 0: memory.native_load_policy = static_cast<NativeLoadPolicy>(2); break;
+        case 1: memory.scope = MemoryScope::invocation; break;
+        case 2: memory.is_volatile = true; break;
+        case 3: memory.alignment = 8; break;
+        case 4: memory.space = AddressSpace::shared; break;
+        case 5: memory.space = AddressSpace::local; break;
+        case 6: memory.order = MemoryOrder::acquire; break;
+        case 7: memory.element_bytes = 8; memory.alignment = 8; break;
+        case 8: memory.element_bytes = 1; memory.elements = 2; memory.alignment = 2; break;
+        case 9: memory.elements = 3; memory.alignment = 12; break;
+        case 10: memory.array_index = InputIndex{0}; break;
+        case 11: memory.scope = MemoryScope::subgroup; break;
+        }
+        rejects(std::move(p));
+    }
+    for (const auto opcode : {Opcode::store, Opcode::atomic}) {
+        Builder b;
+        const auto result = b.guest(opcode, 0x1000, 0, 4, ScalarType::u32, {word(1)},
+            opcode == Opcode::atomic ? std::optional{AtomicKind::add} : std::nullopt);
+        auto& memory = std::get<MemoryInfo>(b.p.operations.back().info);
+        memory.scope = MemoryScope::device;
+        memory.native_load_policy = NativeLoadPolicy::aligned_v1;
+        if (!result.empty()) b.export_color({result.front(), word(0), word(0), word(0)});
+        rejects(std::move(b.p));
+    }
+
+    // Tamper only after the normal legalization gate. Planning and emission
+    // must each recheck the policy rather than trusting earlier validation.
+    auto prepared = prepare(fixture(true));
+    bool changed = false;
+    for (auto& operation : prepared.program.ir.operations) {
+        auto* memory = std::get_if<MemoryInfo>(&operation.info);
+        if (memory && memory->native_load_policy) {
+            memory->native_load_policy = static_cast<NativeLoadPolicy>(2);
+            changed = true;
+        }
+    }
+    check(changed, "Post-legalization fixture retains the native load marker");
+    check(std::holds_alternative<Diagnostic>(plan_resources(prepared.program, prepared.program.profile)),
+          "Planning rejects a forged post-legalization native load version");
+    check(std::holds_alternative<Diagnostic>(emit_msl(prepared.program, prepared.plan, {})),
+          "Emission independently rejects a forged native load version");
+}
+
 // Two pools sorted by guest start: guest [base2, base2 + 16) backed by the
 // data buffer's bytes 64..79 (entry 1, found by binary search), and guest
 // [base, base + 64) by its first 64 bytes (entry 2, also named by the hint
 // of base's 2 MiB chunk).
 constexpr std::uint64_t base = 0x7db6000000ull, base2 = 0x7c36001000ull;
-std::vector<std::uint32_t> table_for(id<MTLBuffer> data) {
+std::vector<std::uint32_t> table_for(id<MTLBuffer> data, std::uint64_t first_size = 64) {
     std::vector<std::uint32_t> t(guest_memory_bytes / 4);
     t[0] = 3;
     auto entry = [&](unsigned e, std::uint64_t begin, std::uint64_t size, std::uint64_t device) {
@@ -213,7 +307,7 @@ std::vector<std::uint32_t> table_for(id<MTLBuffer> data) {
         t[w + 4] = std::uint32_t(delta); t[w + 5] = std::uint32_t(delta >> 32);
     };
     entry(1, base2, 16, data.gpuAddress + 64);
-    entry(2, base, 64, data.gpuAddress);
+    entry(2, base, first_size, data.gpuAddress);
     const std::uint64_t chunk = base >> 21;
     t[guest_memory_header_words + (chunk & 8191) * guest_memory_entry_words + 6] = std::uint32_t(chunk << 13) | 2;
     return t;
@@ -221,6 +315,7 @@ std::vector<std::uint32_t> table_for(id<MTLBuffer> data) {
 } // namespace
 
 int main() { @autoreleasepool { try {
+    native_load_policy_tests();
     Gpu gpu;
     std::array<std::uint32_t, 20> words{};
     for (unsigned i = 0; i < words.size(); ++i) words[i] = 0x01010101u * (i + 1);
@@ -255,10 +350,65 @@ int main() { @autoreleasepool { try {
     wide.guest(Opcode::store, base + 40, 0, 4, ScalarType::u32, {word(0xa1u), word(0xb2u)}, {}, 2);
     wide.export_color({quad[0], quad[1], quad[2], quad[3]});
     table = table_for(data);
-    pixel = gpu.run(translate(std::move(wide.p)), table, @[data]);
+    const auto wide_artifact = translate(std::move(wide.p));
+    check(occurrences(wide_artifact.source, "*reinterpret_cast<device const uint4*>") == 1 &&
+          occurrences(wide_artifact.source, "*reinterpret_cast<device const uint*>") == 0,
+          "a 128-bit load is one uint4 read and no word reads");
+    pixel = gpu.run(wide_artifact, table, @[data]);
     if (pixel != std::array<std::uint32_t, 4>{words[4], words[5], words[6], words[7]} || after[10] != 0xa1u || after[11] != 0xb2u)
         throw std::runtime_error("wide guest memory access");
     check(table[1] == 0, "wide accesses inside a window record no miss");
+
+    // A 64-bit load is one uint2 read; a 128-bit load past the window reads
+    // four zero words and records a miss.
+    Builder pair;
+    const auto two = pair.guest(Opcode::load, base + 24, 0, 4, ScalarType::u32, {}, {}, 2);
+    const auto outside = pair.guest(Opcode::load, base + 64, 0, 4, ScalarType::u32, {}, {}, 4);
+    pair.export_color({two[0], two[1], outside[0], outside[3]});
+    table = table_for(data);
+    const auto pair_artifact = translate(std::move(pair.p));
+    check(occurrences(pair_artifact.source, "*reinterpret_cast<device const uint2*>") == 1 &&
+          occurrences(pair_artifact.source, "*reinterpret_cast<device const uint4*>") == 1 &&
+          occurrences(pair_artifact.source, "*reinterpret_cast<device const uint*>") == 0,
+          "a 64-bit load is one uint2 read and no word reads");
+    pixel = gpu.run(pair_artifact, table, @[data]);
+    if (pixel != std::array<std::uint32_t, 4>{words[6], words[7], 0u, 0u})
+        throw std::runtime_error("64-bit guest load or missed 128-bit load");
+    check(table[1] == 1, "the 128-bit load past the window records one miss");
+
+    // Vector loads that are word aligned but not vector aligned, and vector
+    // aligned ones whose last words fall past their pool's end, read zeros
+    // and record one miss each without touching memory. The pool at base is
+    // found through its chunk hint; base2's by binary search, where a 128-bit
+    // load filling the pool exactly is a hit.
+    struct WideCase {
+        std::uint64_t address, pool;
+        std::uint8_t elements;
+        std::array<std::uint32_t, 4> expected;
+        const char* name;
+    };
+    for (const auto& wide_case : {
+             WideCase{base + 4, 64, 2, {}, "a 64-bit load off 8-byte alignment"},
+             WideCase{base + 8, 64, 4, {}, "a 128-bit load off 16-byte alignment"},
+             WideCase{base + 56, 60, 2, {}, "a 64-bit load straddling its pool's end"},
+             WideCase{base + 48, 56, 4, {}, "a 128-bit load straddling its pool's end"},
+             WideCase{base2, 64, 4, {words[16], words[17], words[18], words[19]}, "a 128-bit load filling its pool"}}) {
+        Builder vector_load;
+        const auto loaded = vector_load.guest(Opcode::load, wide_case.address, 0, 4, ScalarType::u32, {}, {},
+                                              wide_case.elements);
+        vector_load.export_color({loaded[0], loaded[1], wide_case.elements == 4 ? loaded[2] : word(0),
+                                  wide_case.elements == 4 ? loaded[3] : word(0)});
+        const auto before = std::vector<std::uint32_t>(after, after + words.size());
+        table = table_for(data, wide_case.pool);
+        pixel = gpu.run(translate(std::move(vector_load.p)), table, @[data]);
+        const bool hit = wide_case.expected != std::array<std::uint32_t, 4>{};
+        if (pixel != wide_case.expected || table[1] != (hit ? 0u : 1u) ||
+            !std::equal(before.begin(), before.end(), after)) {
+            std::fprintf(stderr, "%s: %08x %08x %08x %08x, misses %u\n", wide_case.name, pixel[0], pixel[1], pixel[2],
+                         pixel[3], table[1]);
+            throw std::runtime_error("vector guest load alignment or pool end");
+        }
+    }
 
     // A load past the first window, one straddling its end, a misaligned
     // word inside it, a dropped store and a dropped atomic: five misses, the

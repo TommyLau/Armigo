@@ -147,6 +147,138 @@ def game_name_token(text: str) -> str | None:
     return match.group(0) if match else None
 
 
+def _generic_production_source(name: str) -> bool:
+    """True for src/ and include/ files that are not title-owned."""
+    parts = PurePosixPath(name).parts
+    if len(parts) < 2 or parts[0] not in {"src", "include"}:
+        return False
+    if parts[0] == "src" and parts[1] == "titles":
+        return False
+    if len(parts) >= 3 and parts[0] == "include" and parts[1] == "armigo" and parts[2] == "titles":
+        return False
+    return True
+
+
+def title_id_failures(name: str, text: str, title_ids: set[str]) -> list[str]:
+    """Report supported title ids in generic production code.
+
+    A title id is 16 hex digits, matched case-insensitively. The match is
+    bounded by non-hex characters, so a 0x prefix, a ull suffix, an
+    underscore, or a titles/<id> path matches. A longer hex run does not.
+    Title-owned sources and everything outside src/ and include/ are skipped.
+    """
+    if not title_ids or not _generic_production_source(name):
+        return []
+    pattern = re.compile(
+        r"(?<![0-9A-Fa-f])(?:"
+        + "|".join(re.escape(title_id) for title_id in sorted(title_ids, key=len, reverse=True))
+        + r")(?![0-9A-Fa-f])",
+        re.IGNORECASE,
+    )
+    failures = []
+    for number, line in enumerate(text.splitlines(), start=1):
+        if pattern.search(line):
+            failures.append(_violation(name, number, "title-id-in-generic-code"))
+    return failures
+
+
+DUPLICATE_WINDOW = 10
+DUPLICATE_SUFFIXES = {".c", ".cc", ".cpp", ".h", ".hpp", ".m", ".mm"}
+DUPLICATE_ALLOWLIST = "tools/duplicate_allowlist.txt"
+
+
+def duplicate_scope(name: str) -> bool:
+    """True for C, C++ and Objective-C sources under src/ and include/."""
+    path = PurePosixPath(name)
+    return len(path.parts) > 1 and path.parts[0] in {"src", "include"} and path.suffix in DUPLICATE_SUFFIXES
+
+
+def normalized_code_lines(text: str) -> list[tuple[int, str]]:
+    """Code lines with their 1-based numbers, whitespace folded.
+
+    Comments (and so the copyright banner), blank lines, brace-only lines and
+    #include lines are left out: they repeat by nature, not by copying.
+    """
+    lines = []
+    in_comment = False
+    for number, line in enumerate(text.splitlines(), start=1):
+        code = line.strip()
+        if in_comment:
+            if "*/" not in code:
+                continue
+            in_comment = False
+            code = code.split("*/", 1)[1].strip()
+        if code.startswith("/*"):
+            if "*/" not in code:
+                in_comment = True
+                continue
+            code = code.split("*/", 1)[1].strip()
+        code = re.sub(r"//.*$", "", code).strip()
+        if not code or code.startswith("#include") or re.fullmatch(r"[{}();,\s]*", code):
+            continue
+        lines.append((number, re.sub(r"\s+", " ", code)))
+    return lines
+
+
+def duplicate_block_failures(texts: dict[str, str], allowed: set[tuple[str, str]]) -> list[str]:
+    """Blocks of DUPLICATE_WINDOW normalized lines found in more than one file.
+
+    One failure per file pair that is not on the allowlist, naming the first
+    shared block's lines in both files.
+    """
+    windows: dict[str, list[tuple[str, int]]] = {}
+    for name in sorted(texts):
+        lines = normalized_code_lines(texts[name])
+        for start in range(len(lines) - DUPLICATE_WINDOW + 1):
+            key = "\n".join(code for _, code in lines[start:start + DUPLICATE_WINDOW])
+            windows.setdefault(key, []).append((name, lines[start][0]))
+    first: dict[tuple[str, str], tuple[int, int]] = {}
+    for places in windows.values():
+        by_file: dict[str, int] = {}
+        for name, line in places:
+            by_file.setdefault(name, line)
+        names = sorted(by_file)
+        for index, left in enumerate(names):
+            for right in names[index + 1:]:
+                pair = (left, right)
+                lines = (by_file[left], by_file[right])
+                if pair not in first or lines < first[pair]:
+                    first[pair] = lines
+    failures = []
+    for (left, right), (left_line, right_line) in sorted(first.items()):
+        if (left, right) in allowed:
+            continue
+        failures.append(f"{left}:{left_line}: duplicates {DUPLICATE_WINDOW}+ code lines of {right}:{right_line} "
+                        f"(share them, or add a reviewed entry to {DUPLICATE_ALLOWLIST})")
+    return failures
+
+
+def _duplicate_pairs(texts: dict[str, str]) -> set[tuple[str, str]]:
+    pairs = set()
+    for failure in duplicate_block_failures(texts, set()):
+        left = failure.split(":", 1)[0]
+        right = failure.split(" of ", 1)[1].split(":", 1)[0]
+        pairs.add(tuple(sorted((left, right))))
+    return pairs
+
+
+def read_duplicate_allowlist(text: str) -> tuple[set[tuple[str, str]], list[str]]:
+    """Allowed file pairs, one 'left right  # reason' per line, and format failures."""
+    allowed = set()
+    failures = []
+    for number, line in enumerate(text.splitlines(), start=1):
+        entry = line.strip()
+        if not entry or entry.startswith("#"):
+            continue
+        code, _, reason = entry.partition("#")
+        parts = code.split()
+        if len(parts) != 2 or not reason.strip():
+            failures.append(f"{DUPLICATE_ALLOWLIST}:{number}: expected 'left right  # reason'")
+            continue
+        allowed.add(tuple(sorted(parts)))
+    return allowed, failures
+
+
 def cmake_game_name_failures(name: str, text: str) -> list[str]:
     code = "\n".join(line.split("#", 1)[0] for line in text.splitlines())
     failures = []
@@ -267,14 +399,25 @@ def git(*arguments: str) -> bytes:
 
 def main() -> int:
     failures = []
+    # Supported title ids are the 16-hex folder names under titles/ in the index.
+    title_ids = set()
+    for encoded in git("ls-files", "-z", "--", "titles").split(b"\0"):
+        if not encoded:
+            continue
+        parts = PurePosixPath(encoded.decode("utf-8")).parts
+        if len(parts) >= 2 and parts[0] == "titles" and re.fullmatch(r"[0-9A-Fa-f]{16}", parts[1]):
+            title_ids.add(parts[1])
     entries = git("ls-files", "--stage", "-z").split(b"\0")
     checked = 0
+    sources: dict[str, str] = {}
+    indexed: set[str] = set()
     for entry in entries:
         if not entry:
             continue
         metadata, encoded_path = entry.split(b"\t", 1)
         mode, object_id, stage = metadata.split()
         name = encoded_path.decode("utf-8")
+        indexed.add(name)
         path = PurePosixPath(name)
         checked += 1
         if stage != b"0" or mode not in {b"100644", b"100755"}:
@@ -313,6 +456,18 @@ def main() -> int:
         if path.name == "CMakeLists.txt" or path.suffix == ".cmake":
             failures.extend(cmake_game_name_failures(name, text))
         failures.extend(signing_content_failures(name, text))
+        failures.extend(title_id_failures(name, text, title_ids))
+        if duplicate_scope(name):
+            sources[name] = text
+
+    allowlist_text = git("show", f":{DUPLICATE_ALLOWLIST}").decode("utf-8") if DUPLICATE_ALLOWLIST in indexed else ""
+    allowed, allowlist_failures = read_duplicate_allowlist(allowlist_text)
+    failures.extend(allowlist_failures)
+    failures.extend(duplicate_block_failures(sources, allowed))
+    # An entry for a pair that no longer duplicates is stale: the list only shrinks.
+    remaining = {tuple(sorted(failure_pair)) for failure_pair in _duplicate_pairs(sources)}
+    for pair in sorted(allowed - remaining):
+        failures.append(f"{DUPLICATE_ALLOWLIST}: stale entry {pair[0]} {pair[1]} no longer duplicates")
 
     for failure in failures:
         print(failure, file=sys.stderr)

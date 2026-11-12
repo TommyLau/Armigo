@@ -255,9 +255,24 @@ void pool_invalidate_mapped_range(const NVNmemoryPool* pool, std::ptrdiff_t offs
         on_host_stack([&] { backends().resources->invalidate_pool(*state, static_cast<std::uint64_t>(offset), size); });
 }
 
+// Whole-pool addresses name the pool: the pool's buffer address, a buffer's
+// address, and buffer initialization. The same pool is marked once on this
+// thread until a different pool is marked. A texture range and a virtual
+// alias are marked at the call, so they do not skip a later whole-pool mark.
+void mark_pool_addressed(const MemoryPoolState* pool) noexcept {
+    if (!pool || !pool->memory || !pool->size || !backends().resources) return;
+    static thread_local const std::uint8_t* last = nullptr;
+    if (pool->memory == last) return;
+    last = pool->memory;
+    const auto address = reinterpret_cast<std::uint64_t>(pool->memory);
+    const auto size = pool->size;
+    on_host_stack([&] { backends().resources->note_addressed(address, size); });
+}
+
 NVNbufferAddress pool_get_buffer_address(const NVNmemoryPool* pool) noexcept {
     const MemoryPoolState* state = state_of(pool);
     if (!state || (state->flags & NVN_MEMORY_POOL_FLAGS_PHYSICAL)) return 0;
+    mark_pool_addressed(state);
     return reinterpret_cast<NVNbufferAddress>(state->memory);
 }
 
@@ -336,6 +351,7 @@ NVNboolean buffer_initialize(NVNbuffer* buffer, const NVNbufferBuilder* builder)
     BufferState* state = state_of(buffer);
     *state = {live_buffer_tag, 0,           source->device, source->pool,
               source->offset,  source->size, next_resource_serial()};
+    mark_pool_addressed(source->pool);
     return 1;
 }
 
@@ -356,6 +372,7 @@ void* buffer_map(const NVNbuffer* buffer) noexcept {
 NVNbufferAddress buffer_get_address(const NVNbuffer* buffer) noexcept {
     const BufferState* state = state_of(buffer);
     if (!state || state->tag != live_buffer_tag || !state->pool->memory) return 0;
+    mark_pool_addressed(state->pool);
     return reinterpret_cast<NVNbufferAddress>(state->pool->memory + state->offset);
 }
 

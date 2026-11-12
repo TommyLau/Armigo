@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/loader.h>
 
 namespace armigo::services::ro {
@@ -16,37 +17,8 @@ using horizon::IpcDisposition;
 using horizon::IpcMessage;
 using horizon::IpcReply;
 
-constexpr std::uint32_t sfci = 0x49434653;
-constexpr std::uint32_t sfco = 0x4f434653;
+using namespace horizon::cmif;
 
-std::uint32_t read(const IpcMessage& bytes, std::size_t offset) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i < 4; ++i)
-        value |= std::uint32_t{std::to_integer<unsigned char>(bytes[offset + i])} << (8 * i);
-    return value;
-}
-
-std::uint64_t read64(const IpcMessage& bytes, std::size_t offset) {
-    return std::uint64_t{read(bytes, offset)} |
-           (std::uint64_t{read(bytes, offset + 4)} << 32);
-}
-
-void write(IpcMessage& bytes, std::size_t offset, std::uint32_t value) {
-    for (unsigned i = 0; i < 4; ++i)
-        bytes[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
-}
-
-IpcReply control_reply(std::uint32_t value, unsigned width) {
-    IpcReply reply;
-    reply.disposition = IpcDisposition::handled;
-    reply.size = 44;
-    write(reply.bytes, 4, 9);
-    write(reply.bytes, 16, sfco);
-    write(reply.bytes, 28, 0xec6be3ff);
-    write(reply.bytes, 32, value);
-    if (width == 1) reply.size = 40;
-    return reply;
-}
 
 // A domain command that carries no output: the CMIF header is authored where the
 // dispatcher expects it and nothing follows.

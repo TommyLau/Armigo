@@ -48,6 +48,30 @@ sn::Buffer bahs() {
     }
     return b;
 }
+// Two programs. The first control's words at +0x38 read as an entry {L, 0, L, L}
+// with L = 0x100, so the entry's control is the second program, L bytes on.
+// That table position is inside the first control. The second program's table
+// position is inside the length the first entry claims and outside the first
+// control's own 0x48 bytes.
+sn::Buffer nested_bahs() {
+    constexpr std::uint32_t region = 0x400, code = 0x100, extent_a = 0xd8;
+    sn::Buffer b(region + 2 * code);
+    text(b, 0, "BAHS", 4); word(b, 4, 11); word(b, 8, b.size());
+    word(b, 0x18, 2 * code); word(b, 0x1c, region);
+    const std::uint32_t control_a = 0x168, control_b = 0x2a0, entry_b = 0x200;
+    auto section = [&](std::uint32_t at, std::uint32_t extent) {
+        word(b, at, 0x98761234); word(b, at + 4, 0xc9); word(b, at + 8, 20);
+        word(b, at + 0x30, 0); word(b, at + 0xd4, extent);
+    };
+    section(control_a, extent_a);
+    word(b, control_a + 0x38, code); word(b, control_a + 0x3c, 0);
+    word(b, control_a + 0x40, code); word(b, control_a + 0x44, code);
+    section(control_b, code); word(b, control_b + 0x44, code);
+    word(b, 0x100 + 8, extent_a); word(b, 0x100 + 12, control_a - 0x100);
+    word(b, entry_b, code); word(b, entry_b + 8, code); word(b, entry_b + 12, control_b - entry_b);
+    b[region] = std::byte{0x11}; b[region + code] = std::byte{0x22};
+    return b;
+}
 sn::Buffer sarc(const sn::Buffer& payload) {
     sn::Buffer b(0x60 + payload.size());
     text(b, 0, "SARC", 4); word(b, 4, 0x14, 2); word(b, 6, 0xfeff, 2);
@@ -143,6 +167,24 @@ int main() {
         auto broken = video; word(broken, 0x40, 0x10); rejects([&]{ e.scan(broken, "bad"); });
         auto a = bahs(); records.clear(); e.scan(a, "archive"); check(records.size() == 1 && e.inventory().duplicate_candidates == 2);
         check(!records[0].variation && !records[0].slot);
+        {
+            std::vector<sn::Record> nested_records;
+            sn::Enumerator nested([&](const auto& record) { nested_records.push_back(record); });
+            nested.scan(nested_bahs(), "nested");
+            const bool kept = nested_records.size() == 2 && nested_records[0].descriptor_offset == 0x100 &&
+                              nested_records[1].descriptor_offset == 0x200 && nested_records[0].control_offset == 0x168 &&
+                              nested_records[1].control_offset == 0x2a0 && nested_records[0].code_offset == 0x400 &&
+                              nested_records[1].code_offset == 0x500 && nested.inventory().nested_candidates == 1 &&
+                              nested.inventory().duplicate_candidates == 0;
+            if (!kept) {
+                std::string message = "nested BAHS";
+                for (const auto& record : nested_records)
+                    message += " desc=" + std::to_string(record.descriptor_offset);
+                message += " nested=" + std::to_string(nested.inventory().nested_candidates);
+                message += " duplicate=" + std::to_string(nested.inventory().duplicate_candidates);
+                throw std::runtime_error(message);
+            }
+        }
         auto bad = b; word(bad, 0x80, ~std::uint64_t{}, 8); rejects([&]{ e.scan(bad, "bad"); });
         bad = b; word(bad, 0x1c, b.size() + 1); rejects([&]{ e.scan(bad, "bad"); });
         bad = b; word(bad, 0x21c, 0x10); rejects([&]{ e.scan(bad, "bad"); });

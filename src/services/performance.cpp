@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/performance.h>
 
 #include <limits>
@@ -19,17 +20,7 @@ namespace armigo::services::apm {
 namespace {
 using namespace horizon;
 
-std::uint32_t read(const IpcMessage& message, std::size_t offset, unsigned width = 4) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i < width; ++i)
-        value |= std::uint32_t(std::to_integer<unsigned char>(message[offset + i])) << (8 * i);
-    return value;
-}
-
-void write(IpcMessage& message, std::size_t offset, std::uint32_t value, unsigned width = 4) {
-    for (unsigned i = 0; i < width; ++i)
-        message[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
-}
+using namespace horizon::cmif;
 
 bool shape(const IpcMessage& message, unsigned minimum_words) {
     const auto words = read(message, 4);

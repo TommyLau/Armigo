@@ -812,6 +812,19 @@ void test_copy_out_native_atomics() {
     CHECK(copy.read_double_word(copy.context, address + 8, observed));
     CHECK(observed == 0x1122334455667788ULL);
     CHECK(!copy.read_double_word(copy.context, address + 4, observed));
+
+    // Synchronization words may lie anywhere in the kernel's envelope, which
+    // extends past the mapped 39-bit space. Every accessor refuses such a word
+    // before touching host memory: a dereference there would fault the test.
+    for (const auto outside : {horizon::ProcessRecord::query_end, std::uint64_t{0x8000000000},
+                               std::uint64_t{0x3fffffffff8}}) {
+        CHECK(!copy.read_word(copy.context, outside, read));
+        CHECK(!copy.write_word(copy.context, outside, written));
+        std::uint32_t expected = 0;
+        CHECK(copy.compare_exchange_word(copy.context, outside, expected, 1) ==
+              horizon::ProcessWideKey::ExchangeResult::invalid_address);
+        CHECK(!copy.read_double_word(copy.context, outside, observed));
+    }
 }
 
 void test_ipc_whole_range_and_ordered_word_copy() {

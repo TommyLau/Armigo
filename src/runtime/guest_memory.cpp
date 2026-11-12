@@ -51,8 +51,13 @@ LaunchFailure failure(LaunchError code, const char* operation, const char* detai
 LaunchFailure unsupported(const char* operation, const char* detail) {
     return failure(LaunchError::unsupported, operation, detail);
 }
-LaunchFailure host_failure(const char* operation) {
-    return failure(LaunchError::host_failure, operation, "Native memory transaction failed.");
+LaunchFailure host_failure(const char* operation, NativeStatus status = {}) {
+    auto result = failure(LaunchError::host_failure, operation, "Native memory transaction failed.");
+    if (!status.ok()) {
+        result.detail += " ProcessMemoryError=" + std::to_string(static_cast<unsigned>(status.error)) +
+            " (" + platform::describe(status.error) + "), native_code=" + std::to_string(status.native_code) + ".";
+    }
+    return result;
 }
 bool native_range(AddressRange r) noexcept {
     const auto page = platform::native_page_size();
@@ -110,28 +115,49 @@ class NativePageUndo {
     };
     std::vector<Saved> pages_;
 public:
-    static std::optional<NativePageUndo> stage(AddressRange pages, AddressRange writes = {}) {
+    static std::optional<NativePageUndo> stage(AddressRange pages, AddressRange writes = {}, NativeStatus* diagnostic = nullptr) {
         NativePageUndo undo;
-        const auto page = platform::native_page_size();
+        const auto limits = platform::query_host_limits();
+        if (!limits) {
+            if (diagnostic) *diagnostic = {platform::ProcessMemoryError::system_failure};
+            return {};
+        }
+        const auto page = limits->native_page_bytes;
+        const bool private_view = limits->contains(ProcessRecord::query_end, page);
         undo.pages_.reserve(pages.size / page);
         for (auto at = pages.address; at < pages.address + pages.size; at += page) {
             const auto permission = platform::process_memory_permissions(at);
-            if (!permission) return {};
-            auto alias = Region::alias_copy(at, page, Permission::none);
+            if (!permission) {
+                if (diagnostic) *diagnostic = {platform::ProcessMemoryError::system_failure};
+                return {};
+            }
+            auto alias = Region::alias_copy(at, page, Permission::none, diagnostic);
             auto* backing = std::get_if<Region>(&alias);
             if (!backing) return {};
             Saved saved{at, *permission, std::move(*backing), {}, 0, {}};
             if (writes.size && pm::overlaps({at, page}, writes)) {
-                auto writable = Region::writable_host_alias(at, page);
-                auto* view = std::get_if<Region>(&writable);
-                if (!view) return {};
-                saved.writable.emplace(std::move(*view));
+                if (private_view) {
+                    auto writable = Region::writable_host_alias(at, page, diagnostic);
+                    auto* view = std::get_if<Region>(&writable);
+                    if (!view) return {};
+                    saved.writable.emplace(std::move(*view));
+                } else {
+                    // A bounded host has no private VA above the guest limit.
+                    // The retained rollback mapping can itself hold the byte view;
+                    // it is temporary and never published as a guest allocation.
+                    const auto status = saved.backing.protect(0, page, rw);
+                    if (!status.ok()) {
+                        if (diagnostic) *diagnostic = status;
+                        return {};
+                    }
+                }
                 const auto first = std::max(at, writes.address);
                 const auto end = std::min(at + page, writes.address + writes.size);
                 saved.byte_offset = first - at;
                 saved.bytes.resize(end - first);
                 std::memcpy(saved.bytes.data(),
-                    reinterpret_cast<const void*>(saved.writable->address() + saved.byte_offset), saved.bytes.size());
+                    reinterpret_cast<const void*>((saved.writable ? saved.writable->address() : saved.backing.address()) +
+                        saved.byte_offset), saved.bytes.size());
             }
             undo.pages_.push_back(std::move(saved));
         }
@@ -140,8 +166,9 @@ public:
     NativeStatus restore(Region& owner, bool restore_bytes) noexcept {
         NativeStatus result;
         for (const auto& saved : pages_) {
-            if (restore_bytes && saved.writable)
-                std::memcpy(reinterpret_cast<void*>(saved.writable->address() + saved.byte_offset),
+            if (restore_bytes && !saved.bytes.empty())
+                std::memcpy(reinterpret_cast<void*>((saved.writable ? saved.writable->address() : saved.backing.address()) +
+                    saved.byte_offset),
                     saved.bytes.data(), saved.bytes.size());
             const auto status = owner.alias(saved.destination - owner.address(), platform::native_page_size(),
                 saved.backing.address(), saved.permission);
@@ -338,17 +365,17 @@ struct State : std::enable_shared_from_this<State> {
         }) {
             struct Callback {
                 std::remove_reference_t<Apply>* apply;
-                bool failed = false;
+                NativeStatus status;
                 static bool invoke(void* context) noexcept {
                     auto& self = *static_cast<Callback*>(context);
-                    self.failed = !(*self.apply)().ok();
-                    return !self.failed;
+                    self.status = (*self.apply)();
+                    return self.status.ok();
                 }
             } callback{&apply};
             const auto result = next.intervals
                 ? record.commit_memory_updates(next.updates, updated, Callback::invoke, &callback)
                 : record.commit_memory_state(next.legacy, updated, Callback::invoke, &callback);
-            if (callback.failed) return host_failure(operation);
+            if (!callback.status.ok()) return host_failure(operation, callback.status);
             if (result != ProcessStateError::none) {
                 const bool private_metadata = record.configuration().private_system_resource_bytes != 0;
                 return failure(private_metadata && result != ProcessStateError::resource_limit
@@ -364,7 +391,8 @@ struct State : std::enable_shared_from_this<State> {
         const auto checked = ProcessRecord::create(record.configuration(), updated, next.legacy);
         if (!checked.ok())
             return failure(LaunchError::resource_limit, operation, "Memory metadata or accounting admission failed.");
-        if (!apply().ok()) return host_failure(operation);
+        const auto applied = apply();
+        if (!applied.ok()) return host_failure(operation, applied);
         if (record.replace_memory_map(next.legacy) != ProcessStateError::none) {
             restored(undo());
             if (poisoned) return failure(LaunchError::host_failure, operation,
@@ -1172,8 +1200,9 @@ LaunchResult<QueryDisposition> NativeGuestMemory::stack(QueryRegisters& r, bool 
             std::vector<std::uint64_t> fresh;
             for (auto at = pages.address; at < pages.address + pages.size; at += page)
                 if (!native_page_used(s.view({at, page}), at, destination)) fresh.push_back(at);
-            auto undo = NativePageUndo::stage(pages, destination);
-            if (!undo) return host_failure(operation);
+            NativeStatus staged;
+            auto undo = NativePageUndo::stage(pages, destination, &staged);
+            if (!undo) return host_failure(operation, staged);
             bool copied_bytes = false;
             const auto restore = [&] { return undo->restore(*s.stack, copied_bytes); };
             auto status = s.transaction(std::move(next), s.accounting, operation, [&] {
@@ -1605,6 +1634,21 @@ LaunchResult<std::shared_ptr<GuestMemory>> create_guest_memory(const LaunchProfi
             return failure(LaunchError::invalid_input, "create_guest_memory", "Ordinary processes require retained sealed modules.");
         if (profile.origin != ProfileOrigin::synthetic_test && !atomic_record_publication<ProcessRecord>())
             return unsupported("create_guest_memory", "Ordinary processes require atomic ProcessRecord publication from the integrator patch.");
+        const auto host = platform::query_host_limits();
+        if (!host) return failure(LaunchError::host_failure, "create_guest_memory limits",
+            "Host process memory limits could not be queried.");
+        static std::once_flag limits_logged;
+        std::call_once(limits_logged, [&] {
+            const auto available = host->available_memory_bytes
+                ? std::to_string(*host->available_memory_bytes) + " bytes" : std::string("not reported");
+            armigo::diag::write(armigo::diag::Level::info,
+                "Armigo host limits: VM [%#llx, %#llx), guest VA %llu bytes, native page %llu bytes, "
+                "available process memory %s.\n",
+                static_cast<unsigned long long>(host->address_begin),
+                static_cast<unsigned long long>(host->address_end),
+                static_cast<unsigned long long>(host->guest_address_bytes(ProcessRecord::query_end)),
+                static_cast<unsigned long long>(host->native_page_bytes), available.c_str());
+        });
         auto s = std::make_shared<State>();
         s->modules = std::move(modules);
         auto config = profile.process;
@@ -1633,7 +1677,7 @@ LaunchResult<std::shared_ptr<GuestMemory>> create_guest_memory(const LaunchProfi
             // reservation and the host-loaded modules are outside this arena.
             // A Switch 2 arena that the host cannot place with the profile's
             // alias window is retried with smaller windows, down to the minimum.
-            const auto page = platform::native_page_size();
+            const auto page = host->native_page_bytes;
             constexpr std::uint64_t mappable_size = 1ull << 30;
             const auto alias_sizes = alias_window_sizes(config.base_alias_size, switch2);
             std::optional<LaunchFailure> failed;

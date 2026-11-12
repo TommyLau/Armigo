@@ -19,7 +19,8 @@ struct Arithmetic {
     ir::NumericMode numeric;
     std::uint8_t destination{};
     std::vector<ArithmeticSource> sources;
-    // A multiply's power-of-two scale, applied to source A first.
+    // A multiply's power-of-two scale, applied to the rounded product
+    // before final saturation.
     std::optional<std::uint32_t> scale;
     // A directed FADD of RZ and one source: exact, so it is that source,
     // flushed under FTZ, with a zero result signed by the mode (true: toward

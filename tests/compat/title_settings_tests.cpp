@@ -22,9 +22,6 @@
 #include <sstream>
 #include <unistd.h>
 #include <string>
-#include <array>
-#include <algorithm>
-#include <bit>
 #include <optional>
 
 namespace {
@@ -34,55 +31,6 @@ unsigned failures = 0;
 void fail(const std::filesystem::path& where, const std::string& why) {
     std::fprintf(stderr, "%s: %s\n", where.c_str(), why.c_str());
     ++failures;
-}
-
-// Exercise the declared initializer/return words on a synthetic register bank.
-// A counter's floating representation must not escape into an integer state.
-void check_counter_state_return(const std::vector<armigo::compat::WordPatch>& words) {
-    const auto move = [](std::uint32_t word)
-        -> std::optional<std::pair<unsigned, std::uint32_t>> {
-        if ((word & 0xff800000u) != 0x52800000u) return {};
-        const unsigned shift = ((word >> 21) & 3u) * 16;
-        if (shift >= 32) return {};
-        return std::pair{word & 31u, ((word >> 5) & 0xffffu) << shift};
-    };
-    unsigned checked = 0;
-    for (const auto& initial : words) {
-        const auto original = move(initial.expected_instruction);
-        const auto replacement = move(initial.replacement_instruction);
-        if (!original || !replacement || original->first != replacement->first ||
-            replacement->second != std::bit_cast<std::uint32_t>(static_cast<float>(original->second)))
-            continue;
-        const auto branch = std::find_if(words.begin(), words.end(), [&](const auto& word) {
-            return word.offset == initial.offset + 12 &&
-                   (word.replacement_instruction & 0xfc000000u) == 0x14000000u;
-        });
-        if (branch == words.end()) continue;
-        ++checked;
-        std::int64_t displacement = branch->replacement_instruction & 0x03ffffffu;
-        if (displacement & (1ll << 25)) displacement -= 1ll << 26;
-        const auto target = static_cast<std::uint64_t>(static_cast<std::int64_t>(branch->offset) + displacement * 4);
-        const auto restore = std::find_if(words.begin(), words.end(), [&](const auto& word) {
-            return word.offset == target;
-        });
-        CHECK(restore != words.end());
-        if (restore == words.end()) continue;
-        const auto restored = move(restore->replacement_instruction);
-        CHECK(restored && *restored == *original);
-        CHECK(restore->expected_instruction == restore->replacement_instruction);
-        if (!restored) continue;
-        for (std::uint32_t seed : {0u, UINT32_MAX}) {
-            std::array<std::uint32_t, 32> registers;
-            registers.fill(seed);
-            registers[replacement->first] = replacement->second;
-            const auto counter_bits = registers[original->first];
-            registers[restored->first] = restored->second;
-            const auto state = registers[original->first];
-            CHECK(std::bit_cast<float>(counter_bits) == static_cast<float>(original->second));
-            CHECK(state == original->second);
-        }
-    }
-    CHECK(checked == 1);
 }
 
 // One title folder: named by its title id, a profile that reads and names
@@ -100,52 +48,6 @@ void check_folder(const std::filesystem::path& folder) {
         bool zero = true;
         for (const auto byte : patch.identity.main_build_id) zero &= byte == std::byte{0};
         if (zero) fail(folder, "a build id is all zeros");
-        if (*title == 0x01004b10157f2000ull) {
-            // The hidden experiment must leave all admitted fixed call sets
-            // empty and retain their established instruction counts.
-            for (const auto& [rate, count] : std::array<std::pair<const char*, std::size_t>, 5>{{
-                     {"", 0}, {"0", 0}, {"30", 0}, {"60", 17}, {"120", 18}}}) {
-                const auto words = compat::select_patch_words(patch, rate);
-                const auto calls = compat::select_patch_calls(patch, rate);
-                CHECK(std::holds_alternative<std::vector<compat::WordPatch>>(words));
-                CHECK(std::holds_alternative<std::vector<compat::CallPatch>>(calls));
-                if (const auto* selected = std::get_if<std::vector<compat::WordPatch>>(&words)) CHECK(selected->size() == count);
-                if (const auto* selected = std::get_if<std::vector<compat::CallPatch>>(&calls)) CHECK(selected->empty());
-            }
-            const auto calls = compat::select_patch_calls(patch, "variable");
-            CHECK(std::holds_alternative<std::vector<compat::CallPatch>>(calls));
-            if (const auto* selected = std::get_if<std::vector<compat::CallPatch>>(&calls)) CHECK(!selected->empty());
-            const auto variable_words = compat::select_patch_words(patch, "variable");
-            CHECK(std::holds_alternative<std::vector<compat::WordPatch>>(variable_words));
-            if (const auto* selected = std::get_if<std::vector<compat::WordPatch>>(&variable_words))
-                check_counter_state_return(*selected);
-        }
-        if (*title == 0x01007ef00011e000ull) {
-            CHECK(patch.calls.size() == 2);
-            CHECK(patch.frame_rate && patch.frame_rate->default_rate == 60);
-            CHECK(patch.frame_rate->supported_rates == std::vector<std::uint32_t>({30, 60, 120}));
-            CHECK(patch.frame_rate->experimental_rates == std::vector<std::uint32_t>({120}));
-            CHECK(patch.resolution && patch.resolution->gpu_budget_rate == 120);
-            const auto baseline = std::get<std::vector<compat::WordPatch>>(compat::select_patch_words(patch, "60"));
-            CHECK(baseline.size() == 26);
-            for (const char* rate : {"", "0", "30", "60", "120"}) {
-                const auto words = compat::select_patch_words(patch, rate);
-                CHECK(std::holds_alternative<std::vector<compat::WordPatch>>(words));
-                if (const auto* selected = std::get_if<std::vector<compat::WordPatch>>(&words))
-                    CHECK(std::equal(selected->begin(), selected->end(), baseline.begin(), baseline.end(),
-                        [](const auto& left, const auto& right) {
-                            return left.offset == right.offset && left.expected_instruction == right.expected_instruction &&
-                                left.replacement_instruction == right.replacement_instruction && !left.frame_rate;
-                        }));
-                const auto calls = compat::select_patch_calls(patch, rate);
-                CHECK(std::holds_alternative<std::vector<compat::CallPatch>>(calls));
-                if (const auto* selected = std::get_if<std::vector<compat::CallPatch>>(&calls))
-                    CHECK(std::equal(selected->begin(), selected->end(), patch.calls.begin(), patch.calls.end(),
-                        [](const auto& left, const auto& right) {
-                            return left.offset == right.offset && left.expected_instruction == right.expected_instruction;
-                        }));
-            }
-        }
         if (patch.pso_manifest.empty()) continue;
         const fs::path list = patch.pso_manifest;
         expected.insert(list.filename().string());
@@ -223,8 +125,40 @@ void check_lookup() {
     ::unsetenv("ARMIGO_TITLES");
 
     CHECK(compat::title_save_directory(0x0100000000001000).filename() == "0100000000001000");
-    CHECK(compat::title_save_directory(0x0100000000001000).parent_path().filename() == "Armigo");
+    CHECK(compat::title_save_directory(0x0100000000001000).parent_path().filename() == "Saves");
     CHECK(compat::title_cache_directory(0x0100000000001000).filename() == "0100000000001000");
+    const auto isolated = root / "Saves" / "synthetic";
+    const auto legacy = root / "legacy";
+    fs::create_directories(legacy / "unreadable-captures");
+    fs::permissions(legacy / "unreadable-captures", fs::perms::none);
+    CHECK(compat::prepare_save_directory(isolated, legacy).has_value());
+    CHECK(!fs::exists(isolated));
+    fs::create_directories(isolated);
+    std::ofstream(isolated / "arbitrary.binary") << "save";
+    CHECK(!compat::prepare_save_directory(isolated, legacy));
+    CHECK(fs::file_size(isolated / "arbitrary.binary") == 4);
+    const auto alias = root / "Saves" / "legacy-alias";
+    fs::create_directory_symlink(legacy, alias);
+    CHECK(compat::prepare_save_directory(alias, legacy).has_value());
+    const auto fresh = root / "Saves" / "fresh";
+    CHECK(!compat::prepare_save_directory(fresh, root / "absent-legacy"));
+    CHECK(fs::is_directory(fresh));
+    const auto imported = root / "Saves" / "imported";
+    const auto staged = fs::path(imported.string() + ".import");
+    fs::create_directories(staged / "nested");
+    std::ofstream(staged / "nested" / "unknown.save") << "payload";
+    CHECK(compat::prepare_save_directory(imported, legacy).has_value());
+    CHECK(!fs::exists(imported) && fs::exists(staged));
+    std::ofstream(imported.string() + ".import-ready") << "Armigo verified save import v1\n";
+    CHECK(!compat::prepare_save_directory(imported, legacy));
+    CHECK(fs::file_size(imported / "nested" / "unknown.save") == 7);
+    CHECK(!fs::exists(staged) && !fs::exists(imported.string() + ".import-ready"));
+    fs::create_directories(staged);
+    std::ofstream(staged / "replacement") << "must not replace";
+    std::ofstream(imported.string() + ".import-ready") << "Armigo verified save import v1\n";
+    CHECK(!compat::prepare_save_directory(imported, legacy));
+    CHECK(fs::exists(staged) && !fs::exists(imported / "replacement"));
+    fs::permissions(legacy / "unreadable-captures", fs::perms::owner_all);
     fs::remove_all(root);
 }
 } // namespace

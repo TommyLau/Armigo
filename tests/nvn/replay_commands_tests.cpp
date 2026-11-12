@@ -10,6 +10,7 @@
 
 #include "commands.h"
 #include "entry_table.h"
+#include "entry_table_231.h"
 #include "programs.h"
 
 #include <algorithm>
@@ -17,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <utility>
 
 namespace {
 
@@ -32,7 +34,8 @@ unsigned failures = 0;
     } while (false)
 
 template <Entry E> typename EntrySignature<E>::type load() {
-    return reinterpret_cast<typename EntrySignature<E>::type>(armigo_nvn_bootstrap_loader(entry_name(E).data()));
+    const auto loader = bootstrap_loader_for(selected_api_version().value_or(ApiVersion{55,15}));
+    return reinterpret_cast<typename EntrySignature<E>::type>(loader(entry_name(E).data()));
 }
 
 struct ObservedRecord {
@@ -148,6 +151,20 @@ void test_sampler_stamps(NVNdevice& device) {
         CHECK(seen[0].first == Op::sampler_registrations && seen[1].first == Op::draw);
         CHECK(seen[2].first == Op::sampler_registrations && seen[2].second == first);
         CHECK(seen[3].first == Op::draw && seen[4].first == Op::draw);
+    }
+    // Submitting the same retained handles later captures an independent
+    // population boundary without rewriting the command recording.
+    const auto at_first_submit = sampler_registrations.fetch_add(1) + 1;
+    CommandWalkStatus status{};
+    const auto first_submission = prepare_commands({&handle, 1}, status);
+    CHECK(first_submission && status == CommandWalkStatus::complete);
+    const auto at_second_submit = sampler_registrations.fetch_add(1) + 1;
+    const auto second_submission = prepare_commands({&handle, 1}, status);
+    CHECK(second_submission && status == CommandWalkStatus::complete);
+    sampler_registrations.fetch_add(1);
+    if (first_submission && second_submission) {
+        CHECK(submission_sampler_registrations(*first_submission) == at_first_submit);
+        CHECK(submission_sampler_registrations(*second_submission) == at_second_submit);
     }
     load<Entry::nvnDeviceFinalizeCommandHandle>()(&device, handle);
     load<Entry::nvnCommandBufferFinalize>()(&commands);
@@ -557,6 +574,144 @@ void test_compact_bindings(NVNdevice& device) {
     load<Entry::nvnCommandBufferFinalize>()(&commands);
 }
 
+void test_texture_prefix_recording_api231(NVNdevice& device) {
+    struct Restore { ApiVersion version = selected_api_version().value_or(ApiVersion{55,15});
+        ~Restore() { select_api_version(version); } } restore;
+    v231::register_entries();
+    select_api_version({231,40});
+    NVNcommandBuffer commands{};
+    CHECK(load<Entry::nvnCommandBufferInitialize>()(&commands,&device));
+    load<Entry::nvnCommandBufferBeginRecording>()(&commands);
+    load<Entry::nvnCommandBufferBindTexture>()(&commands,NVN_SHADER_STAGE_FRAGMENT,0,17);
+    load<Entry::nvnCommandBufferBindTexture>()(&commands,NVN_SHADER_STAGE_FRAGMENT,-1,0xabcdef0012345678ull);
+    const NVNtextureHandle handles[]{0x1122334455667788ull,29};
+    load<Entry::nvnCommandBufferBindTextures>()(&commands,NVN_SHADER_STAGE_FRAGMENT,-1,2,handles);
+    const auto handle = load<Entry::nvnCommandBufferEndRecording>()(&commands);
+    std::vector<ObservedRecord> records;
+    CHECK(walk_commands(handle,collect,&records)==CommandWalkStatus::complete);
+    CHECK(records.size()==4);
+    if(records.size()==4) {
+        CHECK(records[0].op==Op::bind_textures);
+        CHECK(records[1].op==Op::bind_texture_prefix && records[2].op==Op::bind_texture_prefix);
+        if(records[1].op==Op::bind_texture_prefix && records[2].op==Op::bind_texture_prefix) {
+            CHECK(payload<BindTexturePrefix>(records[1]).bytes==4);
+            CHECK(payload<BindTexturePrefix>(records[1]).handle==0xabcdef0012345678ull);
+            CHECK(payload<BindTexturePrefix>(records[2]).bytes==8);
+            CHECK(payload<BindTexturePrefix>(records[2]).handle==handles[0]);
+        }
+        CHECK(records[3].op==Op::bind_textures);
+        if(records[3].op==Op::bind_textures) {
+            CHECK(payload<BindHandles>(records[3]).first==0 && payload<BindHandles>(records[3]).count==1);
+            CHECK(payload<BindHandles>(records[3]).handles[0]==29);
+        }
+    }
+    CommandWalkStatus status;
+    CHECK(prepare_commands(std::span(&handle,1),status) && status==CommandWalkStatus::complete);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&device,handle);
+    load<Entry::nvnCommandBufferBeginRecording>()(&commands);
+    load<Entry::nvnCommandBufferBindTexture>()(&commands,NVN_SHADER_STAGE_FRAGMENT,-2,17);
+    load<Entry::nvnCommandBufferBindTexture>()(&commands,NVN_SHADER_STAGE_FRAGMENT,128,17);
+    load<Entry::nvnCommandBufferBindTexture>()(&commands,static_cast<NVNshaderStage>(8),-1,17);
+    load<Entry::nvnCommandBufferBindTexture>()(&commands,NVN_SHADER_STAGE_COMPUTE,-1,17);
+    const auto invalid=load<Entry::nvnCommandBufferEndRecording>()(&commands);
+    records.clear();
+    CHECK(walk_commands(invalid,collect,&records)==CommandWalkStatus::complete);
+    CHECK(records.size()==4);
+    for(const auto& record:records)CHECK(record.op==Op::unsupported);
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&device,invalid);
+    // Deferred indices are byte encoded; negative values do not address the
+    // immediate binding prefix and remain explicitly unsupported.
+    for (int count : {1, 2}) {
+        load<Entry::nvnCommandBufferBeginRecording>()(&commands);
+        load<Entry::nvnCommandBufferBindTexturesDeferred>()(&commands, NVN_SHADER_STAGE_FRAGMENT, -1, count, handles);
+        const auto deferred = load<Entry::nvnCommandBufferEndRecording>()(&commands);
+        records.clear();
+        CHECK(walk_commands(deferred, collect, &records) == CommandWalkStatus::invalid_deferred_binding);
+        CHECK(records.empty());
+        CHECK(!prepare_commands(std::span(&deferred, 1), status) && status == CommandWalkStatus::invalid_deferred_binding);
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&device, deferred);
+    }
+    load<Entry::nvnCommandBufferFinalize>()(&commands);
+}
+
+void test_task_mesh_binding_banks(NVNdevice& device) {
+    const std::array<NVNbufferRange, 2> ranges{{{0x1000, 16}, {0x2000, 32}}};
+    const std::array<NVNtextureHandle, 2> textures{17, 29};
+    const std::array<NVNimageHandle, 2> images{31, 43};
+    const std::array<NVNseparateTextureHandle, 2> separate_textures{{{47}, {53}}};
+    const std::array<NVNseparateSamplerHandle, 2> samplers{{{59}, {61}}};
+    // Task and mesh retain their logical banks alongside ordinary stages;
+    // packet payloads retain all other fields.
+    for (const auto [api_stage, stored_stage] : std::array<std::pair<int, int>, 2>{{{6, 6}, {7, 7}}}) {
+        const auto stage = static_cast<NVNshaderStage>(api_stage);
+        NVNcommandBuffer commands{};
+        CHECK(load<Entry::nvnCommandBufferInitialize>()(&commands, &device));
+        load<Entry::nvnCommandBufferBeginRecording>()(&commands);
+        load<Entry::nvnCommandBufferBindUniformBuffer>()(&commands, stage, 0, 0x3000, 64);
+        load<Entry::nvnCommandBufferBindUniformBuffers>()(&commands, stage, 1, 2, ranges.data());
+        load<Entry::nvnCommandBufferBindStorageBuffer>()(&commands, stage, 0, 0x4000, 128);
+        load<Entry::nvnCommandBufferBindStorageBuffers>()(&commands, stage, 1, 2, ranges.data());
+        load<Entry::nvnCommandBufferBindTexture>()(&commands, stage, 0, textures[0]);
+        load<Entry::nvnCommandBufferBindTextures>()(&commands, stage, 1, 2, textures.data());
+        load<Entry::nvnCommandBufferBindImage>()(&commands, stage, 0, images[0]);
+        load<Entry::nvnCommandBufferBindImages>()(&commands, stage, 1, 2, images.data());
+        load<Entry::nvnCommandBufferBindSeparateTexture>()(&commands, stage, 0, separate_textures[0]);
+        load<Entry::nvnCommandBufferBindSeparateTextures>()(&commands, stage, 1, 2, separate_textures.data());
+        load<Entry::nvnCommandBufferBindSeparateSampler>()(&commands, stage, 0, samplers[0]);
+        load<Entry::nvnCommandBufferBindSeparateSamplers>()(&commands, stage, 1, 2, samplers.data());
+        load<Entry::nvnCommandBufferBindTexturesDeferred>()(&commands, stage, 4, 2, textures.data());
+        const auto handle = load<Entry::nvnCommandBufferEndRecording>()(&commands);
+        CHECK(handle != 0);
+        std::vector<ObservedRecord> records;
+        CHECK(walk_commands(handle, collect, &records) == CommandWalkStatus::complete);
+        CHECK(records.size() == 15);
+        for (const auto& record : records) {
+            if (record.op == Op::bind_uniform_buffer || record.op == Op::bind_storage_buffer)
+                CHECK(payload<BindBuffer>(record).stage == stored_stage);
+            else if (record.op == Op::bind_textures || record.op == Op::bind_images || record.op == Op::bind_samplers)
+                CHECK(payload<BindHandles>(record).stage == stored_stage);
+            else if (record.op == Op::bind_textures_deferred)
+                CHECK(payload<BindTexturesDeferred>(record).stage == stored_stage);
+            else CHECK(false);
+        }
+        if (records.size() == 15) {
+            CHECK(payload<BindBuffer>(records[0]).address == 0x3000);
+            CHECK(payload<BindBuffer>(records[5]).size == 32);
+            CHECK(payload<BindHandles>(records[10]).first == 128);
+            CHECK(payload<BindHandles>(records[11]).handles[1] == separate_textures[1].value);
+        }
+        CommandWalkStatus status;
+        auto captured = prepare_commands(std::span(&handle, 1), status);
+        CHECK(captured && status == CommandWalkStatus::complete);
+        records.clear();
+        if (captured) CHECK(walk_commands(*captured, collect, &records) == CommandWalkStatus::complete);
+        CHECK(records.size() == 15);
+        if (records.size() == 15) {
+            CHECK(records.back().op == Op::bind_textures);
+            CHECK(payload<BindHandles>(records.back()).stage == stored_stage);
+            CHECK(payload<BindHandles>(records.back()).handles[1] == textures[1]);
+        }
+        load<Entry::nvnDeviceFinalizeCommandHandle>()(&device, handle);
+        load<Entry::nvnCommandBufferFinalize>()(&commands);
+    }
+    NVNcommandBuffer invalid{};
+    CHECK(load<Entry::nvnCommandBufferInitialize>()(&invalid, &device));
+    load<Entry::nvnCommandBufferBeginRecording>()(&invalid);
+    load<Entry::nvnCommandBufferBindTexture>()(&invalid, static_cast<NVNshaderStage>(8), 0, 17);
+    load<Entry::nvnCommandBufferBindTexture>()(&invalid, static_cast<NVNshaderStage>(6), 128, 17);
+    const auto handle = load<Entry::nvnCommandBufferEndRecording>()(&invalid);
+    std::vector<ObservedRecord> records;
+    CHECK(walk_commands(handle, collect, &records) == CommandWalkStatus::complete);
+    CHECK(records.size() == 2);
+    for (const auto& record : records) {
+        CHECK(record.op == Op::unsupported);
+        if (record.op == Op::unsupported)
+            CHECK(payload<Unsupported>(record).entry == static_cast<std::uint32_t>(Entry::nvnCommandBufferBindTexture));
+    }
+    load<Entry::nvnDeviceFinalizeCommandHandle>()(&device, handle);
+    load<Entry::nvnCommandBufferFinalize>()(&invalid);
+}
+
 void test_submission_validation(NVNdevice& device) {
     NVNcommandBuffer commands{};
     CHECK(load<Entry::nvnCommandBufferInitialize>()(&commands, &device));
@@ -601,6 +756,8 @@ int main() {
     test_record_blocks_and_program_lifetime(device);
     test_submission_lifetime(device);
     test_compact_bindings(device);
+    test_texture_prefix_recording_api231(device);
+    test_task_mesh_binding_banks(device);
     test_submission_validation(device);
     NVNcommandBuffer command_buffer{};
     CHECK(load<Entry::nvnCommandBufferInitialize>()(&command_buffer, &device) == 1);

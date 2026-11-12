@@ -15,12 +15,16 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <utility>
 
 namespace armigo::shader_native {
+
+static_assert(maximum_native_source_bytes == shader::package::detail::maximum_source_size);
+static_assert(maximum_unstored_source_bytes == shader::package::detail::maximum_library_size);
 namespace {
 
 namespace fs = std::filesystem;
@@ -145,7 +149,7 @@ void require_stage_counts(const std::map<std::string, std::uint64_t>& counts) {
     }
 }
 
-std::string validate_stage(const NativeStageWrite& stage) {
+std::string validate_stage(const NativeStageWrite& stage, bool write_source) {
     try {
         detail::require(hex64(stage.stage_identity), "Native stage identity must be 64 lowercase hexadecimal digits");
         detail::require(!stage.program.empty() && stage.program.size() <= detail::maximum_program_size,
@@ -161,7 +165,9 @@ std::string validate_stage(const NativeStageWrite& stage) {
                             "Native stage depth does not match its stage");
             detail::require(!variant.reflection.empty() && variant.reflection.size() <= detail::maximum_reflection_size,
                             "Native reflection exceeds its size policy");
-            detail::require(!variant.source.empty() && variant.source.size() <= detail::maximum_source_size,
+            detail::require(!variant.source.empty() &&
+                                variant.source.size() <= (write_source ? maximum_native_source_bytes
+                                                                       : maximum_unstored_source_bytes),
                             "Native Metal source exceeds its size policy");
             detail::require(!variant.library.empty() && variant.library.size() <= detail::maximum_library_size,
                             "Native Metal library exceeds its size policy");
@@ -253,7 +259,7 @@ NativeVariant parse_variant(const Json& value, std::string_view identity) {
     variant.source_size = take_count(value, "source_size");
     detail::require(variant.library_size > 0 && variant.library_size <= detail::maximum_library_size &&
                         variant.reflection_size > 0 && variant.reflection_size <= detail::maximum_reflection_size &&
-                        variant.source_size > 0 && variant.source_size <= detail::maximum_source_size,
+                        variant.source_size > 0 && variant.source_size <= maximum_unstored_source_bytes,
                     "Native shader variant size is outside its policy");
     return variant;
 }
@@ -375,9 +381,21 @@ struct NativeSectionWriter::State {
 };
 
 struct NativePackage::State {
+    // Program digest plus stage kind. A repeated pair keeps the first identity.
+    struct ProgramKey {
+        std::string digest;
+        NativeStageKind stage = NativeStageKind::fragment;
+        bool operator<(const ProgramKey& other) const {
+            if (digest != other.digest) return digest < other.digest;
+            return static_cast<unsigned>(stage) < static_cast<unsigned>(other.stage);
+        }
+    };
+
     fs::path native;
     NativeSection section;
     std::map<std::string, std::size_t, std::less<>> index;
+    mutable std::once_flag program_index_once;
+    mutable std::map<ProgramKey, std::string> program_index;
 };
 
 NativeSectionWriter::NativeSectionWriter(std::unique_ptr<State> state) : state_(std::move(state)) {}
@@ -411,7 +429,7 @@ std::variant<std::string, NativeSectionWriter> NativeSectionWriter::create(const
 std::variant<std::string, std::monostate> NativeSectionWriter::add(const NativeStageWrite& stage) {
     try {
         detail::require(state_ && !state_->finished, "Native shader section is already finished");
-        if (const std::string failure = validate_stage(stage); !failure.empty()) return failure;
+        if (const std::string failure = validate_stage(stage, state_->write_source); !failure.empty()) return failure;
         for (const NativeEntry& existing : state_->entries) {
             detail::require(existing.stage_identity != stage.stage_identity, "Native shader section repeats a stage identity");
         }
@@ -515,6 +533,43 @@ std::variant<std::string, NativePackage> NativePackage::open(const fs::path& pac
 }
 
 const NativeSection& NativePackage::section() const { return state_->section; }
+
+std::optional<RuntimeStageIdentity> parse_runtime_stage_identity(std::string_view text) {
+    const auto first = text.find('.');
+    if (first != 1) return std::nullopt;
+    const auto second = text.find('.', first + 1);
+    if (second == std::string_view::npos || text.find('.', second + 1) != std::string_view::npos) return std::nullopt;
+    const auto digest = text.substr(first + 1, second - first - 1);
+    if (!hex64(digest)) return std::nullopt;
+    const auto suffix = text.substr(second + 1);
+    RuntimeStageIdentity parsed;
+    parsed.program_digest.assign(digest);
+    switch (text[0]) {
+    case '0': parsed.stage = NativeStageKind::vertex; break;
+    case '1': parsed.stage = NativeStageKind::fragment; break;
+    case '3': parsed.stage = NativeStageKind::task; break;
+    case '4': parsed.stage = NativeStageKind::mesh; break;
+    case '5': parsed.stage = NativeStageKind::compute; break;
+    default: return std::nullopt;
+    }
+    if (parsed.stage == NativeStageKind::vertex || parsed.stage == NativeStageKind::mesh) {
+        if (suffix == "1") parsed.vertex_depth_zero_to_one = true;
+        else if (suffix == "2") parsed.vertex_depth_zero_to_one = false;
+        else return std::nullopt;
+    }
+    return parsed;
+}
+
+std::optional<std::string> NativePackage::identity_for_program(std::string_view program_digest_hex,
+                                                               NativeStageKind stage) const {
+    std::call_once(state_->program_index_once, [this] {
+        for (const NativeEntry& entry : state_->section.entries)
+            state_->program_index.emplace(State::ProgramKey{entry.program_digest, entry.stage}, entry.stage_identity);
+    });
+    const auto found = state_->program_index.find(State::ProgramKey{std::string(program_digest_hex), stage});
+    if (found == state_->program_index.end()) return std::nullopt;
+    return found->second;
+}
 
 std::variant<NativeStageFiles, NativeMiss> NativePackage::find(std::string_view stage_identity, const NativeLookup& lookup) const {
     try {

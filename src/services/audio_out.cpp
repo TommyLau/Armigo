@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/audio_out.h>
 
 #include <algorithm>
@@ -33,19 +34,7 @@ constexpr std::uint32_t result_bad_name = 0x299;
 constexpr std::uint32_t result_bad_rate = 0x699;
 constexpr std::uint32_t result_bad_channels = 0x1499;
 
-std::uint32_t read(const IpcMessage& bytes, std::size_t offset, unsigned width = 4) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i != width; ++i)
-        value |= std::uint32_t(std::to_integer<unsigned char>(bytes[offset + i])) << (8 * i);
-    return value;
-}
-std::uint64_t read64(const IpcMessage& bytes, std::size_t offset) {
-    return read(bytes, offset) | std::uint64_t{read(bytes, offset + 4)} << 32;
-}
-void write(IpcMessage& bytes, std::size_t offset, std::uint32_t value) {
-    for (unsigned i = 0; i != 4; ++i)
-        bytes[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
-}
+using namespace horizon::cmif;
 // A non-domain reply with `output_words` of output after the CMIF header.
 IpcReply reply_with(unsigned output_words, std::uint32_t result = 0) {
     IpcReply reply{IpcDisposition::handled};

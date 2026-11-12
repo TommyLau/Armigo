@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/common/diagnostics.h>
 #include <armigo/services/applet.h>
 #include <armigo/services/graphics_system.h>
@@ -28,16 +29,7 @@
 
 namespace armigo::services::am {
 namespace {
-std::uint32_t read(const horizon::IpcMessage& message, unsigned offset) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i < 4; ++i)
-        value |= std::uint32_t(std::to_integer<unsigned char>(message[offset + i])) << (i * 8);
-    return value;
-}
-void write(horizon::IpcMessage& message, unsigned offset, std::uint32_t value) {
-    for (unsigned i = 0; i < 4; ++i)
-        message[offset + i] = static_cast<std::byte>((value >> (i * 8)) & 255);
-}
+using namespace horizon::cmif;
 } // namespace
 
 ApplicationRunningState::ApplicationRunningState(bool notifications_enabled, bool delivery_ready,
@@ -79,8 +71,6 @@ AppletServiceSession::AppletServiceSession(std::uint64_t process_id,
 
 horizon::IpcReply AppletServiceSession::close_server() {
     const std::lock_guard lock(mutex_);
-    if (contract_ == AppletContract::switch1) return ClientSession::close_server();
-    if (contract_ != AppletContract::switch2) return {};
     if (closed_) return {.disposition = horizon::IpcDisposition::handled,
                          .transport_result = horizon::session_closed_result};
     closed_ = true;
@@ -682,9 +672,12 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
             diagnostic_ = nullptr;
             return reply;
         };
+        // Storage and StorageAccessor replies carry their own interface words.
+        constexpr std::uint32_t storage_interface = 0x8e211f3d;
+        constexpr std::uint32_t accessor_interface = 0x919f469a;
         if (objects_[id - 2].kind == ObjectKind::storage && read(message, 40) == 0) {
             // IStorage command0 Open: an accessor over the same bytes.
-            return output_object(ObjectKind::storage_accessor, objects_[id - 2].data, 0x21f9610e);
+            return output_object(ObjectKind::storage_accessor, objects_[id - 2].data, storage_interface);
         }
         if (objects_[id - 2].kind == ObjectKind::storage_accessor && read(message, 40) == 0) {
             // IStorageAccessor command0 GetSize: the size as a signed 64-bit value.
@@ -693,7 +686,7 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
             reply.size = 56;
             write(reply.bytes, 4, 12);
             write(reply.bytes, 32, 0x4f434653);
-            write(reply.bytes, 44, 0x21f9610e);
+            write(reply.bytes, 44, accessor_interface);
             write(reply.bytes, 48, static_cast<std::uint32_t>(bytes));
             write(reply.bytes, 52, static_cast<std::uint32_t>(std::uint64_t{bytes} >> 32));
             diagnostic_ = nullptr;
@@ -722,7 +715,7 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
             reply.size = 48;
             write(reply.bytes, 4, 10);
             write(reply.bytes, 32, 0x4f434653);
-            write(reply.bytes, 44, 0x21f9610e);
+            write(reply.bytes, 44, accessor_interface);
             diagnostic_ = nullptr;
             return reply;
         }
@@ -734,7 +727,8 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
             write(reply.bytes, 32, 0x4f434653);
             write(reply.bytes, 36, result ? 1 : 0);
             write(reply.bytes, 40, result);
-            write(reply.bytes, 44, 0x21f9610e);
+            write(reply.bytes, 44, objects_[id - 2].kind == ObjectKind::storage_accessor
+                                       ? accessor_interface : 0x21f9610e);
             unsigned at = 48;
             for (const auto value : output) {
                 write(reply.bytes, at, value);
@@ -954,15 +948,12 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
         }
         if (objects_[id - 2].kind == ObjectKind::application_functions && read(message, 40) == 20) {
             // IApplicationFunctions command20 EnsureSaveData(uid) makes the
-            // user's save data exist and returns the extra space that needs, as
-            // a signed 64-bit byte count. The application has one save tree,
-            // which fsp-srv opens for every user and creates on first use, so
-            // nothing has to be made here and no space is required.
+            // title's save data exist and returns the extra space that needs, as
+            // a signed 64-bit byte count. A zero UID skips only the user save
+            // (23.0.1). The application has one save tree, which fsp-srv opens
+            // for every user and creates on first use, so nothing has to be made
+            // here and no space is required.
             if (words < 16 || size < 32) return {};
-            if ((read(message, 48) | read(message, 52) | read(message, 56) | read(message, 60)) == 0) {
-                diagnostic_ = "EnsureSaveData names no user";
-                return {};
-            }
             horizon::IpcReply reply{horizon::IpcDisposition::handled};
             reply.size = 56;
             write(reply.bytes, 4, 12);
@@ -1152,17 +1143,9 @@ horizon::IpcReply AppletServiceSession::handle(const horizon::IpcMessage& reques
         return {};
     const auto command = read(message, 24);
     if (command != 3 && (command != 0 || domain_)) return {};
-    horizon::IpcReply reply{horizon::IpcDisposition::handled};
-    reply.size = 44;
-    write(reply.bytes, 4, 9);
-    write(reply.bytes, 16, 0x4f434653);
-    write(reply.bytes, 28, 0xec6be3ff);
-    if (command == 0) {
-        domain_ = true;
-        write(reply.bytes, 32, 1);
-    }
+    if (command == 0) domain_ = true;
     diagnostic_ = nullptr;
-    return reply;
+    return control_reply(command == 0 ? 1 : 0, 4);
 }
 
 const char* AppletServiceSession::run_keyboard(LibraryApplet& applet,

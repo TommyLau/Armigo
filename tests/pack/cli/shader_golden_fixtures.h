@@ -494,6 +494,50 @@ inline std::vector<std::byte> native_bnsh() {
     return bytes;
 }
 
+// One variation. The vertex and fragment slots keep separate control and code
+// sections, so both can be programs the native front end translates.
+inline std::vector<std::byte> native_graphics_bnsh(const std::vector<std::byte>& vertex_control,
+                                                   const std::vector<std::byte>& vertex_code,
+                                                   const std::vector<std::byte>& fragment_control,
+                                                   const std::vector<std::byte>& fragment_code) {
+    if (vertex_control.empty() || vertex_code.empty() || fragment_control.empty() || fragment_code.empty()) {
+        throw std::runtime_error("Synthetic native stage needs control and code");
+    }
+    constexpr std::size_t kTable = 0x90;
+    constexpr std::size_t kProgram = 0x100;
+    constexpr std::size_t kVertexDescriptor = 0x160;
+    constexpr std::size_t kFragmentDescriptor = 0x180;
+    constexpr std::size_t kVertexControl = 0x1c0;
+    const auto align = [](std::size_t value) { return (value + 15u) & ~std::size_t{15}; };
+    const std::size_t fragment_control_at = kVertexControl + vertex_control.size();
+    const std::size_t vertex_code_at = align(fragment_control_at + fragment_control.size());
+    const std::size_t fragment_code_at = align(vertex_code_at + vertex_code.size());
+    const std::size_t end = fragment_code_at + fragment_code.size();
+    std::vector<std::byte> bytes(end, std::byte{0});
+    text_at(bytes, 0, "BNSH\0\0\0\0", 8);
+    word(bytes, 0x1c, end);
+    text_at(bytes, 0x60, "grsc", 4);
+    word(bytes, 0x7c, 1);
+    word(bytes, 0x80, kTable, 8);
+    word(bytes, kTable + 0x10, kProgram, 8);
+    word(bytes, kProgram + 8, kVertexDescriptor, 8);
+    word(bytes, kProgram + 8 + 4 * 8, kFragmentDescriptor, 8);
+    auto describe = [&](std::size_t at, std::size_t control, std::size_t code, const std::vector<std::byte>& control_bytes,
+                        const std::vector<std::byte>& code_bytes) {
+        word(bytes, at + 8, control, 8);
+        word(bytes, at + 16, code, 8);
+        word(bytes, at + 24, code_bytes.size());
+        word(bytes, at + 28, control_bytes.size());
+    };
+    describe(kVertexDescriptor, kVertexControl, vertex_code_at, vertex_control, vertex_code);
+    describe(kFragmentDescriptor, fragment_control_at, fragment_code_at, fragment_control, fragment_code);
+    std::memcpy(bytes.data() + kVertexControl, vertex_control.data(), vertex_control.size());
+    std::memcpy(bytes.data() + fragment_control_at, fragment_control.data(), fragment_control.size());
+    std::memcpy(bytes.data() + vertex_code_at, vertex_code.data(), vertex_code.size());
+    std::memcpy(bytes.data() + fragment_code_at, fragment_code.data(), fragment_code.size());
+    return bytes;
+}
+
 inline std::vector<std::byte> native_bahs() {
     std::vector<std::byte> bytes(0x500, std::byte{0});
     text_at(bytes, 0, "BAHS", 4);

@@ -80,6 +80,7 @@ struct MockResources final : ResourceBackend {
     }
     void register_texture(const TextureState&) override { ++registered; }
     void release_texture(const TextureState&) override { ++released; }
+    void clear_texture_descriptor(std::int32_t) override { CHECK(false); }
     void register_texture_descriptor(std::int32_t, const TextureState&,
                                      const TextureViewState*) override {}
     void register_sampler_descriptor(std::int32_t, const SamplerParameters&) override {}

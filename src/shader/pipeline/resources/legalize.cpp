@@ -39,6 +39,7 @@ public:
             for (const auto& phi : block.phis) phis[phi.output.value] = &phi;
     }
     Status run();
+    Status rewrite_guest_storage();
 private:
     Program& p;
     FactReader& facts;
@@ -46,6 +47,7 @@ private:
     const MetalProfile& profile;
     std::vector<std::optional<OperationId>> definitions;
     std::vector<const Phi*> phis;
+    bool direct_storage_analysis_ = false;
     // shared_address_aligned through this program's definition index: one
     // step a lookup instead of a scan of every operation.
     bool aligned(const Operand& value, unsigned alignment, AlignmentMemo* memo = nullptr) {
@@ -58,6 +60,7 @@ private:
         }, memo);
     }
     std::array<std::optional<ResourceId>, constant_buffer_slot_count> buffers;
+    std::array<bool, constant_buffer_slot_count> padding_required{};
     std::optional<Diagnostic> error;
     std::uint64_t steps{};
     SourceLocation source;
@@ -123,9 +126,19 @@ private:
     std::vector<TextureKey> address_sources(const Operand&, unsigned = 0);
     std::vector<TextureKey> address_union(const Operand&, std::set<std::uint32_t>&, unsigned = 0);
     bool bind_storage(Operation&, TextureKey, ResourceId&, StorageAddress&);
+    std::optional<ResourceId> storage_resource(TextureKey, Access);
     bool storage_words(const Operation&, const MemoryInfo&, TextureKey);
     bool storage_word_aligned(const Operand&, TextureKey, unsigned = 0);
     bool storage(Operation&);
+    bool guest_storage(Operation&);
+    bool same_address_word(const Operand&, const Operand&, unsigned = 0);
+    bool false_address_predicate(const Operand&, unsigned);
+    bool direct_storage_carry_predicate(const Operand&, const Operand&, const Operand&, const Operand&, unsigned);
+    bool direct_storage_carry(const Operand&, const Operand&, const Operand&, const Operand&, unsigned);
+    bool direct_storage_pair(const Operand&, const Operand&, TextureKey, unsigned = 0, std::set<std::uint32_t> = {});
+    struct OffsetRange { std::uint64_t minimum{}, maximum{UINT32_MAX}; };
+    OffsetRange storage_word_range(const Operand&, unsigned = 0, std::set<std::uint32_t> = {});
+    std::optional<OffsetRange> storage_relative_range(const Operand&, TextureKey, unsigned = 0);
     bool io(Operation&);
     bool lower_word(Operand&, std::vector<OperationId>&);
     // Descriptor origins propagated through local and shared memory.
@@ -452,7 +465,7 @@ std::optional<ResourceId> Resolver::buffer(std::uint8_t slot, std::uint64_t exte
     extent = std::clamp<std::uint64_t>(extent, 4, constant_buffer_window_bytes);
     if (!buffers[slot]) {
         buffers[slot] = append(BufferUse{ConstantBufferSource{slot}, Access::read,
-            {SizeKind::constant_buffer_window, extent, 4, ConstantBufferPolicy::runtime_zero_words_v1}});
+            {SizeKind::constant_buffer_window, extent, 4, ConstantBufferPolicy::padded_zero_words_v2}});
     } else {
         auto& use = std::get<BufferUse>(r.uses[buffers[slot]->value]);
         use.size.bytes = std::max(use.size.bytes, extent);
@@ -861,12 +874,13 @@ bool Resolver::pure_key(const Operand& operand, TextureKey& key, unsigned depth)
         return true;
     }
     const auto* op = definition(operand);
-    if (!op || op->opcode != Opcode::load || op->outputs.size() != 1) return false;
+    if (!op || op->opcode != Opcode::load || (!direct_storage_analysis_ && op->outputs.size() != 1)) return false;
     const auto* memory = std::get_if<MemoryInfo>(&op->info);
     if (!memory) return false;
     const auto& m = *memory;
     if (m.space != AddressSpace::constant_buffer || !m.constant_buffer_slot ||
-        m.element_bytes != 4 || m.elements != 1 || m.array_index || m.is_volatile) return false;
+        m.element_bytes != 4 || m.elements != op->outputs.size() ||
+        (!direct_storage_analysis_ && m.elements != 1) || m.array_index || m.is_volatile) return false;
     std::uint64_t offset = m.byte_offset;
     if (m.dynamic_byte_offset) {
         const auto dynamic = exact(op->inputs[m.dynamic_byte_offset->value], depth + 1);
@@ -1002,9 +1016,281 @@ void Resolver::record_memory_stores() {
     }
 }
 
+bool Resolver::same_address_word(const Operand& left, const Operand& right, unsigned depth) {
+    if (!step(depth)) return false;
+    if (const auto* a = std::get_if<ValueId>(&left))
+        if (const auto* b = std::get_if<ValueId>(&right); b && *a == *b) return true;
+    if (const auto* a = std::get_if<LiteralBits>(&left))
+        if (const auto* b = std::get_if<LiteralBits>(&right)) return *a == *b;
+    const auto* a = definition(left);
+    const auto* b = definition(right);
+    if (a && a->opcode == Opcode::copy && a->inputs.size() == 1) return same_address_word(a->inputs[0], right, depth + 1);
+    if (b && b->opcode == Opcode::copy && b->inputs.size() == 1) return same_address_word(left, b->inputs[0], depth + 1);
+    TextureKey ak, bk;
+    if (pure_key(left, ak, depth + 1) && pure_key(right, bk, depth + 1)) return ak == bk;
+    if (!a || !b || a->opcode != b->opcode || a->inputs.size() != 2 || b->inputs.size() != 2 ||
+        a->outputs.size() != 1 || b->outputs.size() != 1 || a->numeric.scalar != ScalarType::u32 ||
+        b->numeric.scalar != ScalarType::u32 ||
+        (a->numeric.domain != Domain::bits && a->numeric.domain != Domain::unsigned_integer) ||
+        (b->numeric.domain != Domain::bits && b->numeric.domain != Domain::unsigned_integer)) return false;
+    switch (a->opcode) {
+    case Opcode::add: case Opcode::subtract: case Opcode::multiply:
+    case Opcode::shift_left: case Opcode::shift_right: case Opcode::bit_and: case Opcode::bit_or: case Opcode::bit_xor: break;
+    default: return false;
+    }
+    if (same_address_word(a->inputs[0], b->inputs[0], depth + 1) &&
+        same_address_word(a->inputs[1], b->inputs[1], depth + 1)) return true;
+    const bool commutative = a->opcode == Opcode::add || a->opcode == Opcode::multiply ||
+        a->opcode == Opcode::bit_and || a->opcode == Opcode::bit_or || a->opcode == Opcode::bit_xor;
+    return commutative && same_address_word(a->inputs[0], b->inputs[1], depth + 1) &&
+        same_address_word(a->inputs[1], b->inputs[0], depth + 1);
+}
+
+bool Resolver::false_address_predicate(const Operand& value, unsigned depth) {
+    if (!step(depth)) return false;
+    if (const auto* literal = std::get_if<LiteralBits>(&value)) return literal->type == ValueType::predicate && !literal->bits;
+    const auto* op = definition(value);
+    if (!op) return false;
+    if (op->opcode == Opcode::copy && op->inputs.size() == 1) return false_address_predicate(op->inputs[0], depth + 1);
+    if (op->inputs.size() != 2) return false;
+    if (op->opcode == Opcode::logical_or)
+        return false_address_predicate(op->inputs[0], depth + 1) && false_address_predicate(op->inputs[1], depth + 1);
+    if (op->opcode == Opcode::logical_and)
+        return false_address_predicate(op->inputs[0], depth + 1) || false_address_predicate(op->inputs[1], depth + 1);
+    const auto* relation = std::get_if<ComparisonInfo>(&op->info);
+    return op->opcode == Opcode::compare && relation && !relation->unordered &&
+        op->numeric.scalar == ScalarType::u32 && op->numeric.domain == Domain::unsigned_integer &&
+        (relation->relation == Compare::less || relation->relation == Compare::greater || relation->relation == Compare::not_equal) &&
+        same_address_word(op->inputs[0], op->inputs[1], depth + 1);
+}
+
+bool Resolver::direct_storage_carry_predicate(const Operand& value, const Operand& sum,
+                                              const Operand& left, const Operand& right, unsigned depth) {
+    if (!step(depth)) return false;
+    const auto* compare = definition(value);
+    if (!compare) return false;
+    if (compare->opcode == Opcode::copy && compare->inputs.size() == 1)
+        return direct_storage_carry_predicate(compare->inputs[0], sum, left, right, depth + 1);
+    if (compare->opcode == Opcode::logical_or && compare->inputs.size() == 2) {
+        for (unsigned side = 0; side < 2; ++side)
+            if (false_address_predicate(compare->inputs[side], depth + 1) &&
+                direct_storage_carry_predicate(compare->inputs[1 - side], sum, left, right, depth + 1)) return true;
+        return false;
+    }
+    const auto* relation = std::get_if<ComparisonInfo>(&compare->info);
+    return compare->opcode == Opcode::compare && compare->inputs.size() == 2 && relation &&
+        relation->relation == Compare::less && !relation->unordered && compare->numeric.domain == Domain::unsigned_integer &&
+        compare->numeric.scalar == ScalarType::u32 && same_address_word(compare->inputs[0], sum, depth + 1) &&
+        (same_address_word(compare->inputs[1], left, depth + 1) || same_address_word(compare->inputs[1], right, depth + 1));
+}
+
+bool Resolver::direct_storage_carry(const Operand& word, const Operand& sum,
+                                    const Operand& left, const Operand& right, unsigned depth) {
+    if (!step(depth)) return false;
+    const auto* select = definition(word);
+    if (!select || select->opcode != Opcode::select || select->inputs.size() != 3) return false;
+    const auto* one = std::get_if<LiteralBits>(&select->inputs[1]);
+    const auto* zero = std::get_if<LiteralBits>(&select->inputs[2]);
+    if (!one || !zero || one->type != ValueType::word32 || zero->type != ValueType::word32 || one->bits != 1 || zero->bits) return false;
+    return direct_storage_carry_predicate(select->inputs[0], sum, left, right, depth + 1);
+}
+
+// Match both halves together: each high-word addition must be the carry
+// produced by the corresponding low-word addition, not an arbitrary term.
+bool Resolver::direct_storage_pair(const Operand& low, const Operand& high, TextureKey key,
+                                    unsigned depth, std::set<std::uint32_t> path) {
+    if (!step(depth)) return false;
+    for (const auto* word : {&low, &high})
+        if (const auto* id = std::get_if<ValueId>(word); id && p.values[id->value].kind == ValueKind::mutable_local) return false;
+    const auto* lo = definition(low);
+    if (lo && lo->opcode == Opcode::copy && lo->inputs.size() == 1)
+        return direct_storage_pair(lo->inputs[0], high, key, depth + 1, path);
+    TextureKey low_key, high_key;
+    if (pure_key(low, low_key, depth + 1) && low_key == key &&
+        pure_key(high, high_key, depth + 1) && high_key == TextureKey{key.cbuf_slot, key.handle_byte_offset + 4}) return true;
+    const auto* id = std::get_if<ValueId>(&high);
+    if (!id || !path.insert(id->value).second) return false;
+    const auto* hi = definition(high);
+    if (!hi) {
+        const auto* phi = id->value < phis.size() ? phis[id->value] : nullptr;
+        if (!phi) return false;
+        bool incoming = false;
+        for (const auto& input : phi->inputs) {
+            if (input.value == phi->output) continue;
+            incoming = true;
+            if (!direct_storage_pair(low, input.value, key, depth + 1, path)) return false;
+        }
+        return incoming;
+    }
+    if (hi->opcode == Opcode::copy && hi->inputs.size() == 1)
+        return direct_storage_pair(low, hi->inputs[0], key, depth + 1, path);
+    if (hi->opcode == Opcode::select && hi->inputs.size() == 3)
+        return direct_storage_pair(low, hi->inputs[1], key, depth + 1, path) &&
+            direct_storage_pair(low, hi->inputs[2], key, depth + 1, path);
+    if (!lo || lo->opcode != Opcode::add || lo->inputs.size() != 2 || hi->opcode != Opcode::add || hi->inputs.size() != 2 ||
+        lo->numeric.scalar != ScalarType::u32 || hi->numeric.scalar != ScalarType::u32 ||
+        (lo->numeric.domain != Domain::bits && lo->numeric.domain != Domain::unsigned_integer) ||
+        (hi->numeric.domain != Domain::bits && hi->numeric.domain != Domain::unsigned_integer)) return false;
+    for (unsigned h = 0; h < 2; ++h)
+        if (direct_storage_carry(hi->inputs[h], low, lo->inputs[0], lo->inputs[1], depth + 1))
+            for (unsigned l = 0; l < 2; ++l)
+                if (direct_storage_pair(lo->inputs[l], hi->inputs[1 - h], key, depth + 1, path)) return true;
+    return false;
+}
+
+Resolver::OffsetRange Resolver::storage_word_range(const Operand& value, unsigned depth, std::set<std::uint32_t> path) {
+    if (!step(depth)) return {};
+    if (const auto* id = std::get_if<ValueId>(&value)) {
+        if (p.values[id->value].kind == ValueKind::mutable_local || !path.insert(id->value).second) return {};
+    }
+    if (std::holds_alternative<LiteralBits>(value) || std::holds_alternative<ConstantWord>(value)) {
+        if (auto constant = exact(value, depth + 1)) return {*constant, *constant};
+        return {};
+    }
+    const auto* op = definition(value);
+    if (!op || op->outputs.size() != 1) return {};
+    if (op->opcode == Opcode::copy && op->inputs.size() == 1)
+        return storage_word_range(op->inputs[0], depth + 1, path);
+    if (op->opcode == Opcode::load) {
+        if (auto constant = exact(value, depth + 1)) return {*constant, *constant};
+        return {};
+    }
+    if (op->opcode == Opcode::select && op->inputs.size() == 3) {
+        const auto a = storage_word_range(op->inputs[1], depth + 1, path);
+        const auto b = storage_word_range(op->inputs[2], depth + 1, path);
+        return {std::min(a.minimum, b.minimum), std::max(a.maximum, b.maximum)};
+    }
+    if (op->inputs.size() != 2 || op->numeric.scalar != ScalarType::u32 ||
+        (op->numeric.domain != Domain::unsigned_integer && op->numeric.domain != Domain::bits)) return {};
+    const auto a = storage_word_range(op->inputs[0], depth + 1, path);
+    const auto b = storage_word_range(op->inputs[1], depth + 1, path);
+    switch (op->opcode) {
+    case Opcode::bit_and: return {0, std::min(a.maximum, b.maximum)};
+    case Opcode::minimum: return {std::min(a.minimum, b.minimum), std::min(a.maximum, b.maximum)};
+    case Opcode::maximum: return {std::max(a.minimum, b.minimum), std::max(a.maximum, b.maximum)};
+    case Opcode::add:
+        if (a.maximum + b.maximum <= UINT32_MAX) return {a.minimum + b.minimum, a.maximum + b.maximum};
+        break;
+    case Opcode::subtract:
+        if (a.minimum >= b.maximum) return {a.minimum - b.maximum, a.maximum - b.minimum};
+        break;
+    case Opcode::multiply:
+        if (a.maximum * b.maximum <= UINT32_MAX) return {a.minimum * b.minimum, a.maximum * b.maximum};
+        for (unsigned side = 0; side < 2; ++side) {
+            const auto factor = side ? a : b;
+            if (factor.minimum == factor.maximum && factor.maximum && std::has_single_bit(factor.maximum))
+                return {0, UINT32_MAX & ~(factor.maximum - 1)};
+        }
+        break;
+    case Opcode::shift_left: case Opcode::shift_right:
+        if (b.minimum == b.maximum) {
+            const auto shift = b.maximum & 31;
+            if (op->opcode == Opcode::shift_right) return {a.minimum >> shift, a.maximum >> shift};
+            if ((a.maximum << shift) <= UINT32_MAX) return {a.minimum << shift, a.maximum << shift};
+            return {0, std::uint64_t(UINT32_MAX) & ~((std::uint64_t{1} << shift) - 1)};
+        }
+        break;
+    default: break;
+    }
+    return {};
+}
+
+// Keep the sum of descriptor-relative terms wide until the signed LDG
+// displacement is included. Correlated address carries alone do not prove
+// that truncating this sum to a uint preserves the target pool.
+std::optional<Resolver::OffsetRange> Resolver::storage_relative_range(const Operand& value, TextureKey key, unsigned depth) {
+    if (!step(depth)) return {};
+    if (const auto* id = std::get_if<ValueId>(&value); id && p.values[id->value].kind == ValueKind::mutable_local) return {};
+    TextureKey found;
+    if (pure_key(value, found, depth + 1)) return found == key ? std::optional<OffsetRange>{{0, 0}} : std::nullopt;
+    const auto* op = definition(value);
+    if (!op) return {};
+    if (op->opcode == Opcode::copy && op->inputs.size() == 1) return storage_relative_range(op->inputs[0], key, depth + 1);
+    if (op->opcode != Opcode::add || op->inputs.size() != 2 || op->numeric.scalar != ScalarType::u32 ||
+        (op->numeric.domain != Domain::unsigned_integer && op->numeric.domain != Domain::bits)) return {};
+    for (unsigned side = 0; side < 2; ++side) {
+        if (auto base = storage_relative_range(op->inputs[side], key, depth + 1)) {
+            auto term = storage_word_range(op->inputs[1 - side], depth + 1);
+            AlignmentMemo memo;
+            const auto immutable_definitions = [&](ValueId id, std::uint64_t& work) {
+                ValueDefinitions found; ++work;
+                if (p.values[id.value].kind != ValueKind::temporary) return found;
+                if (definitions[id.value]) found.operations.push_back(&p.operations[definitions[id.value]->value]);
+                if (phis[id.value]) found.phis.push_back(phis[id.value]);
+                return found;
+            };
+            for (unsigned alignment : {256u, 128u, 64u, 32u, 16u, 8u, 4u}) {
+                if (shared_address_aligned_by(p, op->inputs[1 - side], alignment, steps, immutable_definitions, &memo)) {
+                    term.maximum &= ~std::uint64_t(alignment - 1);
+                    break;
+                }
+            }
+            return OffsetRange{base->minimum + term.minimum, base->maximum + term.maximum};
+        }
+    }
+    return {};
+}
+
+bool Resolver::guest_storage(Operation& op) {
+    auto& m = std::get<MemoryInfo>(op.info);
+    if (op.opcode != Opcode::load || m.atomic || m.is_volatile || m.element_bytes != 4 ||
+        !m.dynamic_byte_offset || !m.global_address_high || m.array_index) return true;
+    const auto base = base_address(op.inputs[m.dynamic_byte_offset->value]);
+    if (error) return false;
+    if (!base) return true;
+    const auto key = base->key;
+    const bool high = direct_storage_pair(op.inputs[m.dynamic_byte_offset->value], op.inputs[m.global_address_high->value], key);
+    if (error) return false;
+    if (key.handle_byte_offset % 8 || key.handle_byte_offset > constant_buffer_window_bytes - 12 ||
+        !high) return true;
+    const auto range = storage_relative_range(op.inputs[m.dynamic_byte_offset->value], key);
+    if (error) return false;
+    if (!range) return true;
+    const auto displacement = std::int64_t(std::bit_cast<std::int32_t>(m.byte_offset));
+    if (std::int64_t(range->minimum) + displacement < 0 ||
+        std::int64_t(range->maximum) + displacement + m.element_bytes * m.elements > std::int64_t(UINT32_MAX) + 1) return true;
+    auto fact = read(FactQuery<FactKind::bound_storage_descriptor>{key.cbuf_slot, key.handle_byte_offset});
+    if (!fact) return false;
+    const auto* known = std::get_if<Known<bool>>(&*fact);
+    if (!known || !known->value) return true;
+    op.inputs = {base->offset.value_or(Operand{LiteralBits{0, ValueType::word32}})};
+    m.space = AddressSpace::storage;
+    m.direct_storage = key;
+    m.byte_offset += base->const_offset;
+    m.dynamic_byte_offset = InputIndex{0};
+    m.global_address_high.reset();
+    return true;
+}
+
+Status Resolver::rewrite_guest_storage() {
+    if (std::none_of(p.operations.begin(), p.operations.end(), [](const auto& op) {
+            const auto* m = std::get_if<MemoryInfo>(&op.info);
+            return m && m->space == AddressSpace::guest && op.opcode == Opcode::load && m->element_bytes == 4;
+        })) return std::monostate{};
+    direct_storage_analysis_ = true;
+    for (auto& op : p.operations) {
+        const auto* m = std::get_if<MemoryInfo>(&op.info);
+        if (!m || m->space != AddressSpace::guest) continue;
+        source = op.source;
+        if (!guest_storage(op)) {
+            if (error && error->code == DiagnosticCode::limit_exceeded) { error.reset(); continue; }
+            return *error;
+        }
+    }
+    return std::monostate{};
+}
+
 bool Resolver::storage(Operation& op) {
     auto& m = std::get<MemoryInfo>(op.info);
     if (m.resource || m.storage_address) return fail("SSA storage contains preallocated resources", DiagnosticCode::invalid_ir);
+    if (m.direct_storage) {
+        auto bound = require(FactQuery<FactKind::bound_storage_descriptor>{m.direct_storage->cbuf_slot,
+            m.direct_storage->handle_byte_offset});
+        if (!bound) return false;
+        if (!*bound) return fail("Direct storage descriptor is not bound", DiagnosticCode::invalid_fact);
+        m.resource = storage_resource(*m.direct_storage, Access::read);
+        return m.resource.has_value();
+    }
     if (!m.dynamic_byte_offset || m.array_index || m.atomic ||
         (op.opcode != Opcode::load && op.opcode != Opcode::store))
         return fail("Global memory access has no resolvable descriptor address");
@@ -1096,21 +1382,21 @@ bool Resolver::storage_words(const Operation& op, const MemoryInfo& m, TextureKe
 
 // One storage binding per descriptor key, with the descriptor's base and size
 // words appended as inputs of the access.
-bool Resolver::bind_storage(Operation& op, TextureKey key, ResourceId& resource, StorageAddress& address) {
-    const auto access = std::get<MemoryInfo>(op.info).access;
-    std::optional<ResourceId> found;
+std::optional<ResourceId> Resolver::storage_resource(TextureKey key, Access access) {
     for (std::uint32_t i = 0; i < r.uses.size(); ++i) {
-        if (!step()) return false;
+        if (!step()) return {};
         auto* use = std::get_if<BufferUse>(&r.uses[i]);
         const auto* source = use ? std::get_if<StorageBufferSource>(&use->source) : nullptr;
         if (source && source->descriptor == key) {
             use->access = combine(use->access, access);
-            found = ResourceId{i};
-            break;
+            return ResourceId{i};
         }
     }
-    if (!found) found = append(BufferUse{StorageBufferSource{key}, access,
-        {SizeKind::storage_descriptor, 4, 4}});
+    return append(BufferUse{StorageBufferSource{key}, access, {SizeKind::storage_descriptor, 4, 4}});
+}
+
+bool Resolver::bind_storage(Operation& op, TextureKey key, ResourceId& resource, StorageAddress& address) {
+    auto found = storage_resource(key, std::get<MemoryInfo>(op.info).access);
     if (!found) return false;
     auto word = [&](unsigned displacement) {
         const InputIndex index{static_cast<std::uint16_t>(op.inputs.size())};
@@ -1134,8 +1420,40 @@ bool Resolver::memory(Operation& op) {
         return m.resource.has_value();
     }
     if (m.space == AddressSpace::storage)
-        return (m.resource && m.storage_address) || fail("Storage address has no resolved descriptor");
+        return (m.resource && (m.storage_address || m.direct_storage)) || fail("Storage address has no resolved descriptor");
     if (m.array_index) return fail("Memory resource arrays require a source/stride contract");
+    if (m.native_shared_atomic_policy) {
+        if (!valid_native_shared_atomic(op, m, p.stage) || !r.compute || r.compute->shared_memory_bytes < 4)
+            return fail("Native shared atomic policy has no valid workgroup allocation", DiagnosticCode::invalid_fact);
+        std::optional<std::uint32_t> address = m.byte_offset;
+        if (m.dynamic_byte_offset) {
+            address = exact(op.inputs[m.dynamic_byte_offset->value]);
+            if (error) return false;
+            if (address) op.inputs[m.dynamic_byte_offset->value] = LiteralBits{*address, ValueType::word32};
+            if (!aligned(op.inputs[m.dynamic_byte_offset->value], 4))
+                return fail("Native shared atomic word address lacks alignment proof");
+        }
+        if (address && ((*address & 3u) || std::uint64_t(*address) + 4 > r.compute->shared_memory_bytes))
+            return fail("Constant native shared atomic address exceeds allocation", DiagnosticCode::unsupported_capability);
+        // A runtime native word address is not a fabricated static upper bound.
+        return true;
+    }
+    if (m.stage_buffer) {
+        if (m.space != AddressSpace::shared || !r.compute ||
+            !m.stage_buffer->valid_for(r.compute->shared_memory_bytes))
+            return fail("Stage-buffer region disagrees with the header allocation", DiagnosticCode::invalid_fact);
+        const auto& region = *m.stage_buffer;
+        const auto address = exact(op.inputs[m.dynamic_byte_offset->value]);
+        if (error) return false;
+        if (address) {
+            if (*address < region.region_base || std::uint64_t(*address) + m.element_bytes >
+                std::uint64_t(region.region_base) + region.region_bytes)
+                return fail("Constant stage-buffer access exceeds its declared region", DiagnosticCode::unsupported_capability);
+            op.inputs[m.dynamic_byte_offset->value] = LiteralBits{*address, ValueType::word32};
+        }
+        m.dynamic_byte_offset_upper_bound.reset();
+        return true;
+    }
     std::optional<std::uint32_t> maximum;
     if (m.dynamic_byte_offset) {
         maximum = upper(op.inputs[m.dynamic_byte_offset->value]);
@@ -1148,13 +1466,16 @@ bool Resolver::memory(Operation& op) {
         // and word alignment is applied before selecting those host words;
         // B64 reads two independently aligned words at address and address+4.
         std::uint64_t extent = constant_buffer_window_bytes;
+        bool needs_padding = m.dynamic_byte_offset && !maximum;
         if (!m.dynamic_byte_offset || maximum) {
             const std::uint64_t highest_base = std::uint64_t(m.byte_offset) + maximum.value_or(0);
             const std::uint64_t last_component = highest_base + std::uint64_t(m.element_bytes) * (m.elements - 1);
             const std::uint64_t last_word_address = m.element_bytes == 8 ?
                 ((last_component + 4) & ~std::uint64_t{3}) : (last_component & ~std::uint64_t{3});
+            needs_padding = last_word_address + 4 > constant_buffer_window_bytes;
             extent = std::min<std::uint64_t>(last_word_address + 4, constant_buffer_window_bytes);
         }
+        padding_required[*m.constant_buffer_slot] = padding_required[*m.constant_buffer_slot] || needs_padding;
         m.resource = buffer(*m.constant_buffer_slot, extent);
         return m.resource.has_value();
     }
@@ -1284,6 +1605,8 @@ bool Resolver::lower_word(Operand& operand, std::vector<OperationId>& before) {
         std::min<std::uint64_t>((std::uint64_t(word->byte_offset) & ~std::uint64_t{3}) + 4,
             constant_buffer_window_bytes));
     if (!binding) return false;
+    if ((std::uint64_t(word->byte_offset) & ~std::uint64_t{3}) + 4 > constant_buffer_window_bytes)
+        padding_required[word->slot] = true;
     if (p.values.size() >= p.limits.values || p.operations.size() >= p.limits.operations)
         return fail("Constant-buffer load expansion exceeds IR limit", DiagnosticCode::limit_exceeded);
     MemoryInfo m;
@@ -1349,6 +1672,13 @@ Status Resolver::run() {
         if (!ok) return *error;
         block.operations = std::move(order);
     }
+    // Select one binding contract after every access and inserted word load is
+    // known. A proven prefix needs no pad and can keep a full guest binding.
+    for (std::size_t slot = 0; slot < buffers.size(); ++slot) if (buffers[slot]) {
+        auto& use = std::get<BufferUse>(r.uses[buffers[slot]->value]);
+        use.size.constant_buffer_policy = padding_required[slot]
+            ? ConstantBufferPolicy::padded_zero_words_v2 : ConstantBufferPolicy::proven_zero_words_v2;
+    }
     if (std::any_of(buffers.begin(), buffers.end(), [](const auto& buffer) { return buffer.has_value(); })) {
         if (!append(BufferUse{SupportBufferSource{std::string(constant_buffer_support_schema),
                 constant_buffer_support_version}, Access::read,
@@ -1366,6 +1696,15 @@ Result<LegalProgram> legalize(SsaProgram input, FactReader& facts, const MetalPr
     if (auto* error = std::get_if<Diagnostic>(&dependencies)) return *error;
     input.ir.dependencies = std::get<std::vector<Dependency>>(std::move(dependencies));
     if (auto status = passes::cleanup(input.ir); std::holds_alternative<Diagnostic>(status)) return std::get<Diagnostic>(status);
+    ResourceRequirements unused;
+    Resolver address_resolver(input.ir, facts, unused, profile);
+    if (auto status = address_resolver.rewrite_guest_storage(); std::holds_alternative<Diagnostic>(status))
+        return std::get<Diagnostic>(status);
+    if (std::any_of(input.ir.operations.begin(), input.ir.operations.end(), [](const auto& op) {
+            const auto* m = std::get_if<MemoryInfo>(&op.info); return m && m->direct_storage.has_value();
+        }))
+        if (auto status = passes::cleanup(input.ir); std::holds_alternative<Diagnostic>(status)) return std::get<Diagnostic>(status);
+    if (auto status = passes::snap_fragment_depth(input.ir); std::holds_alternative<Diagnostic>(status)) return std::get<Diagnostic>(status);
     if (auto status = passes::legalize_nontexture(input.ir, facts, profile); std::holds_alternative<Diagnostic>(status)) return std::get<Diagnostic>(status);
     if (auto status = validate(input.ir, IrForm::ssa, Phase::legalize); std::holds_alternative<Diagnostic>(status)) return std::get<Diagnostic>(status);
     for (const auto& op : input.ir.operations) {

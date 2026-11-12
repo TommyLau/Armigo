@@ -64,7 +64,7 @@ struct Fixture {
     }
     ResourceId constant_buffer(unsigned slot, unsigned window, unsigned index) {
         auto id = resource(BufferUse{ConstantBufferSource{static_cast<std::uint8_t>(slot)}, Access::read,
-            {SizeKind::constant_buffer_window, window, 4, ConstantBufferPolicy::runtime_zero_words_v1}},
+            {SizeKind::constant_buffer_window, window, 4, ConstantBufferPolicy::padded_zero_words_v2}},
             MetalNamespace::buffer, index);
         resource(BufferUse{SupportBufferSource{std::string(constant_buffer_support_schema), constant_buffer_support_version},
             Access::read, {SizeKind::accessed_extent, constant_buffer_support_bytes, 4}},
@@ -206,6 +206,10 @@ void basic_tests() {
 void depth_bias_tests() {
     Fixture fragment;
     fragment.options.emulate_depth_bias = true;
+    auto mandated = fragment;
+    mandated.p.ir.api_mandated_early_fragment_tests = true;
+    rejected(mandated, "API early tests cannot be replaced by late fragment depth-bias emulation",
+             DiagnosticCode::unsupported_capability);
     fragment.operation({{}, Opcode::discard, {}, {}, {}, {}, {}});
     fragment.p.regions = {SequenceRegion{{RegionId{1}, RegionId{2}}},
         BlockRegion{BlockId{0}}, IfRegion{predicate(true), RegionId{3}, RegionId{4}},
@@ -402,12 +406,13 @@ void memory_tests() {
     auto source = accepted(f, "constant_bytes");
     check(source.find("constant uint* resource0 [[buffer(7)]]") != std::string::npos &&
           source.find("constant uint* resource1 [[buffer(30)]]") != std::string::npos &&
-          source.find("resource1[5u]") != std::string::npos && source.find("65535u") != std::string::npos,
-          "Runtime-sized constant-buffer addressing and planned bindings");
+          source.find("resource1[5u]") == std::string::npos && source.find("65535u") != std::string::npos,
+          "Padded constant-buffer addressing and planned bindings");
     auto bad = f; std::get<MemoryInfo>(bad.p.ir.operations[0].info).resource.reset(); rejected(bad, "Unresolved memory", DiagnosticCode::unresolved_resource);
     bad = f; std::get<MemoryInfo>(bad.p.ir.operations[0].info).byte_offset = 63;
     source = accepted(bad, "Runtime guarded buffer load");
-    check(source.find("armigo_cbuf_word(resource0") != std::string::npos, "Window boundary load is guarded");
+    check(source.find("min(63ul, 64ul)") != std::string::npos &&
+        source.find("armigo_cbuf_word") == std::string::npos, "Window boundary uses a direct padded load");
     bad = f; bad.plan.resources.push_back(bad.plan.resources[0]); rejected(bad, "Duplicate binding");
     memory.byte_offset = 0; memory.dynamic_byte_offset = InputIndex{0};
     f.p.ir.operations[0].info = memory; f.p.ir.operations[0].inputs = {word(3)}; accepted(f, "constant_dynamic");

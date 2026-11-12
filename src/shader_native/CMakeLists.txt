@@ -9,10 +9,8 @@
 # ============================================================================
 
 # Native input and ISA components deliberately do not join the Maxwell source identity.
-find_package(zstd CONFIG QUIET)
 if(NOT TARGET zstd::libzstd_static)
-    message(STATUS "Native shader inventory disabled: static Zstandard package unavailable")
-    return()
+    include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/RuntimeDependencies.cmake")
 endif()
 add_library(armigo_shader_native STATIC input.cpp program.cpp instruction.cpp opcode_inventory.cpp)
 target_include_directories(armigo_shader_native PUBLIC "${PROJECT_SOURCE_DIR}/include")
@@ -34,8 +32,8 @@ if(BUILD_TESTING)
 endif()
 
 # A direct native frontend reuses backend contracts without modifying their sources.
-add_library(armigo_shader_native_frontend STATIC frontend.cpp arithmetic.cpp integer.cpp conversion.cpp flow.cpp texture.cpp memory.cpp system.cpp local.cpp gradient.cpp shared.cpp half.cpp tensor.cpp stage_buffer.cpp stage_memory.cpp mesh_stage.cpp handle_program.cpp)
-target_link_libraries(armigo_shader_native_frontend PUBLIC armigo_shader_native armigo_shader_pipeline)
+include("${CMAKE_CURRENT_SOURCE_DIR}/frontend_component.cmake")
+armigo_add_native_frontend_component()
 add_library(armigo_shader_native_package STATIC package.cpp)
 target_include_directories(armigo_shader_native_package PRIVATE "${PROJECT_SOURCE_DIR}/src/shader")
 target_link_libraries(armigo_shader_native_package PUBLIC armigo_shader_native armigo_shader_package)
@@ -81,7 +79,7 @@ if(BUILD_TESTING AND APPLE AND ARMIGO_ENABLE_GPU_TESTS)
     target_link_libraries(armigo_shader_native_local_gpu_tests PRIVATE armigo_shader_native_frontend "${ARMIGO_FOUNDATION_FRAMEWORK}" "${ARMIGO_METAL_FRAMEWORK}")
     add_test(NAME shader_native.local_gpu COMMAND armigo_shader_native_local_gpu_tests)
     set_tests_properties(shader_native.local_gpu PROPERTIES LABELS "shader;gpu;metal4" TIMEOUT 300)
-    foreach(family shared half tensor mesh)
+    foreach(family shared half tensor mesh match shared_atomic)
         add_executable(armigo_shader_native_${family}_gpu_tests "${PROJECT_SOURCE_DIR}/tests/shader_native/${family}_gpu.mm")
         target_link_libraries(armigo_shader_native_${family}_gpu_tests PRIVATE armigo_shader_native_frontend "${ARMIGO_FOUNDATION_FRAMEWORK}" "${ARMIGO_METAL_FRAMEWORK}")
         add_test(NAME shader_native.${family}_gpu COMMAND armigo_shader_native_${family}_gpu_tests)

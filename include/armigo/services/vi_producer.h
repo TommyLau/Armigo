@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 
 namespace armigo::services::vi {
@@ -31,6 +32,21 @@ struct NativeTexture {
     // The platform texture itself (an id<MTLTexture> on Metal), kept alive by
     // this handle, so a presenter on the same device can draw it directly.
     std::shared_ptr<const void> native_texture;
+    // Resolve the frame's current allocation after its rendering fence. The
+    // returned snapshot owns that allocation until presentation completes.
+    std::function<std::optional<NativeTexture>()> resolve;
+    // Native GPU producers may capture a per-frame allocation in their CPU
+    // submission stream. The returned handle resolves after the rendering
+    // fence; cancel releases unused ordered work on every drop/error path.
+    std::function<std::optional<NativeTexture>(std::uint64_t)> capture;
+    std::function<void()> cancel;
+    // Platform-specific ordered GPU publication context, owned by this frame.
+    std::shared_ptr<void> native_submission;
+    // The captured consumer has a reserved position after all producer GPU
+    // work. Resolve and publish it before waiting for producer CPU retirement.
+    bool ordered_gpu_dependencies = false;
+    // Owns the exact producer result; called after ordered consumer completion.
+    std::function<bool()> ordered_producer_ready;
 };
 
 struct NativeDequeue {

@@ -18,6 +18,7 @@
 // the same shape.
 
 #include "nvn_native_stages.h"
+#include "../../nvn/program_capture.h"
 
 #include <armigo/common/diagnostics.h>
 #include <armigo/nvn/driver.h>
@@ -184,6 +185,7 @@ const char* fact_kind_name(pl::FactKind kind) {
     case pl::FactKind::local_memory_bytes: return "local_memory_bytes";
     case pl::FactKind::compute_local_size: return "compute_local_size";
     case pl::FactKind::compute_shared_memory_bytes: return "compute_shared_memory_bytes";
+    case pl::FactKind::bound_storage_descriptor: return "bound_storage_descriptor";
     case pl::FactKind::constant_buffer_bound_mask: return "constant_buffer_bound_mask";
     case pl::FactKind::constant_buffer_size: return "constant_buffer_size";
     case pl::FactKind::constant_buffer_word: return "constant_buffer_word";
@@ -272,6 +274,8 @@ std::string reflection(const pl::MslArtifact& artifact, const gm::EmitOptions& o
     if (plan.reads_point_coord) out << ",\"point_coord\":\"attribute-v1\"";
     // A vertex stage without outputs draws only with rasterizer discard.
     if (plan.requires_rasterizer_discard) out << ",\"rasterizer_discard\":\"required-v1\"";
+    if (!plan.discard_entry_point.empty())
+        out << ",\"discard_entry_point\":" << quote(plan.discard_entry_point);
     if (plan.emulate_depth_bias) out << ",\"depth_bias_mode\":\"shader-v1\"";
     if (plan.custom_border) {
         out << ",\"custom_border\":{\"abi\":\"coverage-v1\",\"buffer_index\":"
@@ -361,8 +365,9 @@ std::string reflection(const pl::MslArtifact& artifact, const gm::EmitOptions& o
     for (const auto& planned : plan.resources) {
         const auto* buffer = std::get_if<pl::BufferUse>(&planned.use);
         if (!buffer || !std::holds_alternative<pl::ConstantBufferSource>(buffer->source)) continue;
+        const bool proven = buffer->size.constant_buffer_policy == pl::ConstantBufferPolicy::proven_zero_words_v2;
         if (buffer->size.kind != pl::SizeKind::constant_buffer_window ||
-            buffer->size.constant_buffer_policy != pl::ConstantBufferPolicy::runtime_zero_words_v1)
+            (!proven && buffer->size.constant_buffer_policy != pl::ConstantBufferPolicy::padded_zero_words_v2))
             throw std::runtime_error("Ported reflection requires a runtime constant-buffer window");
         if (!first) out << ',';
         first = false;
@@ -371,7 +376,7 @@ std::string reflection(const pl::MslArtifact& artifact, const gm::EmitOptions& o
             << ",\"size_kind\":\"constant_buffer_window\""
             << ",\"window_bytes\":" << buffer->size.bytes
             << ",\"alignment\":" << buffer->size.alignment
-            << ",\"policy\":\"runtime_zero_words_v1\""
+            << ",\"policy\":\"" << (proven ? "proven_zero_words_v2" : "padded_zero_words_v2") << '"'
             << ",\"metal_buffer_index\":" << std::get<pl::MetalRange>(planned.location).first << '}';
     }
     out << "],\"support_buffers\":[";
@@ -458,6 +463,8 @@ std::string reflection(const pl::MslArtifact& artifact, const gm::EmitOptions& o
                     << ",\"access\":" << quote(texture->access == pl::Access::read ? "read" :
                         texture->access == pl::Access::write ? "write" : "read_write");
             }
+            if (!texture->pool && texture->kind == pl::ResourceTextureKind::storage_image && texture->atomic)
+                out << ",\"atomic\":true";
         } else if (sampler->pool) {
             // One sampler pool for the stage: a buffer binding, with no
             // constant-buffer key. Comparison and normalized coordinates are
@@ -669,6 +676,11 @@ std::string native_stage_reflection(const shader::pipeline::MslArtifact& artifac
     return reflection(artifact, emission, stage, identity, launch);
 }
 
+bool native_texture_pools_enabled() {
+    const char* value = std::getenv("ARMIGO_NVN_TEXTURE_POOLS");
+    return value == nullptr || std::string_view(value) != "0";
+}
+
 } // namespace armigo::platform::metal
 
 namespace armigo::nvn {
@@ -735,6 +747,22 @@ void translate(Translation& work) {
             return;
         }
         const auto& artifact = std::get<pl::MslArtifact>(translated);
+        // ARMIGO_NVN_SOURCE_DIR=DIR writes each stage translated at run time
+        // under the name the package build's --source-dir gives it, so the two
+        // can be compared; a mesh stage translated for its fragment stage's
+        // inputs adds "-partner".
+        static const char* source_directory = std::getenv("ARMIGO_NVN_SOURCE_DIR");
+        if (source_directory && *source_directory) {
+            const char* depth = !work.options.vertex_depth ? "stage"
+                : *work.options.vertex_depth == pl::DepthConvention::zero_to_one ? "zero-to-one" : "minus-one-to-one";
+            std::error_code ignored;
+            std::filesystem::create_directories(source_directory, ignored);
+            std::ofstream(std::filesystem::path(source_directory) /
+                              (program.stage_identity + '-' + depth +
+                               (work.options.mesh_fragment_reads ? "-partner" : "") + ".metal"),
+                          std::ios::binary)
+                << artifact.source;
+        }
         // Task and mesh stages occupy the tessellation stage kinds; a mesh
         // stage's outputs are written as a vertex stage's.
         const auto stage = program.stage == sn::Stage::vertex ? shader_input::Stage::Vertex :
@@ -756,7 +784,9 @@ void translate(Translation& work) {
             work.error = "Native shader stage was not accepted: " + failure->detail;
             return;
         }
-        work.stage = std::get<StagePointer>(std::move(made));
+        platform::CompiledGraphicsStage copy = *std::get<StagePointer>(std::move(made));
+        copy.native_stage_identity = program.stage_identity;
+        work.stage = std::make_shared<const platform::CompiledGraphicsStage>(std::move(copy));
     } catch (const std::exception& error) {
         work.error = std::string("Native shader translation failed: ") + error.what();
     } catch (...) {
@@ -800,6 +830,8 @@ Translation translation_for(const sn::Program& program, gm::VertexDepthConventio
                                                                                   : pl::DepthConvention::negative_one_to_one;
         work.emission.vertex_depth = depth;
         key += depth == gm::VertexDepthConvention::ZeroToOne ? " vd=01" : " vd=11";
+        // A mesh stage fetches no vertices, as the package build translates it.
+        work.options.vertex_fetch = false;
         if (program.stage == sn::Stage::vertex) {
             work.options.vertex_fetch = work.emission.vertex_fetch = vertex_fetch_requested();
             key += work.options.vertex_fetch ? " vf=1" : " vf=0";
@@ -813,6 +845,8 @@ Translation translation_for(const sn::Program& program, gm::VertexDepthConventio
             work.emission.fragment_position = gm::FragmentPositionConvention::MetalPositionWMatchesGuestPositionW;
         }
     }
+    work.options.texture_pools = platform::metal::native_texture_pools_enabled();
+    key += work.options.texture_pools ? " tp=1" : " tp=0";
     return work;
 }
 
@@ -869,6 +903,13 @@ public:
         work_ = translation_for(*program_, depth_, key_);
         work_.program = &*program_;
         return true;
+    }
+    void capture_input(program_capture::Call& capture, std::size_t index,
+                       const std::shared_ptr<RecordedStage>& owner, std::uint64_t address) const noexcept {
+        try {
+            if (program_) capture.code(index, owner, code_, program_->payload_digest, program_->stage_identity, address);
+            else capture.code(index, owner, code_, sn::digest(code_), {}, address);
+        } catch (...) { program_capture::record_loss(); }
     }
     std::size_t index() const { return stage_slot(std::to_integer<std::uint32_t>(control_[stage_selector_offset])); }
     const std::string& key() const { return key_; }
@@ -1115,6 +1156,7 @@ StagePointer packaged_stage(const sn::Program& program, gm::VertexDepthConventio
         return nullptr;
     }
     platform::CompiledGraphicsStage copy = *std::get<StagePointer>(std::move(made));
+    copy.native_stage_identity = program.stage_identity;
     copy.metallib = files.library;
     copy.msl_source.clear();
     copy.msl_source_file.clear();
@@ -1163,9 +1205,12 @@ bool resolve_native(void*, const DeviceState* device, std::span<const NVNshaderD
                                                          : gm::VertexDepthConvention::NegativeOneToOne;
     for (const auto& descriptor : descriptors) {
         std::vector<std::byte> control(sn::runtime_control_bytes);
-        if (!read_memory(reinterpret_cast<std::uint64_t>(descriptor.control), control)) {
+        const auto control_address = reinterpret_cast<std::uint64_t>(descriptor.control);
+        if (!read_memory(control_address, control)) {
             error = "Unreadable native shader control"; return false;
         }
+        if (auto* capture = program_capture::Call::active())
+            capture->control(std::size_t(&descriptor - descriptors.data()), control, control_address);
         const auto selector = std::to_integer<std::uint32_t>(control[stage_selector_offset]);
         if (word(control, 0) != control_magic || word(control, 4) != control_family ||
             word(control, 8) > maximum_control_version || selector > last_stage_selector) {
@@ -1184,9 +1229,13 @@ bool resolve_native(void*, const DeviceState* device, std::span<const NVNshaderD
             return false;
         }
         std::vector<std::byte> code(code_size);
-        if (!read_memory(descriptor.data, code)) { error = "Unreadable native shader code"; return false; }
+        const auto data_address = descriptor.data;
+        if (!read_memory(data_address, code)) { error = "Unreadable native shader code"; return false; }
         auto stage = std::make_shared<RecordedStage>(std::move(control), std::move(code), descriptor.data, depth);
-        if (!stage->parse(error)) return false;
+        const bool parsed = stage->parse(error);
+        if (auto* capture = program_capture::Call::active())
+            stage->capture_input(*capture, std::size_t(&descriptor - descriptors.data()), stage, data_address);
+        if (!parsed) return false;
         const auto index = stage->index();
         if (index >= pending.size() || stages[index] || pending[index]) {
             error = "Duplicate or invalid shader stage"; return false;
@@ -1206,7 +1255,12 @@ bool resolve_native(void*, const DeviceState* device, std::span<const NVNshaderD
 
 } // namespace
 
-void set_native_program_resolver() noexcept { set_deferred_program_resolver(resolve_native, nullptr); }
+void set_native_program_resolver() noexcept {
+    program_capture::configure_from_environment([](void*, std::uint64_t address, std::span<std::byte> output) {
+        return read_memory(address, output);
+    });
+    set_deferred_program_resolver(resolve_native, nullptr);
+}
 
 std::shared_ptr<const platform::CompiledGraphicsStage> mesh_stage_for(
     const std::shared_ptr<const platform::CompiledGraphicsStage>& mesh, const platform::CompiledGraphicsStage& fragment,

@@ -13,7 +13,9 @@
 // application reports return the validation result. Switch 2's
 // SendReportWithUser (10500) carries its report in a transfer memory and
 // returns an async context; the offline host validates it the same way.
+// RequestImmediateTransmission (10200) succeeds without sending anything.
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/services/play_report.h>
 
 #include "play_report_validation.h"
@@ -31,26 +33,14 @@ using horizon::IpcDisposition;
 using horizon::IpcMessage;
 using horizon::IpcReply;
 
-constexpr std::uint32_t sfci = 0x49434653;
-constexpr std::uint32_t sfco = 0x4f434653;
+using namespace horizon::cmif;
 constexpr std::uint32_t service_interface = 0x2749f93d;
 constexpr std::uint32_t control_interface = 0xec6be3ff;
 constexpr std::uint32_t invalid_argument = 0x281;
 constexpr std::uint32_t invalid_room = 0xa81;
 constexpr std::uint32_t invalid_report = 0x1281;
 
-std::uint32_t read(const IpcMessage& message, std::size_t offset, unsigned width = 4) {
-    std::uint32_t value = 0;
-    for (unsigned index = 0; index < width; ++index)
-        value |= std::uint32_t{std::to_integer<unsigned char>(message[offset + index])}
-                 << (8 * index);
-    return value;
-}
 
-void write(IpcMessage& message, std::size_t offset, std::uint32_t value) {
-    for (unsigned index = 0; index < 4; ++index)
-        message[offset + index] = static_cast<std::byte>((value >> (8 * index)) & 255);
-}
 
 IpcReply control_reply(std::uint32_t value) {
     IpcReply reply{IpcDisposition::handled};
@@ -300,6 +290,10 @@ IpcReply PlayReportSession::request_with_handles(const IpcMessage& message, std:
         if (domain_ && *cmif >= 32 && read(message, *cmif - 12) != 1)
             return context_request(read(message, *cmif - 12), read(message, *cmif + 8));
         if (read(message, *cmif + 8) == 10500) return send_report(message, buffers, copied_objects);
+        // RequestImmediateTransmission (10200) takes no arguments and asks to
+        // upload stored reports now. The offline host stores none and sends
+        // nothing; the request succeeds with no output.
+        if (read(message, *cmif + 8) == 10200) return report_reply(domain_, 0);
     }
     const auto packet = report_packet(message, domain_);
     if (!packet)

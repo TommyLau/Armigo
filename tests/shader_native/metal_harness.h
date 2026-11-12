@@ -86,7 +86,9 @@ vertex VertexResult native_test_vertex(uint i [[vertex_id]]) {
         if (auto error = std::get_if<ir::Diagnostic>(&translated)) throw std::runtime_error(error->message);
         auto artifact = std::get<ir::MslArtifact>(std::move(translated));
         MTL4LibraryFunctionDescriptor* vertex = [MTL4LibraryFunctionDescriptor new];
-        vertex.library = library(artifact.source); vertex.name = @"armigo_vertex_main";
+        vertex.library = library(artifact.source);
+        vertex.name = [NSString stringWithUTF8String:(artifact.reflection.discard_entry_point.empty()
+            ? artifact.entry_point : artifact.reflection.discard_entry_point).c_str()];
         MTL4RenderPipelineDescriptor* descriptor = [MTL4RenderPipelineDescriptor new];
         descriptor.vertexFunctionDescriptor = vertex; descriptor.rasterizationEnabled = NO;
         descriptor.inputPrimitiveTopology = MTLPrimitiveTopologyClassPoint;
@@ -95,11 +97,77 @@ vertex VertexResult native_test_vertex(uint i [[vertex_id]]) {
             throw std::runtime_error(error.localizedDescription.UTF8String);
         return artifact;
     }
+    // Executes an output-less native vertex through either static entry.
+    // Pixel Z observes the depth adapter; guest memory observes side effects.
+    std::vector<std::array<float, 4>> outputless_vertex(const ir::MslArtifact& artifact,
+            bool discard, bool triangles, const std::vector<std::uint32_t>& input, GuestMemory& guest) {
+        NSError* error = nil;
+        auto vertex = [MTL4LibraryFunctionDescriptor new];
+        vertex.library = library(artifact.source);
+        const auto& entry = discard ? artifact.reflection.discard_entry_point : artifact.entry_point;
+        check(!entry.empty(), "output-less vertex entry is declared");
+        vertex.name = [NSString stringWithUTF8String:entry.c_str()];
+        auto descriptor = [MTL4RenderPipelineDescriptor new];
+        descriptor.vertexFunctionDescriptor = vertex;
+        descriptor.rasterizationEnabled = !discard;
+        descriptor.inputPrimitiveTopology = MTLPrimitiveTopologyClassUnspecified;
+        descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA32Float;
+        if (!discard) {
+            auto fragment = [MTL4LibraryFunctionDescriptor new];
+            fragment.library = library("#include <metal_stdlib>\nusing namespace metal; fragment float4 probe(float4 p [[position]]) { return float4(p.z,1,2,3); }");
+            fragment.name = @"probe";
+            descriptor.fragmentFunctionDescriptor = fragment;
+        }
+        auto pipeline = [compiler_ newRenderPipelineStateWithDescriptor:descriptor compilerTaskOptions:nil error:&error];
+        if (!pipeline) throw std::runtime_error(error.localizedDescription.UTF8String);
+        id<MTLBuffer> words=nil, guest_table=nil, data=nil, bounds=nil;
+        guest_buffers(&guest, words, guest_table);
+        constant_buffers(input, data, bounds);
+        auto td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:4 height:4 mipmapped:NO];
+        td.storageMode = MTLStorageModePrivate; td.usage = MTLTextureUsageRenderTarget;
+        auto target = [device_ newTextureWithDescriptor:td];
+        auto pixels = [device_ newBufferWithLength:256 options:MTLResourceStorageModeShared];
+        NSMutableArray<id<MTLAllocation>>* allocations = [NSMutableArray arrayWithArray:@[words,guest_table,data,bounds,target,pixels]];
+        auto table = bind(artifact, allocations, data, bounds, guest_table, nil);
+        auto residency = [device_ newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:&error];
+        for (id<MTLAllocation> allocation in allocations) [residency addAllocation:allocation];
+        [residency commit];
+        auto allocator = [device_ newCommandAllocator];
+        auto commands = [device_ newCommandBuffer];
+        [commands beginCommandBufferWithAllocator:allocator]; [commands useResidencySet:residency];
+        auto pass = [MTL4RenderPassDescriptor new];
+        pass.colorAttachments[0].texture = target;
+        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor = MTLClearColorMake(-1,-1,-1,-1);
+        auto render = [commands renderCommandEncoderWithDescriptor:pass];
+        [render setRenderPipelineState:pipeline];
+        [render setArgumentTable:table atStages:MTLRenderStageVertex];
+        [render setViewport:MTLViewport{0,0,4,4,0,1}];
+        [render drawPrimitives:triangles ? MTLPrimitiveTypeTriangle : MTLPrimitiveTypePoint
+                  vertexStart:0 vertexCount:triangles ? 3 : 1];
+        [render endEncoding];
+        auto copy = [commands computeCommandEncoder];
+        [copy barrierAfterQueueStages:MTLStageVertex | MTLStageFragment beforeStages:MTLStageBlit
+                   visibilityOptions:MTL4VisibilityOptionDevice];
+        [copy copyFromTexture:target sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+            sourceSize:MTLSizeMake(4,4,1) toBuffer:pixels destinationOffset:0
+            destinationBytesPerRow:64 destinationBytesPerImage:256];
+        [copy endEncoding]; [commands endCommandBuffer];
+        submit(commands);
+        read_back(&guest, words, guest_table);
+        std::vector<std::array<float,4>> result(16);
+        std::memcpy(result.data(), pixels.contents, 256);
+        return result;
+    }
     // Front-facing winding of the harness triangle's draws.
     MTLWinding front_winding = MTLWindingClockwise;
     // Mipmap levels of a 2D pattern texture; above one, the sampler picks the
     // nearest level.
     unsigned mip_levels = 1;
+    // Ordinary sampled textures may exercise wrapping and border gathers.
+    MTLSamplerAddressMode texture_address_mode = MTLSamplerAddressModeClampToEdge;
+    MTLSamplerBorderColor texture_border_color = MTLSamplerBorderColorTransparentBlack;
     // Read-only 2D images become R32Float, each texel holding its w.
     bool red_pattern = false;
     // A texture keyed to a handle program gets the pattern only when the
@@ -522,6 +590,27 @@ private:
                     [table setAddress:guest_table.gpuAddress atIndex:range.first];
                     continue;
                 }
+                if (const auto* storage = std::get_if<ir::StorageBufferSource>(&buffer->source)) {
+                    check(data && guest_table, "storage descriptor data and guest backing");
+                    const auto key = storage->descriptor;
+                    check(key.handle_byte_offset <= data.length - 12, "storage descriptor within test data");
+                    const auto* descriptor = static_cast<const std::uint32_t*>(data.contents) + key.handle_byte_offset / 4;
+                    const auto address = std::uint64_t(descriptor[0]) | (std::uint64_t(descriptor[1]) << 32);
+                    const auto* words = static_cast<const std::uint32_t*>(guest_table.contents);
+                    std::uint64_t device_address = 0;
+                    for (unsigned entry = 1; entry < words[0]; ++entry) {
+                        const auto* row = words + ir::guest_memory_header_words + entry * ir::guest_memory_entry_words;
+                        const auto start = std::uint64_t(row[0]) | (std::uint64_t(row[1]) << 32);
+                        const auto end = std::uint64_t(row[2]) | (std::uint64_t(row[3]) << 32);
+                        if (address >= start && address < end && descriptor[2] <= end - address) {
+                            device_address = address + (std::uint64_t(row[4]) | (std::uint64_t(row[5]) << 32));
+                            break;
+                        }
+                    }
+                    check(device_address != 0, "test storage descriptor fits its guest backing");
+                    [table setAddress:device_address atIndex:range.first];
+                    continue;
+                }
                 [table setAddress:(std::holds_alternative<ir::ConstantBufferSource>(buffer->source) ? data.gpuAddress : bounds.gpuAddress) atIndex:range.first];
             } else if (const auto* texture = std::get_if<ir::TextureUse>(&resource.use); texture && texture->access != ir::Access::read) {
                 // A U32 atomic image is a seeded 4x4 R32Uint texture.
@@ -607,7 +696,8 @@ private:
                 MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
                 sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest; sd.supportArgumentBuffers = YES;
                 if (mip_levels > 1) sd.mipFilter = MTLSamplerMipFilterNearest;
-                sd.sAddressMode = sd.tAddressMode = sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
+                sd.sAddressMode = sd.tAddressMode = sd.rAddressMode = texture_address_mode;
+                sd.borderColor = texture_border_color;
                 auto sampler = [device_ newSamplerStateWithDescriptor:sd];
                 check(sampler != nil, "Metal sampler");
                 [table setSamplerState:sampler.gpuResourceID atIndex:range.first];

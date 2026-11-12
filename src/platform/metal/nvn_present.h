@@ -14,12 +14,21 @@
 
 namespace armigo::platform::metal::nvn_driver {
 
-// The resolver normally calls Resources::texture(state, nullptr). Export keeps
-// that exact Metal object alive even if its guest object is copied or
-// finalized.
+// The resolver normally calls Resources::texture(state, nullptr). Each present
+// resolves the current allocation and retains it through presentation. The
+// lookup returns ready contents; resource-backed lookups use the overload below.
+class Resources;
+class MetalReplayBackend;
+
 using PresentationTextureLookup =
     std::function<id<MTLTexture>(const armigo::nvn::TextureState &)>;
 armigo::nvn::TextureExporter
 make_texture_exporter(id<MTLDevice> device, PresentationTextureLookup lookup);
+// Publishes lookup uploads and returns a pinned allocation with an ordered consumer context.
+armigo::nvn::TextureExporter make_texture_exporter(id<MTLDevice> device, Resources& resources);
+// Window templates capture each frame on the replay worker before a later
+// submission can replace or overwrite its native allocation.
+armigo::nvn::TextureExporter make_texture_exporter(id<MTLDevice> device, Resources& resources,
+                                                  MetalReplayBackend& replay);
 
 } // namespace armigo::platform::metal::nvn_driver

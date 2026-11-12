@@ -121,6 +121,7 @@ void test_device() {
     entry<void (*)(NVNdeviceBuilder*, int)>("nvnDeviceBuilderSetFlags")(&builder, 0);
     CHECK(entry<NVNboolean (*)(NVNdevice*, const NVNdeviceBuilder*)>("nvnDeviceInitialize")(&device, &builder) == 1);
     CHECK(query(&device, 0) == 231 && query(&device, 1) == 40);
+    CHECK(reinterpret_cast<const armigo::nvn::DeviceState*>(&device)->gob_order == 1);
     // The API 231 shader code range and padding; other properties 2-97 keep
     // their API 55 numbers and values.
     CHECK(query(&device, 46) == 201 && query(&device, 47) == 201);
@@ -275,7 +276,7 @@ void record_program_bind(NVNcommandBuffer*, const NVNprogram* program, int stage
     bound_stages = stages;
 }
 
-void test_stage_slots() {
+void test_stage_banks() {
     const auto previous_uniform = installed_entry(armigo::nvn::Entry::nvnCommandBufferBindUniformBuffer);
     const auto previous_deferred = installed_entry(armigo::nvn::Entry::nvnCommandBufferBindTexturesDeferred);
     install<armigo::nvn::Entry::nvnCommandBufferBindUniformBuffer>(&record_uniform_bind);
@@ -285,22 +286,22 @@ void test_stage_slots() {
     const auto deferred = entry<void (*)(NVNcommandBuffer*, NVNshaderStage, int, int, const NVNtextureHandle*)>(
         "nvnCommandBufferBindTexturesDeferred");
     bind(nullptr, NVNshaderStage(6), 2, 0x1000, 0x100);
-    CHECK(bound_stage == NVNshaderStage(3) && bound_index == 2);
+    CHECK(bound_stage == NVNshaderStage(6) && bound_index == 2);
     bind(nullptr, NVNshaderStage(7), 5, 0x1000, 0x100);
-    CHECK(bound_stage == NVNshaderStage(4) && bound_index == 5);
+    CHECK(bound_stage == NVNshaderStage(7) && bound_index == 5);
     bind(nullptr, NVN_SHADER_STAGE_FRAGMENT, 1, 0x1000, 0x100);
     CHECK(bound_stage == NVN_SHADER_STAGE_FRAGMENT && bound_index == 1);
     deferred(nullptr, NVNshaderStage(7), 4, 1, nullptr);
-    CHECK(bound_stage == NVNshaderStage(4) && bound_index == 4);
+    CHECK(bound_stage == NVNshaderStage(7) && bound_index == 4);
     install_entry(armigo::nvn::Entry::nvnCommandBufferBindUniformBuffer, previous_uniform);
     install_entry(armigo::nvn::Entry::nvnCommandBufferBindTexturesDeferred, previous_deferred);
-    // Program bindings: task and mesh bits become the tessellation bits.
+    // Program bindings retain the public task and mesh mask bits.
     const auto previous_program = installed_entry(armigo::nvn::Entry::nvnCommandBufferBindProgram);
     install<armigo::nvn::Entry::nvnCommandBufferBindProgram>(&record_program_bind);
     const auto bind_program = entry<void (*)(NVNcommandBuffer*, const NVNprogram*, int)>("nvnCommandBufferBindProgram");
     NVNprogram program{};
     bind_program(nullptr, &program, 0xc0 | 0x2);
-    CHECK(bound_program == &program && bound_stages == (0x18 | 0x2));
+    CHECK(bound_program == &program && bound_stages == (0xc0 | 0x2));
     bind_program(nullptr, &program, 0x21);
     CHECK(bound_stages == 0x21);
     install_entry(armigo::nvn::Entry::nvnCommandBufferBindProgram, previous_program);
@@ -308,14 +309,15 @@ void test_stage_slots() {
 
 // Graphics push constants as the title's driver emits them: whole words up to
 // 256 bytes at byte offset (offset & 0xff), for hardware constant buffer 16;
-// fewer than 4 bytes record nothing. Task and mesh take the tessellation
-// slots, and compute is refused.
+// fewer than 4 bytes record nothing. Task and mesh retain separate banks,
+// and compute is refused.
 bool collect_mesh_draws(const CommandRecordView& view, void* context) {
     auto& seen = *static_cast<std::vector<std::pair<Op, std::uint64_t>>*>(context);
     if (view.op == Op::draw_mesh_tasks && view.payload_size >= sizeof(DrawMeshTasks)) {
         DrawMeshTasks draw{};
         std::memcpy(&draw, view.payload, sizeof draw);
         seen.emplace_back(view.op, std::uint64_t(std::uint32_t(draw.first)) << 32 | std::uint32_t(draw.count));
+        CHECK(draw.api_return != 0);
     } else if (view.op == Op::draw_mesh_tasks_indirect && view.payload_size >= sizeof(DrawMeshTasksIndirect)) {
         DrawMeshTasksIndirect draw{};
         std::memcpy(&draw, view.payload, sizeof draw);
@@ -381,7 +383,7 @@ void test_push_constants() {
     CHECK(handle && walk_commands(handle, collect_pushes, &pushes) == CommandWalkStatus::complete);
     CHECK(pushes.size() == 3);
     if (pushes.size() == 3) {
-        CHECK(pushes[0].stage == 4 && pushes[0].bank == 16 && pushes[0].offset == 0x10 && pushes[0].size == 12 &&
+        CHECK(pushes[0].stage == 7 && pushes[0].bank == 16 && pushes[0].offset == 0x10 && pushes[0].size == 12 &&
               std::memcmp(pushes[0].data, words.data(), 12) == 0);
         CHECK(pushes[1].stage == NVN_SHADER_STAGE_FRAGMENT && pushes[1].offset == 0 &&
               pushes[1].size == push_constant_bytes &&
@@ -493,12 +495,17 @@ void test_window_active_textures() {
 class CountingResources final : public ResourceBackend {
 public:
     unsigned registered = 0, released = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> addressed;
     bool register_pool(const MemoryPoolState&) override { ++registered; return true; }
+    void note_addressed(std::uint64_t address, std::uint64_t size) override {
+        addressed.push_back({address, size});
+    }
     void release_pool(const MemoryPoolState&) override { ++released; }
     void flush_pool(const MemoryPoolState&, std::uint64_t, std::uint64_t) override {}
     void invalidate_pool(const MemoryPoolState&, std::uint64_t, std::uint64_t) override {}
     void register_texture(const TextureState&) override {}
     void release_texture(const TextureState&) override {}
+    void clear_texture_descriptor(std::int32_t) override { CHECK(false); }
     void register_texture_descriptor(std::int32_t, const TextureState&, const TextureViewState*) override {}
     void register_sampler_descriptor(std::int32_t, const SamplerParameters&) override {}
     bool read_texels(const TextureState&, const TexelTransfer&, std::byte*) override { return false; }
@@ -520,13 +527,19 @@ void test_virtual_alias_registration() {
         Pool alias(nullptr, sizeof storage, virtual_flags);
         CHECK(resources.registered == 1);
         const auto map = entry<NVNboolean (*)(NVNmemoryPool*, int, const NVNmappingRequest*)>("nvnMemoryPoolMapVirtual");
+        NVNmappingRequest partial{&physical.pool, 0, 0, 0x1000, {}, 0};
+        CHECK(map(&alias.pool, 1, &partial) == 0 && resources.addressed.empty());
         NVNmappingRequest whole{&physical.pool, 0, 0, sizeof storage, {}, 0};
         CHECK(map(&alias.pool, 1, &whole) == 1);
+        CHECK(resources.addressed.size() == 1);
+        CHECK(resources.addressed[0].first == reinterpret_cast<std::uint64_t>(storage) &&
+              resources.addressed[0].second == sizeof storage);
         // Initialized again while mapped: the alias gives up its address first.
         CHECK(entry<NVNboolean (*)(NVNmemoryPool*, const NVNmemoryPoolBuilder*)>("nvnMemoryPoolInitialize")(
                   &alias.pool, &alias.builder) == 1);
         CHECK(resources.released == 0 && alias.state().memory == nullptr);
         CHECK(map(&alias.pool, 1, &whole) == 1);
+        CHECK(resources.addressed.size() == 2);
         entry<void (*)(NVNmemoryPool*)>("nvnMemoryPoolFinalize")(&alias.pool);
         CHECK(resources.released == 0);
         entry<void (*)(NVNmemoryPool*)>("nvnMemoryPoolFinalize")(&physical.pool);
@@ -597,7 +610,7 @@ int main() {
     test_program_builder();
     test_virtual_pool();
     test_command_buffers();
-    test_stage_slots();
+    test_stage_banks();
     test_window_active_textures();
     test_virtual_alias_registration();
     test_program_constants_bound();

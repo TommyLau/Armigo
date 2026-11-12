@@ -452,6 +452,48 @@ int main() {
         R"({"containers":"gfd-cache","vertex_depth":"zero-to-one","caches":["BASE/ONE.GSC"],"fallbacks":[{"cache":"BASE/MISSING.GSC","alternatives":["BASE/ALT.GSC"]}]})")));
     CHECK(std::holds_alternative<std::string>(shader_of(
         R"({"containers":"gfd-cache","vertex_depth":"zero-to-one","extra":true})")));
+    // Platforms a pack may target: macOS only by default, else the listed ones.
+    {
+        CHECK(std::holds_alternative<compat::PatchDescriptions>(shader_read) &&
+              std::get<compat::PatchDescriptions>(shader_read).front().platforms == std::vector<std::string>{"macos"});
+        const auto with_platforms = [](const char* list) {
+            return parse(std::string(R"({"version":1,"patches":[{"title_id":"0x0000000000000123",)"
+                                     R"("main_build_id":"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",)"
+                                     R"("platforms":)") + list + "}]}");
+        };
+        const auto both = with_platforms(R"(["macos","ios"])");
+        CHECK(std::holds_alternative<compat::PatchDescriptions>(both) &&
+              std::get<compat::PatchDescriptions>(both).front().platforms ==
+                  std::vector<std::string>({"macos", "ios"}));
+        CHECK(std::holds_alternative<std::string>(with_platforms("[]")));
+        CHECK(std::holds_alternative<std::string>(with_platforms(R"(["windows"])")));
+        CHECK(std::holds_alternative<std::string>(with_platforms(R"(["ios","ios"])")));
+        CHECK(std::holds_alternative<std::string>(with_platforms(R"("ios")")));
+    }
+    // A .nup title's native inputs: the dictionary member and optional member
+    // and stage selections; no vertex depth and no cache names.
+    {
+        const std::string body = R"({"containers":"native","dictionary_member":"Pack/Dic.zs",)"
+                                 R"("members":["Shader/a.bin"],"identities":[")" + std::string(64, 'a') + R"("]})";
+        const auto native = shader_of(body.c_str());
+        CHECK(std::holds_alternative<compat::PatchDescriptions>(native));
+        if (const auto* parsed = std::get_if<compat::PatchDescriptions>(&native)) {
+            const auto& selected = parsed->front().shader_inputs;
+            CHECK(selected.containers == compat::ShaderContainerSet::Native);
+            CHECK(selected.dictionary_member == "Pack/Dic.zs");
+            CHECK(selected.members.size() == 1 && selected.members[0] == "Shader/a.bin");
+            CHECK(selected.identities.size() == 1 && selected.identities[0] == std::string(64, 'a'));
+        }
+        CHECK(std::holds_alternative<compat::PatchDescriptions>(shader_of(R"({"containers":"native"})")));
+        CHECK(std::holds_alternative<std::string>(shader_of(
+            R"({"containers":"native","vertex_depth":"zero-to-one"})")));
+        CHECK(std::holds_alternative<std::string>(shader_of(R"({"containers":"native","caches":["A.GSC"]})")));
+        CHECK(std::holds_alternative<std::string>(shader_of(R"({"containers":"native","identities":["ABC"]})")));
+        CHECK(std::holds_alternative<std::string>(shader_of(
+            R"({"containers":"native","members":["Shader/a.bin","Shader/a.bin"]})")));
+        CHECK(std::holds_alternative<std::string>(shader_of(
+            R"({"containers":"bnsh","vertex_depth":"zero-to-one","dictionary_member":"Pack/Dic.zs"})")));
+    }
     // A ratio-division layout: frame-ratio hooks on the title's FDIV, no
     // original callee and no other calls.
     {

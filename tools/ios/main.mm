@@ -9,6 +9,7 @@
 // ============================================================================
 
 #include <armigo/common/diagnostics.h>
+#include <armigo/compat/title_settings.h>
 #include "application_host.h"
 #include "player_settings.h"
 #include "report_json.h"
@@ -66,6 +67,14 @@ NSString* run_bundled_title(CGSize screen) {
     using namespace armigo;
     @autoreleasepool {
         try {
+            // Development packs opt in before creating any Metal device. A
+            // launch environment override wins over the Settings switch.
+            if ([NSBundle.mainBundle.infoDictionary[@"ArmigoDevelopmentMetalHud"] boolValue] &&
+                !std::getenv("MTL_HUD_ENABLED")) {
+                id preference = [NSUserDefaults.standardUserDefaults objectForKey:@"development_metal_hud"];
+                const bool enabled = preference ? [preference boolValue] : true;
+                setenv("MTL_HUD_ENABLED", enabled ? "1" : "0", 1);
+            }
             const std::filesystem::path root = std::filesystem::path(NSBundle.mainBundle.bundlePath.fileSystemRepresentation) / "Armigo";
             const auto exefs = root / "game/exefs";
             const auto romfs = root / "game/romfs";
@@ -99,13 +108,21 @@ NSString* run_bundled_title(CGSize screen) {
             NSURL* caches = [manager URLForDirectory:NSCachesDirectory inDomain:NSUserDomainMask
                                   appropriateForURL:nil create:YES error:nil];
             if (!documents || !caches) return @"The app's save and cache folders are unavailable.";
-            const auto saves = std::filesystem::path(documents.path.fileSystemRepresentation) / "Armigo" / title;
+            const auto data_root = std::filesystem::path(documents.path.fileSystemRepresentation) / "Armigo";
+            const auto saves = data_root / "Saves" / title;
+            const bool debug_run = [NSBundle.mainBundle.infoDictionary[@"ArmigoDevelopmentPack"] boolValue] &&
+                (std::getenv("ARMIGO_DEV_INPUT_SCRIPT") || std::getenv("ARMIGO_DEV_SAVE_DIR") ||
+                 std::getenv("ARMIGO_DEV_CAPTURE_DIR") || std::getenv("ARMIGO_DEV_FRAMES"));
+            armigo::diag::use_player_defaults(debug_run);
+            if (const auto error = compat::prepare_save_directory(saves, data_root / title))
+                return [NSString stringWithUTF8String:error->c_str()];
             const auto cache = std::filesystem::path(caches.path.fileSystemRepresentation) / "Armigo" / title;
-            std::filesystem::create_directories(saves);
             std::filesystem::create_directories(cache);
-            armigo::diag::open_last_run_log((cache / "last-run.log").c_str());
-            if (!std::freopen((saves / "boot.log").c_str(), "w", stderr))
-                return @"The app's startup log could not be opened.";
+            const auto diagnostics = data_root / "Diagnostics" / title;
+            if (debug_run) {
+                std::filesystem::create_directories(diagnostics);
+                armigo::diag::open_last_run_log((diagnostics / "last-run.log").c_str());
+            }
             setenv("ARMIGO_COMPAT_PATCHES", settings.c_str(), 1);
             setenv("ARMIGO_SHADER_CACHE", (cache / "shaders").c_str(), 1);
             setenv("ARMIGO_PSO_CACHE", (cache / "pipelines").c_str(), 1);
@@ -119,20 +136,28 @@ NSString* run_bundled_title(CGSize screen) {
             arguments.embedded_directory = root;
             arguments.shader_package_directory = shaders;
             arguments.save_directory = saves;
-            arguments.report_file = saves / "run.json";
+            if (debug_run) arguments.report_file = diagnostics / "run.json";
             arguments.fullscreen = true;
             apply_player_settings(screen, arguments);
             const auto addons = root / "game/addons";
             if (std::filesystem::exists(addons)) for (const auto& entry : std::filesystem::directory_iterator(addons)) {
                 if (entry.is_directory()) arguments.addon_directories.push_back(entry.path());
             }
+            const auto configured = tools::apply_development_run_options(arguments,
+                [NSBundle.mainBundle.infoDictionary[@"ArmigoDevelopmentPack"] boolValue]);
+            if (const auto* error = std::get_if<runtime::LaunchFailure>(&configured)) {
+                armigo::diag::error("Armigo development run: %s\n", error->detail.c_str());
+                return @"The development run settings are invalid.";
+            }
             const auto report = tools::run_windowed_shell(arguments, tools::default_shell_environment(),
                                                           tools::create_application_host);
             const auto fields = tools::report_fields(report);
-            tools::emit_shell_report(@"run-ios", fields, arguments.report_file);
+            if (debug_run) tools::emit_shell_report(@"run-ios", fields, arguments.report_file);
             tools::exit_process_if_runtime_retained(static_cast<int>(report.exit_code));
+            if (const auto* error = std::get_if<runtime::LaunchFailure>(&report.result.outcome))
+                return [NSString stringWithFormat:@"The game could not continue: %s", error->detail.c_str()];
             return report.exit_code == tools::RunnerExitCode::success ? @"The game has stopped." :
-                @"The game could not continue. Its startup log is available in the app's Documents folder.";
+                @"The game could not continue. Please restart it.";
         } catch (const std::exception& error) {
             armigo::diag::write(armigo::diag::Level::error,  "Armigo iOS startup: %s\n", error.what());
             return @"The bundled game could not be opened.";

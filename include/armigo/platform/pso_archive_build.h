@@ -42,6 +42,9 @@ struct PipelineArchiveResult {
     std::uint64_t rows = 0, built = 0, unresolved = 0, undecodable = 0, failed = 0;
     std::filesystem::path archive;   // the last archive file written
     std::uint64_t archive_bytes = 0, archive_files = 0;   // all files of the archive directory
+    // Warm-only: misses for pipelines the archive build recorded it could not
+    // archive. They are compiled at warm-up and are not errors.
+    std::uint64_t expected_misses = 0;
     double seconds = 0;
 };
 

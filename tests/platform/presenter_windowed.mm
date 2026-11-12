@@ -15,11 +15,14 @@
 // stdout), mirroring the lane H acceptance rule.
 
 #import <AppKit/AppKit.h>
+#import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <armigo/platform/application.h>
 
 #include <atomic>
+#include <algorithm>
+#include <vector>
 #include <chrono>
 #include <cstdio>
 #include <functional>
@@ -117,6 +120,7 @@ int main() {
         graphics::Rgba8Image image = gradient_image(64, 48);
         PresentationFrame frame;
         frame.queued.frame_number = 5;
+        frame.readback = false;
         frame.pixels = std::make_shared<const graphics::Rgba8Image>(std::move(image));
         const PresentResult result = presenter->present(frame, std::chrono::steady_clock::now() +
                                                                      std::chrono::seconds(10), {});
@@ -127,9 +131,38 @@ int main() {
         CHECK(presented);
         if (presented) {
             CHECK(presented->frame_number == 5);
-            // Windowed completion is the real drawable path; readback is
-            // optional and omitted by this implementation.
+            // An ordinary windowed frame consumes the drawable without a readback.
             CHECK(!presented->readback.has_value());
+        }
+
+        frame.queued.frame_number = 6;
+        frame.readback = true;
+        const auto captured = presenter->present(frame, std::chrono::steady_clock::now() + std::chrono::seconds(10), {});
+        const auto* captured_frame = std::get_if<PresentedFrame>(&captured);
+        CHECK(captured_frame && captured_frame->readback);
+        if (captured_frame && captured_frame->readback)
+            CHECK(captured_frame->readback->pixels == frame.pixels->pixels);
+
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+            width:64 height:48 mipmapped:NO];
+        descriptor.storageMode = MTLStorageModeShared;
+        descriptor.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
+        CHECK(texture != nil);
+        if (texture) {
+            auto bgra = frame.pixels->pixels;
+            for (std::size_t offset = 0; offset < bgra.size(); offset += 4) std::swap(bgra[offset], bgra[offset + 2]);
+            [texture replaceRegion:MTLRegionMake2D(0, 0, 64, 48) mipmapLevel:0 withBytes:bgra.data() bytesPerRow:64 * 4];
+            PresentationFrame native;
+            native.queued.frame_number = 7;
+            native.queued.width = 64; native.queued.height = 48;
+            native.queued.native_texture = std::shared_ptr<const void>((__bridge_retained const void*)texture,
+                [](const void* value) { CFRelease(value); });
+            const auto read = presenter->present(native, std::chrono::steady_clock::now() + std::chrono::seconds(10), {});
+            const auto* completed = std::get_if<PresentedFrame>(&read);
+            CHECK(completed && completed->readback);
+            if (completed && completed->readback) CHECK(completed->readback->pixels == frame.pixels->pixels);
         }
 
         // The presented handler is the compositor's own acknowledgement. It

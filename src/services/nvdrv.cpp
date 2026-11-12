@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/common/diagnostics.h>
 #include <armigo/services/nvdrv.h>
 #include <armigo/graphics/engines.h>
@@ -422,32 +423,8 @@ void write_u64(std::array<std::byte, N>& bytes, std::size_t offset, std::uint64_
         bytes[offset + index] = static_cast<std::byte>((value >> (8 * index)) & 255);
 }
 
-constexpr std::uint32_t sfci = 0x49434653;
-constexpr std::uint32_t sfco = 0x4f434653;
+using namespace horizon::cmif;
 
-std::uint32_t read(const IpcMessage& bytes, std::size_t offset) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i < 4; ++i)
-        value |= std::uint32_t{std::to_integer<unsigned char>(bytes[offset + i])} << (8 * i);
-    return value;
-}
-
-void write(IpcMessage& bytes, std::size_t offset, std::uint32_t value) {
-    for (unsigned i = 0; i < 4; ++i)
-        bytes[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
-}
-
-IpcReply control_reply(std::uint32_t value, unsigned width) {
-    IpcReply reply;
-    reply.disposition = IpcDisposition::handled;
-    reply.size = 44;
-    write(reply.bytes, 4, 9);
-    write(reply.bytes, 16, sfco);
-    write(reply.bytes, 28, 0xec6be3ff);
-    write(reply.bytes, 32, value);
-    if (width == 1) reply.size = 40;
-    return reply;
-}
 
 // A driver reply whose single result word follows the CMIF reply header. The
 // client reads the SFCO word and its result directly after the two-word reply

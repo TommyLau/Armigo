@@ -35,15 +35,12 @@ add_library(armigo_loader STATIC
 )
 add_library(armigo::loader ALIAS armigo_loader)
 
-# ZBIC changes entropy headers; the standard frame decoder is an optional static dependency.
-# Cross builds must supply a package built for their target platform.
-find_package(zstd CONFIG QUIET)
-if(TARGET zstd::libzstd_static)
-    target_link_libraries(armigo_loader PRIVATE zstd::libzstd_static)
-    target_compile_definitions(armigo_loader PRIVATE ARMIGO_HAS_ZSTD=1)
-else()
-    target_compile_definitions(armigo_loader PRIVATE ARMIGO_HAS_ZSTD=0)
+# All player configurations use the same pinned decoder dependency.
+if(NOT TARGET zstd::libzstd_static)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/RuntimeDependencies.cmake")
 endif()
+target_link_libraries(armigo_loader PRIVATE zstd::libzstd_static)
+target_compile_definitions(armigo_loader PRIVATE ARMIGO_HAS_ZSTD=1)
 
 
 target_include_directories(armigo_loader

@@ -62,6 +62,9 @@ ProgramResult parse_program(const Record& record) {
     p.image = code.first(end); p.header = code.first(header_size);
     p.instructions = code.subspan(header_size, end - header_size); p.padding = padding;
     p.constants = code.subspan(constant_offset, constant_size); p.trailing_padding = trailing_padding;
+    if (p.stage == Stage::fragment)
+        p.early_fragment_tests = little_endian(c, 0x5b, 1) != 0 &&
+            (little_endian(p.header, 19 * 4, 4) & 2u) == 0;
     if (p.stage == Stage::compute) {
         ComputeLaunchFacts launch{{static_cast<std::uint32_t>(little_endian(c, 0x58, 4)),
                                    static_cast<std::uint32_t>(little_endian(c, 0x5c, 4)),

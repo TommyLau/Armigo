@@ -36,6 +36,14 @@ constexpr std::uint32_t invalid_info = 0xf001;
 constexpr std::uint32_t invalid_address = 0xcc01;
 constexpr std::uint64_t result_limit = ProcessRecord::query_end;
 constexpr std::uint64_t high_word = 0xffffffff00000000ull;
+// The 23.0.1 kernel's envelope for synchronization words (ArbitrateLock 0x4db00,
+// ArbitrateUnlock 0x4dab0, WaitProcessWideKeyAtomic 0x606f0, WaitForAddress
+// 0x4d8a0, SignalToAddress 0x4d810). It is a validation range, broader than the
+// mapped 39-bit space: a word inside it but unmapped faults on access instead,
+// and SignalToAddress type 0 never reads its word. The process's excluded
+// interval inside it (GetInfo 37/38) is not modelled.
+constexpr std::uint64_t arbitration_start = 0x200000;
+constexpr std::uint64_t arbitration_end = 0x40000000000;
 
 bool region_valid(AddressRange region) {
     return region.address >= ProcessRecord::aslr_start &&
@@ -851,7 +859,7 @@ QueryDisposition StartupQueries::arbitrate_lock(QueryRegisters& registers) const
     const auto owner = static_cast<std::uint32_t>(registers[0]);
     const auto address = registers[1];
     const auto tag = static_cast<std::uint32_t>(registers[2]);
-    if (address < 0x200000 || address >= ProcessRecord::query_end) {
+    if (address < arbitration_start || address >= arbitration_end) {
         finish(registers, 0xd401, 0);
         return QueryDisposition::handled;
     }
@@ -878,7 +886,7 @@ QueryDisposition StartupQueries::arbitrate_unlock(QueryRegisters& registers) con
     // svcArbitrateUnlock(mutex_word): hand the tag to one ordinary or signalled CV waiter,
     // preserving the waiter marker when more handoffs remain; otherwise clear the word.
     const auto address = registers[0];
-    if (address < 0x200000 || address >= ProcessRecord::query_end) {
+    if (address < arbitration_start || address >= arbitration_end) {
         finish(registers, 0xd401, 0);
         return QueryDisposition::handled;
     }
@@ -902,7 +910,7 @@ QueryDisposition StartupQueries::arbitrate(QueryRegisters& registers) const {
     // wait reports the kernel timeout result and does not take the mutex back.
     constexpr std::uint32_t timed_out = 0xea01;
     const auto mutex = registers[0];
-    if (mutex < 0x200000 || mutex >= ProcessRecord::query_end) {
+    if (mutex < arbitration_start || mutex >= arbitration_end) {
         finish(registers, 0xd401, 0);
         return QueryDisposition::handled;
     }
@@ -962,7 +970,7 @@ QueryDisposition StartupQueries::wait_for_address(QueryRegisters& registers) con
     constexpr std::uint32_t timed_out = 0xea01;
     const auto address = registers[0];
     const auto type = static_cast<std::uint32_t>(registers[1]);
-    if (address < 0x200000 || address >= ProcessRecord::query_end) {
+    if (address < arbitration_start || address >= arbitration_end) {
         finish(registers, 0xd401, address);
         return QueryDisposition::handled;
     }
@@ -1027,7 +1035,7 @@ QueryDisposition StartupQueries::signal_to_address(QueryRegisters& registers) co
     const auto type = static_cast<std::uint32_t>(registers[1]);
     const auto value = static_cast<std::uint32_t>(registers[2]);
     const auto count = static_cast<std::int32_t>(static_cast<std::uint32_t>(registers[3]));
-    if (address < 0x200000 || address >= ProcessRecord::query_end) {
+    if (address < arbitration_start || address >= arbitration_end) {
         finish(registers, 0xd401, address);
         return QueryDisposition::handled;
     }

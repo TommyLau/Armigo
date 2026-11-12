@@ -10,7 +10,8 @@
 
 # NVN graphics driver (fast path). Subsystems add their sources here.
 add_library(armigo_nvn STATIC entry_table.cpp entry_table_231.cpp entries_231.cpp null_device.cpp abi.S redirect.cpp guest_wait.cpp
-    device.cpp memory.cpp textures.cpp samplers.cpp programs.cpp state_objects.cpp command_buffers.cpp)
+    device.cpp memory.cpp textures.cpp samplers.cpp programs.cpp state_objects.cpp command_buffers.cpp
+    conditional_reports.cpp program_capture.cpp)
 target_include_directories(armigo_nvn PUBLIC "${PROJECT_SOURCE_DIR}/include")
 target_compile_features(armigo_nvn PUBLIC cxx_std_20)
 target_link_libraries(armigo_nvn PUBLIC armigo_horizon armigo_graphics armigo_execution)
@@ -21,10 +22,15 @@ add_library(armigo_metal_nvn_resources STATIC
     "${PROJECT_SOURCE_DIR}/src/platform/metal/nvn_deswizzle.mm")
 target_include_directories(armigo_metal_nvn_resources PUBLIC "${PROJECT_SOURCE_DIR}/include"
     "${PROJECT_SOURCE_DIR}/src" PRIVATE "${PROJECT_SOURCE_DIR}/src/platform/metal")
-target_link_libraries(armigo_metal_nvn_resources PUBLIC armigo_nvn armigo_metal_texture_format
+target_link_libraries(armigo_metal_nvn_resources PUBLIC armigo_nvn armigo_metal_texture_format armigo_host_memory
     "-framework Metal" "-framework Foundation")
 
 if(BUILD_TESTING)
+    add_executable(armigo_nvn_program_capture_tests "${PROJECT_SOURCE_DIR}/tests/nvn/program_capture_tests.cpp")
+    target_include_directories(armigo_nvn_program_capture_tests PRIVATE "${PROJECT_SOURCE_DIR}/src/nvn" "${PROJECT_SOURCE_DIR}/src/shader")
+    target_link_libraries(armigo_nvn_program_capture_tests PRIVATE armigo_nvn armigo_shader_package)
+    add_test(NAME nvn.program_capture COMMAND armigo_nvn_program_capture_tests)
+    set_tests_properties(nvn.program_capture PROPERTIES TIMEOUT 30)
     add_executable(armigo_nvn_timeline_tests "${PROJECT_SOURCE_DIR}/tests/nvn/timeline_tests.cpp" timeline.cpp)
     target_include_directories(armigo_nvn_timeline_tests PRIVATE "${PROJECT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}")
     target_compile_features(armigo_nvn_timeline_tests PRIVATE cxx_std_20)
@@ -56,6 +62,10 @@ if(BUILD_TESTING)
     add_executable(armigo_nvn_flat_map_tests "${PROJECT_SOURCE_DIR}/tests/nvn/flat_map_tests.cpp")
     target_include_directories(armigo_nvn_flat_map_tests PRIVATE "${PROJECT_SOURCE_DIR}/src/nvn")
     add_test(NAME nvn.flat_map COMMAND armigo_nvn_flat_map_tests)
+    add_executable(armigo_nvn_conditional_reports_tests "${PROJECT_SOURCE_DIR}/tests/nvn/conditional_reports_tests.cpp")
+    target_include_directories(armigo_nvn_conditional_reports_tests PRIVATE "${PROJECT_SOURCE_DIR}/src/nvn")
+    target_link_libraries(armigo_nvn_conditional_reports_tests PRIVATE armigo_nvn)
+    add_test(NAME nvn.conditional_reports COMMAND armigo_nvn_conditional_reports_tests)
     add_executable(armigo_nvn_guest_memory_table_tests "${PROJECT_SOURCE_DIR}/tests/nvn/guest_memory_table_tests.cpp")
     target_include_directories(armigo_nvn_guest_memory_table_tests PRIVATE "${PROJECT_SOURCE_DIR}/src/platform/metal")
     add_test(NAME nvn.guest_memory_table COMMAND armigo_nvn_guest_memory_table_tests)
@@ -73,6 +83,11 @@ if(BUILD_TESTING)
     add_executable(armigo_metal_nvn_resources_tests "${PROJECT_SOURCE_DIR}/tests/metal/nvn_resources.mm")
     target_include_directories(armigo_metal_nvn_resources_tests PRIVATE "${PROJECT_SOURCE_DIR}/src")
     target_link_libraries(armigo_metal_nvn_resources_tests PRIVATE armigo_metal_nvn_resources)
+    add_executable(armigo_metal_nvn_srgb_images_tests "${PROJECT_SOURCE_DIR}/tests/metal/nvn_srgb_images.mm")
+    target_include_directories(armigo_metal_nvn_srgb_images_tests PRIVATE "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/src/nvn")
+    target_link_libraries(armigo_metal_nvn_srgb_images_tests PRIVATE armigo_nvn_metal)
+    add_test(NAME metal.nvn_srgb_images COMMAND armigo_metal_nvn_srgb_images_tests)
+    set_tests_properties(metal.nvn_srgb_images PROPERTIES LABELS "gpu;metal4;graphics" TIMEOUT 60)
     add_test(NAME metal.nvn_resources COMMAND armigo_metal_nvn_resources_tests)
     set_tests_properties(metal.nvn_resources PROPERTIES LABELS "gpu;metal4;graphics" TIMEOUT 60)
 endif()
@@ -82,7 +97,7 @@ target_link_libraries(armigo_nvn PUBLIC armigo_services_vi)
 
 add_library(armigo_nvn_present_metal STATIC ../platform/metal/nvn_present.mm)
 target_link_libraries(armigo_nvn_present_metal PUBLIC armigo_nvn
-    PRIVATE "${ARMIGO_FOUNDATION_FRAMEWORK}" "${ARMIGO_METAL_FRAMEWORK}")
+    PRIVATE armigo_metal_nvn_resources "${ARMIGO_FOUNDATION_FRAMEWORK}" "${ARMIGO_METAL_FRAMEWORK}")
 
 if(BUILD_TESTING)
     foreach(suite sync window)
@@ -100,7 +115,7 @@ endif()
 
 if(BUILD_TESTING AND ARMIGO_ENABLE_GPU_TESTS)
     add_executable(armigo_nvn_present_metal_tests "${PROJECT_SOURCE_DIR}/tests/nvn/present_metal_tests.mm")
-    target_link_libraries(armigo_nvn_present_metal_tests PRIVATE armigo_nvn_present_metal armigo_platform_presenter
+    target_link_libraries(armigo_nvn_present_metal_tests PRIVATE armigo_nvn_present_metal armigo_platform_presenter armigo_metal_nvn_resources
         "${ARMIGO_FOUNDATION_FRAMEWORK}" "${ARMIGO_METAL_FRAMEWORK}")
     add_test(NAME nvn.present_metal COMMAND armigo_nvn_present_metal_tests)
     set_tests_properties(nvn.present_metal PROPERTIES SKIP_RETURN_CODE 77)
@@ -136,12 +151,16 @@ if(BUILD_TESTING)
     add_test(NAME nvn.replay_commands COMMAND armigo_nvn_replay_commands_tests)
 endif()
 
+armigo_find_framework(ARMIGO_NVN_IMAGEIO_FRAMEWORK ImageIO)
 target_sources(armigo_nvn_metal PRIVATE "${PROJECT_SOURCE_DIR}/src/platform/metal/nvn_replay.mm"
+    "${PROJECT_SOURCE_DIR}/src/platform/metal/nvn_pass_dump.mm"
+    "${PROJECT_SOURCE_DIR}/src/platform/metal/nvn_pool_tables.mm"
     "${PROJECT_SOURCE_DIR}/src/platform/metal/nvn_install.mm"
     "${PROJECT_SOURCE_DIR}/src/platform/metal/pso_manifest.cpp"
     "${PROJECT_SOURCE_DIR}/src/platform/metal/pso_archive_build.mm")
 target_link_libraries(armigo_nvn_metal PUBLIC armigo_metal_clear_encoder armigo_metal_texture_format armigo_metal_nvn_resources
-    armigo_nvn_present_metal armigo_services_vi)
+    armigo_nvn_present_metal armigo_services_vi
+    "${ARMIGO_NVN_IMAGEIO_FRAMEWORK}" "${ARMIGO_COREGRAPHICS_FRAMEWORK}")
 # The pipeline warm-up reads compute stages from a native package section when
 # the build has the native package reader (it needs zstd).
 if(TARGET armigo_shader_native_package)
@@ -174,10 +193,32 @@ if(TARGET armigo_shader_native_frontend)
     endif()
 endif()
 if(BUILD_TESTING)
+    add_executable(armigo_metal_nvn_submission_owner_tests
+        "${PROJECT_SOURCE_DIR}/tests/metal/nvn_submission_owner.mm")
+    target_include_directories(armigo_metal_nvn_submission_owner_tests PRIVATE
+        "${PROJECT_SOURCE_DIR}/src/platform/metal")
+    target_link_libraries(armigo_metal_nvn_submission_owner_tests PRIVATE armigo_metal_nvn_resources)
+    if(ARMIGO_ENABLE_GPU_TESTS)
+        add_test(NAME metal.nvn_submission_owner COMMAND armigo_metal_nvn_submission_owner_tests)
+        set_tests_properties(metal.nvn_submission_owner PROPERTIES LABELS "gpu;metal4;nvn" TIMEOUT 60)
+    endif()
     add_executable(armigo_metal_nvn_replay_tests "${PROJECT_SOURCE_DIR}/tests/metal/nvn_replay_tests.mm")
     target_include_directories(armigo_metal_nvn_replay_tests PRIVATE
         "${PROJECT_SOURCE_DIR}/src/nvn" "${PROJECT_SOURCE_DIR}/src/platform/metal")
-    target_link_libraries(armigo_metal_nvn_replay_tests PRIVATE armigo_nvn_metal)
+    target_link_libraries(armigo_metal_nvn_replay_tests PRIVATE armigo_nvn_metal armigo_platform_presenter
+        "${ARMIGO_NVN_IMAGEIO_FRAMEWORK}" "${ARMIGO_COREGRAPHICS_FRAMEWORK}")
+    add_executable(armigo_metal_nvn_texture_copy_tests "${PROJECT_SOURCE_DIR}/tests/metal/nvn_texture_copy.mm")
+    target_include_directories(armigo_metal_nvn_texture_copy_tests PRIVATE
+        "${PROJECT_SOURCE_DIR}/src/nvn" "${PROJECT_SOURCE_DIR}/src/platform/metal")
+    target_link_libraries(armigo_metal_nvn_texture_copy_tests PRIVATE armigo_nvn_metal)
+    if(ARMIGO_ENABLE_GPU_TESTS)
+        foreach(mode default direct validation)
+            add_test(NAME nvn.metal_texture_copy_${mode} COMMAND armigo_metal_nvn_texture_copy_tests)
+            set_tests_properties(nvn.metal_texture_copy_${mode} PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;metal4;nvn")
+        endforeach()
+        set_tests_properties(nvn.metal_texture_copy_direct PROPERTIES ENVIRONMENT "ARMIGO_NVN_ENCODE_THREAD=0")
+        set_tests_properties(nvn.metal_texture_copy_validation PROPERTIES ENVIRONMENT "ARMIGO_NVN_ENCODE_THREAD=0;MTL_DEBUG_LAYER=1")
+    endif()
     # Native task and mesh draws record synthetic native stages through the
     # API 231 resolver.
     if(TARGET armigo_shader_native_frontend)
@@ -186,6 +227,10 @@ if(BUILD_TESTING)
         target_compile_definitions(armigo_metal_nvn_replay_tests PRIVATE ARMIGO_HAS_NATIVE_SHADERS=1)
     endif()
     # Keep the unbatched path covered alongside default and explicit-on variants.
+    target_sources(armigo_metal_nvn_replay_tests PRIVATE
+        "${PROJECT_SOURCE_DIR}/tests/shader/pipeline/cbuf_msl_tests.cpp")
+    target_compile_definitions(armigo_metal_nvn_replay_tests PRIVATE ARMIGO_CBUF_MSL_FIXTURE_ONLY)
+    target_link_libraries(armigo_metal_nvn_replay_tests PRIVATE armigo_shader_pipeline)
     add_test(NAME nvn.metal_replay COMMAND armigo_metal_nvn_replay_tests)
     set_tests_properties(nvn.metal_replay PROPERTIES
         ENVIRONMENT "ARMIGO_NVN_BATCH_FINALIZED_QUERIES=0")

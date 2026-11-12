@@ -100,6 +100,55 @@ int main() {
         CHECK(defaults && !defaults->front().nvn_policy.hoist_implicit_samples);
         CHECK(std::holds_alternative<std::string>(
             parse("true", ",\"nvn_policy\":{\"hoist_implicit_samples\":\"yes\"}")));
+        const auto replay = parse("true", ",\"nvn_policy\":{\"conditional_render\":\"replay\"}");
+        const auto* replayed = std::get_if<PatchDescriptions>(&replay);
+        CHECK(replayed && replayed->front().nvn_policy.replay_conditional_render &&
+              !replayed->front().nvn_policy.hoist_implicit_samples);
+        const auto exact = parse("true", ",\"nvn_policy\":{\"conditional_render\":\"exact\"}");
+        const auto* exacted = std::get_if<PatchDescriptions>(&exact);
+        CHECK(exacted && !exacted->front().nvn_policy.replay_conditional_render);
+        CHECK(defaults && !defaults->front().nvn_policy.replay_conditional_render);
+        CHECK(std::holds_alternative<std::string>(
+            parse("true", ",\"nvn_policy\":{\"conditional_render\":\"foo\"}")));
+        CHECK(std::holds_alternative<std::string>(
+            parse("true", ",\"nvn_policy\":{\"conditional_render\":true}")));
+        const auto current = parse("true", ",\"nvn_policy\":{\"handle_reads\":\"current\"}");
+        const auto* currented = std::get_if<PatchDescriptions>(&current);
+        CHECK(currented && currented->front().nvn_policy.current_handle_reads &&
+              !currented->front().nvn_policy.replay_conditional_render);
+        const auto ordered = parse("true", ",\"nvn_policy\":{\"handle_reads\":\"ordered\"}");
+        const auto* ordereded = std::get_if<PatchDescriptions>(&ordered);
+        CHECK(ordereded && !ordereded->front().nvn_policy.current_handle_reads);
+        CHECK(defaults && !defaults->front().nvn_policy.current_handle_reads);
+        CHECK(std::holds_alternative<std::string>(
+            parse("true", ",\"nvn_policy\":{\"handle_reads\":\"later\"}")));
+        const auto retired = parse("true", ",\"nvn_policy\":{\"guest_store_textures\":\"retired\"}");
+        const auto* retireded = std::get_if<PatchDescriptions>(&retired);
+        CHECK(retireded && retireded->front().nvn_policy.retired_guest_store_textures &&
+              !retireded->front().nvn_policy.current_handle_reads);
+        const auto store_ordered = parse("true", ",\"nvn_policy\":{\"guest_store_textures\":\"ordered\"}");
+        const auto* store_ordereded = std::get_if<PatchDescriptions>(&store_ordered);
+        CHECK(store_ordereded && !store_ordereded->front().nvn_policy.retired_guest_store_textures);
+        CHECK(defaults && !defaults->front().nvn_policy.retired_guest_store_textures);
+        CHECK(std::holds_alternative<std::string>(
+            parse("true", ",\"nvn_policy\":{\"guest_store_textures\":\"later\"}")));
+        const auto core = parse("true", ",\"nvn_policy\":{\"replay\":\"core\"}");
+        const auto* cored = std::get_if<PatchDescriptions>(&core);
+        CHECK(cored && cored->front().nvn_policy.core_replay);
+        const auto standard = parse("true", ",\"nvn_policy\":{\"replay\":\"standard\"}");
+        const auto* standarded = std::get_if<PatchDescriptions>(&standard);
+        CHECK(standarded && !standarded->front().nvn_policy.core_replay);
+        CHECK(defaults && !defaults->front().nvn_policy.core_replay);
+        CHECK(std::holds_alternative<std::string>(
+            parse("true", ",\"nvn_policy\":{\"replay\":\"other\"}")));
+        const auto slots = parse("true", ",\"nvn_policy\":{\"submission_slots\":12}");
+        const auto* slotted = std::get_if<PatchDescriptions>(&slots);
+        CHECK(slotted && slotted->front().nvn_policy.submission_slots == 12);
+        CHECK(defaults && defaults->front().nvn_policy.submission_slots == 0);
+        CHECK(std::holds_alternative<std::string>(
+            parse("true", ",\"nvn_policy\":{\"submission_slots\":0}")));
+        CHECK(std::holds_alternative<std::string>(
+            parse("true", ",\"nvn_policy\":{\"submission_slots\":17}")));
         CHECK(std::holds_alternative<std::string>(parse("true", ",\"nvn_policy\":true")));
     }
     CHECK(std::holds_alternative<std::string>(parse("true", ",\"unknown\":0")));

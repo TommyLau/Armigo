@@ -138,8 +138,8 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                 require([entry isKindOfClass:[NSDictionary class]], "Compatibility record must be an object.");
                 const bool has_patch = entry[@"module"] != nil;
                 auto record = has_patch
-                    ? object(entry, {"title_id", "main_build_id", "module", "calls", "layout"}, {"original_callee", "nvn_driver", "startup_user", "nvn_policy", "pipelines", "words", "present_link", "resolution", "shader_inputs", "note", "frame_rate", "frame_rates"})
-                    : object(entry, {"title_id", "main_build_id"}, {"nvn_driver", "startup_user", "nvn_policy", "pipelines", "words", "present_link", "resolution", "shader_inputs", "note", "frame_rate", "frame_rates"});
+                    ? object(entry, {"title_id", "main_build_id", "module", "calls", "layout"}, {"original_callee", "nvn_driver", "startup_user", "nvn_policy", "pipelines", "words", "present_link", "resolution", "shader_inputs", "note", "frame_rate", "frame_rates", "platforms"})
+                    : object(entry, {"title_id", "main_build_id"}, {"nvn_driver", "startup_user", "nvn_policy", "pipelines", "words", "present_link", "resolution", "shader_inputs", "note", "frame_rate", "frame_rates", "platforms"});
                 PatchDescription patch;
                 patch.identity.title_id = hex(record[@"title_id"], 16);
                 auto build = string(record[@"main_build_id"]);
@@ -164,7 +164,9 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                 }
                 if (id policy = record[@"nvn_policy"]) {
                     NSDictionary* fields = object(policy, {}, {"cpu_cached_texture_writes", "timestamps", "barriers",
-                                                               "hoist_implicit_samples"});
+                                                               "hoist_implicit_samples", "conditional_render",
+                                                               "handle_reads", "guest_store_textures",
+                                                               "replay", "submission_slots"});
                     if (id writes = fields[@"cpu_cached_texture_writes"]) {
                         require(CFGetTypeID((__bridge CFTypeRef)writes) == CFBooleanGetTypeID(),
                                 "Compatibility nvn_policy.cpu_cached_texture_writes must be a JSON boolean.");
@@ -187,6 +189,34 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                                 "Compatibility nvn_policy.hoist_implicit_samples must be a JSON boolean.");
                         patch.nvn_policy.hoist_implicit_samples = [hoist boolValue];
                     }
+                    if (id conditional = fields[@"conditional_render"]) {
+                        const auto mode = string(conditional);
+                        require(mode == "exact" || mode == "replay",
+                                "Compatibility nvn_policy.conditional_render must be \"exact\" or \"replay\".");
+                        patch.nvn_policy.replay_conditional_render = mode == "replay";
+                    }
+                    if (id reads = fields[@"handle_reads"]) {
+                        const auto mode = string(reads);
+                        require(mode == "ordered" || mode == "current",
+                                "Compatibility nvn_policy.handle_reads must be \"ordered\" or \"current\".");
+                        patch.nvn_policy.current_handle_reads = mode == "current";
+                    }
+                    if (id stores = fields[@"guest_store_textures"]) {
+                        const auto mode = string(stores);
+                        require(mode == "ordered" || mode == "retired",
+                                "Compatibility nvn_policy.guest_store_textures must be \"ordered\" or \"retired\".");
+                        patch.nvn_policy.retired_guest_store_textures = mode == "retired";
+                    }
+                    if (id replay = fields[@"replay"]) {
+                        const auto mode = string(replay);
+                        require(mode == "standard" || mode == "core",
+                                "Compatibility nvn_policy.replay must be \"standard\" or \"core\".");
+                        patch.nvn_policy.core_replay = mode == "core";
+                    }
+                    if (id slots = fields[@"submission_slots"])
+                        patch.nvn_policy.submission_slots = layout_count(slots, 16);
+                    require(patch.nvn_policy.submission_slots != 0 || !fields[@"submission_slots"],
+                            "Compatibility nvn_policy.submission_slots must be 1 to 16.");
                 }
                 // The title's pipeline list: a file next to the profile.
                 if (id list = record[@"pipelines"]) {
@@ -202,17 +232,49 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                     patch.pso_manifest = file.string();
                 }
                 if (id inputs = record[@"shader_inputs"]) {
-                    auto selected = object(inputs, {"containers", "vertex_depth"},
-                                           {"caches", "fallbacks", "ignored_needle_offsets"});
+                    const bool native = [inputs isKindOfClass:[NSDictionary class]] &&
+                        [((NSDictionary*)inputs)[@"containers"] isEqual:@"native"];
+                    auto selected = native
+                        ? object(inputs, {"containers"}, {"dictionary_member", "members", "identities"})
+                        : object(inputs, {"containers", "vertex_depth"},
+                                 {"caches", "fallbacks", "ignored_needle_offsets"});
                     const auto containers = string(selected[@"containers"]);
                     if (containers == "bnsh") patch.shader_inputs.containers = ShaderContainerSet::Bnsh;
                     else if (containers == "gfd-cache") patch.shader_inputs.containers = ShaderContainerSet::GfdCache;
                     else if (containers == "glslc") patch.shader_inputs.containers = ShaderContainerSet::Glslc;
-                    else require(false, "Compatibility shader containers are bnsh, gfd-cache or glslc.");
-                    const auto depth = string(selected[@"vertex_depth"]);
-                    if (depth == "minus-one-to-one") patch.shader_inputs.vertex_depth = ShaderVertexDepth::NegativeOneToOne;
-                    else if (depth == "zero-to-one") patch.shader_inputs.vertex_depth = ShaderVertexDepth::ZeroToOne;
-                    else require(false, "Compatibility vertex depth is minus-one-to-one or zero-to-one.");
+                    else if (containers == "native") patch.shader_inputs.containers = ShaderContainerSet::Native;
+                    else require(false, "Compatibility shader containers are bnsh, gfd-cache, glslc or native.");
+                    if (!native) {
+                        const auto depth = string(selected[@"vertex_depth"]);
+                        if (depth == "minus-one-to-one") patch.shader_inputs.vertex_depth = ShaderVertexDepth::NegativeOneToOne;
+                        else if (depth == "zero-to-one") patch.shader_inputs.vertex_depth = ShaderVertexDepth::ZeroToOne;
+                        else require(false, "Compatibility vertex depth is minus-one-to-one or zero-to-one.");
+                    }
+                    if (id member = selected[@"dictionary_member"])
+                        patch.shader_inputs.dictionary_member = cache_member_name(member);
+                    if (id members = selected[@"members"]) {
+                        require([members isKindOfClass:[NSArray class]] && [members count] <= 4096,
+                                "Compatibility shader members must be a bounded array.");
+                        std::set<std::string> names;
+                        for (id item in members) {
+                            auto name = cache_member_name(item);
+                            require(names.insert(name).second, "Duplicate compatibility shader member.");
+                            patch.shader_inputs.members.push_back(std::move(name));
+                        }
+                    }
+                    if (id identities = selected[@"identities"]) {
+                        require([identities isKindOfClass:[NSArray class]] && [identities count] <= 1000000,
+                                "Compatibility shader identities must be a bounded array.");
+                        std::set<std::string> seen;
+                        for (id item in identities) {
+                            auto identity = string(item);
+                            require(identity.size() == 64 &&
+                                        identity.find_first_not_of("0123456789abcdef") == std::string::npos,
+                                    "Compatibility shader identity must be 64 lowercase hexadecimal digits.");
+                            require(seen.insert(identity).second, "Duplicate compatibility shader identity.");
+                            patch.shader_inputs.identities.push_back(std::move(identity));
+                        }
+                    }
                     if (id caches = selected[@"caches"]) {
                         require([caches isKindOfClass:[NSArray class]] && [caches count] <= 64,
                                 "Compatibility shader caches must be a bounded array.");
@@ -266,6 +328,22 @@ PatchReadResult read_patch_descriptions(const std::filesystem::path& path) {
                         require(patch.shader_inputs.caches.empty() && patch.shader_inputs.fallbacks.empty() &&
                                     patch.shader_inputs.ignored_needle_offsets.empty(),
                                 "Only gfd-cache shader input names caches or ignored offsets.");
+                    }
+                }
+                // The platforms a pack may target: "macos" and "ios". Absent
+                // admits macOS only.
+                if (id platforms = record[@"platforms"]) {
+                    require([platforms isKindOfClass:[NSArray class]] && [platforms count] > 0 && [platforms count] <= 2,
+                            "Compatibility platforms must be a nonempty list of macos and ios.");
+                    patch.platforms.clear();
+                    for (id item in platforms) {
+                        auto platform = string(item);
+                        require(platform == "macos" || platform == "ios",
+                                "Compatibility platforms must be a nonempty list of macos and ios.");
+                        require(std::find(patch.platforms.begin(), patch.platforms.end(), platform) ==
+                                    patch.platforms.end(),
+                                "Duplicate compatibility platform.");
+                        patch.platforms.push_back(std::move(platform));
                     }
                 }
                 if (id link = record[@"present_link"]) {

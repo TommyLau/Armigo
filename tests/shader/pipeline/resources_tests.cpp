@@ -298,7 +298,7 @@ void memory_and_limits() {
         check(legal->requirements.uses.size() == 2, "CB loads share one resource plus one support table");
         const auto& b = std::get<BufferUse>(legal->requirements.uses[0]);
         check(b.size.bytes == 256 && b.size.kind == SizeKind::constant_buffer_window &&
-            b.size.constant_buffer_policy == ConstantBufferPolicy::runtime_zero_words_v1,
+            b.size.constant_buffer_policy == ConstantBufferPolicy::proven_zero_words_v2,
             "CB window is the maximum normalized word end");
         const auto& support = std::get<BufferUse>(legal->requirements.uses[1]);
         check(std::get<SupportBufferSource>(support.source).schema == constant_buffer_support_schema &&
@@ -364,6 +364,45 @@ void memory_and_limits() {
             !std::get<MemoryInfo>(load->info).dynamic_byte_offset_upper_bound && buffer &&
             buffer->size.bytes == constant_buffer_window_bytes,
             "Unknown dynamic CB offset retains no invented bound and uses the full window");
+        check(buffer && buffer->size.constant_buffer_policy == ConstantBufferPolicy::padded_zero_words_v2,
+            "Unknown offsets select the padded contract at translation time");
+    }
+    const auto late_static = copy(p, ConstantWord{2, 8});
+    const auto other_static = copy(p, ConstantWord{3, 8});
+    p.functions[0].results = {ValueType::word32, ValueType::word32};
+    p.blocks[0].terminator = Return{{late_static, other_static}};
+    const auto mixed_result = run(p, f);
+    if (const auto* mixed = success(mixed_result, "Mixed bounded and unbounded windows legalize")) {
+        const auto* padded = constant_buffer(mixed->requirements, 2);
+        const auto* proven = constant_buffer(mixed->requirements, 3);
+        check(padded && padded->size.constant_buffer_policy == ConstantBufferPolicy::padded_zero_words_v2 &&
+              proven && proven->size.constant_buffer_policy == ConstantBufferPolicy::proven_zero_words_v2,
+            "One unknown read keeps only its own buffer padded after later static loads");
+        if (!padded || !proven || padded->size.constant_buffer_policy != ConstantBufferPolicy::padded_zero_words_v2 ||
+            proven->size.constant_buffer_policy != ConstantBufferPolicy::proven_zero_words_v2) {
+            for (const auto& use : mixed->requirements.uses) if (const auto* buffer = std::get_if<BufferUse>(&use))
+                if (const auto* slot = std::get_if<ConstantBufferSource>(&buffer->source))
+                    std::cerr << "  slot=" << unsigned(slot->slot) << " policy=" << unsigned(buffer->size.constant_buffer_policy)
+                              << " bytes=" << buffer->size.bytes << '\n';
+        }
+    }
+
+    p = empty();
+    const auto ordinary = copy(p, ConstantWord{2, 4});
+    MemoryInfo boundary; boundary.constant_buffer_slot = 2; boundary.byte_offset = 65532;
+    boundary.elements = 2;
+    const ValueId low{static_cast<std::uint32_t>(p.values.size())}; p.values.push_back({ValueType::word32});
+    const ValueId high{static_cast<std::uint32_t>(p.values.size())}; p.values.push_back({ValueType::word32});
+    p.blocks[0].operations.push_back(OperationId{static_cast<std::uint32_t>(p.operations.size())});
+    p.operations.push_back({{8,{}},Opcode::load,Effects::read_memory,{}, {},{low,high},boundary});
+    p.functions[0].results = {ValueType::word32,ValueType::word32,ValueType::word32};
+    p.blocks[0].terminator = Return{{ordinary,low,high}};
+    const auto mixed_boundary = run(p,f);
+    if (const auto* legal = success(mixed_boundary, "Mixed ordinary and crossing reads legalize")) {
+        const auto* buffer = constant_buffer(legal->requirements,2);
+        check(buffer && buffer->size.bytes == constant_buffer_window_bytes &&
+              buffer->size.constant_buffer_policy == ConstantBufferPolicy::padded_zero_words_v2,
+            "One crossing vector component keeps the whole shared buffer padded");
     }
 
     p = empty();
@@ -483,7 +522,7 @@ void planning() {
     StructuredProgram p; p.ir = empty(Stage::vertex); p.profile = profile();
     auto buffer = [](BufferSource source) -> ResourceUse { return BufferUse{std::move(source), Access::read, {SizeKind::full_binding, 256, 4}}; };
     auto cb = [](std::uint8_t slot) -> ResourceUse { return BufferUse{ConstantBufferSource{slot}, Access::read,
-        {SizeKind::constant_buffer_window, 256, 4, ConstantBufferPolicy::runtime_zero_words_v1}}; };
+        {SizeKind::constant_buffer_window, 256, 4, ConstantBufferPolicy::padded_zero_words_v2}}; };
     auto support = []() -> ResourceUse { return BufferUse{SupportBufferSource{std::string(constant_buffer_support_schema),
         constant_buffer_support_version}, Access::read, {SizeKind::accessed_extent, constant_buffer_support_bytes, 4}}; };
     p.requirements.uses = {cb(7), buffer(VertexStreamSource{9}), support(), cb(1), buffer(VertexStreamSource{2})};
@@ -911,10 +950,83 @@ void independent_pool_resolution() {
     }
 }
 
+void direct_storage_resolution() {
+    auto p = empty();
+    const auto low = copy(p, ConstantWord{0, 0x510});
+    const auto high = copy(p, ConstantWord{0, 0x514});
+    MemoryInfo memory;
+    memory.space = AddressSpace::guest; memory.access = Access::read;
+    memory.element_bytes = 4; memory.elements = 1; memory.alignment = 4;
+    memory.scope = MemoryScope::workgroup;
+    memory.dynamic_byte_offset = InputIndex{0}; memory.global_address_high = InputIndex{1};
+    Operation op{{80, {}}, Opcode::load, Effects::read_memory, {}, {low, high}, {}, memory};
+    const auto loaded = add(p, std::move(op));
+    p.functions[0].results = {ValueType::word32}; p.blocks[0].terminator = Return{{loaded}};
+    auto f = facts();
+    auto unresolved = run(p, f);
+    if (const auto* legal = success(unresolved, "Unknown driver binding keeps a guest-only access")) {
+        check(std::none_of(legal->ir.operations.begin(), legal->ir.operations.end(), [](const auto& operation) {
+            const auto* info = std::get_if<MemoryInfo>(&operation.info);
+            return info && info->direct_storage.has_value();
+        }), "Address provenance alone cannot invent a host buffer binding");
+    }
+    f.set(FactQuery<FactKind::bound_storage_descriptor>{0, 0x510}, true);
+    auto resolved = run(p, f);
+    if (const auto* legal = success(resolved, "Known driver binding resolves the descriptor-relative load")) {
+        success(plan_resources(structured(*legal), profile()), "Direct storage plans without a pool table");
+        check(std::none_of(legal->requirements.uses.begin(), legal->requirements.uses.end(), [](const auto& use) {
+            const auto* buffer = std::get_if<BufferUse>(&use);
+            const auto* support = buffer ? std::get_if<SupportBufferSource>(&buffer->source) : nullptr;
+            return support && support->schema == guest_memory_schema;
+        }), "A proven direct load needs no guest-pool table");
+        const auto access = std::find_if(legal->ir.operations.begin(), legal->ir.operations.end(), [](const auto& operation) {
+            const auto* info = std::get_if<MemoryInfo>(&operation.info);
+            return info && info->direct_storage.has_value();
+        });
+        check(access != legal->ir.operations.end(), "Known driver descriptor is reflected on the load");
+        if (access == legal->ir.operations.end()) return;
+        const auto index = static_cast<std::size_t>(access - legal->ir.operations.begin());
+        auto mutated = structured(*legal);
+        std::erase_if(mutated.ir.dependencies, [](const auto& dependency) {
+            return dependency.key.kind == FactKind::bound_storage_descriptor;
+        });
+        rejected(plan_resources(mutated, profile()), DiagnosticCode::invalid_ir, "Bound guest storage requires its driver fact");
+        mutated = structured(*legal);
+        std::get<MemoryInfo>(mutated.ir.operations[index].info).resource = ResourceId{9999};
+        rejected(plan_resources(mutated, profile()), DiagnosticCode::invalid_ir, "Bound guest storage cannot name an invalid resource");
+        mutated = structured(*legal);
+        std::get<MemoryInfo>(mutated.ir.operations[index].info).direct_storage->handle_byte_offset += 16;
+        rejected(plan_resources(mutated, profile()), DiagnosticCode::invalid_ir, "Bound guest storage rechecks descriptor identity");
+        mutated = structured(*legal);
+        std::get<MemoryInfo>(mutated.ir.operations[index].info).dynamic_byte_offset = InputIndex{9999};
+        rejected(plan_resources(mutated, profile()), DiagnosticCode::invalid_ir, "Bound guest storage rechecks descriptor input roles");
+    }
+    for (const auto scope : {MemoryScope::workgroup, MemoryScope::device}) {
+        auto native = p;
+        auto& load = std::get<MemoryInfo>(native.operations.back().info);
+        load.scope = scope;
+        load.native_load_policy = NativeLoadPolicy::aligned_v1;
+        auto native_result = run(std::move(native), f);
+        if (const auto* legal = success(native_result, "Native aligned LDG can resolve to a driver storage binding")) {
+            const auto access = std::find_if(legal->ir.operations.begin(), legal->ir.operations.end(), [](const auto& operation) {
+                const auto* info = std::get_if<MemoryInfo>(&operation.info);
+                return info && info->direct_storage.has_value();
+            });
+            check(access != legal->ir.operations.end(), "Native aligned LDG retains descriptor resolution");
+            if (access != legal->ir.operations.end()) {
+                const auto& info = std::get<MemoryInfo>(access->info);
+                check(info.native_load_policy == NativeLoadPolicy::aligned_v1 && info.scope == scope,
+                      "Descriptor resolution preserves native load policy and decoded scope");
+            }
+            success(plan_resources(structured(*legal), profile()), "Resolved native LDG policy passes independent planning");
+        }
+    }
+}
+
 int main() {
     for (auto test : {vertex_depth_dependency, basic_resolution, bindless_resolution, phi_and_io_resolution, memory_and_limits,
             arrays_and_numeric, per_texel_gather_offsets, dependency_and_pass_contracts, planning, argument_buffer_planning,
-            independent_pool_resolution}) {
+            independent_pool_resolution, direct_storage_resolution}) {
         try { test(); } catch (const std::exception& error) {
             ++failures; std::cerr << "Test threw: " << error.what() << '\n';
         }

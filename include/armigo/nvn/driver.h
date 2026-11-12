@@ -97,6 +97,29 @@ struct TitlePolicy {
     // Run-time shader translation also moves implicit-LOD and bias samples
     // out of their predicate guards (the project documentation).
     bool hoist_implicit_samples = false;
+    // How a conditional render block is evaluated. exact keeps the GPU
+    // predicate or the GPU wait. replay compares the two counters on the CPU
+    // while the submission is encoded and skips draws and clears only when
+    // both are known and the comparison fails.
+    enum class ConditionalRender : std::uint8_t { exact, replay } conditional_render =
+        ConditionalRender::exact;
+    // How bindless handles are read from constant buffers while encoding.
+    // ordered waits for GPU work of the submission that may have written
+    // them. current reads them as memory and the submission's captured
+    // uniform updates leave them, without waiting for the GPU.
+    enum class HandleReads : std::uint8_t { ordered, current } handle_reads = HandleReads::ordered;
+    // When guest-memory stores reach a texture with storage of its own.
+    // ordered waits for the storing work before such a texture is used.
+    // retired takes the stores when their submission retires: a use while
+    // the writer runs reads the texels from before the stores.
+    enum class GuestStoreTextures : std::uint8_t { ordered, retired } guest_store_textures = GuestStoreTextures::ordered;
+    // Which replay runs the title's submissions. standard is today's. core
+    // replaces its queue model and submission core in stages; until a stage
+    // lands, core behaves as standard.
+    enum class Replay : std::uint8_t { standard, core } replay = Replay::standard;
+    // How many submissions the replay encodes and keeps in flight at once
+    // (1 to 16); 0 keeps the replay's default.
+    std::uint8_t submission_slots = 0;
 };
 void set_title_policy(const TitlePolicy& policy) noexcept;
 [[nodiscard]] TitlePolicy title_policy() noexcept;

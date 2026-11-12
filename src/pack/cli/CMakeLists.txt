@@ -23,6 +23,7 @@ armigo_find_framework(ARMIGO_PACK_CORESERVICES_FRAMEWORK CoreServices)
 add_library(armigo_pack STATIC
     naming.cpp
     command.cpp
+    run.cpp
     space.cpp
     settings.cpp
     bundle.cpp
@@ -37,7 +38,8 @@ target_include_directories(armigo_pack
         "${CMAKE_SOURCE_DIR}/include"
         "${CMAKE_CURRENT_SOURCE_DIR}"
     PRIVATE
-        "${CMAKE_SOURCE_DIR}/src/shader")
+        "${CMAKE_SOURCE_DIR}/src/shader"
+        "${CMAKE_BINARY_DIR}/generated")
 target_link_libraries(armigo_pack
     PUBLIC
         armigo_pack_nacp
@@ -53,8 +55,22 @@ target_compile_features(armigo_pack PUBLIC cxx_std_20)
 
 if(BUILD_TESTING)
     add_executable(armigo_pack_cli_tests
-        "${CMAKE_SOURCE_DIR}/tests/pack/cli/pack_cli_tests.cpp")
+        "${CMAKE_SOURCE_DIR}/tests/pack/cli/pack_cli_tests.cpp"
+        pack_flow.cpp
+        "${CMAKE_SOURCE_DIR}/src/platform/metal/pso_manifest.cpp")
+    target_include_directories(armigo_pack_cli_tests PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/platform/metal")
     target_link_libraries(armigo_pack_cli_tests PRIVATE armigo_pack)
+    add_executable(armigo_pack_pipeline_warmup_tests
+        "${CMAKE_SOURCE_DIR}/tests/pack/cli/pipeline_warmup_tests.cpp" pipelines.cpp)
+    target_link_libraries(armigo_pack_pipeline_warmup_tests PRIVATE armigo_pack armigo_nvn_metal)
+    add_test(NAME pack.pipeline_warmup COMMAND armigo_pack_pipeline_warmup_tests)
+    set_tests_properties(pack.pipeline_warmup PROPERTIES LABELS pack TIMEOUT 60)
+    add_executable(armigo_pack_localization_tests
+        "${CMAKE_SOURCE_DIR}/tests/pack/cli/bundle_localization_tests.mm")
+    target_link_libraries(armigo_pack_localization_tests PRIVATE armigo_pack)
+    add_test(NAME pack.localizations COMMAND armigo_pack_localization_tests)
+    set_tests_properties(pack.localizations PROPERTIES LABELS pack TIMEOUT 60)
     add_test(NAME pack.cli COMMAND armigo_pack_cli_tests)
     set_tests_properties(pack.cli PROPERTIES LABELS pack TIMEOUT 60)
     add_test(NAME pack.commit
@@ -76,6 +92,7 @@ add_custom_target(armigo_pack_commit
 
 add_executable(armigo_pack_cli
     main.cpp
+    pack_flow.cpp
     shaders.cpp
     pipelines.cpp
     native_shaders.cpp)
@@ -106,6 +123,7 @@ if(TARGET armigo_shader_native_package)
         "${CMAKE_SOURCE_DIR}/src/platform/metal"
         "${CMAKE_SOURCE_DIR}/src/loader")
     target_link_libraries(armigo-native-shader-package PRIVATE
+        armigo_pack
         armigo_shader_native_frontend
         armigo_shader_native_package
         armigo_shader_package
@@ -114,6 +132,8 @@ if(TARGET armigo_shader_native_package)
     set_target_properties(armigo-native-shader-package PROPERTIES
         OUTPUT_NAME armigo-native-shader-package
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+    # The title settings beside the tool select a .nup title's shader inputs.
+    add_dependencies(armigo-native-shader-package armigo_titles)
 endif()
 if(BUILD_TESTING AND TARGET armigo_shader_native_package)
     # Pins the stages each shader reader yields from synthetic containers.
@@ -124,7 +144,8 @@ if(BUILD_TESTING AND TARGET armigo_shader_native_package)
         "${CMAKE_SOURCE_DIR}/src/loader"
         "${CMAKE_SOURCE_DIR}/src/platform/metal"
         "${CMAKE_SOURCE_DIR}/tests/loader"
-        "${CMAKE_SOURCE_DIR}/tests/shader_input")
+        "${CMAKE_SOURCE_DIR}/tests/shader_input"
+        "${CMAKE_SOURCE_DIR}/tests/shader_native")
     target_link_libraries(armigo_pack_shader_golden_tests PRIVATE
         armigo_pack
         armigo_shader_package
@@ -137,4 +158,5 @@ if(BUILD_TESTING AND TARGET armigo_shader_native_package)
         "${CMAKE_SOURCE_DIR}/tests/pack/shader_golden.txt")
     set_tests_properties(pack.shader_golden PROPERTIES LABELS pack TIMEOUT 120)
 endif()
-add_dependencies(armigo_pack_cli armigo armigo_titles armigo-shader-translate armigo-prepare armigo_pack_commit)
+add_dependencies(armigo_pack_cli armigo armigo-headless armigo_titles armigo-shader-translate armigo-prepare
+    armigo_pack_commit)

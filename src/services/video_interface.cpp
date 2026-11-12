@@ -8,6 +8,7 @@
 // See LICENSE, COMMERCIAL-LICENSE.md, and DISCLAIMER.md.
 // ============================================================================
 
+#include <armigo/horizon/cmif.h>
 #include <armigo/common/diagnostics.h>
 #include <armigo/services/video_interface.h>
 #include <armigo/nvn/timeline.h>
@@ -41,36 +42,8 @@ using horizon::IpcDisposition;
 using horizon::IpcMessage;
 using horizon::IpcReply;
 
-constexpr std::uint32_t sfci = 0x49434653;
-constexpr std::uint32_t sfco = 0x4f434653;
+using namespace horizon::cmif;
 
-std::uint32_t read(const IpcMessage& bytes, std::size_t offset) {
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i < 4; ++i)
-        value |= std::uint32_t{std::to_integer<unsigned char>(bytes[offset + i])} << (8 * i);
-    return value;
-}
-
-std::uint64_t read64(const IpcMessage& bytes, std::size_t offset) {
-    return std::uint64_t{read(bytes, offset)} | (std::uint64_t{read(bytes, offset + 4)} << 32);
-}
-
-void write(IpcMessage& bytes, std::size_t offset, std::uint32_t value) {
-    for (unsigned i = 0; i < 4; ++i)
-        bytes[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 255);
-}
-
-IpcReply control_reply(std::uint32_t value, unsigned width) {
-    IpcReply reply;
-    reply.disposition = IpcDisposition::handled;
-    reply.size = 44;
-    write(reply.bytes, 4, 9);
-    write(reply.bytes, 16, sfco);
-    write(reply.bytes, 28, 0xec6be3ff);
-    write(reply.bytes, 32, value);
-    if (width == 1) reply.size = 40;
-    return reply;
-}
 
 // A reply that hands the caller one handle. The client materialises its display from
 // that handle, so the special header announces one copied handle and the value sits in
@@ -145,6 +118,7 @@ struct DisplaySession::QueueState {
     std::uint64_t frame_counter = 0;
     std::weak_ptr<NativeWindowProducerImpl> native_producer;
     bool native_registered = false;
+    bool native_failed = false;
     // Native windows may present from only their first `active` textures (NVN
     // active textures); zero means every registered one.
     std::uint32_t active = 0;
@@ -153,6 +127,7 @@ struct DisplaySession::QueueState {
     std::uint32_t dequeue_limit() const { return active ? std::min(active, maximum) : maximum; }
 
     void update_free_event() {
+        if (native_registered && native_failed) { free_event->signal(); return; }
         bool ready = false;
         for (std::size_t index = 0; index < dequeue_limit(); ++index)
             ready = ready || slots[index].state == Slot::State::Free;
@@ -239,7 +214,7 @@ public:
     NativeDequeue dequeue() override {
         const std::lock_guard queue_lock(queue_->mutex);
         if (!attached_ || !queue_->native_registered ||
-            queue_->native_producer.lock().get() != this || source_->failure())
+            queue_->native_producer.lock().get() != this || queue_->native_failed || source_->failure())
             return {-2, 0};
         std::optional<std::size_t> selected;
         for (std::size_t index = 0; index < queue_->dequeue_limit(); ++index) {
@@ -307,6 +282,7 @@ public:
         if (!attached_ || !queue_->native_registered ||
             queue_->native_producer.lock().get() != this)
             return failure("Native window producer is not bound");
+        if (queue_->native_failed) return failure("Native presentation previously failed");
         if (requested_slot < 0 ||
             static_cast<std::size_t>(requested_slot) >= queue_->maximum)
             return failure("Native presentation slot is outside the active queue");
@@ -330,12 +306,37 @@ public:
         slot.frame_number = frame;
         slot.state = DisplaySession::QueueState::Slot::State::Acquired;
         queue_->update_free_event();
-        const NativeTexture texture = registered;
+        NativeTexture texture = registered;
         const auto presenter = queue_->presenter;
         queue_lock.unlock();
 
-        if (!presenter)
+        const auto rollback = [&] {
+            std::lock_guard lock(queue_->mutex);
+            auto& failed = queue_->slots[static_cast<std::size_t>(requested_slot)];
+            if (failed.state == DisplaySession::QueueState::Slot::State::Acquired && failed.frame_number == frame)
+                failed.state = DisplaySession::QueueState::Slot::State::Dequeued;
+            queue_->update_free_event();
+        };
+
+        if (!presenter) {
+            rollback();
             return failure("Native presentation has no synchronous presenter");
+        }
+        if (texture.capture) {
+            try {
+                auto captured = texture.capture(fence);
+                if (!captured || captured->serial != texture.serial || captured->width != texture.width ||
+                    captured->height != texture.height || !captured->read_pixels) {
+                    if (captured && captured->cancel) captured->cancel();
+                    rollback();
+                    return failure("Native frame capture could not be queued in submission order");
+                }
+                texture = std::move(*captured);
+            } catch (...) {
+                rollback();
+                return failure("Native frame capture threw an exception");
+            }
+        }
         PendingPresent item;
         item.texture = texture;
         item.slot = static_cast<std::uint32_t>(requested_slot);
@@ -345,9 +346,13 @@ public:
         item.crop = crop;
         item.interval = interval;
         {
-            std::lock_guard present_lock(present_mutex_);
-            if (stopping_)
+            std::unique_lock present_lock(present_mutex_);
+            if (stopping_) {
+                present_lock.unlock();
+                if (item.texture.cancel) item.texture.cancel();
+                rollback();
                 return failure("Native presentation is stopping");
+            }
             pending_.push_back(std::move(item));
             ++in_flight_;
         }
@@ -357,18 +362,64 @@ public:
     }
 
     void present_queued(const PendingPresent& item, std::stop_token stop) {
+        struct CancelUnconsumed {
+            std::function<void()> cancel;
+            ~CancelUnconsumed() { if (cancel) cancel(); }
+        } cancel_unconsumed{item.texture.cancel};
         const auto queue = queue_;
-        nvn::timeline_event("pres_fence_wait_begin", item.frame, 0);
-        try {
-            if (!item.wait_fence || !item.wait_fence(item.fence)) {
-                note_failure("the frame's GPU work did not complete");
+        const bool ordered = item.texture.ordered_gpu_dependencies;
+        const auto note_frame_failure = [this, ordered](const std::string& detail) {
+            if (ordered) {
+                const std::lock_guard lock(queue_->mutex);
+                queue_->native_failed = true;
+                queue_->update_free_event();
+            }
+            note_failure(detail);
+        };
+        struct ProducerCompletion {
+            std::once_flag once;
+            bool succeeded = false;
+        };
+        const auto cached_ready = [frame = item.frame](std::function<bool()> wait) {
+            auto producer = std::make_shared<ProducerCompletion>();
+            return std::function<bool()>([producer, wait = std::move(wait), frame] {
+                std::call_once(producer->once, [&] {
+                    nvn::timeline_event("pres_fence_wait_begin", frame, 0);
+                    try { producer->succeeded = wait && wait(); } catch (...) {}
+                    if (producer->succeeded) nvn::timeline_event("pres_fence_ready", frame, 0);
+                });
+                return producer->succeeded;
+            });
+        };
+        std::function<bool()> producer_ready;
+        if (!ordered) {
+            producer_ready = cached_ready([wait = item.wait_fence, fence = item.fence] { return wait && wait(fence); });
+            if (!producer_ready()) {
+                note_frame_failure("the frame's GPU work did not complete");
                 return;
             }
-        } catch (...) {
-            note_failure("the frame's GPU work wait threw an exception");
+        }
+        NativeTexture texture = item.texture;
+        if (texture.resolve) {
+            try {
+                auto resolved = texture.resolve();
+                if (!resolved || resolved->serial != texture.serial ||
+                    resolved->width != texture.width || resolved->height != texture.height ||
+                    !resolved->read_pixels || resolved->ordered_gpu_dependencies != ordered) {
+                    note_frame_failure("the frame's current native texture allocation is unavailable");
+                    return;
+                }
+                texture = std::move(*resolved);
+            } catch (...) {
+                note_frame_failure("the native texture allocation resolver threw an exception");
+                return;
+            }
+        }
+        if (ordered && (!texture.native_submission || !texture.ordered_producer_ready)) {
+            note_frame_failure("the ordered native frame has no submission context or producer result");
             return;
         }
-        nvn::timeline_event("pres_fence_ready", item.frame, 0);
+        if (ordered) producer_ready = cached_ready(texture.ordered_producer_ready);
         // Present pacer: a frame's slot is one refresh period after the previous
         // frame's slot. A frame that is ready early waits for its slot; a frame
         // that is late by less than one period presents at once and keeps the
@@ -377,14 +428,14 @@ public:
         if (const auto clock = source_->imposed_clock()) {
             const auto planned = clock->schedule(last_imposed_refresh_, present_link_interval(item.interval));
             if (const auto* error = std::get_if<runtime::LaunchFailure>(&planned)) {
-                note_failure(error->detail);
+                note_frame_failure(error->detail);
                 return;
             }
             const auto target = std::get<runtime::PresentationSchedule>(planned);
             // The guest clock ends this wait at the slot.
             const auto waited = clock->clock()->wait_until(target.deadline, stop);
             if (const auto* error = std::get_if<runtime::LaunchFailure>(&waited)) {
-                note_failure(error->detail);
+                note_frame_failure(error->detail);
                 return;
             }
             if (std::get<runtime::ClockWait>(waited) == runtime::ClockWait::cancelled) return;
@@ -420,25 +471,31 @@ public:
         }
 
         services::GraphicsPresentation presentation;
-        presentation.native_read_pixels = item.texture.read_pixels;
-        presentation.native_texture_serial = item.texture.serial;
-        presentation.native_texture = item.texture.native_texture;
+        presentation.native_read_pixels = texture.read_pixels;
+        presentation.native_texture_serial = texture.serial;
+        presentation.native_texture = texture.native_texture;
+        presentation.native_submission = texture.native_submission;
+        if (ordered) presentation.native_producer_ready = producer_ready;
         presentation.native_vsync_paced = true;
         presentation.slot = item.slot;
         presentation.frame_number = item.frame;
-        presentation.width = item.texture.width;
-        presentation.height = item.texture.height;
+        presentation.width = texture.width;
+        presentation.height = texture.height;
         presentation.auto_timestamp = true;
         presentation.crop = item.crop;
         presentation.swap_interval = item.interval;
         nvn::timeline_event("pres_present", item.frame, std::uint64_t(item.interval));
         try {
             const auto completed = queue->presenter(presentation);
+            if (completed.completed && ordered && !producer_ready()) {
+                note_frame_failure("the ordered frame's producer did not complete successfully");
+                return;
+            }
             if (completed.completed) nvn::timeline_event("pres_complete", item.frame, std::uint64_t(item.interval));
             if (!completed.completed && !completed.diagnostic.empty())
-                note_failure(completed.diagnostic);
+                note_frame_failure(completed.diagnostic);
         } catch (...) {
-            note_failure("the presenter threw an exception");
+            note_frame_failure("the presenter threw an exception");
         }
     }
 
@@ -554,6 +611,7 @@ private:
         queue_->maximum = 0;
         queue_->active = 0;
         queue_->native_registered = false;
+        queue_->native_failed = false;
         queue_->update_free_event();
     }
 
@@ -1185,16 +1243,14 @@ IpcReply DisplaySession::request_locked(const IpcMessage& message) {
     case 2020: {
         // OpenLayer: displayName[0x40], u64 layer id, AppletResourceUserId. The
         // service fills the caller's buffer with the layer description.
-        if (buffers_ == nullptr || buffers_->empty() || (*buffers_)[0].size < 0x40)
+        if (buffers_ == nullptr || buffers_->empty() || (*buffers_)[0].size < 0x3c)
             return unsupported("OpenLayer needs the caller's layer buffer");
         const auto layer_id = static_cast<std::uint64_t>(read(message, cmif + 16 + 0x40)) |
                               (static_cast<std::uint64_t>(read(message, cmif + 16 + 0x44)) << 32);
-        // A parcel flat image: {u32 data size, u32 data offset, u32 object bytes,
-        // u32 object offset} then one flat_binder_object naming the producer.
-        // Parcel flat image: the object table holds 64-bit offsets into the data
-        // region, so one object costs eight table bytes and the flat object itself
-        // lives in the data region.
-        std::array<std::byte, 0x40> parcel{};
+        // Parcel flat image: {u32 data size, u32 data offset, u32 object table bytes,
+        // u32 object table offset}, the data region, then one four-byte table entry
+        // per object. The length is exactly header, data and table: 0x3c here.
+        std::array<std::byte, 0x3c> parcel{};
         const auto put = [&](std::size_t offset, std::uint32_t value) {
             for (unsigned index = 0; index != 4; ++index)
                 parcel[offset + index] = static_cast<std::byte>((value >> (8 * index)) & 255);
@@ -1203,25 +1259,23 @@ IpcReply DisplaySession::request_locked(const IpcMessage& message) {
         put(0x04, 0x10);   // data offset
         put(0x08, 0x04);   // object table bytes: one four-byte offset
         put(0x0c, 0x38);   // object table offset
-        // Object form the client's unflatten_binder reads: type 2 is a handle at
-        // offset 8, type 0 a local binder named by the cookie at offset 16.
+        // The producer as a proxy binder object: type 2 (handle), flags 0x7f, the
+        // 64-bit handle at +8, a zero cookie at +0x10 and the binder driver's
+        // service name in the 16 bytes at +0x18. Local binder types (0, 1) are never
+        // serialized here.
         put(0x10, 2);
-        put(0x14, 0);
+        put(0x14, 0x7f);
         put(0x18, layer_id != 0 ? 1u : 0u);
         put(0x1c, 0);
         put(0x20, 0);
         put(0x24, 0);
-        // The object names the service whose interface the client resolves for the
-        // producer: a NUL-terminated name in its trailing words.
         constexpr char producer_service[] = "dispdrv";
         for (std::size_t index = 0; index != sizeof producer_service; ++index)
             parcel[0x28 + index] = static_cast<std::byte>(producer_service[index]);
         put(0x30, 0);
         put(0x34, 0);
         put(0x38, 0);      // object 0 sits at data offset zero
-        std::array<std::byte, 0x40> data{};
-        std::copy(parcel.begin(), parcel.end(), data.begin());
-        if (!buffers_->write(0, data)) return unsupported("OpenLayer could not fill the layer buffer");
+        if (!buffers_->write(0, parcel)) return unsupported("OpenLayer could not fill the layer buffer");
         // A reply that carries a buffer keeps its interface word directly after the
         // reply header: SFCO at 16, the result at 24 and the written length at 32.
         IpcReply reply;

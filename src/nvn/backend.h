@@ -22,8 +22,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
+#include <string>
 
 namespace armigo::nvn {
 
@@ -45,6 +47,13 @@ public:
     virtual void release_pool(const MemoryPoolState& pool) = 0;
     // The CPU wrote [offset, offset + size) of the pool.
     virtual void flush_pool(const MemoryPoolState& pool, std::uint64_t offset, std::uint64_t size) = 0;
+    // The driver handed out [gpu_address, gpu_address + size). A guest-memory
+    // table lists a pool only once some handed-out address meets it. A backend
+    // that keeps no such table ignores the call.
+    virtual void note_addressed(std::uint64_t gpu_address, std::uint64_t size) {
+        (void)gpu_address;
+        (void)size;
+    }
     // The driver is about to store into [offset, offset + size) of the pool:
     // backend GPU work that still reads pool bytes finishes first.
     virtual void prepare_pool_write(const MemoryPoolState&, std::uint64_t, std::uint64_t) {}
@@ -66,11 +75,18 @@ public:
     // Descriptor pool slots as the game writes them.
     virtual void register_texture_descriptor(std::int32_t id, const TextureState& texture,
                                              const TextureViewState* view) = 0;
+    // A null texture or image registration empties that descriptor ID.
+    virtual void clear_texture_descriptor(std::int32_t id) = 0;
     virtual void register_sampler_descriptor(std::int32_t id, const SamplerParameters& sampler) = 0;
 
     // CPU texel access (nvnTextureReadTexels / WriteTexels and their strided forms).
     virtual bool read_texels(const TextureState& texture, const TexelTransfer& transfer, std::byte* out) = 0;
     virtual bool write_texels(const TextureState& texture, const TexelTransfer& transfer, const std::byte* in) = 0;
+};
+
+struct NativeProducerFence {
+    std::uint64_t fence = 0;
+    std::function<std::string()> result;
 };
 
 class ReplayBackend {
@@ -109,6 +125,12 @@ public:
         static_cast<void>(queue);
         return submit(handles);
     }
+    // Native presentation snapshots the producer fence and pins its result in
+    // one transaction. Other backends keep their existing fence/wait path.
+    virtual std::optional<NativeProducerFence> snapshot_native_producer(std::uintptr_t queue) {
+        static_cast<void>(queue);
+        return std::nullopt;
+    }
     // The queue `queue` names waits for `fence` to complete before its later
     // work runs (nvnQueueWaitSync). Returns the fence that completes once the
     // wait passed, which becomes the queue's latest fence (0 when nothing is
@@ -124,6 +146,8 @@ public:
     virtual void forget_queue(std::uintptr_t queue) { static_cast<void>(queue); }
     // Starts submitted work without waiting (nvnQueueFlush).
     virtual void flush() = 0;
+    // Fatal replay failures must be observable even when presentation stops.
+    [[nodiscard]] virtual std::string fatal_error_detail() const { return {}; }
     // Highest fence value the GPU completed, with every fence before it.
     [[nodiscard]] virtual std::uint64_t completed_fence() const = 0;
     // Whether the work of `fence` completed: a backend that holds a queue's
@@ -131,7 +155,7 @@ public:
     [[nodiscard]] virtual bool fence_completed(std::uint64_t fence) const { return completed_fence() >= fence; }
     // Blocks the calling thread until the fence completes (fence_completed)
     // or the timeout (nanoseconds, UINT64_MAX for none) passes; false on
-    // timeout.
+    // timeout or a fatal replay failure.
     virtual bool wait_fence(std::uint64_t fence, std::uint64_t timeout_ns) = 0;
 };
 

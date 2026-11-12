@@ -668,7 +668,8 @@ int test_mode(armigo::services::OperationMode mode) {
     // OpenLayer (command 2020) fills the caller's buffer with a parcel that names
     // the layer's producer and answers with the written length. The client's own
     // parser reads a 40-byte binder object from the parcel's data region and a
-    // four-byte object table entry pointing at it.
+    // four-byte object table entry pointing at it; the reported length covers
+    // exactly header, data and table.
     {
         std::array<std::byte, 0x100> layer_buffer{};
         armigo::horizon::GuestBuffers buffers(
@@ -704,15 +705,18 @@ int test_mode(armigo::services::OperationMode mode) {
         CHECK(reply.disposition == IpcDisposition::handled);
         CHECK(get(reply.bytes, 16) == 0x4f434653);
         CHECK(get(reply.bytes, 24) == 0);
-        CHECK(get(reply.bytes, 32) == 0x40);
+        CHECK(get(reply.bytes, 32) == 0x3c);
         const auto* words = reinterpret_cast<const std::uint32_t*>(layer_buffer.data());
         CHECK(words[0] == 0x28);    // data bytes
         CHECK(words[1] == 0x10);    // data offset
         CHECK(words[2] == 0x04);    // object table bytes
         CHECK(words[3] == 0x38);    // object table offset
         CHECK(words[4] == 2);       // handle object
+        CHECK(words[5] == 0x7f);    // proxy binder flags
+        CHECK(std::memcmp(layer_buffer.data() + 0x28, "dispdrv", 8) == 0);
         CHECK(words[6] == 1);       // producer handle
         CHECK(words[14] == 0);      // object 0 sits at data offset zero
+        CHECK(words[15] == 0);      // nothing written past the 0x3c-byte parcel
         // Without the caller's buffer the command stays explicit.
         reply = session.request(message, 5);
         CHECK(reply.disposition == IpcDisposition::unsupported);

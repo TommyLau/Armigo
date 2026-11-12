@@ -314,12 +314,16 @@ void present(NVNqueue *queue, NVNwindow *window, int index) {
   services::GraphicsPresentationResult result;
   try {
     replay->flush();
-    const auto fence = queue_last_fence(queue);
+    // Select and retain together: a concurrent submit may supersede this
+    // producer before the texture exporter captures the frame.
+    const auto native_producer = replay->snapshot_native_producer(queue_identity(queue));
+    const auto fence = native_producer ? native_producer->fence : queue_last_fence(queue);
     timeline_event("present_call", fence, std::uint64_t(index));
     const auto completed = blocking_wait([&] {
       result = instance->producer->present(
           index, fence,
-          [replay](std::uint64_t value) {
+          [replay, producer_result = native_producer ? native_producer->result : std::function<std::string()>{}](std::uint64_t value) {
+            static_cast<void>(producer_result);
             return replay->wait_fence(value, UINT64_MAX);
           },
           crop, interval);

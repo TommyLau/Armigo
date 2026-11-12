@@ -32,7 +32,8 @@ with tempfile.TemporaryDirectory(prefix="armigo-player-choices-") as directory:
     }
     environment = {key: value for key, value in os.environ.items() if not key.startswith("ARMIGO_")}
 
-    def check(policy, expected, *arguments, clock=60, fallback=0, options="0,30,60,"):
+    def check(policy, expected, *arguments, clock=60, fallback=0, options="0,30,60,",
+              language=None, language_fallback=0, supported="en-US,ja,fr,"):
         metadata = dict(base)
         if policy is not None:
             metadata["ArmigoTitleFrameRate"] = policy
@@ -41,6 +42,8 @@ with tempfile.TemporaryDirectory(prefix="armigo-player-choices-") as directory:
         result = subprocess.run([str(executable), *arguments], env=environment,
                                 text=True, capture_output=True, check=True)
         expected += f"\nclock={clock} fallback={fallback} options={options}"
+        if language is not None:
+            expected += f"\nlanguage={language} fallback={language_fallback} supported={supported}"
         assert result.stdout.strip() == expected, (result.stdout, result.stderr, expected)
 
     check(None, "60 0 0 unset 60")
@@ -67,9 +70,44 @@ with tempfile.TemporaryDirectory(prefix="armigo-player-choices-") as directory:
           fallback=1, options="0,30,")
     check(None, "60 0 0 unset 60", "-frame_rate", "120", "-display_hz", "120", fallback=1)
     check({"Default": "30", "DisplayRefresh": 60}, "60 0 0 unset 60")
+
+    language_args = ("-language_key", "game_language", "-languages", "en-US,ja,fr")
+    check(None, "60 0 0 unset 60", *language_args, language="auto")
+    check(None, "60 0 0 unset 60", "-write_language", "game_language", "fr",
+          *language_args, language="fr")
+    check(None, "60 0 0 unset 60", *language_args, language="fr")
+    check(None, "60 0 0 unset 60", "-write_language", "game_language", "auto",
+          *language_args, language="auto")
+    check(None, "60 0 0 unset 60", "-write_language", "game_language", "es",
+          *language_args, language="auto", language_fallback=1)
+    check(None, "60 0 0 unset 60", *language_args, language="auto", language_fallback=1)
+    check(None, "60 0 0 unset 60", "-write_language", "game_language", "auto",
+          "-language_key", "game_language", "-languages", "en-US,not-a-language,fr,en-US",
+          language="auto", supported="en-US,fr,")
+
+    first_title = "game_language.0200000000000A42"
+    second_title = "game_language.0200000000000A43"
+    check(None, "60 0 0 unset 60", "-write_language", first_title, "fr",
+          "-write_language", second_title, "ja", "-language_key", first_title,
+          "-languages", "en-US,ja,fr", "-expect_language", second_title, "ja", language="fr")
+    check(None, "60 0 0 unset 60", "-language_key", second_title, "-languages", "en-US,ja,fr",
+          "-expect_language", first_title, "fr", language="ja")
+
+    migration_args = (
+        "-write_language", "game_language", "fr", "-write_frame_rate", "frame_rate", "120",
+        "-language", "en-US", "-region", "1", "-fps_overlay", "1", "-display_hz", "120",
+        *language_args,
+    )
+    check(high, "120 1 120 120 120", *migration_args, clock=120, options="0,30,60,120,", language="fr")
+    check(high, "120 1 120 120 120", "-display_hz", "120", *language_args,
+          clock=120, options="0,30,60,120,", language="fr")
+    check(high, "120 1 120 120 120", "-write_language", "game_language", "es",
+          "-display_hz", "120", *language_args, clock=120, options="0,30,60,120,",
+          language="auto", language_fallback=1)
+
     environment["ARMIGO_COMPAT_FRAME_RATE"] = "30"
     check(policy, "60 1 60 30 60", "-frame_rate", "60")
     environment["ARMIGO_VI_REFRESH_HZ"] = "30"
     check(policy, "60 1 60 30 30", "-frame_rate", "60")
 
-print("Player title frame-rate preference checks passed.")
+print("Player display and game-language preference checks passed.")

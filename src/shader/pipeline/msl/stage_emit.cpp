@@ -493,6 +493,7 @@ class StageContext final : public MslContext {
     std::optional<DepthConvention> depth_;
     // A vertex stage that writes no output (see ResourcePlan).
     bool void_vertex_{};
+    bool default_vertex_position_{};
     // SIMD-groups of a compute stage with warp matrix operations, each with a
     // 256-word threadgroup scratch block; zero without such operations.
     std::uint32_t matrix_groups_{};
@@ -701,15 +702,7 @@ public:
         return callback(*this, current_, [&] {
             if (helper_names_.contains(std::string(name))) return;
             std::string source;
-            if (name == "armigo_cbuf_word") source = R"(
-inline uint armigo_cbuf_word(constant uint* cb, ulong address, uint size_bytes, uint window_bytes) {
-    // Every bound window holds window_bytes: guest words below the bound size
-    // and zero words past it, so only the window limits the read.
-    const ulong word_address = address & ~3ul;
-    return word_address <= ulong(window_bytes - 4u) ? cb[word_address / 4ul] : 0u;
-}
-)";
-            else if (name == "armigo_multiply_rne") source = armigo::shader::emit_rne_multiply_msl();
+            if (name == "armigo_multiply_rne") source = armigo::shader::emit_rne_multiply_msl();
             else if (name == "armigo_reciprocal_rne") source = armigo::shader::emit_reciprocal_msl();
             else if (name == "armigo_mul_rtz_ftz") source = armigo::shader::emit_rtz_ftz_multiply_msl();
             else if (name == "armigo_i2f")
@@ -749,18 +742,27 @@ inline void armigo_mma_get_c(thread simdgroup_half8x8 (&c)[2], const threadgroup
     const threadgroup half* h = reinterpret_cast<const threadgroup half*>(s) + 384;
     simdgroup_load(c[0], h, 8); simdgroup_load(c[1], h + 64, 8);
 }
-// D = A B + C: binary16 products are exact in binary32, which accumulates
-// them over k with C; the second multiply-accumulate rounds each element to
-// binary16 once, as the D words hold it, so a D kept as the next C equals
-// the words read back.
+// Each eight-product block accumulates in binary32 and then rounds to
+// binary16. Keep intermediates separate from D until every input is read:
+// a retained output can also be an input of this operation.
 inline void armigo_mma(thread simdgroup_half8x8 (&d)[2],
                        thread const simdgroup_half8x8& a0, thread const simdgroup_half8x8& a1,
                        thread const simdgroup_half8x8& a2, thread const simdgroup_half8x8& a3,
                        thread const simdgroup_half8x8& b0, thread const simdgroup_half8x8& b1,
                        thread const simdgroup_half8x8& c0, thread const simdgroup_half8x8& c1) {
     simdgroup_float8x8 low, high;
-    simdgroup_multiply_accumulate(low, a0, b0, c0); simdgroup_multiply_accumulate(d[0], a2, b1, low);
-    simdgroup_multiply_accumulate(high, a1, b0, c1); simdgroup_multiply_accumulate(d[1], a3, b1, high);
+    simdgroup_half8x8 rounded_low, rounded_high;
+    simdgroup_multiply_accumulate(low, a0, b0, c0); simdgroup_multiply_accumulate(high, a1, b0, c1);
+    for (uint i = 0; i < 2; ++i) {
+        rounded_low.thread_elements()[i] = half(low.thread_elements()[i]);
+        rounded_high.thread_elements()[i] = half(high.thread_elements()[i]);
+    }
+    simdgroup_multiply_accumulate(low, a2, b1, rounded_low);
+    simdgroup_multiply_accumulate(high, a3, b1, rounded_high);
+    for (uint i = 0; i < 2; ++i) {
+        d[0].thread_elements()[i] = half(low.thread_elements()[i]);
+        d[1].thread_elements()[i] = half(high.thread_elements()[i]);
+    }
 }
 inline uint2 armigo_mma_lanes(threadgroup uint* s, uint lane, thread const simdgroup_half8x8 (&d)[2]) {
     const uint g = (lane & 31u) >> 2u, t = lane & 3u;
@@ -922,9 +924,8 @@ inline ulong armigo_guest_address(device uint* table, ulong address, uint bytes,
     return armigo_guest_search(table, address, bytes, tag, write);
 }
 )";
-            // armigo_cbuf_word, armigo_multiply_rne: requested by the memory
-            // generators (runtime window guard, perspective-correction
-            // product). armigo_reciprocal_rne stays registered as the reserved
+            // armigo_multiply_rne supports perspective-correction products.
+            // armigo_reciprocal_rne stays registered as the reserved
             // exact reciprocal for non-multifunction users. armigo_i2f carries
             // the exact integer-to-float truncation, which the native cast
             // cannot express; armigo_mul_rtz_ftz the exact toward-zero product, no longer requested here (FMUL.RZ is the native product). Every other floating operation generator is
@@ -934,19 +935,18 @@ inline ulong armigo_guest_address(device uint* table, ulong address, uint bytes,
             helpers_ += source; helper_names_.insert(std::string(name));
         });
     }
-    bool marks_pool_reads() const {
-        if (!std::any_of(plan_.resources.begin(), plan_.resources.end(), [](const auto& r) {
-                const auto* t = std::get_if<TextureUse>(&r.use);
-                return t && t->pool;
-            })) return false;
+    bool can_use_early_fragment_tests() const {
         if (std::any_of(plan_.io.begin(), plan_.io.end(), [](const auto& io) {
-                return io.access == Access::write && (io.semantic == IoSemantic::fragment_depth ||
-                                                      io.semantic == IoSemantic::sample_mask);
+                return io.access == Access::write && io.semantic == IoSemantic::fragment_depth;
+            })) return false;
+        if (p_.ir.api_mandated_early_fragment_tests) return true;
+        if (std::any_of(plan_.io.begin(), plan_.io.end(), [](const auto& io) {
+                return io.access == Access::write && io.semantic == IoSemantic::sample_mask;
             })) return false;
         for (const auto& op : p_.ir.operations) {
             const auto effects = required_effects(op);
-            if (includes(effects, Effects::discard)) return false;
-            if (!includes(effects, Effects::write_memory) && !includes(effects, Effects::atomic)) continue;
+            if (includes(effects, Effects::discard) || includes(effects, Effects::atomic)) return false;
+            if (!includes(effects, Effects::write_memory)) continue;
             const auto* memory = std::get_if<MemoryInfo>(&op.info);
             if (!memory || memory->space != AddressSpace::local) return false;
         }
@@ -972,8 +972,15 @@ inline ulong armigo_guest_address(device uint* table, ulong address, uint bytes,
                     "Shared memory and warp matrix scratch exceed the threadgroup memory", DiagnosticCode::limit_exceeded);
             matrix_plan_ = plan_matrices(p_, [this] { step(); });
         }
-        void_vertex_ = plan_.stage == Stage::vertex &&
+        if (plan_.stage == Stage::vertex)
+            for (const auto& d : plan_.dependencies) if (d.key.kind == FactKind::depth_convention) {
+                require(!depth_ && std::holds_alternative<DepthConvention>(d.value), "Conflicting/invalid vertex depth dependency");
+                depth_ = std::get<DepthConvention>(d.value);
+            }
+        const bool outputless_vertex = plan_.stage == Stage::vertex &&
             std::none_of(plan_.io.begin(), plan_.io.end(), [](const auto& io) { return io.access == Access::write; });
+        default_vertex_position_ = outputless_vertex && depth_.has_value();
+        void_vertex_ = outputless_vertex && !default_vertex_position_;
         fixed_point_size_ = plan_.stage == Stage::vertex && !void_vertex_ &&
             std::none_of(plan_.io.begin(), plan_.io.end(), [](const auto& io) {
                 return io.access == Access::write &&
@@ -981,6 +988,9 @@ inline ulong armigo_guest_address(device uint* table, ulong address, uint bytes,
                         io.semantic == IoSemantic::viewport_index);
             });
         validate_plan(p_, plan_, options_);
+        require(!p_.ir.api_mandated_early_fragment_tests || !options_.emulate_depth_bias,
+                "API early fragment tests cannot use fragment depth-bias emulation",
+                DiagnosticCode::unsupported_capability);
         const auto& ir = p_.ir;
         require(p_.regions.size() <= ir.limits.regions && ir.values.size() <= ir.limits.values && ir.operations.size() <= ir.limits.operations &&
                 ir.blocks.size() <= ir.limits.blocks && ir.functions.size() <= ir.limits.functions, "Structured program exceeds limits", DiagnosticCode::limit_exceeded);
@@ -1018,11 +1028,7 @@ inline ulong armigo_guest_address(device uint* table, ulong address, uint bytes,
             for (const auto& io : plan_.io)
                 if (io.semantic == IoSemantic::position && io.access == Access::write && io.mask && !(io.mask & ~15u))
                     position = true;
-            require(position || void_vertex_, "Vertex stage must declare a position output");
-            for (const auto& d : plan_.dependencies) if (d.key.kind == FactKind::depth_convention) {
-                require(!depth_ && std::holds_alternative<DepthConvention>(d.value), "Conflicting/invalid vertex depth dependency");
-                depth_ = std::get<DepthConvention>(d.value);
-            }
+            require(position || void_vertex_ || default_vertex_position_, "Vertex stage must declare a position output");
             if (!depth_ && !void_vertex_) {
                 auto d = diagnose(Phase::emit_msl, DiagnosticCode::missing_fact, {}, "Vertex stage requires a recorded clip-depth convention");
                 d.missing_fact = FactKey{FactKind::depth_convention}; throw Failure{d};
@@ -1051,8 +1057,19 @@ inline ulong armigo_guest_address(device uint* table, ulong address, uint bytes,
         }
         append(pool_declarations(plan_));
         if (plan_.custom_border) append(std::string(custom_border_msl));
-        append(io_declarations(plan_, false, options_.fragment_output_types_from_render_targets, options_.emulate_depth_bias, fixed_point_size_));
-        append(io_declarations(plan_, true, options_.fragment_output_types_from_render_targets, options_.emulate_depth_bias, fixed_point_size_,
+        auto emitted_plan = plan_;
+        if (default_vertex_position_) {
+            // The vertex position register starts at (0, 0, 0, 1), including
+            // programs with no exports. It still permits point rasterization.
+            IoUse position{};
+            position.semantic = IoSemantic::position;
+            position.access = Access::write;
+            position.mask = 15;
+            position.type = {ScalarType::f32, 4};
+            emitted_plan.io.push_back(position);
+        }
+        append(io_declarations(emitted_plan, false, options_.fragment_output_types_from_render_targets, options_.emulate_depth_bias, fixed_point_size_));
+        append(io_declarations(emitted_plan, true, options_.fragment_output_types_from_render_targets, options_.emulate_depth_bias, fixed_point_size_,
                                options_.invariant_position));
         const bool vertex_fetch = plan_.vertex_fetch_buffer_index.has_value();
         if (vertex_fetch) append(std::string(vertex_fetch_msl()));
@@ -1084,11 +1101,12 @@ inline ulong armigo_guest_address(device uint* table, ulong address, uint bytes,
             append("constant bool armigo_border_records_ [[function_constant(12)]];\n"
                    "constant bool armigo_border_records = is_function_constant_defined("
                    "armigo_border_records_) ? armigo_border_records_ : true;\n");
-        // A pool read's mark is a store, which would move the depth test
-        // after the stage; the mark is the host's own and must not move it
-        // (the project documentation). A stage that discards, writes
-        // depth, sample mask or memory itself keeps the test where it was.
-        if (ir.stage == Stage::fragment && !options_.emulate_depth_bias && marks_pool_reads()) append("[[early_fragment_tests]] ");
+        // Host lookup diagnostics must not move an originally read-only
+        // fragment's depth test after shading. Classify the guest operations,
+        // not the device writes introduced by the emitted helpers.
+        if (ir.stage == Stage::fragment && !options_.emulate_depth_bias && can_use_early_fragment_tests())
+            append("[[early_fragment_tests]] ");
+        const auto function_begin = text_.size();
         append((ir.stage == Stage::compute ? "kernel void " : void_vertex_ ? "vertex void " :
                 ir.stage == Stage::vertex ? "vertex ArmigoOutput " : "fragment ArmigoOutput ") + entry + "(");
         bool argument = false;
@@ -1177,6 +1195,7 @@ inline ulong armigo_guest_address(device uint* table, ulong address, uint bytes,
         }
         append(") {\n");
         if (ir.stage != Stage::compute && !void_vertex_) line("ArmigoOutput out;");
+        if (default_vertex_position_) line("out.position = float4(0.0f, 0.0f, 0.0f, 1.0f);");
         if (vertex_fetch) {
             if (std::any_of(plan_.io.begin(), plan_.io.end(), [](const auto& io) {
                     return io.access == Access::read && io.semantic == IoSemantic::generic; }))
@@ -1231,8 +1250,21 @@ inline ulong armigo_guest_address(device uint* table, ulong address, uint bytes,
                     line("uint4 armigo_" + io_name(io.semantic, io.location) + "_raw = uint4(0);");
             }
         }
-        if (plan_.compute && plan_.compute->shared_memory_bytes)
+        if (std::any_of(p_.ir.operations.begin(), p_.ir.operations.end(), [](const auto& op) {
+                const auto* memory = std::get_if<MemoryInfo>(&op.info);
+                return memory && memory->space == AddressSpace::guest && memory->native_load_policy.has_value();
+            })) line("// native_ldg_aligned_v1: ordinary aligned native LDG loads.");
+        if (plan_.compute && plan_.compute->shared_memory_bytes) {
+            if (std::any_of(p_.ir.operations.begin(), p_.ir.operations.end(), [](const auto& op) {
+                    const auto* memory = std::get_if<MemoryInfo>(&op.info);
+                    return memory && memory->stage_buffer.has_value();
+                })) line("// stage_buffer_header_direct_v1: direct indexing of declared stage-buffer regions.");
+            if (std::any_of(p_.ir.operations.begin(), p_.ir.operations.end(), [](const auto& op) {
+                    const auto* memory = std::get_if<MemoryInfo>(&op.info);
+                    return memory && memory->native_shared_atomic_policy.has_value();
+                })) line("// native_shared_word_atomic_v1: direct native workgroup word indexing.");
             line("threadgroup atomic_uint armigo_shared_words[" + number(plan_.compute->shared_memory_bytes / 4) + "];");
+        }
         if (matrix_groups_) {
             line("threadgroup uint armigo_matrix_scratch[" + number(matrix_groups_ * 256u) + "];");
             line("threadgroup uint* const armigo_mma_block = armigo_matrix_scratch + armigo_simdgroup * 256u;");
@@ -1290,10 +1322,34 @@ inline ulong armigo_guest_address(device uint* table, ulong address, uint bytes,
             line("const uint " + io_name(io.semantic, io.location) + " = armigo_instance_index - armigo_guest_first_instance;");
         for (const auto& io : plan_.io) if (io.access == Access::read && io.semantic == IoSemantic::render_target_height)
             line("const uint " + io_name(io.semantic, io.location) + " = armigo_draw_parameters[1];");
-        // Owner decision: every value starts at zero/false, so a read whose
+        // Owner decision: each referenced value starts at zero/false, so a read whose
         // definition does not reach every structured path observes zero instead
         // of an uninitialized MSL local.
-        for (std::size_t i = 0; i < ir.values.size(); ++i) line(raw_type(ir.values[i].type) + " value" + number(i) + " = {};");
+        const bool direct_storage = std::any_of(ir.operations.begin(), ir.operations.end(), [](const auto& op) {
+            const auto* memory = std::get_if<MemoryInfo>(&op.info);
+            return memory && memory->direct_storage.has_value();
+        });
+        std::vector<bool> referenced_values(ir.values.size(), !direct_storage);
+        const auto mark = [&](const Operand& operand) {
+            if (const auto* value = std::get_if<ValueId>(&operand)) referenced_values[value->value] = true;
+        };
+        if (direct_storage) {
+            for (std::size_t i = 0; i < ir.values.size(); ++i)
+                if (ir.values[i].kind == ValueKind::mutable_local) referenced_values[i] = true;
+            for (const auto& op : ir.operations) {
+                for (const auto& input : op.inputs) mark(input);
+                for (const auto& output : op.outputs) mark(output);
+            }
+            for (const auto& function : ir.functions) for (auto parameter : function.parameters) mark(parameter);
+            for (const auto& block : ir.blocks) {
+                for (const auto& phi : block.phis) { mark(phi.output); for (const auto& input : phi.inputs) mark(input.value); }
+                if (const auto* branch = std::get_if<Branch>(&block.terminator)) mark(branch->condition);
+                if (const auto* selection = std::get_if<Switch>(&block.terminator)) mark(selection->selector);
+                if (const auto* result = std::get_if<Return>(&block.terminator)) for (const auto& value : result->values) mark(value);
+            }
+        }
+        for (std::size_t i = 0; i < ir.values.size(); ++i)
+            if (referenced_values[i]) line(raw_type(ir.values[i].type) + " value" + number(i) + " = {};");
         region(p_.functions[0].root);
         require(regions_.size() == p_.regions.size() && blocks_.size() == ir.blocks.size() && operations_.size() == ir.operations.size(),
                 "Structured traversal does not cover every region/block/operation");
@@ -1303,6 +1359,18 @@ inline ulong armigo_guest_address(device uint* table, ulong address, uint bytes,
             emit_return();
         }
         append("}\n");
+        if (default_vertex_position_) {
+            // Metal requires a void vertex when guest draw state disables
+            // rasterization. Both static entries execute the same guest body.
+            auto discard = text_.substr(function_begin);
+            const auto signature = std::string("vertex ArmigoOutput ") + entry;
+            discard.replace(0, signature.size(), "vertex void " + entry + "_discard");
+            for (std::size_t at = 0; (at = discard.find("return out;", at)) != std::string::npos; ) {
+                discard.replace(at, 11, "return;");
+                at += 7;
+            }
+            append(discard);
+        }
         // Relaxed math with fast contraction is the native Metal arithmetic.
         // The guest rules it would lose stay explicit in the emitted code:
         // NaN tests on the bits, precise extrema and saturation, and the
@@ -1311,7 +1379,8 @@ inline ulong armigo_guest_address(device uint* table, ulong address, uint bytes,
         std::string prelude = "#include <metal_stdlib>\nusing namespace metal;\n#pragma METAL fp math_mode(relaxed)\n#pragma METAL fp contract(fast)\n";
         require(prelude.size() + helpers_.size() + text_.size() <= ir.limits.source_bytes, "MSL source limit exceeded", DiagnosticCode::limit_exceeded);
         require(helpers_.find(" " + entry + "(") == std::string::npos, "Entry point collides with an emitted helper");
-        auto reflection = plan_;
+        auto reflection = std::move(emitted_plan);
+        if (default_vertex_position_) reflection.discard_entry_point = entry + "_discard";
         reflection.fragment_position = options_.fragment_position;
         reflection.emulate_depth_bias = options_.emulate_depth_bias;
         reflection.fixed_point_size = fixed_point_size_;

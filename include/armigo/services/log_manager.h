@@ -18,23 +18,17 @@
 
 namespace armigo::services::lm {
 
-// Platform policy for log-manager lifecycle and descriptor admission.
-// Horizon 23.0.1 is the release on both.
-enum class LogManagerContract { switch1, switch2 };
-
-// One LM client session under an explicitly selected platform contract.
-// Supports CMIF controls 3 and 0,
+// One LM client session. Switch 1 and Switch 2 share one code path: both run
+// Horizon 23.0.1, and no platform parameter of this service has evidence of a
+// difference. Supports CMIF controls 3 and 0,
 // followed by domain ILogService::OpenLogger (command 0), and the logger's
 // command 0, whose retail implementation does not consume the log payload.
-// Both platforms validate a bounded input copy and reply with the logger
-// interface word. The Switch 2 platform contract uses a 56-byte reply; the
-// Switch 1 platform contract keeps a 48-byte reply. The copy-size caps are
-// host admission. HIPC types 5/7 serve controls and types 4/6 serve domain
+// The session validates a bounded input copy and replies with the logger
+// interface word in a 56-byte reply. The copy-size caps are host admission. HIPC types 5/7 serve controls and types 4/6 serve domain
 // requests. No SDK replacement or non-domain handle factory is implied.
 class LogManagerSession final : public horizon::ClientSession {
 public:
-    explicit LogManagerSession(std::uint64_t process_id,
-        LogManagerContract contract = LogManagerContract::switch1);
+    explicit LogManagerSession(std::uint64_t process_id);
     horizon::IpcReply close_server() override;
 
     horizon::IpcReply request(const horizon::IpcMessage& message,
@@ -71,7 +65,6 @@ private:
 
     mutable std::mutex mutex_;
     const std::uint64_t process_id_;
-    const LogManagerContract contract_;
     std::shared_ptr<DomainObject> root_;
     bool closed_ = false;
     // IDs are one-based indices into owned objects. No guest/kernel handle is

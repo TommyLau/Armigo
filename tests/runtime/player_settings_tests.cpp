@@ -63,6 +63,29 @@ void test_manifest_and_language_selection() {
         CHECK(armigo::services::set::console_region_code() == 2);
         CHECK(armigo::tools::apply_language_manifest(*parsed, {}) == "en-US");
         CHECK(armigo::services::set::console_region_code() == 1);
+
+        // The file lists pt, but its supported-language bit is absent.
+        const std::vector<std::string> expected_languages{"en-US", "ja", "de", "fr", "zh-Hans"};
+        const auto automatic = armigo::tools::game_language_choice(*parsed, std::nullopt);
+        CHECK(automatic.supported_languages == expected_languages);
+        CHECK(automatic.preference == "auto" && !automatic.fell_back);
+        const auto japanese = armigo::tools::game_language_choice(*parsed, std::string("ja"));
+        CHECK(japanese.preference == "ja" && !japanese.fell_back);
+        const auto stale = armigo::tools::game_language_choice(*parsed, std::string("es"));
+        CHECK(stale.preference == "auto" && stale.fell_back);
+        CHECK(armigo::tools::game_language_choice(*parsed, std::string("not-a-language")).fell_back);
+        auto duplicated = *parsed;
+        duplicated.supported_language_flag = 0x9;
+        duplicated.languages = {"en-US", "not-a-language", "ja", "fr", "en-US"};
+        CHECK(armigo::tools::game_language_choice(duplicated, std::nullopt).supported_languages ==
+              std::vector<std::string>({"en-US", "fr"}));
+
+        CHECK(armigo::tools::apply_language_manifest(*parsed, {{"ja-JP"}}, "fr") == "fr");
+        CHECK(armigo::services::set::console_region_code() == 2);
+        CHECK(armigo::tools::apply_language_manifest(*parsed, {{"de-DE"}}, "ja") == "ja");
+        CHECK(armigo::services::set::console_region_code() == 0);
+        CHECK(armigo::tools::apply_language_manifest(*parsed, {{"ja-JP"}}, "es").empty());
+        CHECK(armigo::tools::apply_language_manifest(*parsed, {}) == "en-US");
     }
     {
         std::ofstream output(manifest_path);
@@ -109,8 +132,16 @@ void test_resolution_and_choices() {
     CHECK(arguments.content_width == 1920 && !arguments.display_sync);
     unsetenv("MTL_HUD_ENABLED");
     armigo::tools::apply_performance_overlay(armigo::tools::PlayerChoices{});
-    CHECK(!std::getenv("MTL_HUD_ENABLED"));
+    CHECK(std::string_view(std::getenv("MTL_HUD_ENABLED")) == "0");
+    unsetenv("MTL_HUD_ENABLED");  // A fresh process starts with the original launch environment.
     armigo::tools::apply_performance_overlay(choices);
+    CHECK(std::string_view(std::getenv("MTL_HUD_ENABLED")) == "1");
+    // Explicit launch overrides survive either preference and restart.
+    setenv("MTL_HUD_ENABLED", "0", 1);
+    armigo::tools::apply_performance_overlay(choices);
+    CHECK(std::string_view(std::getenv("MTL_HUD_ENABLED")) == "0");
+    setenv("MTL_HUD_ENABLED", "1", 1);
+    armigo::tools::apply_performance_overlay(armigo::tools::PlayerChoices{});
     CHECK(std::string_view(std::getenv("MTL_HUD_ENABLED")) == "1");
     unsetenv("MTL_HUD_ENABLED");
     CHECK(std::string_view(std::getenv("ARMIGO_COMPAT_RESOLUTION_WIDTH")) == "1920");
@@ -243,6 +274,7 @@ void test_title_frame_rate_policy() {
               std::vector<std::uint32_t>({30, 60, 120, armigo::compat::variable_frame_rate}));
         CHECK(policy->experimental_rates == std::vector<std::uint32_t>({120}));
         CHECK(frame_rate_preference_key(policy->title_id) == "frame_rate.0200000000000A42");
+        CHECK(language_preference_key(policy->title_id) == "game_language.0200000000000A42");
         const auto automatic = title_frame_rate_choices(*policy, std::nullopt);
         CHECK(automatic.title_frame_rate && automatic.frame_rate == 0 && automatic.default_frame_rate == 30);
         CHECK(automatic.display_refresh_rate == 60 && automatic.experimental_frame_rates == policy->experimental_rates);
@@ -250,6 +282,7 @@ void test_title_frame_rate_policy() {
         CHECK(title_frame_rate_choices(*policy, 45).frame_rate == 0);
     }
     CHECK(frame_rate_preference_key(std::nullopt) == "frame_rate");
+    CHECK(language_preference_key(std::nullopt) == "game_language");
     // Other inputs, a build the settings do not describe, and settings off.
     auto container = arguments;
     container.container_file = root / "game.nsp";
@@ -347,6 +380,25 @@ void test_restart_command() {
           std::vector<std::string>({"Armigo", "run", "--exefs", "exefs", "--romfs", "romfs", "--width", "1600"}));
     CHECK(command.environment == std::vector<std::string>({"HOME=/home", "ARMIGO_COMPAT_RESOLUTION_RATE=120",
                                                             "ARMIGO_AUDIO=0", "MTL_HUD_ENABLED=1"}));
+    const auto original_without_hud = restart_command(run, {environment.data(), environment.size() - 1}, false);
+    CHECK(std::none_of(original_without_hud.environment.begin(), original_without_hud.environment.end(),
+        [](const auto& entry) { return entry.starts_with("MTL_HUD_ENABLED="); }));
+    // Armigo's injected On value is absent from the original launch snapshot.
+    // Applying the saved Off choice in a fresh process must explicitly disable it.
+    armigo::tools::PlayerChoices overlay_on;
+    overlay_on.performance_overlay = true;
+    unsetenv("MTL_HUD_ENABLED");
+    armigo::tools::apply_performance_overlay(overlay_on);
+    CHECK(std::string_view(std::getenv("MTL_HUD_ENABLED")) == "1");
+    CHECK(restart_command(run, {}, false).environment.empty());
+    unsetenv("MTL_HUD_ENABLED");
+    armigo::tools::apply_performance_overlay(armigo::tools::PlayerChoices{});
+    CHECK(std::string_view(std::getenv("MTL_HUD_ENABLED")) == "0");
+    unsetenv("MTL_HUD_ENABLED");
+    for (const char* external : {"0", "1"}) {
+        const std::vector<std::string> explicit_hud{std::string("MTL_HUD_ENABLED=") + external};
+        CHECK(restart_command(run, explicit_hud, false).environment == explicit_hud);
+    }
     command = restart_command(run, environment, true);
     CHECK(command.arguments.back() == "--fullscreen" && command.arguments.size() == 9);
     // --fullscreen follows the window: kept once in full screen, dropped when
@@ -365,7 +417,7 @@ void test_restart_command() {
           std::vector<std::string>({"Armigo", "run", "--report", "--refresh-hz", "--saves", "--fullscreen",
                                     "--fullscreen"}));
     // A packed app opened from the Finder.
-    const std::vector<std::string> packed{"/Applications/Game.app/Contents/MacOS/Armigo"};
+    const std::vector<std::string> packed{"/Applications/Game (0100000000000001).app/Contents/MacOS/Game-0100000000000001"};
     CHECK(restart_command(packed, {}, false).arguments == packed);
     CHECK(restart_command(packed, {}, true).arguments ==
           std::vector<std::string>({packed[0], "run", "--fullscreen"}));
